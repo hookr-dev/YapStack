@@ -5515,8 +5515,17 @@ pub async fn start_live_transcription(
                 (Some(v), None) | (None, Some(v)) => v,
                 (None, None) => 0.0,
             };
-            // 5% safety margin: avoid reading data near the ring buffer write head
-            config.backfill_seconds.min(available * 0.95)
+            // Clamp to what the buffer actually holds. When the buffer holds the
+            // full request we honour it exactly (no proportional shave — see the
+            // Full/Max tail-loss regression). Only when the request EXCEEDS
+            // everything available do we step back by an EXACT fixed write-head
+            // guard to stay clear of samples a concurrent writer may overwrite
+            // between this snapshot and extraction. See
+            // `clamp_backfill_to_available` for the full rationale.
+            yapstack_audio::ring_buffer::clamp_backfill_to_available(
+                config.backfill_seconds,
+                available,
+            )
         } else {
             0.0
         }

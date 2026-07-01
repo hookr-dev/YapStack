@@ -10,7 +10,12 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import { Ban } from "lucide-react";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Ban, ChevronsUpDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ICON_OPTIONS, COLOR_OPTIONS } from "@/lib/folder-constants";
 
@@ -43,6 +48,9 @@ export function FolderDialog({
   const [icon, setIcon] = useState<string | null>(null);
   const [color, setColor] = useState<string | null>(null);
   const [description, setDescription] = useState("");
+  // Icon grid is collapsed by default so it stops dominating the dialog;
+  // the selected icon stays visible in the trigger while collapsed.
+  const [iconPickerOpen, setIconPickerOpen] = useState(false);
 
   const initName = initialData?.name;
   const initIcon = initialData?.icon;
@@ -55,8 +63,14 @@ export function FolderDialog({
       setIcon(initIcon ?? null);
       setColor(initColor ?? null);
       setDescription(initDescription ?? "");
+      setIconPickerOpen(false);
     }
   }, [open, initName, initIcon, initColor, initDescription]);
+
+  const selectedIconOption = icon
+    ? ICON_OPTIONS.find((o) => o.name === icon)
+    : null;
+  const SelectedIcon = selectedIconOption?.icon ?? Ban;
 
   const handleSubmit = () => {
     const trimmed = name.trim();
@@ -106,43 +120,90 @@ export function FolderDialog({
             />
           </div>
 
-          {/* Icon picker */}
+          {/* Icon picker — a compact trigger opens a floating grid (Popover) so
+              the ~36-icon set never reflows the dialog. `modal` gives the
+              popover its own focus scope inside the Radix Dialog. */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">
               Icon
             </label>
-            <div className="grid grid-cols-8 gap-1">
-              <button
-                type="button"
-                className={cn(
-                  "flex h-8 w-8 items-center justify-center rounded-md transition-all",
-                  icon === null
-                    ? "ring-2 ring-primary bg-accent"
-                    : "hover:bg-muted",
-                )}
-                onClick={() => setIcon(null)}
+            <Popover
+              open={iconPickerOpen}
+              onOpenChange={setIconPickerOpen}
+              modal
+            >
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between rounded-md border border-input bg-transparent px-2.5 py-1.5 text-xs transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="flex h-6 w-6 items-center justify-center rounded-md bg-muted">
+                      <SelectedIcon
+                        className={cn(
+                          "h-4 w-4",
+                          icon === null && "text-muted-foreground",
+                        )}
+                      />
+                    </span>
+                    <span className="text-muted-foreground">
+                      {icon === null ? "No icon" : "Change icon"}
+                    </span>
+                  </span>
+                  <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground/60" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="start"
+                className="max-h-(--radix-popover-content-available-height) w-auto overflow-y-auto p-2"
               >
-                <Ban className="h-3.5 w-3.5 text-muted-foreground" />
-              </button>
-              {ICON_OPTIONS.map((opt) => {
-                const Icon = opt.icon;
-                return (
+                <div className="grid grid-cols-8 gap-1">
                   <button
-                    key={opt.name}
                     type="button"
+                    aria-label="No icon"
+                    aria-pressed={icon === null}
+                    title="No icon"
                     className={cn(
-                      "flex h-8 w-8 items-center justify-center rounded-md transition-all",
-                      icon === opt.name
-                        ? "ring-2 ring-primary bg-accent"
+                      "flex h-8 w-8 items-center justify-center rounded-md transition-colors",
+                      icon === null
+                        ? "bg-accent ring-1 ring-ring"
                         : "hover:bg-muted",
                     )}
-                    onClick={() => setIcon(opt.name)}
+                    onClick={() => {
+                      setIcon(null);
+                      setIconPickerOpen(false);
+                    }}
                   >
-                    <Icon className="h-4 w-4" />
+                    <Ban className="h-3.5 w-3.5 text-muted-foreground" />
                   </button>
-                );
-              })}
-            </div>
+                  {ICON_OPTIONS.map((opt) => {
+                    const Icon = opt.icon;
+                    const selected = icon === opt.name;
+                    return (
+                      <button
+                        key={opt.name}
+                        type="button"
+                        aria-label={opt.name}
+                        aria-pressed={selected}
+                        title={opt.name}
+                        className={cn(
+                          "flex h-8 w-8 items-center justify-center rounded-md transition-colors",
+                          selected
+                            ? "bg-accent ring-1 ring-ring"
+                            : "hover:bg-muted",
+                        )}
+                        onClick={() => {
+                          setIcon(opt.name);
+                          setIconPickerOpen(false);
+                        }}
+                      >
+                        <Icon className="h-4 w-4" />
+                      </button>
+                    );
+                  })}
+                </div>
+              </PopoverContent>
+            </Popover>
           </div>
 
           {/* Color palette */}
@@ -173,19 +234,24 @@ export function FolderDialog({
             </div>
           </div>
 
-          {/* Description */}
+          {/* Context for AI — the primary field. Feeds the AI chat that runs
+              over sessions in this folder, so it gets the most room. */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">
-              Description{" "}
+              Context for AI{" "}
               <span className="text-muted-foreground/60">(optional)</span>
             </label>
             <Textarea
               placeholder="Add context for AI chat..."
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              rows={3}
-              className="resize-none text-xs"
+              rows={5}
+              className="min-h-[120px] resize-y text-xs"
             />
+            <p className="text-[11px] text-muted-foreground/60">
+              Used as context when you chat with AI about sessions in this
+              folder.
+            </p>
           </div>
         </div>
 

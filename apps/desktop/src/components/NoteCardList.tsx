@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useAppStore } from "@/stores/appStore";
+import { useScrollPositionMemory } from "@/hooks/useScrollPositionMemory";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { NoteCard } from "@/components/NoteCard";
 import { Button } from "@/components/ui/button";
@@ -90,6 +91,14 @@ export function NoteCardList() {
     () => groupSessionsByDay(filteredSessions),
     [filteredSessions],
   );
+
+  // Each filter keeps its own scroll position across remounts (this list fully
+  // unmounts when the user opens a session and re-mounts on back-nav).
+  const scrollKey =
+    listFilter.type === "folder"
+      ? `folder:${listFilter.folderId ?? ""}`
+      : listFilter.type;
+  const scrollRef = useScrollPositionMemory<HTMLDivElement>(scrollKey);
 
   if (listFilter.type === "dictation") {
     return <DictationHistoryList />;
@@ -206,7 +215,7 @@ export function NoteCardList() {
   return (
     <div className="flex flex-1 flex-col min-h-0">
       {breadcrumbBar}
-      <ScrollArea className="min-h-0 flex-1">
+      <ScrollArea ref={scrollRef} className="min-h-0 flex-1">
         <div className="space-y-1 px-3 pt-1 pb-28">
           {hasCards && (
             <div className="grid grid-cols-2 gap-1.5 mt-2">

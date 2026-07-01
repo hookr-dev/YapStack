@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useScrollAnchor } from "@/hooks/useScrollAnchor";
 import { TranscriptSegments } from "@/components/TranscriptSegments";
 import {
   MarqueeOverlay,
@@ -156,11 +157,40 @@ export function ChatView({
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
 
-  // Stick-to-bottom: follow new segments unless the user has scrolled away.
+  // Scroll anchoring. The transcript is time-ordered, so backfill brings in
+  // OLDER segments that sort to the TOP and prepend mid-stream. Anchoring keeps
+  // the visible content fixed on prepend (no "bounce") and only follows the
+  // bottom (live tail) when the user is genuinely pinned there and content was
+  // appended. `isAdjustingRef` flags the programmatic compensation so the scroll
+  // handler below ignores it instead of mistaking it for a user scroll.
+  const getViewport = useCallback(
+    () =>
+      (scrollAreaRef.current?.querySelector(
+        "[data-slot='scroll-area-viewport']",
+      ) as HTMLElement | null) ?? null,
+    [],
+  );
+  const { isAdjustingRef } = useScrollAnchor({
+    getViewport,
+    dep: segments.length,
+    // Identity of the top (earliest) row. A backfill prepend changes it; a
+    // live append at the bottom does not — that's how the hook tells a prepend
+    // (compensate) from an append (leave a scrolled-up reader alone).
+    topKey: segments[0]?.id ?? null,
+    userScrolled,
+    // Smooth bottom-follow for the live-tail (append-while-pinned) case only.
+    scrollToBottom: () => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    },
+  });
+
+  // Resume following on demand (e.g. playback stops -> userScrolled cleared)
+  // even without a new segment, matching the prior stick-to-bottom behavior.
   useEffect(() => {
-    if (userScrolled) return;
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [segments.length, userScrolled]);
+    if (!userScrolled) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [userScrolled]);
 
   useEffect(() => {
     if (initialScrollToBottom) {
@@ -205,6 +235,14 @@ export function ChatView({
 
     const handleScroll = () => {
       const newScrollTop = viewport.scrollTop;
+      // Prepend compensation moves scrollTop programmatically. Track the new
+      // position (so the next real scroll deltas off the right baseline) but
+      // do not let it flip userScrolled or scrollDirection — it isn't a user
+      // gesture.
+      if (isAdjustingRef.current) {
+        lastScrollTopRef.current = newScrollTop;
+        return;
+      }
       const wentUp = newScrollTop < lastScrollTopRef.current - 1;
       lastScrollTopRef.current = newScrollTop;
 
@@ -232,7 +270,7 @@ export function ChatView({
 
     viewport.addEventListener("scroll", handleScroll, { passive: true });
     return () => viewport.removeEventListener("scroll", handleScroll);
-  }, [isPlaying]);
+  }, [isPlaying, isAdjustingRef]);
 
   const handleJumpToCurrent = useCallback(() => {
     setUserScrolled(false);

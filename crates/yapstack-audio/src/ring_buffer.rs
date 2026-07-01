@@ -415,6 +415,69 @@ impl AudioRingBuffer {
     }
 }
 
+/// Small fixed time guard (in seconds) subtracted from `available_seconds`
+/// when a backfill rewind would otherwise reach the very oldest committed
+/// samples.
+///
+/// Why a *fixed constant* and not a percentage: `available_seconds` is sampled
+/// once (under a lock), but the actual rewind + extraction happens slightly
+/// later under a separate lock acquisition. In that gap the producer thread
+/// keeps writing and overwrites the oldest samples. Rewinding by MORE than
+/// `available@T0` (an explicit over-request) can therefore land the read cursor
+/// behind `write_pos@T1 - capacity` — i.e. where committed data has already
+/// been overwritten — producing a silently clamped snapshot. The exact-equal
+/// boundary is intentionally NOT guarded (`clamp_backfill_to_available` honours
+/// `requested == available`): real callers reach it only with a strictly-
+/// smaller stale `available`, and `snapshot_since` clamps any residual to
+/// committed data, so honouring a full "Full buffer" request there is benign.
+///
+/// The size of that race window is bounded by *elapsed wall-clock time* between
+/// sampling and extraction (lock contention + setup), NOT by the buffer's
+/// capacity. A fixed sub-second guard covers it exactly. A percentage margin
+/// (the old `available * 0.95`) scaled the guard with capacity, so a 300s
+/// buffer lost ~15s of tail audio even though the race window is only tens of
+/// milliseconds. This constant is generous (50ms) relative to that window.
+pub const BACKFILL_WRITE_HEAD_GUARD_SECONDS: f32 = 0.05;
+
+/// Clamps a requested backfill rewind to what the ring buffer can actually and
+/// safely yield, returning the effective rewind in seconds.
+///
+/// This is a pure helper (no I/O, no buffer access) so the clamp policy is unit
+/// testable in isolation. Behaviour:
+///
+/// - `requested <= available` -> returns `requested` unchanged. The full
+///   requested rewind is honoured when the buffer holds it; there is NO
+///   proportional shave (this is the regression guard for the Full/Max tail
+///   loss bug). The exact-equal boundary is intentionally in this branch: real
+///   callers reach it only with a slightly-stale, strictly-smaller `available`
+///   (so the rewind still lands inside committed data), and `snapshot_since`
+///   clamps any residual over-read to committed samples rather than returning
+///   garbage — so honouring a full "Full buffer" request here is safe.
+/// - `requested > available` -> returns `available` minus the exact fixed
+///   [`BACKFILL_WRITE_HEAD_GUARD_SECONDS`] guard (never less than 0). This is
+///   the explicit over-request path (e.g. a ceil-rounded "all backfill"): the
+///   caller asked for more than exists, so we step back by the small fixed
+///   guard to stay clear of the live write head.
+///
+/// `available` here is the live snapshot of committed audio. The guard is a
+/// fixed time constant, not a fraction of `available`, so it does not grow with
+/// buffer size — see [`BACKFILL_WRITE_HEAD_GUARD_SECONDS`].
+pub fn clamp_backfill_to_available(requested_seconds: f32, available_seconds: f32) -> f32 {
+    if requested_seconds <= 0.0 || available_seconds <= 0.0 {
+        return 0.0;
+    }
+
+    if requested_seconds <= available_seconds {
+        // Buffer holds the full request: honour it exactly, no shave.
+        requested_seconds
+    } else {
+        // Requesting at/over everything available: back off by the exact fixed
+        // write-head guard so a concurrent writer can't overwrite the oldest
+        // samples out from under the read cursor before extraction runs.
+        (available_seconds - BACKFILL_WRITE_HEAD_GUARD_SECONDS).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +878,172 @@ mod tests {
         assert_eq!(
             snap,
             vec![15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0]
+        );
+    }
+
+    // --- clamp_backfill_to_available -----------------------------------------
+
+    /// Regression guard for the Full/Max backfill tail-loss bug. When the
+    /// buffer holds the full requested rewind, the FULL request must come back
+    /// with no proportional shave. A 300s request against 300s of available
+    /// audio used to return ~285s (5% margin); it must now return exactly 300s.
+    #[test]
+    fn test_clamp_backfill_requested_within_available_returns_requested() {
+        // 300s requested, 300s available, full buffer -> full 300s, no drop.
+        assert_eq!(clamp_backfill_to_available(300.0, 300.0), 300.0);
+        // Comfortably inside the buffer -> unchanged.
+        assert_eq!(clamp_backfill_to_available(120.0, 300.0), 120.0);
+        assert_eq!(clamp_backfill_to_available(5.0, 300.0), 5.0);
+    }
+
+    /// Boundary: requested == available must yield exactly available with NO
+    /// 5% (or any percentage) shave.
+    #[test]
+    fn test_clamp_backfill_at_boundary_no_percentage_shave() {
+        assert_eq!(clamp_backfill_to_available(300.0, 300.0), 300.0);
+        assert_eq!(clamp_backfill_to_available(42.0, 42.0), 42.0);
+    }
+
+    /// When requesting MORE than available, the result is clamped to available
+    /// minus the exact fixed write-head guard — and never exceeds available.
+    #[test]
+    fn test_clamp_backfill_over_available_uses_exact_fixed_guard() {
+        let effective = clamp_backfill_to_available(500.0, 300.0);
+        assert!((effective - (300.0 - BACKFILL_WRITE_HEAD_GUARD_SECONDS)).abs() < 1e-3);
+        assert!(effective < 300.0);
+        // The guard is a fixed constant, NOT a fraction of available: the gap
+        // below `available` must be the same tiny constant regardless of how
+        // large the buffer is. (Compared with an epsilon because f32
+        // subtraction of large magnitudes is not bit-exact.)
+        let small = clamp_backfill_to_available(50.0, 10.0);
+        assert!((10.0 - small - BACKFILL_WRITE_HEAD_GUARD_SECONDS).abs() < 1e-3);
+        let large = clamp_backfill_to_available(5000.0, 1000.0);
+        assert!((1000.0 - large - BACKFILL_WRITE_HEAD_GUARD_SECONDS).abs() < 1e-3);
+    }
+
+    /// Zero / negative inputs collapse to 0.0 (no backfill).
+    #[test]
+    fn test_clamp_backfill_zero_inputs() {
+        assert_eq!(clamp_backfill_to_available(0.0, 300.0), 0.0);
+        assert_eq!(clamp_backfill_to_available(120.0, 0.0), 0.0);
+        assert_eq!(clamp_backfill_to_available(-5.0, 300.0), 0.0);
+        // Available smaller than the guard never underflows below 0.
+        assert_eq!(clamp_backfill_to_available(10.0, 0.01), 0.0);
+    }
+
+    // --- backfill extraction path (clamp + rewind + snapshot) ----------------
+
+    /// Mirrors the real caller's rewind: rewind `write_pos` by
+    /// `effective_seconds` worth of samples, frame-aligned to `channels`, then
+    /// pull `cursor..write_pos` via the actual snapshot/extract API
+    /// (`snapshot_since_with_pos`). Returns `(extracted_samples, cursor)`.
+    ///
+    /// This is the same arithmetic `build_initial_sources_and_backfill` uses
+    /// (`raw = seconds * sr * ch`, rounded down to a frame boundary, then
+    /// `write_pos.saturating_sub(rewind)`) followed by `extract_source_audio`'s
+    /// `snapshot_since_with_pos`. It exists so the extraction path — not just
+    /// the clamp arithmetic — is exercised end to end.
+    fn rewind_and_extract(buf: &AudioRingBuffer, effective_seconds: f32) -> (Vec<f32>, usize) {
+        let write_pos = buf.samples_written();
+        let raw = (effective_seconds * buf.sample_rate() as f32 * buf.channels() as f32) as usize;
+        let ch = buf.channels() as usize;
+        let rewind = raw - (raw % ch);
+        let cursor = write_pos.saturating_sub(rewind);
+        let (snap, _new_pos) = buf.snapshot_since_with_pos(cursor);
+        (snap, cursor)
+    }
+
+    /// Integration regression for the Full/Max backfill tail-loss bug, walking
+    /// the REAL extraction path (clamp helper -> rewind cursor -> snapshot),
+    /// which the clamp-arithmetic unit tests do not exercise.
+    ///
+    /// The original bug clamped the rewind to `available * 0.95`, which dropped
+    /// the OLDEST ~5% of samples. Here we fill a buffer that holds a full
+    /// 300s-equivalent window, request the full window, compute the effective
+    /// backfill via `clamp_backfill_to_available`, then extract. The extracted
+    /// region must cover the ENTIRE requested window (no tail loss) and must
+    /// begin at the oldest committed sample (the tail was not dropped).
+    #[test]
+    fn test_backfill_extraction_full_window_keeps_oldest_samples() {
+        // Small but representative: a 100 Hz mono "sample rate" so 300 seconds
+        // is 30_000 samples — exercises the real capacity/rewind math without
+        // allocating millions of atomics. Each sample value is its monotonic
+        // index, so the oldest sample is uniquely identifiable as `0.0`.
+        let sample_rate = 100;
+        let channels = 1;
+        let window_seconds = 300.0_f32;
+        let total = (window_seconds * sample_rate as f32 * channels as f32) as usize; // 30_000
+
+        // Capacity is exactly the window: the buffer holds the full request.
+        let buf = AudioRingBuffer::new(total, sample_rate, channels);
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let available = buf.info().available_seconds;
+        assert!((available - window_seconds).abs() < 1e-3);
+
+        // Requesting exactly the full window: the clamp must honour it with no
+        // proportional shave (regression guard) — effective == requested.
+        let effective = clamp_backfill_to_available(window_seconds, available);
+        assert_eq!(effective, window_seconds);
+
+        // Walk the real extraction path with that effective backfill.
+        let (extracted, cursor) = rewind_and_extract(&buf, effective);
+
+        // No tail loss: the extracted region covers the entire window. The old
+        // `available * 0.95` clamp would have returned ~28_500 samples here.
+        assert_eq!(
+            extracted.len(),
+            total,
+            "extraction must yield the full requested window, not a shaved subset"
+        );
+
+        // The OLDEST sample (index 0) is the one the original bug truncated.
+        assert_eq!(cursor, 0, "rewind must reach the oldest committed sample");
+        assert_eq!(
+            extracted.first().copied(),
+            Some(0.0),
+            "the oldest (first) requested sample must be present — tail not dropped"
+        );
+        assert_eq!(
+            extracted.last().copied(),
+            Some((total - 1) as f32),
+            "the newest requested sample must still be present"
+        );
+    }
+
+    /// Companion to the full-window case: when the caller over-requests (asks
+    /// for MORE than the buffer holds), the clamp steps back by exactly the
+    /// fixed write-head guard, and the extraction path drops ONLY that tiny
+    /// guard's worth of the oldest samples — never a percentage of the window.
+    #[test]
+    fn test_backfill_extraction_over_request_drops_only_fixed_guard() {
+        let sample_rate = 100;
+        let channels = 1;
+        let window_seconds = 300.0_f32;
+        let total = (window_seconds * sample_rate as f32 * channels as f32) as usize;
+
+        let buf = AudioRingBuffer::new(total, sample_rate, channels);
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let available = buf.info().available_seconds;
+
+        // Over-request: ask for far more than the buffer holds.
+        let effective = clamp_backfill_to_available(10_000.0, available);
+        assert!((effective - (available - BACKFILL_WRITE_HEAD_GUARD_SECONDS)).abs() < 1e-3);
+
+        let (extracted, cursor) = rewind_and_extract(&buf, effective);
+
+        // Only the fixed guard's worth of oldest samples is skipped — 0.05s at
+        // 100 Hz mono == 5 samples. A percentage shave would skip ~1_500.
+        let guard_samples = (BACKFILL_WRITE_HEAD_GUARD_SECONDS * sample_rate as f32) as usize;
+        assert_eq!(cursor, guard_samples, "only the fixed guard is skipped");
+        assert_eq!(extracted.len(), total - guard_samples);
+        assert_eq!(
+            extracted.first().copied(),
+            Some(guard_samples as f32),
+            "extraction starts exactly one fixed guard past the oldest sample"
         );
     }
 }
