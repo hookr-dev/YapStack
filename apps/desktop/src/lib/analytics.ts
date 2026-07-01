@@ -47,6 +47,20 @@ export function trackManualNoteCreated(): void {
   track("manual_note_created");
 }
 
+// Transcript copy / export
+export function trackTranscriptExported(props: {
+  /** "selection" (bulk bar) or "session" (header ⋮ menu). */
+  scope: string;
+  /** "clipboard" (copy) or "file" (save to disk). */
+  mechanism: string;
+  /** "full" | "mine" | "theirs". */
+  kind: string;
+  /** Source segment count in scope. */
+  segments: number;
+}): void {
+  track("transcript_exported", props);
+}
+
 // Dictation
 export function trackDictationStarted(props: {
   slot_id: string;
