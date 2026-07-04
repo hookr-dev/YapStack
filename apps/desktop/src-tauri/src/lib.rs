@@ -531,7 +531,7 @@ pub fn run() {
         )
         .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
         .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
-        .manage(Arc::new(AtomicBool::new(false)) as commands::BackendReadyState)
+        .manage(Arc::new(commands::BackendReadyFlag::new()) as commands::BackendReadyState)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);
@@ -837,8 +837,7 @@ pub fn run() {
             // before a webview's listener attaches (no replay), which is the
             // same race this flag closes. The frontend's command poll is the
             // sole readiness signal.
-            app.state::<commands::BackendReadyState>()
-                .store(true, std::sync::atomic::Ordering::Release);
+            app.state::<commands::BackendReadyState>().set_ready();
 
             Ok(())
         })

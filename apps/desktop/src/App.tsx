@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { AppLayout } from "@/components/AppLayout";
 import { useAppStore } from "@/stores/appStore";
@@ -67,16 +67,39 @@ function MainApp() {
   useEffect(() => {
     const appWindow = getCurrentWindow();
 
-    // Restore saved position
+    // Restore saved position — only if it still intersects a monitor.
+    // macOS clamps off-screen frames back onto a display; Windows does
+    // not, so stale coordinates (monitor unplugged/undocked since last
+    // run) would restore the window fully off-screen with no visible
+    // recovery path.
     const saved = localStorage.getItem(WINDOW_POS_KEY);
     if (saved) {
-      try {
-        const pos: WindowPosition = JSON.parse(saved);
-        appWindow.setPosition(new PhysicalPosition(pos.x, pos.y));
-        appWindow.setSize(new PhysicalSize(pos.width, pos.height));
-      } catch {
-        // Ignore invalid saved position
-      }
+      (async () => {
+        try {
+          const pos: WindowPosition = JSON.parse(saved);
+          const monitors = await availableMonitors();
+          const visible = monitors.some((m) => {
+            const mx = m.position.x;
+            const my = m.position.y;
+            const right = Math.min(pos.x + pos.width, mx + m.size.width);
+            const left = Math.max(pos.x, mx);
+            const bottom = Math.min(pos.y + pos.height, my + m.size.height);
+            const top = Math.max(pos.y, my);
+            // Require a meaningful overlap (enough titlebar to grab),
+            // not a 1px sliver.
+            return right - left >= 100 && bottom - top >= 50;
+          });
+          if (visible) {
+            appWindow.setPosition(new PhysicalPosition(pos.x, pos.y));
+            appWindow.setSize(new PhysicalSize(pos.width, pos.height));
+          } else {
+            appWindow.setSize(new PhysicalSize(pos.width, pos.height));
+            await appWindow.center();
+          }
+        } catch {
+          // Ignore invalid saved position
+        }
+      })();
     }
 
     // Persist position/size on every move or resize so it survives Cmd+Q

@@ -43,12 +43,39 @@ pub fn health_check() -> HealthStatus {
 /// hook stays synchronous and fatal-on-error — a setup failure exits the
 /// process, so "never ready" cannot be observed by a live frontend. If setup
 /// ever spawns fallible async init, upgrade this to carry the failure.
-pub type BackendReadyState = std::sync::Arc<std::sync::atomic::AtomicBool>;
+///
+/// Newtype, NOT a bare `Arc<AtomicBool>`: Tauri manages state by `TypeId`,
+/// `LiveSessionPresent` is already a managed `Arc<AtomicBool>`, and a
+/// duplicate `manage` is a silent no-op — an alias here would make the
+/// end-of-setup store flip the live-session flag instead.
+pub struct BackendReadyFlag(std::sync::atomic::AtomicBool);
+
+impl BackendReadyFlag {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn set_ready(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for BackendReadyFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type BackendReadyState = std::sync::Arc<BackendReadyFlag>;
 
 #[tauri::command]
 #[specta::specta]
 pub fn backend_ready(state: tauri::State<'_, BackendReadyState>) -> bool {
-    state.load(std::sync::atomic::Ordering::Acquire)
+    state.is_ready()
 }
 
 #[tauri::command]
