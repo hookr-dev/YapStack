@@ -337,6 +337,9 @@ fn resolved_accel_label(choice: AccelChoice) -> &'static str {
             {
                 "coreml"
             }
+            // Auto stays CPU on non-macOS until Gate C (canary validates WebGPU
+            // correct + faster than CPU on real Windows GPU); then flip Auto ->
+            // WebGPU. Current opt-in: YAPSTACK_PARAKEET_ACCEL=webgpu.
             #[cfg(not(target_os = "macos"))]
             {
                 "cpu"
@@ -359,6 +362,12 @@ fn resolved_accel_label(choice: AccelChoice) -> &'static str {
 /// the new Apple Silicon default of WebGPU, this only fires when CoreML
 /// is the only EP compiled in (legacy/fallback build) — which means the
 /// fp32 bundle on those builds keeps its CPU-only behavior.
+//
+// `needless_return` is allowed here for the same reason as `auto_exec_config`:
+// the trailing arms are mutually-exclusive `#[cfg]` blocks (only one compiled
+// per target × feature), and the early `return false` in the webgpu arm reads
+// as a clean guard. Lint-only: no runtime behavior changes.
+#[allow(clippy::needless_return)]
 fn auto_skip_due_to_external_data(model_path: &Path) -> bool {
     if !has_external_data_file(model_path) {
         return false;
@@ -403,7 +412,22 @@ fn build_exec_config(
 /// `ComputeUnits::CPUAndGPU` rather than `CPUAndNeuralEngine` — so CoreML
 /// is not the path to ANE acceleration today. WebGPU bypasses that issue
 /// at the cost of going through Metal instead of Apple's CoreML compiler.
-/// Other targets fall through to CPU; Windows CUDA arrives in a follow-up.
+///
+/// Non-macOS targets (Windows/Linux) stay CPU-by-default under Auto — even
+/// when the `webgpu` feature is compiled in. Per ADR 0004's validation gate,
+/// WebGPU stays behind the explicit `YAPSTACK_PARAKEET_ACCEL=webgpu` opt-in
+/// (which routes through `AccelChoice::WebGpu` → `build_webgpu_config`) until
+/// Gate C: a canary machine validates it's correct AND faster than CPU on a
+/// real Windows GPU. Once Gate C passes, flip this non-macOS Auto arm to
+/// `build_webgpu_config()`. Do not flip it before then.
+//
+// `needless_return` is allowed here because the body is a set of
+// mutually-exclusive `#[cfg]` blocks — exactly one is compiled per target ×
+// feature combo. The early `return`s let each arm read as a self-contained
+// branch; rewriting them as a single tail expression would force an awkward
+// cfg-nested if/else that clippy can't see through anyway. Lint-only: no
+// runtime behavior changes.
+#[allow(clippy::needless_return)]
 fn auto_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionConfig> {
     #[cfg(all(target_os = "macos", feature = "webgpu"))]
     {
@@ -414,6 +438,9 @@ fn auto_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionCo
     {
         return build_coreml_config(cache_dir);
     }
+    // Auto stays CPU on non-macOS until Gate C (canary validates WebGPU
+    // correct + faster than CPU on real Windows GPU); then flip Auto ->
+    // WebGPU here. Current opt-in for canary A/B: YAPSTACK_PARAKEET_ACCEL=webgpu.
     #[cfg(not(target_os = "macos"))]
     {
         _ = cache_dir;
@@ -449,7 +476,8 @@ fn build_coreml_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::Executio
 #[cfg(feature = "webgpu")]
 fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
-    info!("WebGPU EP requested (Metal under the hood on macOS)");
+    // Dawn drives the WebGPU EP: Metal on macOS, Vulkan/D3D12 on Windows/Linux.
+    info!("WebGPU EP requested (Dawn → Metal on macOS, Vulkan/D3D12 elsewhere)");
     Some(ExecutionConfig::default().with_execution_provider(ExecutionProvider::WebGPU))
 }
 

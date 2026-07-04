@@ -37,6 +37,12 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 - [`IMPLEMENTATION_LOG.md`](IMPLEMENTATION_LOG.md) — phase-by-phase build history. Use to understand *why* something was built a certain way.
 - [`adr/`](adr/) — architecture decision records (append-only).
 
+## Cross-platform
+
+- [`plans/windows-support.md`](plans/windows-support.md) — **active** Windows rollout plan (pipeline → audio-device correctness gate → Parakeet WebGPU accel + polish).
+- [`plans/linux-support.md`](plans/linux-support.md) — Linux state + gap list, **deferred** (documented, not scheduled).
+- [`adr/0004-cross-platform-rollout-windows-first.md`](adr/0004-cross-platform-rollout-windows-first.md) — decision: Windows first, Linux deferred; Parakeet WebGPU/Dawn GPU (Whisper stays CPU); Linux mic-only + X11/Wayland-best-effort.
+
 ## Plans (transient)
 
 - [`plans/`](plans/) — historical implementation plans, mostly archived. Browse only when researching prior approaches.

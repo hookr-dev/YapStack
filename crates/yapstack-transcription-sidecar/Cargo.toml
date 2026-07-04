@@ -9,7 +9,6 @@ repository.workspace = true
 default = ["whisper", "parakeet"]
 whisper = ["dep:whisper-rs"]
 metal = ["whisper-rs/metal"]
-cuda = ["whisper-rs/cuda"]
 # Sortformer (speaker diarization) ships under the same parakeet feature
 # so it travels with the engine that needs it.
 parakeet = ["dep:parakeet-rs"]

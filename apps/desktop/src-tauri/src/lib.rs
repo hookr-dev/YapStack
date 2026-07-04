@@ -355,6 +355,12 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default();
+    // Must be the first plugin registered so a second launch short-circuits
+    // before any other plugin (tray, DB writer, global-shortcut) initializes.
+    // The callback surfaces the running instance's main window.
+    builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        show_main_window(app);
+    }));
     #[cfg(target_os = "macos")]
     {
         builder = builder.plugin(tauri_nspanel::init());
@@ -603,12 +609,27 @@ pub fn run() {
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 
-            let tray_icon =
-                tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
+            // macOS uses a monochrome template glyph tinted by the system;
+            // `icon_as_template` is a no-op elsewhere, and the black glyph
+            // vanishes on the dark Win10/11 taskbar. Off macOS, fall back to
+            // the bundled colored window icon so the tray stays visible — the
+            // tray is the only re-entry point after close-to-tray.
+            #[cfg(target_os = "macos")]
+            let tray_builder = TrayIconBuilder::new()
+                .icon(tauri::image::Image::from_bytes(include_bytes!(
+                    "../icons/tray-icon.png"
+                ))?)
+                .icon_as_template(true);
+            #[cfg(not(target_os = "macos"))]
+            let tray_builder = {
+                let mut b = TrayIconBuilder::new();
+                if let Some(icon) = app.default_window_icon() {
+                    b = b.icon(icon.clone());
+                }
+                b
+            };
 
-            let tray = TrayIconBuilder::new()
-                .icon(tray_icon)
-                .icon_as_template(true)
+            let tray = tray_builder
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "start_capture" => {

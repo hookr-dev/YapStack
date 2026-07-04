@@ -50,10 +50,23 @@ jobs:
         with:
           components: clippy
 
+      - name: Xcode fingerprint for cache key
+        # Cached build-script output embeds absolute toolchain paths (e.g.
+        # objc2-exception-helper's clang_rt.osx search dir). macos-latest
+        # serves mixed images, so a cache saved under one Xcode breaks
+        # relinks under another ("library 'clang_rt.osx' not found").
+        # Keying the cache by Xcode version keeps caches image-consistent.
+        id: xcode
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: ci-macos-latest
+          key: ${{ steps.xcode.outputs.version }}
+          # ort-sys downloads its prebuilt binaries here at build-script time;
+          # cache it so a fingerprint-skipped build script still has its libs.
+          cache-directories: ~/Library/Caches/ort.pyke.io
 
       - name: Create sidecar + framework placeholders
         # tauri.conf.json declares an externalBin (sidecar) and a
@@ -71,6 +84,62 @@ jobs:
         run: cargo clippy --all -- -D warnings
 
       - name: Run tests
+        run: cargo test --all
+
+  rust-windows:
+    name: Rust (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check cmake
+        # windows-latest ships cmake in the runner image; the sidecar's
+        # whisper-rs / parakeet-rs cmake builds use it. Echo the version so
+        # runner-image updates that break the build are diagnosable.
+        run: cmake --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: ci-windows-latest
+          # ort-sys downloads its prebuilt binaries here at build-script time;
+          # cache it so a fingerprint-skipped build script still has its libs.
+          cache-directories: ~/AppData/Local/ort.pyke.io
+
+      - name: Create sidecar placeholder
+        # tauri.conf.json declares an externalBin (sidecar) whose path the
+        # Tauri build script validates before linking. On Windows the
+        # externalBin resolves to the msvc-triple-suffixed .exe. Locally
+        # `scripts/build-sidecars.sh` emits it under
+        # target/<triple>/<profile>/; in CI we just need the file to exist so
+        # cargo check / clippy / test pass. No macOS framework dylib here —
+        # the WebGPU Dawn dependency is pulled by `ort` at build time, not a
+        # prebuilt sidecar artifact.
+        shell: bash
+        run: |
+          mkdir -p apps/desktop/src-tauri/binaries
+          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
+
+      - name: Clippy
+        run: cargo clippy --all -- -D warnings
+
+      - name: Clippy (parakeet webgpu)
+        # The default-feature clippy above does NOT compile the
+        # `cfg(not(target_os = "macos"))` WebGPU arm in the parakeet engine.
+        # Lint it explicitly so the non-macOS WebGPU codepath is actually
+        # compiled + checked on the Windows leg. Whisper stays CPU-only on
+        # Windows — no VULKAN_SDK / CUDA setup; only Parakeet gets webgpu.
+        run: cargo clippy -p yapstack-transcription-sidecar --features webgpu -- -D warnings
+
+      - name: Run tests
+        # WASAPI COM tests are #[cfg_attr(target_os = "windows", ignore)], so
+        # the crashing ones don't run here.
         run: cargo test --all
 
   frontend:

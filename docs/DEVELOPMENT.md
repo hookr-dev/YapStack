@@ -91,8 +91,7 @@ cargo build -p yapstack-transcription-sidecar                                   
 | `metal` | Metal GPU acceleration for whisper-rs (Apple). |
 | `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
 | `coreml` | Adds the ORT-CoreML execution provider for Parakeet on Apple. Strict superset of `parakeet`. The Parakeet backend's "Auto" policy will skip CoreML at load time if the model dir contains external `.onnx.data` files (known ORT bug); set `YAPSTACK_PARAKEET_ACCEL=coreml` to force-attempt. |
-| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Vulkan/Dawn elsewhere). Set `YAPSTACK_PARAKEET_ACCEL=webgpu` to opt in. |
-| `cuda` | NVIDIA CUDA EP for Parakeet (Linux/Windows). |
+| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows; shipping on macOS, planned for Windows behind `YAPSTACK_PARAKEET_ACCEL=webgpu` per ADR 0004). Whisper stays CPU on Windows. Set `YAPSTACK_PARAKEET_ACCEL=webgpu` to opt in. |
 
 If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`. The dispatcher in `main.rs` is engine-agnostic and unconditional.
 

@@ -85,7 +85,11 @@ for target in "${TARGETS[@]}"; do
     if [[ "$target" == *"apple"* ]]; then
         FEATURES="whisper,parakeet,metal,coreml,webgpu"
     elif [[ "$target" == *"windows"* ]]; then
-        FEATURES="whisper,parakeet,cuda"
+        # CPU-only for now. The `webgpu` feature adds a load-time
+        # webgpu_dawn.dll import (ort-sys links Dawn dynamically) and nothing
+        # stages that DLL on Windows yet, so a webgpu build fails before main().
+        # The flag returns together with the Dawn DLL staging in plan item W2 #12.
+        FEATURES="whisper,parakeet"
     fi
 
     # shellcheck disable=SC2086
