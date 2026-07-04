@@ -80,7 +80,7 @@ System tray with quick actions. Fully customizable global shortcuts. Recording i
 |-----------------------|-------------------------|-------|
 | macOS (Apple Silicon) | ✅ Officially supported | Primary target. Metal acceleration for Whisper, WebGPU + int8 Parakeet. |
 | macOS (Intel)         | ⚠️ Best-effort           | Builds, but reduced performance and limited testing. |
-| Windows               | 🧪 Experimental          | **Not officially supported.** CI/CD does not produce Windows builds. CUDA support exists in code; you may build and run locally at your own discretion. Official Windows support is planned for a future release. |
+| Windows               | 🧪 Experimental          | **Not officially supported.** CI/CD does not produce Windows builds. Parakeet GPU uses WebGPU/Dawn (shipping on macOS; planned for Windows behind `YAPSTACK_PARAKEET_ACCEL=webgpu` per ADR 0004) and Whisper stays CPU; you may build and run locally at your own discretion. Official Windows support is planned for a future release. |
 | Linux                 | ❌ Not yet               | No current build target. |
 
 ## Getting Started
