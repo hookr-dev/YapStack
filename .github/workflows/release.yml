@@ -158,6 +158,9 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: release-windows
+          # ort-sys downloads its prebuilt binaries here at build-script time;
+          # cache it so builds don't depend on cdn.pyke.io availability.
+          cache-directories: ~/AppData/Local/ort.pyke.io
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
