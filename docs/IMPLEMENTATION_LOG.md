@@ -1610,10 +1610,57 @@ A handful of independent items that landed between Phase 37 and the `1.0.0-alpha
 
 ---
 
+## Phase 39 — Windows W0: build pipeline, app hardening, first msvc compile
+
+### What was built
+
+The first slice of the Windows-first cross-platform rollout (ADR 0004, `docs/plans/windows-support.md`, PR #78) — the pipeline and hardening work that makes Windows builds exist at all:
+
+- **`rust-windows` CI leg.** Every PR now compiles, clippys (`-D warnings`), and tests the whole workspace on `windows-latest` for `x86_64-pc-windows-msvc`, including a dedicated `--features webgpu` clippy pass so the sidecar's non-macOS WebGPU arm is always compiled. This is the mechanism that keeps the port from rotting — there is no local Windows dev environment; the loop is CI-compile → fix → push.
+- **`build-windows` release job.** Mirrors `build-macos`: msvc sidecar build, `pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis` (NSIS only — `targets: "all"` would drag in MSI/WiX, which rejects pre-release versions like `1.0.0-alpha.N`), NSIS installer + `v1Compatible` updater zip/sig uploads, `windows-x86_64` entry in `latest.json`, and a skippable Authenticode placeholder gated at **job-level** env (a step-level `env:` is invisible to that step's own `if:`).
+- **CPU-first sidecar.** The forced `cuda` feature is gone (it had no code paths and no runner could compile it). Windows builds `whisper,parakeet` — the `webgpu` feature was deliberately *not* shipped in W0 because ort links Dawn as a dynamic library (`webgpu_dawn.dll` load-time import) and nothing stages that DLL yet; flag + packaging land together in plan item #12. `AccelChoice::Auto` resolves to CPU off macOS; WebGPU is reachable only via `YAPSTACK_PARAKEET_ACCEL=webgpu` until the canary validates it (Gate C). The int8 single-file Parakeet variant is the recommended model on all hosts except CPU-only Intel macOS, and the fp32 model-size constants were corrected to HTTP-HEAD-verified actuals (the encoder blob is 2.44 GB, not 560 MB).
+- **App hardening from the 8-surface Windows-readiness review:** `tauri-plugin-single-instance` registered first in the plugin chain (Windows has no Launch Services dedup; with close-to-tray, Start-Menu relaunch would spawn a second process sharing the SQLite DB, tray, and hotkeys); `core:window` minimize/toggle-maximize/close capability grants (the custom title-bar buttons render only off macOS and had no IPC permissions — dead chrome on the first canary build); per-platform tray icon (the solid-black macOS template glyph is invisible on a dark Windows taskbar; non-macOS uses the colored default window icon); `CREATE_NO_WINDOW` on both dictation spawns (`cmd /C clip`, PowerShell SendKeys).
+- **CI cache hardening.** macOS Rust caches are keyed by Xcode version and `ort.pyke.io` is cached on all Rust legs (see "What was learned").
+
+### Bugs / gaps being addressed
+
+- A multi-agent review of every Windows-relevant code path (8 surfaces, adversarial verification per finding) found the changeset's own blockers before push: the webgpu-feature-without-DLL-staging sequencing bug, the MSI/pre-release version hard-fail, and the never-true Authenticode gate — plus the unplanned app gaps above. Findings that remain open are plan items #18–#32 in `docs/plans/windows-support.md`.
+- The plan's claim "the dependency graph compiles on Windows" had never been tested; the first live msvc run proved it true up to four small lint errors — no structural problems.
+
+### Key decisions
+
+- **CPU-first W0, WebGPU behind an env flag.** An installable build that transcribes on CPU beats an accelerated build that fails to load. The `ort` WebGPU EP is experimental (can return wrong output), so `Auto` flips to WebGPU only after the canary proves it correct AND faster (Gate C) — never silently.
+- **Draft-release canary loop.** Windows builds ship from CI only (no local Windows build env). A `v*` tag produces a **draft** GitHub release — invisible to the public — whose NSIS installer the maintainer side-loads onto a Windows canary machine for manual UAT. Publishing remains a separate explicit act.
+- **Goal boards stay local.** `docs/goals/` (GoalBuddy working state) is gitignored — plans and ADRs are the committed record; boards are agent process scaffolding.
+
+### What was learned
+
+- **The msvc port was 4 lints away from compiling.** whisper.cpp's cmake build, cpal's WASAPI backend, and the full tauri app compiled first try; the only failures were dead-code/unreachable-pattern lints on macOS-only-constructed enum variants — the mirror image of the `cfg_attr(target_os = "macos", allow(dead_code))` idioms the codebase already had for the opposite direction.
+- **`macos-latest` serves mixed runner images, and Rust caches embed absolute toolchain paths.** Cached build-script output (e.g. `objc2-exception-helper`'s `clang_rt.osx` search dir, `ort-sys`'s dylib dir under `~/Library/Caches/ort.pyke.io`) breaks relinks when restored under a different Xcode. Cache-key bumps are band-aids; keying the cache by `xcodebuild -version` and caching `ort.pyke.io` is the fix.
+- **Trust but verify third-party action pins.** A `lukka/get-cmake` SHA that doesn't exist upstream fails the job at action-download time; runner images ship cmake, so the action was pure risk with no benefit.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `.github/workflows/ci-checks.yml` | `rust-windows` job (msvc clippy/test + webgpu clippy leg, msvc `.exe` externalBin placeholder); Xcode-fingerprinted macOS cache key; `ort.pyke.io` cache-directories. |
+| `.github/workflows/release.yml` | `build-windows` job (NSIS-only, updater artifacts, checksums); `create-release` needs both platforms; `windows-x86_64` in `latest.json`; job-level-env Authenticode gate; macOS cache hardening. |
+| `scripts/build-transcription-sidecar.sh` | Windows `FEATURES="whisper,parakeet"` (CPU-first; webgpu returns with Dawn staging in plan #12). |
+| `crates/yapstack-transcription-sidecar/Cargo.toml`, `src/engines/parakeet.rs` | `cuda` feature removed; non-macOS `Auto` → CPU; explicit WebGPU opt-in path retained. |
+| `crates/yapstack-transcription/src/model.rs` | `recommended_for_host()` → `TdtV3Int8` everywhere except CPU-only Intel macOS; size constants corrected to HEAD-verified actuals. |
+| `crates/yapstack-audio/src/system/device_watcher.rs` | `to_event` allowed dead off macOS until the WASAPI watcher (plan #8) consumes it. |
+| `apps/desktop/src-tauri/Cargo.toml`, `src/lib.rs` | `tauri-plugin-single-instance` (first plugin, focuses existing window); per-platform tray icon. |
+| `apps/desktop/src-tauri/capabilities/default.json` | `core:window` minimize/toggle-maximize/close grants. |
+| `apps/desktop/src-tauri/src/commands/dictation.rs` | `CREATE_NO_WINDOW` on the clip + PowerShell spawns. |
+| `apps/desktop/src-tauri/src/commands/{permissions,system_volume}.rs` | Scoped lint allows for macOS-only-constructed variants / off-macOS-unreachable match arms. |
+| `docs/adr/0004-*.md`, `docs/plans/{windows,linux}-support.md` | ADR + active Windows plan (incl. review items #18–#32) + deferred Linux gap list. |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
-- **CI/CD pipeline** — GitHub Actions for cross-platform builds, sidecar compilation
+- **CI/CD pipeline** — macOS + Windows builds land in alpha.12 (rust-windows CI leg, build-windows release job); Linux builds not yet (see `docs/plans/linux-support.md`)
 - **Temp file cleanup** — WAV files from capture accumulate; needs cleanup after transcription
 - **Progress events during sidecar inference** — the sidecar emits `Progress` responses and the client handles them (skipping to wait for final result), but whisper-rs doesn't provide a progress callback during inference itself
 - **Memory system** — Three-layer knowledge model (permanent facts, project context, daily logs) with SQLite storage, tag-based retrieval, and AI tools (`create_memory`, `update_memory`). Planned as Phase 4 of knowledge management.
@@ -1621,6 +1668,6 @@ A handful of independent items that landed between Phase 37 and the `1.0.0-alpha
 - **Memory UI & vault sync** — Memory browser, backlinks panel, action item tracker, optional markdown vault sync for Obsidian interop.
 - **Tag management UI** — Tag CRUD, tag picker, tag filtering in sidebar, tags in search results. Tags infrastructure exists but no dedicated management UI yet.
 - **Sharing** — `shares` table exists but no sharing UI or backend logic
-- **Multi-platform dictation testing** — Auto-paste (`osascript`) is macOS-only. Windows implementation needs testing. Linux not yet supported.
+- **Multi-platform dictation testing** — Windows dictation paths now compile in CI but await canary UAT (paste via PowerShell SendKeys is slated for a `SendInput` rewrite, and the `cmd /C clip` clipboard write needs a Unicode-safe replacement — plan items #15/#18). Linux not yet supported.
 - **Mixed-source WAV preserves system audio during dictation** — Phase 37's WAV muting zeros the (mic+system) mix sample for the dictation window, which loses the system audio for that interval. Precise impl would extract system-only audio for the overlap and substitute it. Tracked as MVP behavior in the helper rustdoc.
 - **Session-stable speaker IDs** — Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries. Diarization is force-disabled on upgrade (settings v22→23) until session-stable IDs land. The IPC + DB + sidecar plumbing is intact, so re-enabling is a one-line change once stability is solved.
