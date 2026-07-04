@@ -160,7 +160,13 @@ export function trackEngineError(props: {
   error: string;
   phase: string;
 }): void {
-  track("engine_error", { ...props, error: props.error.slice(0, 100) });
+  // Coerce defensively: a non-string sneaking in here must not throw —
+  // this runs inside engine-error handling, and an exception here masks
+  // the real engine error before it reaches state or logs.
+  track("engine_error", {
+    ...props,
+    error: String(props.error ?? "unknown").slice(0, 100),
+  });
 }
 
 // Settings

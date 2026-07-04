@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { commands } from "@/lib/tauri";
+import { commandErrorMessage } from "@/lib/command-error";
 import type {
   CaptureStatusDto,
   BufferStatusDto,
@@ -1178,7 +1179,7 @@ function createAppStore() {
           // Clean up the DB row we just created
           await dbDeleteSession(sessionId).catch(() => {});
           if (requestedBackfill) set({ backfillActive: false });
-          throw new Error(result.error.message);
+          throw new Error(commandErrorMessage(result.error));
         }
 
         trackSessionCreated({
@@ -1300,7 +1301,7 @@ function createAppStore() {
         if (result.status === "error") {
           // No DB rollback needed — we deferred the status flip until after
           // backend success.
-          toast.error(`Could not resume session: ${result.error.message}`);
+          toast.error(`Could not resume session: ${commandErrorMessage(result.error)}`);
           return;
         }
 
@@ -1557,6 +1558,12 @@ function createAppStore() {
 
             const recommendedRes =
               await commands.getRecommendedParakeetVariant();
+            if (recommendedRes.status === "error") {
+              console.error(
+                "getRecommendedParakeetVariant failed; falling back to selected variant:",
+                commandErrorMessage(recommendedRes.error),
+              );
+            }
             const recommended =
               recommendedRes.status === "ok" ? recommendedRes.data : null;
 
@@ -1612,12 +1619,12 @@ function createAppStore() {
                 } else {
                   // No fallback on disk → first-install error path.
                   trackEngineError({
-                    error: dl.error.message,
+                    error: commandErrorMessage(dl.error),
                     phase: "downloading",
                   });
                   set({
                     enginePhase: "error",
-                    engineError: dl.error.message,
+                    engineError: commandErrorMessage(dl.error),
                   });
                   return;
                 }
@@ -1644,7 +1651,7 @@ function createAppStore() {
               if (dl.status === "error") {
                 console.error(
                   "sortformer download failed; continuing without diarization:",
-                  dl.error.message,
+                  commandErrorMessage(dl.error),
                 );
               }
               set({ modelDownloadProgress: null });
@@ -1659,8 +1666,8 @@ function createAppStore() {
               settings.diarizationEnabled,
             );
             if (initResult.status === "error") {
-              trackEngineError({ error: initResult.error.message, phase: "initializing" });
-              set({ enginePhase: "error", engineError: initResult.error.message });
+              trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
+              set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
               return;
             }
             set({ enginePhase: "ready", engineError: null });
@@ -1684,10 +1691,10 @@ function createAppStore() {
               settings.selectedModelSize,
             );
             if (downloadResult.status === "error") {
-              trackEngineError({ error: downloadResult.error.message, phase: "downloading" });
+              trackEngineError({ error: commandErrorMessage(downloadResult.error), phase: "downloading" });
               set({
                 enginePhase: "error",
-                engineError: downloadResult.error.message,
+                engineError: commandErrorMessage(downloadResult.error),
                 modelDownloadProgress: null,
               });
               return;
@@ -1704,13 +1711,17 @@ function createAppStore() {
             false,
           );
           if (initResult.status === "error") {
-            trackEngineError({ error: initResult.error.message, phase: "initializing" });
-            set({ enginePhase: "error", engineError: initResult.error.message });
+            trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
+            set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
             return;
           }
 
           set({ enginePhase: "ready", engineError: null });
         } catch (e) {
+          // console.error routes through the frontend log bridge, so the
+          // failure lands in the unified log file — engine setup errors on
+          // a user's machine must be diagnosable from logs alone.
+          console.error("engine autoSetup failed:", e);
           set({ enginePhase: "error", engineError: String(e) });
         }
       },
@@ -1720,7 +1731,7 @@ function createAppStore() {
         try {
           const result = await commands.downloadModel(size);
           if (result.status === "error") {
-            throw new Error(result.error.message);
+            throw new Error(commandErrorMessage(result.error));
           }
           trackModelDownloaded({ model_size: size });
           await get().refreshModels();
@@ -1732,7 +1743,7 @@ function createAppStore() {
       deleteModel: async (size: ModelSizeDto) => {
         const result = await commands.deleteModel(size);
         if (result.status === "error") {
-          throw new Error(result.error.message);
+          throw new Error(commandErrorMessage(result.error));
         }
         trackModelDeleted({ model_size: size });
         await get().refreshModels();
@@ -1748,7 +1759,7 @@ function createAppStore() {
             set({ enginePhase: "downloading", modelDownloadProgress: 0 });
             const downloadResult = await commands.downloadModel(size);
             if (downloadResult.status === "error") {
-              throw new Error(downloadResult.error.message);
+              throw new Error(commandErrorMessage(downloadResult.error));
             }
             set({ modelDownloadProgress: null });
             await get().refreshModels();
@@ -1767,7 +1778,7 @@ function createAppStore() {
             false,
           );
           if (initResult.status === "error") {
-            throw new Error(initResult.error.message);
+            throw new Error(commandErrorMessage(initResult.error));
           }
 
           trackModelSwitched({ model_size: size, from_size: fromSize });
@@ -1832,7 +1843,7 @@ function createAppStore() {
               const dl = await commands.downloadParakeetModel(variant);
               if (dl.status === "error") {
                 set({ modelDownloadProgress: null });
-                throw new Error(dl.error.message);
+                throw new Error(commandErrorMessage(dl.error));
               }
               set({ modelDownloadProgress: null });
               await get().refreshParakeetModels();
@@ -1845,7 +1856,7 @@ function createAppStore() {
                 if (dl.status === "error") {
                   console.error(
                     "sortformer download failed; continuing without diarization:",
-                    dl.error.message,
+                    commandErrorMessage(dl.error),
                   );
                 }
                 set({ modelDownloadProgress: null });
@@ -1864,7 +1875,7 @@ function createAppStore() {
               );
               if (dl.status === "error") {
                 set({ modelDownloadProgress: null });
-                throw new Error(dl.error.message);
+                throw new Error(commandErrorMessage(dl.error));
               }
               set({ modelDownloadProgress: null });
               await get().refreshModels();
@@ -1882,7 +1893,7 @@ function createAppStore() {
             engine === "Parakeet" ? settings.diarizationEnabled : false,
           );
           if (initResult.status === "error") {
-            throw new Error(initResult.error.message);
+            throw new Error(commandErrorMessage(initResult.error));
           }
 
           set({ enginePhase: "ready", engineError: null });
@@ -1898,7 +1909,7 @@ function createAppStore() {
         try {
           const result = await commands.downloadParakeetModel(variant);
           if (result.status === "error") {
-            throw new Error(result.error.message);
+            throw new Error(commandErrorMessage(result.error));
           }
           await get().refreshParakeetModels();
         } finally {
@@ -1933,7 +1944,7 @@ function createAppStore() {
       deleteParakeetModel: async (variant: ParakeetVariantDto) => {
         const result = await commands.deleteParakeetModel(variant);
         if (result.status === "error") {
-          throw new Error(result.error.message);
+          throw new Error(commandErrorMessage(result.error));
         }
         await get().refreshParakeetModels();
       },
@@ -1975,8 +1986,8 @@ function createAppStore() {
             false,
           );
           if (r.status === "error") {
-            set({ enginePhase: "error", engineError: r.error.message });
-            throw new Error(r.error.message);
+            set({ enginePhase: "error", engineError: commandErrorMessage(r.error) });
+            throw new Error(commandErrorMessage(r.error));
           }
           set({ enginePhase: "ready", engineError: null });
         }
