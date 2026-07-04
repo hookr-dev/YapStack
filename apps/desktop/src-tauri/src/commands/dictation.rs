@@ -54,8 +54,12 @@ pub async fn clipboard_paste(text: String, auto_paste: bool) -> Result<(), Comma
 
     #[cfg(target_os = "windows")]
     {
+        // Suppress the console window that would otherwise flash on each paste.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         let mut child = std::process::Command::new("cmd")
             .args(["/C", "clip"])
+            .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| CommandError::Internal {
@@ -94,12 +98,16 @@ pub async fn clipboard_paste(text: String, auto_paste: bool) -> Result<(), Comma
 
         #[cfg(target_os = "windows")]
         {
+            // Suppress the console window that would otherwise flash on each paste.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
             let output = std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
                     "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
                 ])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .map_err(|e| CommandError::Internal {
                     message: format!("powershell: {e}"),

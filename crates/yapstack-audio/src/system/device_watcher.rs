@@ -118,6 +118,9 @@ pub enum DefaultDeviceKind {
 }
 
 impl DefaultDeviceKind {
+    // Only the macOS watcher imp calls this today; the Windows watcher
+    // (windows-support plan #8) will too, at which point the allow can go.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn to_event(self) -> DeviceEvent {
         match self {
             Self::Input => DeviceEvent::DefaultInputChanged,

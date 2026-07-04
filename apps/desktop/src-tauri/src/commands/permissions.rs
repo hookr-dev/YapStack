@@ -12,7 +12,11 @@ use crate::commands::error::CommandError;
 
 #[derive(Debug, Clone, Copy, Serialize, Type)]
 pub enum ScreenCapturePermissionDto {
+    // Granted/NotDetermined are only constructed on macOS (the inverse of
+    // Unavailable below), so off macOS rustc sees them as never built.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Granted,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NotDetermined,
     // Only returned on non-macOS where Screen Recording TCC doesn't exist; the
     // target_os cfg means rustc can't see this variant constructed on macOS.

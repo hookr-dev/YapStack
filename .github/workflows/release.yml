@@ -30,10 +30,19 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      - name: Xcode fingerprint for cache key
+        # Same rationale as ci-checks.yml: caches embed absolute Xcode
+        # toolchain paths; key by Xcode version so mixed runner images
+        # can't poison relinks.
+        id: xcode
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: release-macos
+          key: ${{ steps.xcode.outputs.version }}
+          cache-directories: ~/Library/Caches/ort.pyke.io
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -112,9 +121,123 @@ jobs:
             target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
             target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
 
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
+      # Mapped at job level (not on the signing step) so its `if:` can read it:
+      # GitHub evaluates a step's `if:` BEFORE applying that step's own `env:`.
+      WINDOWS_SIGN_CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check cmake
+        # windows-latest ships cmake in the runner image; the sidecar's
+        # whisper-rs / parakeet-rs cmake builds use it. Echo the version so
+        # runner-image updates that break the build are diagnosable.
+        run: cmake --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: release-windows
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@10.28.2 --activate
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build sidecars
+        # Pass the Windows target explicitly so the build script's Windows
+        # branch runs (features: whisper,parakeet) and emits the
+        # target-triple-suffixed exe that Tauri's externalBin requires:
+        # binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: "1"
+        run: ./scripts/build-sidecars.sh x86_64-pc-windows-msvc
+
+      # TODO(T005): Authenticode signing — needs a WINDOWS_CERTIFICATE secret
+      # that does NOT exist yet. Until it is wired, this job produces an
+      # UNSIGNED NSIS installer (SmartScreen will warn on first run). The step
+      # below is a clearly-marked, skippable placeholder: it is a no-op today
+      # and only runs once WINDOWS_SIGN_CERT is populated. Do not invent a
+      # secret value here — routes to T005 (Authenticode signing secret).
+      - name: Import Windows code signing certificate (gated — T005)
+        # WINDOWS_SIGN_CERT is mapped at JOB level, not here: a step's `if:` is
+        # evaluated before that same step's `env:`, so mapping it here would
+        # leave this condition permanently false. Do not move it back.
+        if: ${{ env.WINDOWS_SIGN_CERT != '' }}
+        run: |
+          echo "Authenticode signing is gated on the WINDOWS_CERTIFICATE secret (T005)."
+          echo "This step is a placeholder and is skipped until that secret is wired."
+
+      - name: Build Tauri app
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # Restrict to NSIS: tauri.conf.json bundle.targets is "all", but on
+        # Windows that also builds MSI/WiX, which hard-fails on the non-numeric
+        # pre-release version (tauri-bundler rejects "1.0.0-alpha.NN" for MSI).
+        # Updater artifacts (*.nsis.zip[.sig]) come from createUpdaterArtifacts
+        # in tauri.conf.json and are emitted alongside the nsis bundle.
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd target/x86_64-pc-windows-msvc/release/bundle/nsis
+          sha256sum *-setup.exe > checksums-windows.txt
+          cat checksums-windows.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-nsis
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/checksums-windows.txt
+
+      - name: Upload updater artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-updater
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.nsis.zip
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.nsis.zip.sig
+
   create-release:
     name: Create Release
-    needs: [build-macos]
+    needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,9 +254,22 @@ jobs:
           name: macos-updater
           path: artifacts/macos-updater
 
+      - name: Download Windows artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-nsis
+          path: artifacts/windows
+
+      - name: Download Windows updater artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-updater
+          path: artifacts/windows-updater
+
       - name: Combine checksums
         run: |
           cat artifacts/macos/checksums-macos.txt > checksums-sha256.txt
+          cat artifacts/windows/checksums-windows.txt >> checksums-sha256.txt
           cat checksums-sha256.txt
 
       - name: Generate latest.json
@@ -142,11 +278,13 @@ jobs:
           VERSION="${TAG#v}"
           REPO="${GITHUB_REPOSITORY}"
 
-          # Read signature
+          # Read signatures
           MACOS_SIG=$(cat artifacts/macos-updater/*.app.tar.gz.sig)
+          WINDOWS_SIG=$(cat artifacts/windows-updater/*-setup.nsis.zip.sig)
 
-          # Get filename
+          # Get filenames
           MACOS_FILE=$(basename artifacts/macos-updater/*.app.tar.gz)
+          WINDOWS_FILE=$(basename artifacts/windows-updater/*-setup.nsis.zip)
 
           cat > latest.json << EOF
           {
@@ -157,6 +295,10 @@ jobs:
               "darwin-aarch64": {
                 "signature": "${MACOS_SIG}",
                 "url": "https://github.com/${REPO}/releases/download/${TAG}/${MACOS_FILE}"
+              },
+              "windows-x86_64": {
+                "signature": "${WINDOWS_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/${WINDOWS_FILE}"
               }
             }
           }
@@ -172,5 +314,8 @@ jobs:
             artifacts/macos/*.dmg
             artifacts/macos-updater/*.app.tar.gz
             artifacts/macos-updater/*.app.tar.gz.sig
+            artifacts/windows/*-setup.exe
+            artifacts/windows-updater/*-setup.nsis.zip
+            artifacts/windows-updater/*-setup.nsis.zip.sig
             latest.json
             checksums-sha256.txt

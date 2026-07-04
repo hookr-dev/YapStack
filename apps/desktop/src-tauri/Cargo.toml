@@ -26,6 +26,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 rusqlite = { version = "0.32", features = ["bundled"] }
 hound = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -89,8 +89,10 @@ pub enum ParakeetVariant {
     /// nvidia/parakeet-tdt-0.6b-v3 (multilingual, 25 European languages),
     /// repackaged to ONNX by `istupakov` on HuggingFace. fp32 weights — the
     /// encoder ships a 2.4 GB external `.onnx.data` blob which prevents
-    /// CoreML EP from loading the model. Default outside Apple Silicon;
-    /// on Windows we keep this variant pending CUDA EP support.
+    /// accelerator EPs (CoreML, WebGPU) from loading the model. Retained
+    /// only for the CPU-only Intel-macOS build, which has no GPU EP path;
+    /// every WebGPU-capable host (Apple Silicon, Windows, Linux) uses the
+    /// int8 single-file bundle instead.
     TdtV3,
     /// int8-quantized variant of the same `nvidia/parakeet-tdt-0.6b-v3`
     /// model, also from `istupakov`. Single-file inlined ONNX bundles —
@@ -99,21 +101,28 @@ pub enum ParakeetVariant {
     /// identical accuracy on LibriSpeech (97.84%) and indistinguishable
     /// WER on the leaderboard (15.72–15.77%); RNN-T joint decisions are
     /// driven by relative logit magnitudes so quantization doesn't change
-    /// argmax decoding. Default on Apple Silicon.
+    /// argmax decoding. Default on every WebGPU-capable host — Apple Silicon
+    /// (Metal), Windows and Linux (Dawn → Vulkan/D3D12).
     TdtV3Int8,
 }
 
 impl ParakeetVariant {
     /// The variant we should pick at install time for the current host.
-    /// Apple Silicon runs the int8 bundle so accelerators (WebGPU today,
-    /// CoreML if upstream lands static-shape conversion) can load it; all
-    /// other targets stay on the fp32 bundle until their own GPU path
-    /// arrives (Windows CUDA in a follow-up).
+    /// Apple Silicon and non-macOS hosts (Windows/Linux) both run the int8
+    /// bundle so the WebGPU EP can load it — int8 is a single-file inlined
+    /// ONNX bundle with no external `.onnx.data` initializer, which is what
+    /// blocks accelerator EPs from loading the fp32 encoder. The fp32
+    /// `TdtV3` variant is retained only for the CPU-only Intel-macOS build,
+    /// which has neither a WebGPU nor a CoreML acceleration path today.
     pub fn recommended_for_host() -> Self {
-        if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-            ParakeetVariant::TdtV3Int8
-        } else {
+        // macOS + aarch64 (Apple Silicon, WebGPU/Metal) → int8.
+        // Non-macOS (Windows/Linux, WebGPU/Dawn) → int8.
+        // Only CPU-only Intel macOS falls back to the fp32 bundle.
+        let macos_intel = cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64");
+        if macos_intel {
             ParakeetVariant::TdtV3
+        } else {
+            ParakeetVariant::TdtV3Int8
         }
     }
 
@@ -134,25 +143,25 @@ impl ParakeetVariant {
                 (
                     "encoder-model.onnx",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx",
-                    1_700_000,
+                    41_770_866,
                 ),
                 (
                     "encoder-model.onnx.data",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx.data",
-                    560_000_000,
+                    2_435_420_160,
                 ),
                 (
                     "decoder_joint-model.onnx",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.onnx",
-                    34_000_000,
+                    72_520_893,
                 ),
                 (
                     "vocab.txt",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-                    32_000,
+                    93_939,
                 ),
             ],
-            // Sizes verified against the HF tree (Apr 2026): encoder ~652 MB,
+            // Sizes verified against the HF tree (2026-07-02): encoder ~652 MB,
             // decoder ~18 MB, preprocessor ~140 KB, vocab ~94 KB. The
             // sub-MB values double as Content-Length fallbacks; HF returns
             // accurate Content-Length so they're rarely consulted.
@@ -160,12 +169,12 @@ impl ParakeetVariant {
                 (
                     "encoder-model.int8.onnx",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-                    683_700_000,
+                    652_183_999,
                 ),
                 (
                     "decoder_joint-model.int8.onnx",
                     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-                    19_100_000,
+                    18_202_004,
                 ),
                 (
                     "nemo128.onnx",
@@ -192,7 +201,7 @@ impl ParakeetVariant {
     /// that they differ on disk.
     pub fn display_name(&self) -> &'static str {
         match self {
-            ParakeetVariant::TdtV3 => "Parakeet TDT v3 (~600 MB)",
+            ParakeetVariant::TdtV3 => "Parakeet TDT v3 (~2.5 GB)",
             ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 (~700 MB)",
         }
     }
@@ -654,11 +663,14 @@ mod tests {
         // `recommended_for_host` is `cfg!`-driven, so the test runner sees
         // exactly one branch on each CI runner. We assert against the same
         // cfg flags here so the test is meaningful on every target without
-        // having to mock the host detection.
-        let expected = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-            ParakeetVariant::TdtV3Int8
-        } else {
+        // having to mock the host detection. Only CPU-only Intel macOS keeps
+        // the fp32 bundle; every WebGPU-capable host (Apple Silicon +
+        // Windows/Linux) takes the int8 single-file bundle.
+        let macos_intel = cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64");
+        let expected = if macos_intel {
             ParakeetVariant::TdtV3
+        } else {
+            ParakeetVariant::TdtV3Int8
         };
         assert_eq!(ParakeetVariant::recommended_for_host(), expected);
     }
