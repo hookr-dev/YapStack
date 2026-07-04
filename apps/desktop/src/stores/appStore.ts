@@ -2,6 +2,31 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { commands } from "@/lib/tauri";
 import { commandErrorMessage } from "@/lib/command-error";
+
+/**
+ * Poll the builder-managed `backend_ready` flag until the Rust setup hook
+ * has managed every command dependency. The webviews load concurrently with
+ * setup, so invoking a setup-managed command too early fails with Tauri's
+ * "state not managed" error. Resolves (with a logged warning) after the
+ * timeout rather than blocking the app forever.
+ */
+async function waitForBackendReady(timeoutMs = 15000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      if (await commands.backendReady()) return;
+    } catch {
+      // invoke layer not up yet — keep polling
+    }
+    if (Date.now() - start > timeoutMs) {
+      console.error(
+        "backend_ready timed out; proceeding with engine setup anyway",
+      );
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 import type {
   CaptureStatusDto,
   BufferStatusDto,
@@ -1505,6 +1530,13 @@ function createAppStore() {
         // duplicate calls are harmless.
         if (get().enginePhase === "ready") return;
 
+        // The webview boots concurrently with the Rust setup hook, so a fast
+        // frontend can invoke commands whose managed state doesn't exist yet
+        // ("state not managed" — observed on the Windows canary). Wait for
+        // the backend's ready flag before the first engine command; the flag
+        // itself is builder-managed, so this poll can never race.
+        await waitForBackendReady();
+
         const { settings } = get();
 
         // Request Screen Recording TCC up front — on macOS 14.2+ this gates
@@ -1834,7 +1866,26 @@ function createAppStore() {
         try {
           if (engine === "Parakeet") {
             await get().refreshParakeetModels();
-            const variant = settings.selectedParakeetVariant;
+            // Prefer a variant already on disk (host-recommended first),
+            // else download the host-recommended one. Using the persisted
+            // selection alone downloaded fp32 TdtV3 (2.5 GB, unusably slow
+            // on CPU) on hosts whose recommendation is int8.
+            const recommendedRes =
+              await commands.getRecommendedParakeetVariant();
+            const recommended =
+              recommendedRes.status === "ok" ? recommendedRes.data : null;
+            const downloadedVariants = get().parakeetModels.filter(
+              (m) => m.downloaded,
+            );
+            const variant =
+              downloadedVariants.find((m) => m.variant === recommended)
+                ?.variant ??
+              downloadedVariants[0]?.variant ??
+              recommended ??
+              settings.selectedParakeetVariant;
+            if (variant !== settings.selectedParakeetVariant) {
+              get().updateSettings({ selectedParakeetVariant: variant });
+            }
             const ready = get().parakeetModels.find(
               (m) => m.variant === variant && m.downloaded,
             );
@@ -1889,7 +1940,9 @@ function createAppStore() {
           const initResult = await commands.initTranscriptionClient(
             engine,
             engine === "Whisper" ? settings.selectedModelSize : null,
-            engine === "Parakeet" ? settings.selectedParakeetVariant : null,
+            // Re-read: the Parakeet branch above may have re-resolved the
+            // variant to the host recommendation and persisted it.
+            engine === "Parakeet" ? get().settings.selectedParakeetVariant : null,
             engine === "Parakeet" ? settings.diarizationEnabled : false,
           );
           if (initResult.status === "error") {
