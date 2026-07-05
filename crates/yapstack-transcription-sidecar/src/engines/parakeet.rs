@@ -491,7 +491,10 @@ fn build_coreml_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::Executio
     Some(cfg)
 }
 
-#[cfg(feature = "webgpu")]
+// Gated to macOS because its only caller is auto_exec_config's macOS arm —
+// every other path (explicit opt-in, non-macOS Auto) uses the strict
+// variant below.
+#[cfg(all(feature = "webgpu", target_os = "macos"))]
 fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
     // Dawn drives the WebGPU EP: Metal on macOS, Vulkan/D3D12 on Windows/Linux.
