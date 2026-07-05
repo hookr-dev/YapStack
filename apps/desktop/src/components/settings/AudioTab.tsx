@@ -81,15 +81,22 @@ export function AudioTab() {
         <div className="flex-1 min-w-0 space-y-2">
           <Label className="text-xs text-muted-foreground">Input Device</Label>
           <Select
-            value={selectedMicDeviceId ?? ""}
+            value={selectedMicDeviceId ?? "__default"}
             onValueChange={(v) =>
-              updateSettings({ selectedMicDeviceId: v || null })
+              updateSettings({ selectedMicDeviceId: v === "__default" ? null : v })
             }
           >
             <SelectTrigger className="h-8 w-full text-xs">
               <SelectValue placeholder="Default" />
             </SelectTrigger>
             <SelectContent>
+              {/* Sentinel row (same idiom as onboarding): null means
+                  follow-the-OS-default, which Radix can't express as an
+                  empty item value. Without this row there's no way back
+                  to Default after picking a concrete device. */}
+              <SelectItem value="__default" className="text-xs">
+                System Default
+              </SelectItem>
               {inputDevices.map((device) => (
                 <SelectItem
                   key={device.id ?? device.name}

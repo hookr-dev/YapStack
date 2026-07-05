@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
@@ -6,8 +6,16 @@ import { EVENTS, listenEvent } from "@/lib/events";
 import { trackStreamHealthEvent } from "@/lib/analytics";
 
 /** Listens for live transcription segment, backfill, and status events. Mounted in AppLayout. */
+
+/// Restarts landing within this window render as one combined toast — an
+/// OS default-device change commonly restarts mic and system audio
+/// back-to-back.
+const RESTART_COALESCE_MS = 1500;
 export function useLiveTranscriptionEvents() {
   const setLivePhase = useAppStore((s) => s.setLivePhase);
+  // source -> latest restart within the coalescing window (see
+  // RESTART_COALESCE_MS). Ref, not state: toast rendering is imperative.
+  const recentRestartsRef = useRef(new Map<string, { text: string; at: number }>());
   const onLiveSegment = useAppStore((s) => s.onLiveSegment);
   const onBackfillComplete = useAppStore((s) => s.onBackfillComplete);
   const onSessionPartReady = useAppStore((s) => s.onSessionPartReady);
@@ -94,18 +102,29 @@ export function useLiveTranscriptionEvents() {
           source: payload.source,
           status: payload.status,
         });
-        const toastId = `stream-health-${payload.source}`;
         if (payload.status === "restarted") {
-          // Auto-failover toast names the new device when known.
-          // Falls back to the existing diagnostic message otherwise.
-          const sourceLabel = payload.source === "Mic" ? "mic" : "system audio";
-          const text = payload.bound_device_name
-            ? `Switched ${sourceLabel} to ${payload.bound_device_name}`
-            : payload.message;
-          toast.success(text, { id: toastId, duration: 3000 });
+          // Auto-failover toast names the new device when known. A single
+          // OS default-device change often restarts BOTH sources within a
+          // beat; render every restart in the window through ONE updating
+          // toast instead of stacking a mic toast on a system toast.
+          const now = Date.now();
+          const recent = recentRestartsRef.current;
+          recent.set(payload.source, {
+            text: payload.bound_device_name
+              ? `${payload.source === "Mic" ? "mic" : "system audio"} → ${payload.bound_device_name}`
+              : payload.message,
+            at: now,
+          });
+          for (const [source, entry] of recent) {
+            if (now - entry.at > RESTART_COALESCE_MS) recent.delete(source);
+          }
+          const parts = [...recent.values()].map((e) => e.text);
+          const text =
+            parts.length > 1 ? `Switched ${parts.join(" · ")}` : `Switched ${parts[0]}`;
+          toast.success(text, { id: "stream-health-restarted", duration: 3000 });
         } else {
           toast.error(payload.message, {
-            id: toastId,
+            id: `stream-health-${payload.source}`,
             duration: payload.status === "restart_abandoned" ? Infinity : 5000,
           });
         }
