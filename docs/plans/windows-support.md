@@ -229,13 +229,16 @@ This is the known weak point. GA does not ship until every item here is closed.
       internal CPU build first. Gates public GA, not internal builds.
 
 13. **WebGPU hardware-validation gate — GATES GPU-on-by-default.** — **M** —
-    **IN PROGRESS 2026-07-05:** canary confirmed the opt-in path is functional
-    (EP registers strictly, transcribes). Still required before flipping
-    non-macOS `Auto` → WebGPU: the canary's explicit **correct AND
-    faster-than-CPU** verdict (RTFx numbers from the
-    `parakeet transcribe: ... (N.Nx realtime)` log lines, CPU vs WebGPU, plus
-    a transcript-correctness read), and it validates only the canary's GPU
-    vendor — broader NVIDIA/AMD/Intel coverage remains a GA consideration.
+    **GATE C PASSED 2026-07-05:** the canary's explicit verdict — WebGPU is
+    **correct and clearly faster than CPU** on real Windows hardware via the
+    strict opt-in path. Non-macOS `Auto` now attempts WebGPU with strict EP
+    registration; EP-init failure routes through `load_model`'s explicit CPU
+    fallback (logged `live_accel_fallback`, honest `accel=cpu` label), so
+    GPU-less machines degrade visibly, not silently.
+    `YAPSTACK_PARAKEET_ACCEL=cpu` is the escape hatch. **Residual for GA:**
+    validated on the canary's GPU vendor only — broader NVIDIA/AMD/Intel
+    coverage remains a GA consideration, mitigated by the honest-fallback
+    design and the env escape hatch.
     - The `ort` WebGPU EP is flagged **experimental** (can return *wrong*
       transcripts, not just crash) with an open macOS multi-thread crash
       (onnxruntime #27592). Before flipping Parakeet WebGPU on by default: run a

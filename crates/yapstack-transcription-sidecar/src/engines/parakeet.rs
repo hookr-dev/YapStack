@@ -337,10 +337,14 @@ fn resolved_accel_label(choice: AccelChoice) -> &'static str {
             {
                 "coreml"
             }
-            // Auto stays CPU on non-macOS until Gate C (canary validates WebGPU
-            // correct + faster than CPU on real Windows GPU); then flip Auto ->
-            // WebGPU. Current opt-in: YAPSTACK_PARAKEET_ACCEL=webgpu.
-            #[cfg(not(target_os = "macos"))]
+            // Gate C passed 2026-07-05: non-macOS Auto attempts WebGPU (see
+            // auto_exec_config). This is the ATTEMPTED label; load_model's
+            // fallback rewrites the actual label to "cpu" if the EP fails.
+            #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
+            {
+                "webgpu"
+            }
+            #[cfg(all(not(target_os = "macos"), not(feature = "webgpu")))]
             {
                 "cpu"
             }
@@ -418,13 +422,12 @@ fn build_exec_config(
 /// is not the path to ANE acceleration today. WebGPU bypasses that issue
 /// at the cost of going through Metal instead of Apple's CoreML compiler.
 ///
-/// Non-macOS targets (Windows/Linux) stay CPU-by-default under Auto — even
-/// when the `webgpu` feature is compiled in. Per ADR 0004's validation gate,
-/// WebGPU stays behind the explicit `YAPSTACK_PARAKEET_ACCEL=webgpu` opt-in
-/// (which routes through `AccelChoice::WebGpu` → `build_webgpu_config`) until
-/// Gate C: a canary machine validates it's correct AND faster than CPU on a
-/// real Windows GPU. Once Gate C passes, flip this non-macOS Auto arm to
-/// `build_webgpu_config()`. Do not flip it before then.
+/// Non-macOS targets (Windows/Linux) attempt WebGPU under Auto since Gate C
+/// passed (2026-07-05: the Windows canary validated WebGPU correct AND
+/// clearly faster than CPU per ADR 0004's validation gate). Registration is
+/// strict — EP-init failure surfaces through `load_model`'s explicit CPU
+/// fallback (logged, honest label) rather than ort's silent one.
+/// `YAPSTACK_PARAKEET_ACCEL=cpu` remains the escape hatch.
 //
 // `needless_return` is allowed here because the body is a set of
 // mutually-exclusive `#[cfg]` blocks — exactly one is compiled per target ×
@@ -443,10 +446,20 @@ fn auto_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionCo
     {
         return build_coreml_config(cache_dir);
     }
-    // Auto stays CPU on non-macOS until Gate C (canary validates WebGPU
-    // correct + faster than CPU on real Windows GPU); then flip Auto ->
-    // WebGPU here. Current opt-in for canary A/B: YAPSTACK_PARAKEET_ACCEL=webgpu.
-    #[cfg(not(target_os = "macos"))]
+    // Gate C PASSED (2026-07-05): the Windows canary judged WebGPU correct
+    // AND clearly faster than CPU, so non-macOS Auto now attempts WebGPU.
+    // STRICT registration on purpose: if the EP can't initialize (no
+    // adapter, VM, RDP, stale drivers), session creation fails and
+    // `load_model`'s explicit fallback retries CPU with a logged
+    // `live_accel_fallback` marker and an honest accel="cpu" label — no
+    // silent ort-internal fallback under a webgpu label, and no
+    // hard-broken default for GPU-less machines.
+    #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
+    {
+        _ = cache_dir;
+        return build_webgpu_config_strict();
+    }
+    #[cfg(all(not(target_os = "macos"), not(feature = "webgpu")))]
     {
         _ = cache_dir;
         None
