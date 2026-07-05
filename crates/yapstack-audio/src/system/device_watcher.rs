@@ -276,8 +276,8 @@ mod imp {
     use windows::core::{implement, PCWSTR};
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{
-        eCapture, eConsole, eRender, EDataFlow, ERole, IMMDeviceEnumerator,
-        IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE,
+        eCapture, eConsole, eRender, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
+        IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -393,17 +393,15 @@ mod imp {
                     let _ = ready_tx.send(Err(format!("CoInitializeEx failed: {hr}")));
                     return;
                 }
-                let registration = (|| -> windows::core::Result<(
-                    IMMDeviceEnumerator,
-                    IMMNotificationClient,
-                )> {
-                    let enumerator: IMMDeviceEnumerator =
-                        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-                    let client: IMMNotificationClient =
-                        NotificationClient { sink, kind }.into();
-                    unsafe { enumerator.RegisterEndpointNotificationCallback(&client)? };
-                    Ok((enumerator, client))
-                })();
+                let registration =
+                    (|| -> windows::core::Result<(IMMDeviceEnumerator, IMMNotificationClient)> {
+                        let enumerator: IMMDeviceEnumerator =
+                            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+                        let client: IMMNotificationClient =
+                            NotificationClient { sink, kind }.into();
+                        unsafe { enumerator.RegisterEndpointNotificationCallback(&client)? };
+                        Ok((enumerator, client))
+                    })();
                 match registration {
                     Ok((enumerator, client)) => {
                         let _ = ready_tx.send(Ok(()));
@@ -431,7 +429,10 @@ mod imp {
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                info!("WASAPI default-{:?} device change listener registered", kind);
+                info!(
+                    "WASAPI default-{:?} device change listener registered",
+                    kind
+                );
                 Ok(WatcherInner {
                     shutdown_tx,
                     join: Some(join),
@@ -439,13 +440,19 @@ mod imp {
             }
             Ok(Err(msg)) => {
                 let _ = join.join();
-                warn!("WASAPI default-{:?} listener registration failed: {msg}", kind);
+                warn!(
+                    "WASAPI default-{:?} listener registration failed: {msg}",
+                    kind
+                );
                 Err(AudioError::PlatformNotSupported)
             }
             Err(_) => {
                 // Thread died without reporting (panic before send).
                 let _ = join.join();
-                warn!("WASAPI default-{:?} listener thread died during setup", kind);
+                warn!(
+                    "WASAPI default-{:?} listener thread died during setup",
+                    kind
+                );
                 Err(AudioError::PlatformNotSupported)
             }
         }

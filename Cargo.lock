@@ -8436,6 +8436,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "windows",
+ "windows-core 0.61.2",
  "yapstack-common",
 ]
 

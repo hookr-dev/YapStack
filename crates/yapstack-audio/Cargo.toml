@@ -31,3 +31,6 @@ windows = { version = "0.61", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
 ] }
+# Direct dep required by #[implement]: the macro expands to `windows_core::`
+# paths, which only resolve if this crate names windows-core itself.
+windows-core = "0.61"

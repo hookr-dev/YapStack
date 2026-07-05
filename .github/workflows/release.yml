@@ -43,7 +43,11 @@ jobs:
         # toolchain paths; key by Xcode version so mixed runner images
         # can't poison relinks.
         id: xcode
-        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+        # The marketing version ("Xcode 16.4") is not precise enough: two
+        # images can share it while shipping different clang majors, and the
+        # clang RESOURCE DIR is the exact absolute path cached build-script
+        # output goes stale against. Fingerprint that path directly.
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
