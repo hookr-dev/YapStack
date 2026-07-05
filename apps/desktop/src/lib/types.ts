@@ -8,6 +8,9 @@ export const commands = {
 async healthCheck() : Promise<HealthStatus> {
     return await TAURI_INVOKE("health_check");
 },
+async backendReady() : Promise<boolean> {
+    return await TAURI_INVOKE("backend_ready");
+},
 async listAudioDevices() : Promise<Result<AudioDeviceInfoDto[], CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_audio_devices") };

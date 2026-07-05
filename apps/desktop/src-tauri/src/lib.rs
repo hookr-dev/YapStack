@@ -270,6 +270,7 @@ pub fn run() {
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
+            commands::backend_ready,
             commands::audio::list_audio_devices,
             commands::audio::get_default_input_device,
             commands::audio::start_capture,
@@ -530,6 +531,7 @@ pub fn run() {
         )
         .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
         .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
+        .manage(Arc::new(commands::BackendReadyFlag::new()) as commands::BackendReadyState)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);
@@ -571,25 +573,15 @@ pub fn run() {
                 .app_config_dir()
                 .map(|p| p.join("yapstack.db"))
                 .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
-            db::ensure_runtime_schema(&db_path);
 
-            // Seed the trusted-audio-dirs set from existing parts rows + the
-            // default audio dir, then sweep those dirs for orphan files left
-            // by a crash between WAV finalize and the prior FE-driven INSERT.
-            let app_audio_dir = app_data_dir.join("audio");
-            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
-            db::reconcile_audio_parts(&db_path, &trusted_dirs);
-            // Re-list after reconciliation so newly-recovered parts'
-            // directories land in the trusted set.
-            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
-            if let Some(state) = app.try_state::<TrustedAudioDirs>() {
-                if let Ok(mut guard) = state.lock() {
-                    guard.extend(trusted_dirs);
-                }
-            }
+            // Manage every command dependency BEFORE the db/filesystem sweeps
+            // below: the webviews load concurrently with this hook, and a
+            // command invoked before its state is managed fails with
+            // "state not managed". (The frontend additionally gates on
+            // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
 
-            let model_manager = ModelManager::new(app_data_dir);
+            let model_manager = ModelManager::new(app_data_dir.clone());
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
@@ -606,6 +598,23 @@ pub fn run() {
             // dictation live loops. Always present; the flag flips at runtime.
             app.manage(Arc::new(commands::transcription::DictationOwnsMic::new())
                 as commands::transcription::DictationOwnsMicState);
+
+            db::ensure_runtime_schema(&db_path);
+
+            // Seed the trusted-audio-dirs set from existing parts rows + the
+            // default audio dir, then sweep those dirs for orphan files left
+            // by a crash between WAV finalize and the prior FE-driven INSERT.
+            let app_audio_dir = app_data_dir.join("audio");
+            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
+            db::reconcile_audio_parts(&db_path, &trusted_dirs);
+            // Re-list after reconciliation so newly-recovered parts'
+            // directories land in the trusted set.
+            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
+            if let Some(state) = app.try_state::<TrustedAudioDirs>() {
+                if let Ok(mut guard) = state.lock() {
+                    guard.extend(trusted_dirs);
+                }
+            }
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 
@@ -821,6 +830,14 @@ pub fn run() {
                     );
                 }
             }
+
+            // Every command dependency is managed — unblock frontends that
+            // gate on `backend_ready` before their first engine command.
+            // Deliberately NO companion event: Tauri drops events emitted
+            // before a webview's listener attaches (no replay), which is the
+            // same race this flag closes. The frontend's command poll is the
+            // sole readiness signal.
+            app.state::<commands::BackendReadyState>().set_ready();
 
             Ok(())
         })

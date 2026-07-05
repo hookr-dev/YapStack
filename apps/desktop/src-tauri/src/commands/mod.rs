@@ -29,6 +29,55 @@ pub fn health_check() -> HealthStatus {
     }
 }
 
+/// True once the setup hook has managed every command dependency. Tauri
+/// creates config-declared webview windows BEFORE running the setup hook
+/// (tauri 2.11 `app.rs`: windows built at the top of the internal `setup()`,
+/// user hook invoked after), so a fast frontend boot can invoke commands
+/// whose `State` isn't managed yet (observed on Windows: "state not managed
+/// ... on command `download_model`"). This flag is managed on the builder
+/// chain — extractable from the very first invoke — and flips at the end of
+/// setup; the frontend polls it before its first engine command. Same shape
+/// as the official splashscreen-guide handshake.
+///
+/// A bare bool (not a Ready/Failed tri-state) is honest ONLY while the setup
+/// hook stays synchronous and fatal-on-error — a setup failure exits the
+/// process, so "never ready" cannot be observed by a live frontend. If setup
+/// ever spawns fallible async init, upgrade this to carry the failure.
+///
+/// Newtype, NOT a bare `Arc<AtomicBool>`: Tauri manages state by `TypeId`,
+/// `LiveSessionPresent` is already a managed `Arc<AtomicBool>`, and a
+/// duplicate `manage` is a silent no-op — an alias here would make the
+/// end-of-setup store flip the live-session flag instead.
+pub struct BackendReadyFlag(std::sync::atomic::AtomicBool);
+
+impl BackendReadyFlag {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn set_ready(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for BackendReadyFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type BackendReadyState = std::sync::Arc<BackendReadyFlag>;
+
+#[tauri::command]
+#[specta::specta]
+pub fn backend_ready(state: tauri::State<'_, BackendReadyState>) -> bool {
+    state.is_ready()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn get_autostart_enabled(app: tauri::AppHandle) -> Result<bool, error::CommandError> {
