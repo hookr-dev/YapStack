@@ -174,7 +174,15 @@ This is the known weak point. GA does not ship until every item here is closed.
 ## Phase W2 — Acceleration + polish → public GA
 
 12. **WebGPU execution provider for Parakeet (reuse the macOS Dawn path) + int8
-    variant.** — **L**
+    variant.** — **L** — **LANDED 2026-07-05** (`feat/parakeet-webgpu-windows`):
+    webgpu feature + full DLL staging (the pyke wgpu dist ships
+    `webgpu_dawn.dll` + `dxcompiler.dll` + `dxil.dll`; the build-script glob
+    caught all three), `tauri.windows.conf.json` bundles `binaries/*.dll` to
+    the install root, and the explicit opt-in registers the EP with
+    `error_on_failure` via `with_custom_configure` (parakeet-rs's own arm is
+    soft; macOS Auto keeps shipping soft behavior). Canary confirmed the EP
+    initializes and transcribes with `YAPSTACK_PARAKEET_ACCEL=webgpu`.
+    Remaining from this item: the in-house WER check (below) is still open.
     - `auto_exec_config` returns `None` off macOS
       (`crates/yapstack-transcription-sidecar/src/engines/parakeet.rs:417`), so
       Parakeet is CPU on Windows. **Extend non-macOS `AccelChoice::Auto` to
@@ -220,7 +228,14 @@ This is the known weak point. GA does not ship until every item here is closed.
     - Largest single Windows item; land after W0/W1 so there's a shippable
       internal CPU build first. Gates public GA, not internal builds.
 
-13. **WebGPU hardware-validation gate — GATES GPU-on-by-default.** — **M**
+13. **WebGPU hardware-validation gate — GATES GPU-on-by-default.** — **M** —
+    **IN PROGRESS 2026-07-05:** canary confirmed the opt-in path is functional
+    (EP registers strictly, transcribes). Still required before flipping
+    non-macOS `Auto` → WebGPU: the canary's explicit **correct AND
+    faster-than-CPU** verdict (RTFx numbers from the
+    `parakeet transcribe: ... (N.Nx realtime)` log lines, CPU vs WebGPU, plus
+    a transcript-correctness read), and it validates only the canary's GPU
+    vendor — broader NVIDIA/AMD/Intel coverage remains a GA consideration.
     - The `ort` WebGPU EP is flagged **experimental** (can return *wrong*
       transcripts, not just crash) with an open macOS multi-thread crash
       (onnxruntime #27592). Before flipping Parakeet WebGPU on by default: run a
