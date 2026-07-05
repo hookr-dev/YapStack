@@ -174,7 +174,15 @@ This is the known weak point. GA does not ship until every item here is closed.
 ## Phase W2 — Acceleration + polish → public GA
 
 12. **WebGPU execution provider for Parakeet (reuse the macOS Dawn path) + int8
-    variant.** — **L**
+    variant.** — **L** — **LANDED 2026-07-05** (`feat/parakeet-webgpu-windows`):
+    webgpu feature + full DLL staging (the pyke wgpu dist ships
+    `webgpu_dawn.dll` + `dxcompiler.dll` + `dxil.dll`; the build-script glob
+    caught all three), `tauri.windows.conf.json` bundles `binaries/*.dll` to
+    the install root, and the explicit opt-in registers the EP with
+    `error_on_failure` via `with_custom_configure` (parakeet-rs's own arm is
+    soft; macOS Auto keeps shipping soft behavior). Canary confirmed the EP
+    initializes and transcribes with `YAPSTACK_PARAKEET_ACCEL=webgpu`.
+    Remaining from this item: the in-house WER check (below) is still open.
     - `auto_exec_config` returns `None` off macOS
       (`crates/yapstack-transcription-sidecar/src/engines/parakeet.rs:417`), so
       Parakeet is CPU on Windows. **Extend non-macOS `AccelChoice::Auto` to
@@ -220,7 +228,17 @@ This is the known weak point. GA does not ship until every item here is closed.
     - Largest single Windows item; land after W0/W1 so there's a shippable
       internal CPU build first. Gates public GA, not internal builds.
 
-13. **WebGPU hardware-validation gate — GATES GPU-on-by-default.** — **M**
+13. **WebGPU hardware-validation gate — GATES GPU-on-by-default.** — **M** —
+    **GATE C PASSED 2026-07-05:** the canary's explicit verdict — WebGPU is
+    **correct and clearly faster than CPU** on real Windows hardware via the
+    strict opt-in path. Non-macOS `Auto` now attempts WebGPU with strict EP
+    registration; EP-init failure routes through `load_model`'s explicit CPU
+    fallback (logged `live_accel_fallback`, honest `accel=cpu` label), so
+    GPU-less machines degrade visibly, not silently.
+    `YAPSTACK_PARAKEET_ACCEL=cpu` is the escape hatch. **Residual for GA:**
+    validated on the canary's GPU vendor only — broader NVIDIA/AMD/Intel
+    coverage remains a GA consideration, mitigated by the honest-fallback
+    design and the env escape hatch.
     - The `ort` WebGPU EP is flagged **experimental** (can return *wrong*
       transcripts, not just crash) with an open macOS multi-thread crash
       (onnxruntime #27592). Before flipping Parakeet WebGPU on by default: run a
@@ -249,10 +267,18 @@ This is the known weak point. GA does not ship until every item here is closed.
       unreliable against elevated/game windows. Use direct `SendInput` /
       `keybd_event` via the `windows` crate.
 
-16. **Add Authenticode signing.** — **M**
-    - `bundle.windows` has only `nsis.installMode` (`tauri.conf.json:117-121`) —
-      no cert/timestamp, so the installer is unsigned → SmartScreen warnings.
-      Wire a signing secret into the `build-windows` job.
+16. **Add Authenticode signing.** — **DESCOPED (operator decision,
+    2026-07-05): no certificate, and none planned.** Windows ships unsigned.
+    - Accepted consequences: SmartScreen "More info → Run anyway" on first
+      install (document this in the README/release notes when Windows builds
+      go public) and some AV false-positive risk on unsigned executables.
+    - NOT affected: the auto-updater — Tauri's updater verifies the minisign
+      signature (`TAURI_SIGNING_PRIVATE_KEY`), not Authenticode, so updates
+      remain integrity-checked and functional.
+    - The gated signing placeholder in `release.yml` (job-level
+      `WINDOWS_SIGN_CERT` env, permanently-skipped step) stays as-is: it costs
+      nothing, cannot fire without the secret, and preserves the wiring if a
+      certificate ever materializes.
 
 17. **Frontend Windows polish.** — **M**
     - Ctrl/Alt modifier glyphs instead of hardcoded ⌘/⌥; non-macOS permission
