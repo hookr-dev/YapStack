@@ -267,10 +267,18 @@ This is the known weak point. GA does not ship until every item here is closed.
       unreliable against elevated/game windows. Use direct `SendInput` /
       `keybd_event` via the `windows` crate.
 
-16. **Add Authenticode signing.** — **M**
-    - `bundle.windows` has only `nsis.installMode` (`tauri.conf.json:117-121`) —
-      no cert/timestamp, so the installer is unsigned → SmartScreen warnings.
-      Wire a signing secret into the `build-windows` job.
+16. **Add Authenticode signing.** — **DESCOPED (operator decision,
+    2026-07-05): no certificate, and none planned.** Windows ships unsigned.
+    - Accepted consequences: SmartScreen "More info → Run anyway" on first
+      install (document this in the README/release notes when Windows builds
+      go public) and some AV false-positive risk on unsigned executables.
+    - NOT affected: the auto-updater — Tauri's updater verifies the minisign
+      signature (`TAURI_SIGNING_PRIVATE_KEY`), not Authenticode, so updates
+      remain integrity-checked and functional.
+    - The gated signing placeholder in `release.yml` (job-level
+      `WINDOWS_SIGN_CERT` env, permanently-skipped step) stays as-is: it costs
+      nothing, cannot fire without the secret, and preserves the wiring if a
+      certificate ever materializes.
 
 17. **Frontend Windows polish.** — **M**
     - Ctrl/Alt modifier glyphs instead of hardcoded ⌘/⌥; non-macOS permission
