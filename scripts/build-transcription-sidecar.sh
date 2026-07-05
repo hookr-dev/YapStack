@@ -85,11 +85,13 @@ for target in "${TARGETS[@]}"; do
     if [[ "$target" == *"apple"* ]]; then
         FEATURES="whisper,parakeet,metal,coreml,webgpu"
     elif [[ "$target" == *"windows"* ]]; then
-        # CPU-only for now. The `webgpu` feature adds a load-time
-        # webgpu_dawn.dll import (ort-sys links Dawn dynamically) and nothing
-        # stages that DLL on Windows yet, so a webgpu build fails before main().
-        # The flag returns together with the Dawn DLL staging in plan item W2 #12.
-        FEATURES="whisper,parakeet"
+        # Parakeet WebGPU (Dawn -> D3D12/Vulkan). The feature adds a
+        # load-time webgpu_dawn.dll import (ort-sys links Dawn dynamically);
+        # the DLL-staging block below MUST ship every dist DLL next to the
+        # sidecar .exe or it fails before main(). Whisper stays CPU.
+        # Runtime default is still CPU: WebGPU is opt-in via
+        # YAPSTACK_PARAKEET_ACCEL=webgpu until Gate C validates it.
+        FEATURES="whisper,parakeet,webgpu"
     fi
 
     # shellcheck disable=SC2086
@@ -153,6 +155,27 @@ for target in "${TARGETS[@]}"; do
                 echo "Added rpath $rp to $dest"
             fi
         done
+    fi
+
+    # Windows: ort-sys links Dawn dynamically (webgpu_dawn.dll load-time
+    # import) and its copy-dylibs step drops every DLL from the pyke dist
+    # next to the built exe in target/. Stage them all into binaries/ so
+    # Tauri bundles them into the install root next to the sidecar .exe
+    # (tauri.windows.conf.json bundle.resources). No rpath dance: Windows
+    # resolves DLLs from the exe's own directory first.
+    if [[ "$target" == *"windows"* ]] && [[ "$FEATURES" == *"webgpu"* ]]; then
+        dawn_src="$PROJECT_ROOT/target/$target/$PROFILE_DIR/webgpu_dawn.dll"
+        if [ ! -f "$dawn_src" ]; then
+            echo "ERROR: webgpu_dawn.dll not found at $dawn_src" \
+                 "(expected because webgpu feature is enabled)"
+            exit 1
+        fi
+        shopt -s nullglob
+        for dll in "$PROJECT_ROOT/target/$target/$PROFILE_DIR"/*.dll; do
+            cp "$dll" "$BINARIES_DIR/$(basename "$dll")"
+            echo "Copied $(basename "$dll") to $BINARIES_DIR"
+        done
+        shopt -u nullglob
     fi
 
     # Dev fallback: `find_sidecar_path()` in apps/desktop looks for

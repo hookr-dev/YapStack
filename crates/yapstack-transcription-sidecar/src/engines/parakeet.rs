@@ -400,8 +400,13 @@ fn build_exec_config(
         AccelChoice::Auto => auto_exec_config(cache_dir),
         #[cfg(feature = "coreml")]
         AccelChoice::CoreMl => build_coreml_config(cache_dir),
+        // Explicit opt-in (YAPSTACK_PARAKEET_ACCEL=webgpu) registers the EP
+        // strictly: if WebGPU can't initialize, session creation FAILS and
+        // the error surfaces, instead of ort silently falling back to CPU
+        // while we report accel="webgpu" — that would invalidate any
+        // GPU-vs-CPU comparison made against the label (Gate C).
         #[cfg(feature = "webgpu")]
-        AccelChoice::WebGpu => build_webgpu_config(),
+        AccelChoice::WebGpu => build_webgpu_config_strict(),
     }
 }
 
@@ -477,8 +482,41 @@ fn build_coreml_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::Executio
 fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
     // Dawn drives the WebGPU EP: Metal on macOS, Vulkan/D3D12 on Windows/Linux.
+    // SOFT registration (parakeet-rs registers the EP without
+    // error_on_failure): if WebGPU can't initialize, ort silently falls
+    // back to CPU. Kept for the macOS Auto path where that is the shipping
+    // behavior; the accel label can overreport on that path. The explicit
+    // opt-in routes through build_webgpu_config_strict instead.
     info!("WebGPU EP requested (Dawn → Metal on macOS, Vulkan/D3D12 elsewhere)");
     Some(ExecutionConfig::default().with_execution_provider(ExecutionProvider::WebGPU))
+}
+
+/// Strict WebGPU registration for the explicit opt-in: the EP carries
+/// `error_on_failure`, so an unavailable adapter/driver fails session
+/// creation loudly instead of silently degrading to CPU. parakeet-rs's own
+/// WebGPU arm registers the EP soft, so we pass `Cpu` (a no-op arm) and
+/// register providers ourselves via the `configure` hook, which parakeet-rs
+/// applies after its own arm. CPU stays registered AFTER WebGPU as the
+/// per-node fallback for ops the EP doesn't implement — node placement
+/// within a working GPU session, not session-level fallback. Memory
+/// patterns are disabled per WebGPU-EP guidance for dynamic input shapes
+/// (the TDT transducer reshapes every chunk).
+#[cfg(feature = "webgpu")]
+fn build_webgpu_config_strict() -> Option<parakeet_rs::ExecutionConfig> {
+    use parakeet_rs::{ExecutionConfig, ExecutionProvider};
+    info!("WebGPU EP requested (strict: registration failure is a hard error)");
+    Some(
+        ExecutionConfig::default()
+            .with_execution_provider(ExecutionProvider::Cpu)
+            .with_custom_configure(|builder| {
+                Ok(builder
+                    .with_memory_pattern(false)?
+                    .with_execution_providers([
+                        ort::ep::WebGPU::default().build().error_on_failure(),
+                        ort::ep::CPU::default().build().error_on_failure(),
+                    ])?)
+            }),
+    )
 }
 
 fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegment]) {

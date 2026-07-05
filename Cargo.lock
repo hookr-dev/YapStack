@@ -8514,6 +8514,7 @@ name = "yapstack-transcription-sidecar"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "ort",
  "parakeet-rs",
  "serde",
  "serde_json",
