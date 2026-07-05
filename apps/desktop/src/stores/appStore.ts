@@ -307,7 +307,7 @@ export interface Settings {
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
   /// Restored as soon as recording ends. Only ever lowers — never raises.
-  /// macOS only (no-op on other platforms).
+  /// macOS + Windows (no-op on other platforms).
   dictationDuckEnabled: boolean;
   /// Fraction by which to reduce the current system volume while ducking,
   /// in [0, 1]. The ducked level is `current * (1 - dictationDuckAmount)`.

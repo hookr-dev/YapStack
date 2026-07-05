@@ -8489,6 +8489,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows",
  "yapstack-audio",
  "yapstack-common",
  "yapstack-transcription",
