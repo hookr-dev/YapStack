@@ -412,19 +412,19 @@ fn try_send_intent(inbox: &RestartIntentInbox, intent: RestartIntent) -> bool {
     }
 }
 
-/// Strip cpal's macOS `DeviceId` prefix (`"coreaudio:"`) so the bare
-/// `kAudioDevicePropertyDeviceUID` string can be passed to
-/// `yapstack_audio::device::device_liveness`. cpal's `HostId::Display`
-/// lowercases the host name (see `cpal/src/platform/mod.rs`), so the
-/// real prefix is lowercase — `CoreAudio:` (CamelCase) never appears
-/// in `device.id().to_string()`. The match is case-insensitive
-/// belt-and-braces in case cpal ever changes the formatter.
+/// Strip cpal's `DeviceId` host prefix (`"coreaudio:"` on macOS,
+/// `"wasapi:"` on Windows) so the bare device identifier — a
+/// `kAudioDevicePropertyDeviceUID` string or a WASAPI endpoint ID — can
+/// be passed to `yapstack_audio::device::device_liveness`. cpal's
+/// `HostId::Display` lowercases the host name (see
+/// `cpal/src/platform/mod.rs`), so the real prefixes are lowercase; the
+/// CamelCase arms are belt-and-braces in case cpal ever changes the
+/// formatter.
 fn strip_cpal_prefix(uid: &str) -> &str {
-    if let Some(rest) = uid.strip_prefix("coreaudio:") {
-        return rest;
-    }
-    if let Some(rest) = uid.strip_prefix("CoreAudio:") {
-        return rest;
+    for prefix in ["coreaudio:", "CoreAudio:", "wasapi:", "WASAPI:"] {
+        if let Some(rest) = uid.strip_prefix(prefix) {
+            return rest;
+        }
     }
     uid
 }
@@ -570,7 +570,10 @@ mod tests {
         // device_liveness's lookup path.
         assert_eq!(strip_cpal_prefix("BuiltInMic"), "BuiltInMic");
         assert_eq!(strip_cpal_prefix(""), "");
-        assert_eq!(strip_cpal_prefix("wasapi:something"), "wasapi:something");
+        assert_eq!(
+            strip_cpal_prefix("wasapi:{0.0.1.00000000}.{72cf7635-4bbf-45bc-a195-b8d916da4aac}"),
+            "{0.0.1.00000000}.{72cf7635-4bbf-45bc-a195-b8d916da4aac}"
+        );
     }
 
     #[test]

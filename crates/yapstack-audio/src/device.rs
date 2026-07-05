@@ -300,8 +300,9 @@ pub enum DeviceLiveness {
     /// Device list enumeration succeeded and no device with this UID was
     /// present. The device is genuinely gone.
     Absent,
-    /// Could not determine liveness — Core Audio enumeration or per-device
-    /// query failed, the UID is empty, or this is a non-macOS build.
+    /// Could not determine liveness — platform enumeration or per-device
+    /// query failed, the UID is empty, or this platform has no liveness
+    /// probe (Linux).
     Unknown,
 }
 
@@ -441,9 +442,66 @@ pub fn device_liveness(uid: &str) -> DeviceLiveness {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn device_liveness(_uid: &str) -> DeviceLiveness {
     DeviceLiveness::Unknown
+}
+
+/// Probe WASAPI endpoint liveness by its endpoint ID string.
+///
+/// `uid` is the bare endpoint ID (`{0.0.1.00000000}.{guid...}`) — NOT
+/// cpal's `"wasapi:<id>"` form; callers must strip that prefix first (an
+/// unstripped id falls into `Absent`: `GetDevice` has no record of it).
+///
+/// `Dead` covers endpoints Windows still knows about but that aren't
+/// active (`DEVICE_STATE_DISABLED` / `NOTPRESENT` / `UNPLUGGED`);
+/// `Absent` means the registry has no endpoint with this ID at all.
+#[cfg(target_os = "windows")]
+pub fn device_liveness(uid: &str) -> DeviceLiveness {
+    use windows::core::PCWSTR;
+    use windows::Win32::Media::Audio::{
+        IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    // HRESULT_FROM_WIN32(ERROR_NOT_FOUND): GetDevice's "no endpoint with
+    // this id" result. Genuinely gone, distinct from a failed query.
+    const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(0x8007_0490_u32 as i32);
+
+    if uid.is_empty() {
+        return DeviceLiveness::Unknown;
+    }
+
+    // Called from arbitrary worker threads (the broker's tokio pool):
+    // initialize COM per call. S_OK/S_FALSE must be balanced with
+    // CoUninitialize; RPC_E_CHANGED_MODE (thread already STA) leaves COM
+    // usable but must NOT be balanced.
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let need_uninit = hr.is_ok();
+
+    let wide: Vec<u16> = uid.encode_utf16().chain(std::iter::once(0)).collect();
+    let liveness = (|| {
+        let enumerator: IMMDeviceEnumerator =
+            match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
+                Ok(e) => e,
+                Err(_) => return DeviceLiveness::Unknown,
+            };
+        match unsafe { enumerator.GetDevice(PCWSTR(wide.as_ptr())) } {
+            Ok(device) => match unsafe { device.GetState() } {
+                Ok(state) if state == DEVICE_STATE_ACTIVE => DeviceLiveness::Alive,
+                Ok(_) => DeviceLiveness::Dead,
+                Err(_) => DeviceLiveness::Unknown,
+            },
+            Err(e) if e.code() == E_NOTFOUND => DeviceLiveness::Absent,
+            Err(_) => DeviceLiveness::Unknown,
+        }
+    })();
+    if need_uninit {
+        unsafe { CoUninitialize() };
+    }
+    liveness
 }
 
 #[cfg(test)]
