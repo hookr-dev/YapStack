@@ -8435,6 +8435,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "windows",
+ "windows-core 0.61.2",
  "yapstack-common",
 ]
 
@@ -8487,6 +8489,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows",
  "yapstack-audio",
  "yapstack-common",
  "yapstack-transcription",

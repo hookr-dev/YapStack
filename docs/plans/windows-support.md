@@ -125,7 +125,15 @@ This is the known weak point. GA does not ship until every item here is closed.
      COM-initialized thread with a matching apartment model. **Do not ship
      Windows until these pass un-ignored.**
 
-8. **Implement the WASAPI default-device-change watcher.** — **L**
+8. **Implement the WASAPI default-device-change watcher.** — **L** —
+   **LANDED 2026-07-05** (`feat/wasapi-device-watcher`): `IMMNotificationClient`
+   via the `windows` crate's `#[implement]`, one client per watcher kind on a
+   dedicated MTA COM thread (register → park → unregister on drop). Role
+   filtering: `eConsole` only (one physical change = one event, not three);
+   `DefaultSystemOutput` never fires on Windows (no separate alerts route —
+   the console render endpoint is covered by `Output`). Supersedes W0 #6
+   (broker-inertness interim net). Pending: rust-windows CI compile + canary
+   hot-swap validation.
    - `DefaultDeviceWatcher` is a silent no-op off macOS (`device_watcher.rs:287`):
      `new()` returns `Ok`, the sink is stored but never invoked. cpal does not
      auto-reroute, so unplugging the active mic or switching default output
@@ -141,7 +149,13 @@ This is the known weak point. GA does not ship until every item here is closed.
      detector; weigh whether that is sufficient or a loopback-specific health
      check is still needed.
 
-9. **Implement `device_liveness` for Windows.** — **M**
+9. **Implement `device_liveness` for Windows.** — **M** — **LANDED
+   2026-07-05** (same branch, shipped paired with #8):
+   `IMMDeviceEnumerator::GetDevice` + `GetState == DEVICE_STATE_ACTIVE`
+   (per-call COM init, RPC_E_CHANGED_MODE-aware); `E_NOTFOUND` → `Absent`,
+   other inactive states → `Dead`. `strip_cpal_prefix` gained the `wasapi:`
+   arm and the pinned pass-through test was inverted. Pending: CI compile +
+   canary validation.
    - Always returns `Unknown` off macOS (`device.rs:445`), so the broker can't
      preserve an explicit still-alive non-default mic on a default change.
      Latent today (masked by the no-op watcher), it becomes a live correctness

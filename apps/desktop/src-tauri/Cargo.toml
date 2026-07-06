@@ -65,6 +65,19 @@ memory-stats = "1"
 [dev-dependencies]
 tempfile = { workspace = true }
 
+# WASAPI FFI for the dictation volume duck (IAudioEndpointVolume on the
+# default render endpoint). Same crate/version tauri and yapstack-audio
+# already pull on Windows, so Cargo deduplicates the build.
+[target."cfg(target_os = \"windows\")".dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
 # CoreAudio FFI for the dictation duck feature (system_volume module).

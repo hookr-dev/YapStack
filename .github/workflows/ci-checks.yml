@@ -57,7 +57,11 @@ jobs:
         # relinks under another ("library 'clang_rt.osx' not found").
         # Keying the cache by Xcode version keeps caches image-consistent.
         id: xcode
-        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+        # The marketing version ("Xcode 16.4") is not precise enough: two
+        # images can share it while shipping different clang majors, and the
+        # clang RESOURCE DIR is the exact absolute path cached build-script
+        # output goes stale against. Fingerprint that path directly.
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
@@ -112,19 +116,20 @@ jobs:
           # cache it so a fingerprint-skipped build script still has its libs.
           cache-directories: ~/AppData/Local/ort.pyke.io
 
-      - name: Create sidecar placeholder
+      - name: Create sidecar + DLL placeholders
         # tauri.conf.json declares an externalBin (sidecar) whose path the
-        # Tauri build script validates before linking. On Windows the
-        # externalBin resolves to the msvc-triple-suffixed .exe. Locally
-        # `scripts/build-sidecars.sh` emits it under
-        # target/<triple>/<profile>/; in CI we just need the file to exist so
-        # cargo check / clippy / test pass. No macOS framework dylib here —
-        # the WebGPU Dawn dependency is pulled by `ort` at build time, not a
-        # prebuilt sidecar artifact.
+        # Tauri build script validates before linking; on Windows it resolves
+        # to the msvc-triple-suffixed .exe. tauri.windows.conf.json
+        # additionally declares a `binaries/*.dll` resources glob (the Dawn
+        # runtime set), and tauri-build HARD-FAILS on a glob that matches
+        # zero files — release builds stage the real DLLs, this leg only
+        # needs the glob to match. Mirrors the macOS leg's framework-dylib
+        # placeholder.
         shell: bash
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
           touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
+          touch apps/desktop/src-tauri/binaries/webgpu_dawn.dll
 
       - name: Clippy
         run: cargo clippy --all -- -D warnings

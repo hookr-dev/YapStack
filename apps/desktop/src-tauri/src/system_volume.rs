@@ -24,8 +24,11 @@
 //! speakers, AirPods, USB DACs, and aggregate devices, including those whose
 //! hardware doesn't expose a true master scalar on the main element.
 //!
-//! Windows / Linux are stubs that return `Unsupported`; future ports plug in
-//! against the same `SystemOutputVolume` trait.
+//! Windows drives `IAudioEndpointVolume::SetMasterVolumeLevelScalar` on the
+//! default render endpoint — the same scalar the taskbar volume slider
+//! drives — with the endpoint ID string as the device identity. Linux is a
+//! stub that returns `Unsupported`; a future port plugs in against the same
+//! `SystemOutputVolume` trait.
 
 use std::sync::Mutex;
 
@@ -36,11 +39,18 @@ pub enum VolumeError {
     #[cfg(target_os = "macos")]
     #[error("CoreAudio call failed: OSStatus={0}")]
     CoreAudio(i32),
+    #[cfg(target_os = "windows")]
+    #[error("WASAPI call failed: {0}")]
+    Wasapi(String),
 }
 
 /// Opaque identifier for an output device. On macOS this is an
-/// `AudioObjectID`; on stub platforms it's a placeholder that's never read.
+/// `AudioObjectID`; on Windows the WASAPI endpoint ID string; on stub
+/// platforms a placeholder that's never read.
+#[cfg(not(target_os = "windows"))]
 pub type DeviceId = u32;
+#[cfg(target_os = "windows")]
+pub type DeviceId = String;
 
 pub trait SystemOutputVolume: Send + Sync {
     /// Resolve the current default output device. Returns `Unsupported` on
@@ -49,12 +59,12 @@ pub trait SystemOutputVolume: Send + Sync {
     /// `kAudioObjectUnknown` / 0).
     fn default_device(&self) -> Result<DeviceId, VolumeError>;
     /// Read the volume of `device` in [0.0, 1.0].
-    fn get(&self, device: DeviceId) -> Result<f32, VolumeError>;
+    fn get(&self, device: &DeviceId) -> Result<f32, VolumeError>;
     /// Set `device`'s volume. `level` is clamped to [0.0, 1.0].
-    fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError>;
+    fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DuckOutcome {
     /// Volume on `device` was set from `from` to `to` (= `from * (1 - amount)`),
     /// and `(device, from)` is now snapshotted. With `amount = 0` this still
@@ -71,7 +81,7 @@ pub enum DuckOutcome {
     AlreadyDucked { amount: f32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Snapshot {
     device: DeviceId,
     level: f32,
@@ -84,7 +94,11 @@ fn controller() -> Box<dyn SystemOutputVolume> {
     {
         Box::new(macos::CoreAudioController)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows_impl::WasapiController)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Box::new(stub::StubController)
     }
@@ -107,7 +121,7 @@ fn apply_duck_inner(
 ) -> Result<DuckOutcome, VolumeError> {
     let amount = amount.clamp(0.0, 1.0);
     let device = ctrl.default_device()?;
-    let current = ctrl.get(device)?;
+    let current = ctrl.get(&device)?;
 
     // Hold the snapshot mutex across BOTH the snapshot write AND the volume
     // set. Without this, a concurrent `restore_inner` call landing between
@@ -118,13 +132,13 @@ fn apply_duck_inner(
     // CoreAudio call, typically sub-millisecond on macOS), in exchange for
     // strict apply/restore atomicity.
     let mut snap = snap_cell.lock().expect("system_volume snapshot poisoned");
-    if let Some(snapped) = *snap {
+    if let Some(snapped) = snap.clone() {
         // Already ducked — re-apply against the snapshotted *original*
         // level (not the currently-ducked level, which would compound).
         // Only set if we'd actually be lowering; never raise.
         let absolute = (snapped.level * (1.0 - amount)).clamp(0.0, 1.0);
-        if ctrl.get(snapped.device)? > absolute {
-            ctrl.set(snapped.device, absolute)?;
+        if ctrl.get(&snapped.device)? > absolute {
+            ctrl.set(&snapped.device, absolute)?;
         }
         return Ok(DuckOutcome::AlreadyDucked { amount });
     }
@@ -134,11 +148,16 @@ fn apply_duck_inner(
     // Write snapshot first, then apply. If the set call fails, the snapshot
     // is rolled back so a later restore can't try to "recover" to a level
     // we never actually reached.
-    *snap = Some(Snapshot {
-        device,
-        level: current,
-    });
-    if let Err(e) = ctrl.set(device, absolute) {
+    // DeviceId is Copy (u32) on macOS but String on Windows; the clone is
+    // load-bearing for the cross-platform type.
+    #[allow(clippy::clone_on_copy)]
+    {
+        *snap = Some(Snapshot {
+            device: device.clone(),
+            level: current,
+        });
+    }
+    if let Err(e) = ctrl.set(&device, absolute) {
         *snap = None;
         return Err(e);
     }
@@ -172,7 +191,7 @@ fn restore_inner(
     let Some(snapped) = snap.take() else {
         return Ok(());
     };
-    ctrl.set(snapped.device, snapped.level)
+    ctrl.set(&snapped.device, snapped.level)
 }
 
 #[cfg(target_os = "macos")]
@@ -239,7 +258,8 @@ mod macos {
             Ok(device_id as DeviceId)
         }
 
-        fn get(&self, device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
+            let device = *device;
             let address = volume_address();
             let mut value: f32 = 0.0;
             let mut size = mem::size_of::<f32>() as u32;
@@ -260,7 +280,8 @@ mod macos {
             Ok(value.clamp(0.0, 1.0))
         }
 
-        fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError> {
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
+            let device = *device;
             let address = volume_address();
             let value: f32 = level.clamp(0.0, 1.0);
             let size = mem::size_of::<f32>() as u32;
@@ -283,7 +304,99 @@ mod macos {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::{DeviceId, SystemOutputVolume, VolumeError};
+    use windows::core::PCWSTR;
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+        COINIT_MULTITHREADED,
+    };
+
+    /// Drives `IAudioEndpointVolume` master scalar on the default render
+    /// endpoint — the same value the taskbar volume slider moves. The
+    /// device identity is the WASAPI endpoint ID string, so `restore`
+    /// targets the originally-ducked endpoint even if the default output
+    /// changed mid-dictation (same contract as the macOS controller).
+    pub struct WasapiController;
+
+    fn wasapi_err(e: windows::core::Error) -> VolumeError {
+        VolumeError::Wasapi(e.to_string())
+    }
+
+    /// Duck/restore fire from arbitrary (tokio) worker threads: initialize
+    /// COM per call. S_OK/S_FALSE must be balanced with `CoUninitialize`;
+    /// RPC_E_CHANGED_MODE (thread already STA) leaves COM usable but must
+    /// NOT be balanced — the same rules cpal's guard follows.
+    fn with_com<T>(f: impl FnOnce() -> Result<T, VolumeError>) -> Result<T, VolumeError> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let need_uninit = hr.is_ok();
+        let out = f();
+        if need_uninit {
+            unsafe { CoUninitialize() };
+        }
+        out
+    }
+
+    fn enumerator() -> Result<IMMDeviceEnumerator, VolumeError> {
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(wasapi_err)
+    }
+
+    fn device_by_id(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<IMMDevice, VolumeError> {
+        let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { enumerator.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(wasapi_err)
+    }
+
+    fn endpoint_volume(device: &IMMDevice) -> Result<IAudioEndpointVolume, VolumeError> {
+        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(wasapi_err)
+    }
+
+    impl SystemOutputVolume for WasapiController {
+        fn default_device(&self) -> Result<DeviceId, VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+                    .map_err(wasapi_err)?;
+                let pw = unsafe { device.GetId() }.map_err(wasapi_err)?;
+                let id = unsafe { pw.to_string() }
+                    .map_err(|e| VolumeError::Wasapi(format!("endpoint id not UTF-16: {e}")));
+                // GetId allocates via CoTaskMemAlloc; free unconditionally,
+                // including on the to_string error path.
+                unsafe { CoTaskMemFree(Some(pw.0 as *const _)) };
+                id
+            })
+        }
+
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = device_by_id(&enumerator, device)?;
+                let volume = endpoint_volume(&device)?;
+                unsafe { volume.GetMasterVolumeLevelScalar() }.map_err(wasapi_err)
+            })
+        }
+
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = device_by_id(&enumerator, device)?;
+                let volume = endpoint_volume(&device)?;
+                // Null event-context GUID: we don't need to correlate our own
+                // change notifications.
+                unsafe {
+                    volume.SetMasterVolumeLevelScalar(level.clamp(0.0, 1.0), std::ptr::null())
+                }
+                .map_err(wasapi_err)
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod stub {
     use super::{DeviceId, SystemOutputVolume, VolumeError};
 
@@ -293,10 +406,10 @@ mod stub {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
             Err(VolumeError::Unsupported)
         }
-        fn get(&self, _device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, _device: &DeviceId) -> Result<f32, VolumeError> {
             Err(VolumeError::Unsupported)
         }
-        fn set(&self, _device: DeviceId, _level: f32) -> Result<(), VolumeError> {
+        fn set(&self, _device: &DeviceId, _level: f32) -> Result<(), VolumeError> {
             Err(VolumeError::Unsupported)
         }
     }
@@ -350,7 +463,8 @@ mod tests {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
             Ok(*self.default.lock().unwrap())
         }
-        fn get(&self, device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
+            let device = *device;
             self.volumes
                 .lock()
                 .unwrap()
@@ -358,7 +472,8 @@ mod tests {
                 .copied()
                 .ok_or(VolumeError::Unsupported)
         }
-        fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError> {
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
+            let device = *device;
             if !self.set_delay.is_zero() {
                 std::thread::sleep(self.set_delay);
             }
@@ -397,7 +512,7 @@ mod tests {
             other => panic!("expected Applied, got {other:?}"),
         }
         close(ctrl.snapshot_of(1), 0.16);
-        let s = snap.lock().unwrap().expect("snapshot present");
+        let s = snap.lock().unwrap().clone().expect("snapshot present");
         assert_eq!(s.device, 1);
         close(s.level, 0.80);
     }
@@ -598,7 +713,7 @@ mod tests {
     fn hardware_get_returns_unit_interval() {
         let ctrl = controller();
         let device = ctrl.default_device().expect("default device");
-        let v = ctrl.get(device).expect("get system volume");
+        let v = ctrl.get(&device).expect("get system volume");
         assert!((0.0..=1.0).contains(&v), "volume out of range: {v}");
     }
 
@@ -609,17 +724,17 @@ mod tests {
         let snap = fresh_snap();
         let ctrl = controller();
         let device = ctrl.default_device().expect("default device");
-        let original = ctrl.get(device).expect("get original");
+        let original = ctrl.get(&device).expect("get original");
 
         // Force a known starting point well above any plausible duck target.
         let start = 0.6_f32;
-        ctrl.set(device, start).expect("set start");
-        let observed_start = ctrl.get(device).expect("get observed start");
+        ctrl.set(&device, start).expect("set start");
+        let observed_start = ctrl.get(&device).expect("get observed start");
 
         let amount = 0.8_f32;
         let expected = observed_start * (1.0 - amount);
         apply_duck_inner(&snap, ctrl.as_ref(), amount).expect("apply_duck");
-        let after_duck = ctrl.get(device).expect("get after duck");
+        let after_duck = ctrl.get(&device).expect("get after duck");
         assert!(
             (after_duck - expected).abs() < 0.05,
             "expected duck near {expected} (= {observed_start} * {}), got {after_duck}",
@@ -627,13 +742,13 @@ mod tests {
         );
 
         restore_inner(&snap, ctrl.as_ref()).expect("restore");
-        let after_restore = ctrl.get(device).expect("get after restore");
+        let after_restore = ctrl.get(&device).expect("get after restore");
         assert!(
             (after_restore - observed_start).abs() < 0.05,
             "expected restore near {observed_start}, got {after_restore}"
         );
 
         // Best-effort cleanup.
-        let _ = ctrl.set(device, original);
+        let _ = ctrl.set(&device, original);
     }
 }
