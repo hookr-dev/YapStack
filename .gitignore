@@ -71,3 +71,9 @@ apps/desktop/src-tauri/gen/
 
 # GoalBuddy goal boards are local agent working state, not repo docs
 docs/goals/
+
+# Local business-strategy docs + spike harness — keep out of the public remote
+# (specific paths only; legitimate plan docs under docs/plans/ stay committed)
+docs/plans/ENTITLEMENTS_SEAM.md
+docs/plans/research/
+scripts/spike-crsqlite/
