@@ -272,9 +272,16 @@ jobs:
         # Restrict to NSIS (matching release.yml): tauri.conf.json targets "all" also
         # builds MSI/WiX, which hard-fails on the non-numeric pre-release version.
         # Unsigned NSIS is fine for own-machine UAT (SmartScreen click-through).
+        #
+        # /FORCE:MULTIPLE: the vendored cr-sqlite no_std bundle (crsql_bundle) defines
+        # its own `rust_eh_personality`, which collides with libstd's on the MSVC linker
+        # (LNK2005 -> LNK1169). macOS's linker merges the duplicate silently; link.exe is
+        # strict. Both definitions are equivalent no-ops under panic="abort" (the repo's
+        # release profile), so allowing the first-wins duplicate is safe for this build.
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RUSTFLAGS: "-Clink-arg=/FORCE:MULTIPLE"
         run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync
 
       - name: Upload Windows sync artifact
