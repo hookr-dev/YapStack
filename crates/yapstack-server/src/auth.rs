@@ -477,7 +477,7 @@ pub async fn refresh(
 
     let access = st
         .jwt
-        .issue_access(claims.sub, claims.tenant)
+        .issue_access(claims.sub, claims.tenant, claims.client_id)
         .map_err(|e| AppError::Internal(format!("jwt: {e}")))?;
     let refresh_token = st
         .jwt
@@ -525,7 +525,7 @@ async fn issue_pair(
 
     let access = st
         .jwt
-        .issue_access(user_id, workspace_id)
+        .issue_access(user_id, workspace_id, client_id)
         .map_err(|e| AppError::Internal(format!("jwt: {e}")))?;
     let refresh_token = st
         .jwt

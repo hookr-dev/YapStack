@@ -18,7 +18,14 @@ pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 pub struct AccessClaims {
     pub sub: Uuid,    // user_id
     pub tenant: Uuid, // workspace_id == tenant_id; bound at issuance
-    pub typ: String,  // "access"
+    /// The calling device (§7.1 fresh UUIDv4) this token was minted for. Bound at
+    /// login/finish + refresh from server-validated state (the device authenticating
+    /// IS the client), NEVER request-supplied — it lets a handler tell WHICH device is
+    /// calling (e.g. gate `PUT /devices/roster` to an ACTIVE caller, §7.5). `Option`
+    /// because the recovery path logs in without a specific enrolled device yet.
+    #[serde(default)]
+    pub client_id: Option<Uuid>,
+    pub typ: String, // "access"
     pub iat: i64,
     pub exp: i64,
 }
@@ -50,7 +57,9 @@ impl JwtKeys {
         }
     }
 
-    /// Issue a 15-minute access token bound to `(user, tenant)`.
+    /// Issue a 15-minute access token bound to `(user, tenant, client_id)`. The
+    /// `client_id` is the calling device (supplied from server-validated state, never
+    /// the request body) so downstream handlers can identify WHICH device is calling.
     ///
     /// # Errors
     /// Propagates a `jsonwebtoken` encoding error (unreachable for HS256).
@@ -58,11 +67,13 @@ impl JwtKeys {
         &self,
         user: Uuid,
         tenant: Uuid,
+        client_id: Option<Uuid>,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = Utc::now().timestamp();
         let claims = AccessClaims {
             sub: user,
             tenant,
+            client_id,
             typ: "access".to_string(),
             iat: now,
             exp: now + ACCESS_TTL_SECS,
@@ -134,10 +145,12 @@ mod tests {
         let keys = JwtKeys::new(b"test-secret");
         let user = Uuid::new_v4();
         let tenant = Uuid::new_v4();
-        let token = keys.issue_access(user, tenant).unwrap();
+        let client = Uuid::new_v4();
+        let token = keys.issue_access(user, tenant, Some(client)).unwrap();
         let claims = keys.verify_access(&token).unwrap();
         assert_eq!(claims.sub, user);
         assert_eq!(claims.tenant, tenant);
+        assert_eq!(claims.client_id, Some(client));
         assert_eq!(claims.typ, "access");
     }
 
@@ -154,7 +167,7 @@ mod tests {
         // A refresh token MUST NOT validate as an access token.
         assert!(keys.verify_access(&refresh).is_err());
         // And vice versa.
-        let access = keys.issue_access(u, t).unwrap();
+        let access = keys.issue_access(u, t, None).unwrap();
         assert!(keys.verify_refresh(&access).is_err());
     }
 
@@ -162,7 +175,9 @@ mod tests {
     fn wrong_secret_rejected() {
         let keys = JwtKeys::new(b"secret-a");
         let other = JwtKeys::new(b"secret-b");
-        let token = keys.issue_access(Uuid::new_v4(), Uuid::new_v4()).unwrap();
+        let token = keys
+            .issue_access(Uuid::new_v4(), Uuid::new_v4(), None)
+            .unwrap();
         assert!(other.verify_access(&token).is_err());
     }
 }

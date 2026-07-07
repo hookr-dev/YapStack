@@ -12,9 +12,15 @@
 //!     the vault key and does not try),
 //!   * `vault_key_epoch` monotonicity (never decreases).
 //!
-//! `devices.status` (pending|active) is an ADVISORY index the relay maintains from
-//! client-supplied plaintext metadata (`active_devices`). It is NOT authoritative:
-//! clients trust the signed roster, which they verify themselves.
+//! `devices.status` (pending|active) is a plaintext index the relay maintains from
+//! client-supplied metadata (`active_devices`). For MEMBERSHIP it is not the crypto
+//! source of truth — clients trust the signed roster, which they verify themselves. It
+//! IS, however, the relay's server-side WRITE-AUTHZ gate for `PUT /devices/roster`:
+//! only a caller whose own device row is `active` may replace the roster (§7.5). This
+//! stops a pending/unapproved caller (or a stolen pending-device token) from
+//! overwriting the roster (DoS) or self-promoting via a crafted roster. Honest devices
+//! still independently full-verify the signed roster; this gate is defense-in-depth
+//! integrity/availability, not a confidentiality control.
 
 use axum::extract::State;
 use axum::Json;
@@ -97,7 +103,29 @@ pub async fn put_roster(
         return Err(AppError::BadRequest("signature: expected 64 bytes".into()));
     }
 
+    // AUTHZ (§7.5): only an ALREADY-ACTIVE device may write the roster. The caller is
+    // the `client_id` bound into its access token at login (server-validated, never
+    // request-supplied). A PENDING (awaiting-approval) or unknown caller — including a
+    // holder of a pending device's stolen access token — is rejected, closing the
+    // roster-overwrite DoS and the advisory self-promotion path (a pending device can no
+    // longer author a roster naming itself active). Signup remains the BOOTSTRAP that
+    // writes the FIRST active roster directly (no active device exists yet at signup, so
+    // that path never reaches this gate). A caller whose token carries no `client_id`
+    // (e.g. the recovery login) also cannot mutate the roster here.
+    let caller = auth.client_id.ok_or(AppError::Forbidden)?;
+
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+
+    // The caller-device lookup is RLS-scoped to the tenant (the tx set `app.tenant_id`).
+    let caller_status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM devices WHERE workspace_id = $1 AND client_id = $2")
+            .bind(auth.tenant_id)
+            .bind(caller)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if !matches!(caller_status.as_ref(), Some((s,)) if s == "active") {
+        return Err(AppError::Forbidden);
+    }
 
     // Lock the roster row for this tenant, then compare-and-set (§7.4). The lock is held
     // to commit, so concurrent uploads are serialized and the check is race-free.

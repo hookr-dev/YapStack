@@ -362,6 +362,12 @@ async fn unknown_device_enrolls_pending_then_roster_promotes() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // The signup device is ACTIVE and its access token carries first_client — this is
+    // the token that may write the roster (only active callers may, §7.5 / T012b).
+    let first_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // A NEW device logs in presenting its own client_id + Ed25519 pubkey -> enrolled
     // PENDING (not auto-promoted). It also receives the roster signature (§7.5 step 2).
@@ -403,14 +409,15 @@ async fn unknown_device_enrolls_pending_then_roster_promotes() {
         .expect("first device present");
     assert_eq!(first_dev["status"], json!("active"));
 
-    // The approving device uploads a re-signed roster (counter 0 -> 1) naming the new
-    // device active -> promotion pending->active.
+    // The approving device (the ACTIVE first device) uploads a re-signed roster
+    // (counter 0 -> 1) naming the new device active -> promotion pending->active. The
+    // write uses first_access: only an active caller may write the roster (T012b).
     let vault_key = [0x33u8; 32];
     let (roster, sig) = signed_roster(&vault_key, 1, 0);
     let resp = put_auth(
         &app,
         "/devices/roster",
-        &access,
+        &first_access,
         json!({
             "device_list": roster,
             "signature": sig,
@@ -560,4 +567,94 @@ async fn concurrent_roster_uploads_are_compare_and_set_safe() {
         .count();
     assert_eq!(oks, 1, "exactly one concurrent roster upload may win");
     assert_eq!(conflicts, 1, "the second must be rejected by anti-rollback");
+}
+
+// --------------------------------------------- T012b: active-caller roster gate
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn pending_caller_put_roster_forbidden_active_accepted() {
+    // T012b hardening: PUT /devices/roster is gated to an ALREADY-ACTIVE caller device.
+    // The caller is identified by the client_id bound into its access token at login
+    // (server-validated, never request-supplied). A PENDING device's write is FORBIDDEN
+    // — it cannot overwrite the roster (DoS) nor self-promote via a crafted roster. The
+    // ACTIVE signup device's write succeeds.
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+
+    // signup: the first device is ACTIVE; its access token carries first_client.
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A NEW device logs in -> enrolled PENDING; its access token carries new_client.
+    let new_client = uuid::Uuid::new_v4();
+    let new_pub = B64.encode([0x07u8; 32]);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email,
+            "auth_key": auth_key,
+            "client_id": new_client,
+            "ed25519_pub": new_pub,
+            "label": "new-laptop"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let pending_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let vault_key = [0x33u8; 32];
+
+    // PENDING caller -> FORBIDDEN. It even tries to name ITSELF active (self-promotion);
+    // the relay refuses to let a non-active device author the roster at all.
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &pending_access,
+        json!({
+            "device_list": roster,
+            "signature": sig,
+            "counter": 1,
+            "vault_key_epoch": 0,
+            "active_devices": [first_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // ACTIVE caller (the signup device) with the SAME next counter -> accepted (proving
+    // the pending rejection was authz, not anti-rollback: the stored counter is still 0).
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster,
+            "signature": sig,
+            "counter": 1,
+            "vault_key_epoch": 0,
+            "active_devices": [first_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

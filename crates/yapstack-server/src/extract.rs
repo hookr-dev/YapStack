@@ -12,11 +12,16 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// The validated `(user_id, tenant_id)` from a `Authorization: Bearer <access>` header.
+/// The validated `(user_id, tenant_id, client_id)` from a
+/// `Authorization: Bearer <access>` header.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthTenant {
     pub user_id: Uuid,
     pub tenant_id: Uuid,
+    /// The calling DEVICE bound into the access token at login (never request-supplied).
+    /// `None` on the recovery path (no specific enrolled device). Handlers that must
+    /// know which device is calling (e.g. `PUT /devices/roster`, §7.5) read this.
+    pub client_id: Option<Uuid>,
 }
 
 #[axum::async_trait]
@@ -37,6 +42,7 @@ impl FromRequestParts<AppState> for AuthTenant {
         Ok(AuthTenant {
             user_id: claims.sub,
             tenant_id: claims.tenant,
+            client_id: claims.client_id,
         })
     }
 }
