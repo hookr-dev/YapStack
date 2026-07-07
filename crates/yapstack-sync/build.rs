@@ -7,7 +7,8 @@
 //!
 //!   1. Build the vendored Rust bundle (`crsql_bundle_static`) STANDALONE with the
 //!      pinned nightly (its own `rust-toolchain.toml`) into `OUT_DIR`, producing
-//!      `libcrsql_bundle_static.a`. It is excluded from this workspace's stable
+//!      `libcrsql_bundle_static.a` on unix (macOS/linux) or `crsql_bundle_static.lib`
+//!      on windows-msvc. It is excluded from this workspace's stable
 //!      graph (root `Cargo.toml` `exclude`), so it never contaminates the build.
 //!   2. Compile the three vendored C shims (`crsqlite.c`, `changes-vtab.c`,
 //!      `ext-data.c`) with `-DSQLITE_CORE` so they bind DIRECTLY to the SQLite
@@ -101,9 +102,26 @@ fn main() {
     );
 
     let rust_lib_dir = cr_target.join("release");
+    // The nested `cargo build` (no `--target`) emits the staticlib for the HOST
+    // toolchain's default target, which — in this repo's non-cross-compiling CI —
+    // matches the target `yapstack-sync` itself is being built for. Predict the
+    // produced filename from THIS crate's target so the existence check is
+    // platform-correct: MSVC has no `lib` prefix and uses the `.lib` extension
+    // (`crsql_bundle_static.lib`), while unix (macOS/linux) uses the GNU archive
+    // form (`libcrsql_bundle_static.a`). The `cargo:rustc-link-lib=static=` LINK
+    // directive below stays the same logical name on both platforms — cargo/rustc
+    // reattach the platform prefix/extension for linking.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let static_lib_file = if target_os == "windows" && target_env == "msvc" {
+        "crsql_bundle_static.lib"
+    } else {
+        "libcrsql_bundle_static.a"
+    };
     assert!(
-        rust_lib_dir.join("libcrsql_bundle_static.a").exists(),
-        "expected libcrsql_bundle_static.a at {}",
+        rust_lib_dir.join(static_lib_file).exists(),
+        "expected {} at {}",
+        static_lib_file,
         rust_lib_dir.display()
     );
 

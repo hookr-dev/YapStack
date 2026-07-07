@@ -160,11 +160,14 @@ jobs:
           rm certificate.p12
 
       - name: Build Tauri app (--features sync)
-        # -f sync forwards the cargo feature to the app crate. When mac_signed=false the
-        # Apple identity vars are empty -> tauri produces an unsigned/ad-hoc .app (no
-        # notarization). When true, the imported cert + identity drive sign + notarize.
+        # -f sync forwards the cargo feature to the app crate. When mac_signed=false we
+        # AD-HOC sign (APPLE_SIGNING_IDENTITY='-' -> `codesign -s -`): tauri still runs
+        # codesign, so an EMPTY identity makes it invoke `codesign` with no signer and
+        # FAIL ("failed to sign app"). Ad-hoc signs with no cert, is locally runnable,
+        # and Gatekeeper allows right-click -> Open. No notarization (other Apple vars
+        # stay empty). When true, the imported cert + real identity drive sign + notarize.
         env:
-          APPLE_SIGNING_IDENTITY: ${{ inputs.mac_signed && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ inputs.mac_signed && secrets.APPLE_SIGNING_IDENTITY || '-' }}
           APPLE_ID: ${{ inputs.mac_signed && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ inputs.mac_signed && secrets.APPLE_PASSWORD || '' }}
           APPLE_TEAM_ID: ${{ inputs.mac_signed && secrets.APPLE_TEAM_ID || '' }}
@@ -237,13 +240,23 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Create sidecar placeholder
-        # tauri.conf.json declares an externalBin whose path Tauri validates before
-        # linking. Stub it (0-byte) — this is a SYNC test build, not transcription.
+      - name: Create sidecar + Dawn DLL placeholders
+        # Two Windows-specific paths the Tauri build resolves before bundling:
+        #   * tauri.conf.json externalBin — the transcription sidecar (0-byte stub;
+        #     transcription won't work, but sync UAT doesn't need it).
+        #   * tauri.windows.conf.json bundle.resources glob "binaries/*.dll" — the
+        #     Parakeet Dawn WebGPU DLL (release.yml's build-sidecars.sh stages the
+        #     real webgpu_dawn.dll here). Tauri resolves the glob at bundle time and
+        #     hard-fails ("path not found or didn't match any files") if NOTHING
+        #     matches. This is a SYNC test build (no WebGPU), so we drop a 0-byte
+        #     placeholder DLL to satisfy the glob — resources are copied verbatim,
+        #     not loaded/PE-validated, so an empty file matches. Matches the exact
+        #     name release.yml stages (webgpu_dawn.dll).
         shell: bash
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
           touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
+          touch apps/desktop/src-tauri/binaries/webgpu_dawn.dll
 
       - name: Build Tauri app (--features sync)
         # Restrict to NSIS (matching release.yml): tauri.conf.json targets "all" also
