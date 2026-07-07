@@ -8760,6 +8760,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -8843,11 +8844,15 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "hmac",
  "http-body-util",
  "jsonwebtoken",
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -8856,6 +8861,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yapstack-common",
  "yapstack-crypto",
  "yapstack-entitlements",
 ]

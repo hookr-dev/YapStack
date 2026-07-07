@@ -8,6 +8,8 @@ use yapstack_entitlements::{AllowAll, StoredLimits, TenantLimitSource};
 
 use crate::config::Config;
 use crate::jwt::JwtKeys;
+use crate::ratelimit::RateLimiter;
+use crate::sse::SseHub;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +19,13 @@ pub struct AppState {
     /// Selected by config ONLY (ENTITLEMENTS_SEAM.md guardrail): `[limits]` present ⇒
     /// [`StoredLimits`], absent ⇒ [`AllowAll`]. No compiled-in private impl.
     pub limits: Arc<dyn TenantLimitSource>,
+    /// In-process SSE wakeup fan-out (wakeup-only; pull is source of truth).
+    pub sse: Arc<SseHub>,
+    /// Per-(tenant, ip) push rate limiter (architecture §10).
+    pub ratelimit: Arc<RateLimiter>,
+    /// Parsed Ed25519 admin public key. `Some` ⇒ the admin API is mounted; `None` ⇒
+    /// the control-plane endpoints are disabled entirely.
+    pub admin_key: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -30,11 +39,22 @@ impl AppState {
             )),
             None => Arc::new(AllowAll),
         };
+        let ratelimit = Arc::new(RateLimiter::new(config.ratelimit.push_per_minute));
+        let admin_key = config.admin_public_key_bytes();
         Self {
             pool,
             config: Arc::new(config),
             jwt,
             limits,
+            sse: Arc::new(SseHub::new()),
+            ratelimit,
+            admin_key,
         }
+    }
+
+    /// Is the control-plane admin API enabled (a valid `admin_public_key` was parsed)?
+    #[must_use]
+    pub fn admin_enabled(&self) -> bool {
+        self.admin_key.is_some()
     }
 }

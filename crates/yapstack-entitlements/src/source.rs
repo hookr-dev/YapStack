@@ -136,14 +136,25 @@ impl StoredLimits {
     }
 
     async fn fetch(&self, tenant: TenantId) -> Result<Option<StoredRow>, sqlx::Error> {
-        sqlx::query_as::<_, StoredRow>(
+        // `tenant_limits` is FORCE-RLS (fail-closed on an unset guard). The read MUST run
+        // inside a transaction that sets the transaction-local `app.tenant_id`, or the
+        // row is invisible and every tenant silently resolves to the default. This is
+        // the same pooling guard the relay's tenant-scoped handlers use.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query_as::<_, StoredRow>(
             "SELECT plan, storage_bytes, upload_bytes_period, share_count, device_count, \
              period_start, warn_storage, warn_upload, state, grace_until \
              FROM tenant_limits WHERE tenant_id = $1",
         )
         .bind(tenant)
-        .fetch_optional(&self.pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 }
 

@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }

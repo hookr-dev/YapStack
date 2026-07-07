@@ -28,6 +28,56 @@ pub struct Config {
     /// Absent ⇒ AllowAll + admin API disabled.
     #[serde(default)]
     pub limits: Option<LimitsConfig>,
+    /// Object-storage (S3/MinIO) presigning target. Absent ⇒ audio presign disabled
+    /// (the relay still stores no bytes; it only signs URLs). Presigning is pure local
+    /// HMAC — the relay makes ZERO outbound calls.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    /// Per-`(workspace_id, ip)` push rate limit (architecture §10). Defaulted.
+    #[serde(default)]
+    pub ratelimit: RateLimitConfig,
+}
+
+/// S3/MinIO presigning parameters. The relay uses these only to compute SigV4
+/// presigned URLs locally; it never uploads or downloads bytes itself.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    /// e.g. `https://s3.us-east-1.amazonaws.com` or `http://minio:9000`.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// Optional client-facing endpoint if it differs from the signing endpoint
+    /// (e.g. a public MinIO hostname). Defaults to `endpoint`.
+    #[serde(default)]
+    pub public_endpoint: Option<String>,
+    /// Presigned-URL lifetime in seconds (default 15 min).
+    #[serde(default = "default_presign_ttl")]
+    pub presign_ttl_secs: u32,
+}
+
+fn default_presign_ttl() -> u32 {
+    900
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct RateLimitConfig {
+    /// Max `POST /sync/push` calls per `(workspace_id, ip)` per rolling minute.
+    #[serde(default = "default_push_per_minute")]
+    pub push_per_minute: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            push_per_minute: default_push_per_minute(),
+        }
+    }
+}
+
+fn default_push_per_minute() -> u32 {
+    120
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,8 +105,12 @@ impl Default for SyncInfoConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     /// `ed25519:<base64>` — presence enables StoredLimits + the admin API. The admin
-    /// PUT is verified against this key (T008 wires verification).
+    /// PUT/usage requests are verified against this key.
     pub admin_public_key: String,
+    /// Upsell/help URL echoed in the `HTTP 429 quota_exceeded` body. Empty/absent on
+    /// self-host (no hardcoded commercial endpoint in this AGPL repo).
+    #[serde(default)]
+    pub help_url: Option<String>,
     #[serde(default)]
     pub default: LimitsDefaultConfig,
 }
@@ -111,6 +165,30 @@ impl Config {
     #[must_use]
     pub fn limits_enabled(&self) -> bool {
         self.limits.is_some()
+    }
+
+    /// The 32-byte Ed25519 admin public key, parsed from `ed25519:<base64>`. `None`
+    /// when `[limits]` is absent (admin API disabled) or the value is malformed (which
+    /// also disables the admin API — fail-closed for the admin surface specifically,
+    /// while the tenant limit path stays fail-OPEN).
+    #[must_use]
+    pub fn admin_public_key_bytes(&self) -> Option<[u8; 32]> {
+        let raw = self
+            .limits
+            .as_ref()?
+            .admin_public_key
+            .strip_prefix("ed25519:")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw).ok()?;
+        <[u8; 32]>::try_from(bytes.as_slice()).ok()
+    }
+
+    /// Upsell `help_url` for the quota-exceeded body. Empty string on self-host.
+    #[must_use]
+    pub fn help_url(&self) -> String {
+        self.limits
+            .as_ref()
+            .and_then(|l| l.help_url.clone())
+            .unwrap_or_default()
     }
 }
 
