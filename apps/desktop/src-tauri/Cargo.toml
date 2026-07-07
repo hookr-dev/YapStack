@@ -62,6 +62,32 @@ silero = "0.2"
 # pulls in CPU, disk, and OS-wide process enumeration we don't use.
 memory-stats = "1"
 
+# --- YapStack Sync (Gate 5B, T010b) ---------------------------------------
+# All optional and gated behind the off-by-default `sync` feature. Enabling it
+# links the vendored cr-sqlite CRR engine (via yapstack-sync), which requires the
+# pinned nightly-2023-10-05 toolchain and inherits panic=abort. The default
+# desktop debug build never pulls these, so it is unaffected by either hazard —
+# this is the deliberate isolation of the panic=abort/eh_personality shadow.
+yapstack-sync = { path = "../../../crates/yapstack-sync", optional = true }
+yapstack-crypto = { path = "../../../crates/yapstack-crypto", optional = true }
+keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+rand = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+uuid = { version = "1", features = ["serde", "v4"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[features]
+# Off by default. See the sync deps block above and src/sync.rs for why.
+sync = [
+    "dep:yapstack-sync",
+    "dep:yapstack-crypto",
+    "dep:keyring",
+    "dep:rand",
+    "dep:base64",
+    "dep:uuid",
+    "dep:reqwest",
+]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

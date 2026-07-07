@@ -3,6 +3,11 @@ mod db;
 mod device_broker;
 mod logging;
 mod system_volume;
+// YapStack Sync (Gate 5B, T010b). Behind the off-by-default `sync` feature so
+// the default build never links the vendored cr-sqlite CRR engine (nightly +
+// panic=abort). See src/sync.rs for the isolation rationale.
+#[cfg(feature = "sync")]
+mod sync;
 
 const WINDOW_MAIN: &str = "main";
 #[cfg(target_os = "macos")]
@@ -580,6 +585,18 @@ pub fn run() {
             // "state not managed". (The frontend additionally gates on
             // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
+
+            // YapStack Sync runtime (deliverable A): manage the drain handle and,
+            // if the keychain holds an enabled session, start the encrypted
+            // push/pull drain on its own dedicated single-thread runtime. No-op
+            // when signed out. Entirely behind the `sync` cargo feature.
+            #[cfg(feature = "sync")]
+            {
+                let sync_runtime: sync::SyncRuntimeState =
+                    Arc::new(StdMutex::new(None));
+                app.manage(sync_runtime.clone());
+                sync::start_drain_if_enabled(&db_path, &sync_runtime);
+            }
 
             let model_manager = ModelManager::new(app_data_dir.clone());
             app.manage(

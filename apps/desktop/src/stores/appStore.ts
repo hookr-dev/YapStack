@@ -102,6 +102,11 @@ import {
 import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
 import {
+  DEFAULT_SYNC_SERVER_URL,
+  syncCommands,
+  type SyncStatus,
+} from "@/lib/sync";
+import {
   migrateLegacyAISettings,
   type LegacyAISettings,
   type LegacyDictationSlot,
@@ -273,6 +278,27 @@ export interface OnboardingState {
   completedFlows: Record<string, string>; // flowId → ISO timestamp
 }
 
+/**
+ * Persisted sync slice (YAPSTACK_SYNC §14). Deliberately holds NO secrets: the
+ * vault key and auth tokens live in the OS keychain (Rust side), never here.
+ * Only the non-sensitive handles the UI needs to render connection state are
+ * persisted — the server URL, whether sync is enabled, the last-seen changeset
+ * cursor, and this device's public fingerprint. Everything else is fetched live
+ * via `syncCommands.status()`.
+ */
+export interface SyncConfig {
+  /** Relay base URL — default hosted, or a pasted self-host URL. */
+  serverUrl: string;
+  /** True once crr_migrate has run and the user opted into sync. */
+  syncEnabled: boolean;
+  /** Signed-in account email (non-secret), null when signed out. */
+  email: string | null;
+  /** Last-seen server changeset_seq watermark (dense cursor, arch §7). */
+  lastChangesetSeq: number;
+  /** This device's public fingerprint (base32 4×4), null before enrollment. */
+  deviceFingerprint: string | null;
+}
+
 export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
@@ -428,6 +454,16 @@ interface AppState {
 
   // Settings (persisted)
   settings: Settings;
+
+  // Sync (config persisted; live status runtime-only). See lib/sync.ts.
+  syncConfig: SyncConfig;
+  syncStatus: SyncStatus | null;
+  setSyncConfig: (partial: Partial<SyncConfig>) => void;
+  setSyncStatus: (status: SyncStatus | null) => void;
+  /** Fetch live sync/auth status from the Rust runtime. Surfaces connection
+   *  errors verbatim into `syncStatus.lastError` — never auto-routes or falls
+   *  back (repo posture: the user fixes a broken connection). */
+  refreshSyncStatus: () => Promise<void>;
 
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
@@ -663,6 +699,14 @@ const defaultSettings: Settings = {
   onboarding: { completedFlows: {} },
 };
 
+const defaultSyncConfig: SyncConfig = {
+  serverUrl: DEFAULT_SYNC_SERVER_URL,
+  syncEnabled: false,
+  email: null,
+  lastChangesetSeq: 0,
+  deviceFingerprint: null,
+};
+
 function updateSessionFolderMap(
   current: Record<string, string[]>,
   sessionId: string,
@@ -751,6 +795,8 @@ function createAppStore() {
       updateAvailable: null,
       updateDismissedVersion: null,
       settings: defaultSettings,
+      syncConfig: defaultSyncConfig,
+      syncStatus: null,
       devices: [],
       models: [],
       engineCatalogue: [],
@@ -1464,6 +1510,52 @@ function createAppStore() {
       settingsRequest: null,
       setSettingsRequest: (request) => {
         set({ settingsRequest: request });
+      },
+
+      setSyncConfig: (partial) => {
+        set({ syncConfig: { ...get().syncConfig, ...partial } });
+      },
+      setSyncStatus: (status) => {
+        set({ syncStatus: status });
+        // Mirror the non-secret handles the UI persists. Never store tokens or
+        // the vault key here — those stay in the OS keychain (Rust side).
+        if (status) {
+          set({
+            syncConfig: {
+              ...get().syncConfig,
+              serverUrl: status.serverUrl,
+              email: status.email,
+              syncEnabled: status.syncEnabled,
+              deviceFingerprint: status.deviceFingerprint,
+            },
+          });
+        }
+      },
+      refreshSyncStatus: async () => {
+        try {
+          const status = await syncCommands.status();
+          get().setSyncStatus(status);
+        } catch (e) {
+          // Surface the failure verbatim; do NOT auto-route or fall back. A
+          // broken connection is the user's to fix (feedback_surface_ai_errors).
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error("Failed to fetch sync status:", msg);
+          const prev = get().syncStatus;
+          set({
+            syncStatus: {
+              phase: "error",
+              serverUrl: get().syncConfig.serverUrl,
+              email: get().syncConfig.email,
+              deviceFingerprint: get().syncConfig.deviceFingerprint,
+              roster: prev?.roster ?? [],
+              vaultKeyEpoch: prev?.vaultKeyEpoch ?? null,
+              rosterFingerprint: prev?.rosterFingerprint ?? null,
+              syncEnabled: get().syncConfig.syncEnabled,
+              lastError: msg,
+              billingUrl: prev?.billingUrl ?? null,
+            },
+          });
+        }
       },
 
       setListFilter: (filter) => {
@@ -2590,6 +2682,9 @@ function createAppStore() {
       version: 31,
       partialize: (state) => ({
         settings: state.settings,
+        // Non-secret sync handles only (server URL, enabled flag, cursor,
+        // device fingerprint). Tokens + vault key never persist here.
+        syncConfig: state.syncConfig,
       }),
       // Custom merge does two non-obvious things:
       // 1. Deep-merges `settings` so new fields in DEFAULT_SETTINGS backfill
@@ -2598,7 +2693,11 @@ function createAppStore() {
       // 2. Hosts legacy field renames so they run unconditionally on every
       //    rehydrate, robust to any prior persist-version arithmetic skew.
       merge: (persisted, current) => {
-        const p = (persisted as { settings?: Record<string, unknown> }) ?? {};
+        const p =
+          (persisted as {
+            settings?: Record<string, unknown>;
+            syncConfig?: Partial<SyncConfig>;
+          }) ?? {};
         const persistedSettings = { ...(p.settings ?? {}) };
 
         // dictationDuckTarget (reduce-TO) → dictationDuckAmount (reduce-BY).
@@ -2618,6 +2717,11 @@ function createAppStore() {
           settings: {
             ...current.settings,
             ...(persistedSettings as Partial<Settings>),
+          },
+          // Backfill new SyncConfig fields for pre-sync persisted state.
+          syncConfig: {
+            ...current.syncConfig,
+            ...(p.syncConfig ?? {}),
           },
         };
       },

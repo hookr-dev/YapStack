@@ -77,6 +77,66 @@ export const DEFAULT_AI_CONFIG: AIConfig = {
   },
 };
 
+// ----- Vault-wrapping AI connection secrets (CRYPTO_SPEC §4, sync deliverable E) -----
+
+/** The vault-wrapped form of a Connection's credential. `apiKey`/`baseUrl` are
+ *  replaced by an opaque base64 committing envelope so they can never reach a
+ *  syncable surface in plaintext. */
+export interface WrappedConnection
+  extends Omit<Connection, "apiKey" | "baseUrl"> {
+  /** base64 committing envelope of `apiKey` (empty string when no key). */
+  wrappedApiKey: string;
+  /** base64 committing envelope of `baseUrl`. */
+  wrappedBaseUrl: string;
+}
+
+export interface WrappedAIConfig extends Omit<AIConfig, "connections"> {
+  connections: WrappedConnection[];
+}
+
+/**
+ * Strip credentials from an AIConfig, leaving structure/labels intact. Used
+ * anywhere an AIConfig might be logged, exported, or handed to a non-secret
+ * surface. Never emits `apiKey`/`baseUrl`.
+ */
+export function stripAiSecrets(
+  config: AIConfig,
+): Omit<WrappedAIConfig, "connections"> & {
+  connections: Omit<Connection, "apiKey" | "baseUrl">[];
+} {
+  return {
+    ...config,
+    connections: config.connections.map(({ apiKey: _k, baseUrl: _b, ...rest }) => rest),
+  };
+}
+
+/**
+ * Vault-wrap every connection credential before the config can be synced. The
+ * plaintext `apiKey`/`baseUrl` are wrapped via the Rust vault command
+ * (`syncCommands.wrapSecret`) under the vault key held in the OS keychain — the
+ * plaintext never enters a syncable payload. This is the enforcement point for
+ * deliverable E: the AI apiKey is envelope-wrapped, not persisted raw, before
+ * any path that could reach the relay.
+ *
+ * `wrap` is injected (not imported) so this stays pure/testable and callers
+ * choose the vault binding. In the app that's `syncCommands.wrapSecret`.
+ */
+export async function prepareAiConfigForSync(
+  config: AIConfig,
+  wrap: (plaintext: string) => Promise<string>,
+): Promise<WrappedAIConfig> {
+  const connections: WrappedConnection[] = [];
+  for (const c of config.connections) {
+    const { apiKey, baseUrl, ...rest } = c;
+    connections.push({
+      ...rest,
+      wrappedApiKey: apiKey ? await wrap(apiKey) : "",
+      wrappedBaseUrl: baseUrl ? await wrap(baseUrl) : "",
+    });
+  }
+  return { ...config, connections };
+}
+
 export type ToolExecutionStatus = "running" | "done" | "error";
 
 export interface ToolExecution {
