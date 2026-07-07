@@ -68,6 +68,10 @@ fn signup_body(email: &str) -> Value {
     let sig = yapstack_crypto::sign::sign_roster(&vault_key, roster.to_string().as_bytes());
     json!({
         "email": email, "auth_key": auth_key, "salt_enc": B64.encode(salt_enc),
+        // Required by SignupRequest since T010d (recovery-code auth path). This suite
+        // never exercises /auth/recover, so any well-formed opaque value suffices; the
+        // server only ever second-hashes it. Matches the auth_flow.rs fixture shape.
+        "recovery_auth_key": B64.encode([0x5au8; 20]),
         "wrapped_vault_key_password": wrapped, "wrapped_vault_key_recovery": wrapped,
         "device_list": {
             "device_list": roster, "signature": B64.encode(sig),
