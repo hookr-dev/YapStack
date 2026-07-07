@@ -27,13 +27,28 @@ use std::process::Command;
 /// Pinned cr-sqlite release (matches `vendor/cr-sqlite`, tag v0.16.3).
 const CRSQLITE_COMMIT_SHA: &str = "0d62b52b4662ee1a762c9fd9264d48a91ab8df83";
 
+/// `Path::canonicalize` on Windows returns an extended-length `\\?\` path that
+/// MSVC's `cl.exe` cannot open (it fails with `C1083: Cannot open source file`
+/// when such a path is handed to the C compiler via the `cc` crate). Strip the
+/// `\\?\` verbatim prefix so downstream tooling gets a plain absolute path.
+/// No-op on non-Windows (macOS/Linux paths are already plain).
+fn plain_canonical(p: PathBuf) -> std::io::Result<PathBuf> {
+    let canonical = p.canonicalize()?;
+    #[cfg(windows)]
+    {
+        let s = canonical.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // repo_root/vendor/cr-sqlite/core
-    let vendor_core = manifest
-        .join("../../vendor/cr-sqlite/core")
-        .canonicalize()
+    let vendor_core = plain_canonical(manifest.join("../../vendor/cr-sqlite/core"))
         .expect("vendored cr-sqlite/core must exist");
 
     let bundle_static = vendor_core.join("rs/bundle_static");

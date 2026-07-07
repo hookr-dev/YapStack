@@ -159,18 +159,28 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           rm certificate.p12
 
-      - name: Build Tauri app (--features sync)
-        # -f sync forwards the cargo feature to the app crate. When mac_signed=false we
-        # AD-HOC sign (APPLE_SIGNING_IDENTITY='-' -> `codesign -s -`): tauri still runs
-        # codesign, so an EMPTY identity makes it invoke `codesign` with no signer and
-        # FAIL ("failed to sign app"). Ad-hoc signs with no cert, is locally runnable,
-        # and Gatekeeper allows right-click -> Open. No notarization (other Apple vars
-        # stay empty). When true, the imported cert + real identity drive sign + notarize.
+      # Two mutually-exclusive build steps. tauri treats an *empty-but-defined*
+      # APPLE_TEAM_ID as "notarize me" and fails ("Team ID must be at least 3
+      # characters"). So the unsigned path must not define APPLE_ID/PASSWORD/TEAM_ID
+      # AT ALL — only then does tauri skip notarization.
+      - name: Build Tauri app (--features sync, ad-hoc unsigned)
+        if: ${{ !inputs.mac_signed }}
+        # AD-HOC sign (APPLE_SIGNING_IDENTITY='-' -> `codesign -s -`): signs with no
+        # cert, locally runnable, Gatekeeper right-click -> Open. No Apple notarization
+        # vars are set, so tauri does not attempt to notarize.
         env:
-          APPLE_SIGNING_IDENTITY: ${{ inputs.mac_signed && secrets.APPLE_SIGNING_IDENTITY || '-' }}
-          APPLE_ID: ${{ inputs.mac_signed && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ inputs.mac_signed && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ inputs.mac_signed && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
+
+      - name: Build Tauri app (--features sync, signed + notarized)
+        if: ${{ inputs.mac_signed }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
