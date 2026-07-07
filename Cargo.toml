@@ -5,6 +5,9 @@ members = [
     "crates/yapstack-audio",
     "crates/yapstack-transcription",
     "crates/yapstack-transcription-sidecar",
+    "crates/yapstack-crypto",
+    "crates/yapstack-entitlements",
+    "crates/yapstack-server",
     "apps/desktop/src-tauri",
 ]
 
@@ -33,3 +36,21 @@ futures-util = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rubato = "0.16"
 mp3lame-encoder = "0.2"
+# --- sync backend (yapstack-server / -entitlements) ---
+axum = "0.7"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "macros",
+    "migrate",
+] }
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+jsonwebtoken = "9"
+base64 = "0.22"
+rand = "0.8"
+toml = "0.8"
+async-trait = "0.1"
