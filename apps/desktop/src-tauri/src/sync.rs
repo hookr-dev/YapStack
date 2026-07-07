@@ -51,9 +51,11 @@ use yapstack_common::auth::{
     LoginFinishResponse, RecoverRequest, RecoverResponse, RosterEnvelope, RosterUploadRequest,
     RosterUploadResponse, SignupRequest, TokenResponse,
 };
-use yapstack_sync::crypto::ChangesetCipher;
+use yapstack_sync::crypto::{ChangesetCipher, SnapshotCipher};
+use yapstack_sync::snapshot::{self, SnapshotMeta};
+use yapstack_sync::transport::SyncTransport;
 use yapstack_sync::{
-    cascade, outbox, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
+    cascade, outbox, reconcile, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
     CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION,
 };
 
@@ -1268,6 +1270,219 @@ pub async fn sync_device_list() -> Result<Vec<DeviceRosterEntryDto>, String> {
             }
         })
         .collect())
+}
+
+// ----- R1/R2 two-populated-device onboarding (seed / join) -----
+//
+// OWNER DECISION: the Mac (primary ~41 MB DB) SEEDS; the Windows device JOINs. The seed
+// publishes an encrypted DB SNAPSHOT (R2 — not a ~434k-change replay); the join
+// re-bootstraps from it and RECONCILES its own local-only rows with app-level dedup,
+// NEVER independently CRRifying-and-merging (which is silently lossy). See sync::reconcile.
+
+/// One surfaced reconciliation collision (an ambiguous local row that was NOT silently
+/// dropped — the owner reviews these before discarding the old local DB).
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct CollisionDto {
+    pub table: String,
+    pub pk: String,
+    /// "content_diverged" (same PK, different values) or "logical_duplicate".
+    pub kind: String,
+}
+
+/// Result of a join reconciliation. `accounted == inserted + matched + collisions` and
+/// equals the join's local row count — the no-silent-loss guarantee, surfaced to the UI.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct ReconcileReportDto {
+    pub inserted_local_only: u32,
+    pub matched_identical: u32,
+    pub collisions: Vec<CollisionDto>,
+}
+
+fn snapshot_scratch_dir(live_db: &Path) -> PathBuf {
+    live_db
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// SEED (deliverable R2 seed side): CRRify a COPY of the primary DB, publish it as one
+/// encrypted snapshot, and suppress re-pushing the whole history as changesets (the
+/// snapshot carries it). Then start the drain. This device holds the authoritative
+/// library; the other device joins from the snapshot.
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_seed(
+    app: tauri::AppHandle,
+    runtime: State<'_, SyncRuntimeState>,
+) -> Result<SyncStatusDto, String> {
+    let mut session = load_session()?.ok_or_else(|| "Sign in before seeding.".to_string())?;
+    let vault_key = session.vault_key()?;
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+
+    // CRRify a COPY of the live DB (VACUUM INTO — the live DB is never opened for write).
+    let sync_db = prepare_library_for_sync(&db_path)?;
+
+    // Produce + encrypt the snapshot from the prepared CRR copy.
+    let scratch = snapshot_scratch_dir(&db_path);
+    let bytes = snapshot::produce_snapshot_bytes(&sync_db, &scratch).map_err(|e| e.to_string())?;
+    let generation = 1u64; // v1: one snapshot generation per seed (re-seed bumps later).
+    let cipher = SnapshotCipher::new(vault_key, session.epoch, session.tenant_id);
+    let blob = cipher
+        .encrypt(generation, &bytes)
+        .map_err(|e| e.to_string())?;
+
+    let transport = HttpTransport::new(base_url(&session.server_url), session.bearer.clone());
+    // Baseline = the relay's current cursor: the join resumes incremental pull from here.
+    let baseline_seq = transport
+        .completeness()
+        .await
+        .map(|c| c.max_changeset_seq)
+        .map_err(|e| e.to_string())?;
+    transport
+        .put_snapshot(
+            SnapshotMeta {
+                generation,
+                baseline_seq,
+            },
+            &blob,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // R2 seed side: do NOT re-emit the whole history as changesets — advance the push
+    // watermark past every row already captured in the snapshot.
+    {
+        let db = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
+        let max_dbv: i64 = db
+            .conn()
+            .query_row(
+                "SELECT coalesce(max(db_version),0) FROM crsql_changes WHERE site_id = crsql_site_id()",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        state::set_push_watermark(db.conn(), max_dbv).map_err(|e| e.to_string())?;
+    }
+
+    start_and_store_drain(&session, &runtime, &sync_db)?;
+    session.sync_enabled = true;
+    store_session(&session)?;
+    Ok(build_status_dto(&session).await)
+}
+
+/// JOIN (deliverable R1 + R2 join side): re-bootstrap from the seed's snapshot into a
+/// fresh CRR base, RECONCILE this device's own local-only rows into it (preserved, with
+/// ambiguous collisions surfaced), then start the drain. NEVER independently
+/// CRRifies-and-merges the live DB (silently lossy). The live DB is only ever READ.
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_join(
+    app: tauri::AppHandle,
+    runtime: State<'_, SyncRuntimeState>,
+) -> Result<ReconcileReportDto, String> {
+    let mut session = load_session()?.ok_or_else(|| "Sign in before joining.".to_string())?;
+    let vault_key = session.vault_key()?;
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+
+    // Pull the seed's snapshot (surface, never fall back to a lossy self-merge).
+    let transport = HttpTransport::new(base_url(&session.server_url), session.bearer.clone());
+    let (meta, blob) = transport
+        .get_snapshot()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "No snapshot on the relay yet — publish one from the seed device first.".to_string()
+        })?;
+    let cipher = SnapshotCipher::new(vault_key, session.epoch, session.tenant_id);
+    let snap_bytes = cipher
+        .decrypt(meta.generation, &blob)
+        .map_err(|e| e.to_string())?;
+
+    // Write it as the CRR base and re-site so this device becomes an independent peer
+    // (fresh site id + client id) that will not re-push the seed's history.
+    let sync_db = sync_db_path(&db_path);
+    snapshot::write_snapshot_file(&sync_db, &snap_bytes).map_err(|e| e.to_string())?;
+    {
+        let base = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
+        reconcile::resite_as_fresh_peer(base.conn()).map_err(|e| e.to_string())?;
+        reconcile::reset_join_local_state(base.conn()).map_err(|e| e.to_string())?;
+    }
+
+    // Reopen (so cr-sqlite re-reads the fresh site id) and reconcile local-only rows.
+    let base = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
+    state::set_pull_watermark(base.conn(), meta.baseline_seq).map_err(|e| e.to_string())?;
+
+    // The live DB is opened READ-ONLY — it is never written (data-safety invariant).
+    let live_ro = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| e.to_string())?;
+    let report =
+        reconcile::reconcile_local_rows(&live_ro, base.conn()).map_err(|e| e.to_string())?;
+    drop(live_ro);
+
+    // Reinstate the stripped FK cascade + UNIQUE invariants after reconciliation.
+    cascade::cascade_gc(base.conn()).map_err(|e| e.to_string())?;
+    uniqueness::enforce_uniqueness(base.conn()).map_err(|e| e.to_string())?;
+    mark_prepared(base.conn()).map_err(|e| e.to_string())?;
+    drop(base);
+
+    start_and_store_drain(&session, &runtime, &sync_db)?;
+    session.sync_enabled = true;
+    store_session(&session)?;
+
+    Ok(ReconcileReportDto {
+        inserted_local_only: report.inserted_local_only as u32,
+        matched_identical: report.matched_identical as u32,
+        collisions: report
+            .collisions
+            .into_iter()
+            .map(|c| CollisionDto {
+                table: c.table,
+                pk: c.pk,
+                kind: match c.kind {
+                    reconcile::CollisionKind::ContentDiverged => "content_diverged".into(),
+                    reconcile::CollisionKind::LogicalDuplicate => "logical_duplicate".into(),
+                },
+            })
+            .collect(),
+    })
+}
+
+/// Spawn the drain on its dedicated thread and store the handle (shared by seed + join).
+fn start_and_store_drain(
+    session: &Session,
+    runtime: &State<'_, SyncRuntimeState>,
+    sync_db: &Path,
+) -> Result<(), String> {
+    let vault_key = session.vault_key()?;
+    let handle = spawn_drain(
+        sync_db.to_path_buf(),
+        session.server_url.clone(),
+        session.bearer.clone(),
+        vault_key,
+        session.epoch,
+        session.tenant_id,
+    )?;
+    let mut guard = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
+    if let Some(mut prev) = guard.take() {
+        prev.stop();
+    }
+    *guard = Some(handle);
+    Ok(())
 }
 
 #[cfg(test)]

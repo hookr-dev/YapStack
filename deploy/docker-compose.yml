@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# YapStack self-host relay — server + postgres + minio, one .env (arch §5, §13 Phase 5).
+#
+# The relay is a BLIND store: it holds only ciphertext + opaque metadata, runs no CRDT
+# engine, decrypts nothing, and makes ZERO outbound calls. There is NO admin key and NO
+# [limits] section, so entitlements resolve to AllowAll — self-host is always the max
+# tier. See docs/self-hosting.md for install, reverse proxy, and the backup runbook.
+
+name: yapstack
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # Consumed by the init script below to create the non-owner yapstack_app role.
+      YAPSTACK_APP_PASSWORD: ${YAPSTACK_APP_PASSWORD:?set YAPSTACK_APP_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs ONCE on first DB init (as the superuser): pgcrypto + the non-owner
+      # yapstack_app LOGIN role the RLS relies on.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: create the bucket that holds encrypted audio + snapshot blobs, then exit.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set yap http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+      mc mb --ignore-existing yap/\"$${MINIO_BUCKET}\" &&
+      echo 'yapstack: bucket ready'
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-yapstack}
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    image: yapstack-server:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # The entrypoint renders yapstack-relay.toml from these before exec'ing the server.
+      YAPSTACK_BIND_ADDR: ${YAPSTACK_BIND_ADDR:-0.0.0.0:8080}
+      # Default: connect as the DB owner (FORCE RLS still isolates it). To harden, run
+      # migrations once as the owner then point this at the non-owner yapstack_app role
+      # (docs/self-hosting.md).
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      SERVER_PEPPER: ${SERVER_PEPPER:?set SERVER_PEPPER in .env}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_BUCKET: ${MINIO_BUCKET:-yapstack}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${YAPSTACK_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  postgres-data:
+  minio-data:

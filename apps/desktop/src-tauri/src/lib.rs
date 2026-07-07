@@ -382,6 +382,8 @@ pub fn run() {
             sync::sync_login_finish,
             sync::sync_recover,
             sync::sync_enable,
+            sync::sync_seed,
+            sync::sync_join,
             sync::sync_approve_device,
             sync::sync_device_list,
             sync::sync_sign_out,

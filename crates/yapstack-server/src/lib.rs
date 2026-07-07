@@ -24,6 +24,7 @@ pub mod extract;
 pub mod jwt;
 pub mod ratelimit;
 pub mod routes;
+pub mod snapshot;
 pub mod sse;
 pub mod state;
 pub mod storage;
@@ -58,7 +59,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sync/stream", get(sync::stream::stream))
         // --- audio E2E blobs (§9) ---
         .route("/audio/presign", post(audio::presign))
-        .route("/audio/:session_id", get(audio::get));
+        .route("/audio/:session_id", get(audio::get))
+        // --- R2 snapshot bootstrap (blind opaque blob, §9-style) ---
+        .route("/snapshot/presign", post(snapshot::presign))
+        .route("/snapshot", get(snapshot::head));
 
     if state.admin_enabled() {
         router = router

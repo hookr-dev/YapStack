@@ -9,6 +9,7 @@
 //! by the desktop runtime (wired in T010b).
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -17,6 +18,7 @@ use yapstack_common::sync::{
     PushResponse,
 };
 
+use crate::snapshot::SnapshotMeta;
 use crate::SyncError;
 
 #[async_trait]
@@ -24,6 +26,43 @@ pub trait SyncTransport: Send + Sync {
     async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError>;
     async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError>;
     async fn completeness(&self) -> Result<CompletenessResponse, SyncError>;
+
+    /// R2: publish the encrypted DB snapshot (the seed device's bootstrap artifact).
+    /// The relay stores it as an opaque blob and never reads it.
+    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError>;
+
+    /// R2: fetch the latest encrypted snapshot for the tenant, or `None` if the seed
+    /// has not published one yet (a join device then falls back to full changeset pull).
+    async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError>;
+}
+
+// ---- snapshot endpoint wire DTOs (client side) --------------------------------
+//
+// Defined here rather than in `yapstack-common` for now (T011 allowed-files scope); the
+// field names mirror the server's `snapshot` handler exactly. T012 may hoist them into
+// `yapstack-common` alongside the other sync DTOs (arch §14) — a mechanical move.
+
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotPresignRequest {
+    /// Lowercase hex SHA-256 of the CIPHERTEXT.
+    sha256: String,
+    size: u64,
+    generation: u64,
+    baseline_seq: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotPresignResponse {
+    already_exists: bool,
+    upload_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotHeadResponse {
+    present: bool,
+    generation: u64,
+    baseline_seq: i64,
+    download_url: Option<String>,
 }
 
 // --------------------------------------------------------------- HTTP transport
@@ -82,6 +121,76 @@ impl SyncTransport for HttpTransport {
             .error_for_status()?;
         Ok(r.json().await?)
     }
+
+    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
+        // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
+        // and byte-free — the bytes go directly to object storage).
+        let sha = crate::snapshot::ciphertext_sha256_hex(ciphertext);
+        let presign: SnapshotPresignResponse = self
+            .client
+            .post(format!("{}/snapshot/presign", self.base_url))
+            .bearer_auth(&self.bearer)
+            .json(&SnapshotPresignRequest {
+                sha256: sha,
+                size: ciphertext.len() as u64,
+                generation: meta.generation,
+                baseline_seq: meta.baseline_seq,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if presign.already_exists {
+            return Ok(());
+        }
+        let url = presign.upload_url.ok_or_else(|| {
+            SyncError::Transport("snapshot presign returned no upload_url".into())
+        })?;
+        // Direct upload to object storage; content-length pinned by the presigned policy.
+        self.client
+            .put(url)
+            .header("content-length", ciphertext.len())
+            .body(ciphertext.to_vec())
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+        let head: SnapshotHeadResponse = self
+            .client
+            .get(format!("{}/snapshot", self.base_url))
+            .bearer_auth(&self.bearer)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if !head.present {
+            return Ok(None);
+        }
+        let url = head.download_url.ok_or_else(|| {
+            SyncError::Transport("snapshot head present but no download_url".into())
+        })?;
+        let bytes = self
+            .client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec();
+        Ok(Some((
+            SnapshotMeta {
+                generation: head.generation,
+                baseline_seq: head.baseline_seq,
+            },
+            bytes,
+        )))
+    }
 }
 
 // --------------------------------------------------------------- mock relay
@@ -106,6 +215,9 @@ struct MockInner {
     log: Vec<StoredChange>,
     // (client_id, client_seq) -> assigned changeset_seq (idempotency)
     seen: HashMap<(Uuid, i64), i64>,
+    // latest published snapshot (meta, opaque ciphertext) — faithfully opaque: the
+    // mock never inspects the bytes, mirroring the blind relay.
+    snapshot: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 impl MockRelay {
@@ -199,5 +311,16 @@ impl SyncTransport for MockRelay {
                 })
                 .collect(),
         })
+    }
+
+    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
+        let mut g = self.inner.lock().unwrap();
+        g.snapshot = Some((meta, ciphertext.to_vec()));
+        Ok(())
+    }
+
+    async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+        let g = self.inner.lock().unwrap();
+        Ok(g.snapshot.clone())
     }
 }
