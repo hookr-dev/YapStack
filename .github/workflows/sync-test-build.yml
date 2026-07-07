@@ -47,6 +47,12 @@ on:
         description: "Sign + notarize the macOS build (needs Apple secrets in the release env)"
         type: boolean
         default: false
+  # Push trigger scoped to the sync branch: workflow_dispatch only works once the file
+  # is on the DEFAULT branch, so a push to this feature branch is how the build runs
+  # today. Builds both OSes unsigned (inputs are empty on push). Remove/retarget when
+  # the workflow lands on main.
+  push:
+    branches: [feat/sync-relay-skeleton]
 
 # Minimal top-level permissions — jobs elevate as needed
 permissions: {}
@@ -58,7 +64,7 @@ jobs:
   build-macos-sync:
     name: Build macOS (sync)
     # Runs on dispatch — NOT gated on refs/tags (unlike release.yml build-macos).
-    if: ${{ inputs.mac }}
+    if: ${{ github.event_name == 'push' || inputs.mac }}
     runs-on: macos-latest
     # `release` env carries the Apple + Tauri updater-signing secrets. tauri.conf.json
     # sets createUpdaterArtifacts, so TAURI_SIGNING_PRIVATE_KEY is required even for an
@@ -169,7 +175,7 @@ jobs:
 
   build-windows-sync:
     name: Build Windows (sync)
-    if: ${{ inputs.windows }}
+    if: ${{ github.event_name == 'push' || inputs.windows }}
     runs-on: windows-latest
     # Same rationale as the macOS job: createUpdaterArtifacts needs the Tauri signing key.
     environment: release
