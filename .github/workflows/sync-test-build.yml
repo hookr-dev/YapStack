@@ -1,0 +1,249 @@
+# SYNC-TEST build — EXPERIMENTAL, NOT a production release.
+#
+# This workflow builds installable Mac + Windows desktop artifacts WITH the
+# off-by-default `sync` cargo feature enabled (--features sync), so the owner can
+# test two-device end-to-end sync on real machines.
+#
+# It is DELIBERATELY separate from release.yml. Production releases (release.yml,
+# tag v*) stay NO-SYNC: the sync backend is experimental and behind a human legal
+# gate (LICENSING.md / TRADEMARK.md / DCO). This workflow NEVER creates a GitHub
+# release — it only uploads run artifacts you download and install by hand.
+#
+# Extra vs release.yml:
+#   * `rustup toolchain install nightly-2023-10-05` — crates/yapstack-sync/build.rs
+#     nested-builds the vendored cr-sqlite static bundle, whose Rust half is pinned
+#     to that nightly (vendor/cr-sqlite/core/rs/bundle_static/rust-toolchain.toml).
+#     That file pins ONLY the channel (no components), so installing the toolchain
+#     is all the runner needs — no rust-src / extra target.
+#   * `-f sync` on the tauri build — forwards the cargo feature to the app crate
+#     (apps/desktop/src-tauri/Cargo.toml [features] sync).
+#
+# Transcription sidecars are TOUCH placeholders (same as ci-checks.yml): this build
+# targets sync UAT, not transcription. The bundled sidecar is a 0-byte placeholder
+# so the Tauri build links; transcribing NEW audio will not work in these artifacts.
+# Syncing EXISTING data (the UAT path) is unaffected.
+#
+# Signing caveats (expected for own-machine UAT):
+#   * Windows: UNSIGNED NSIS — SmartScreen warns on first run (click "More info" ->
+#     "Run anyway"); currentUser install; Credential Manager works.
+#   * macOS: UNSIGNED / ad-hoc unless mac_signed=true (Gatekeeper: right-click ->
+#     Open the first time). mac_signed=true replicates release.yml sign+notarize
+#     and requires the Apple secrets in the `release` environment.
+
+name: Sync Test Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mac:
+        description: "Build macOS (aarch64)"
+        type: boolean
+        default: true
+      windows:
+        description: "Build Windows (x86_64 NSIS)"
+        type: boolean
+        default: true
+      mac_signed:
+        description: "Sign + notarize the macOS build (needs Apple secrets in the release env)"
+        type: boolean
+        default: false
+
+# Minimal top-level permissions — jobs elevate as needed
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos-sync:
+    name: Build macOS (sync)
+    # Runs on dispatch — NOT gated on refs/tags (unlike release.yml build-macos).
+    if: ${{ inputs.mac }}
+    runs-on: macos-latest
+    # `release` env carries the Apple + Tauri updater-signing secrets. tauri.conf.json
+    # sets createUpdaterArtifacts, so TAURI_SIGNING_PRIVATE_KEY is required even for an
+    # unsigned (mac_signed=false) build. The canary Windows dispatch precedent shows the
+    # release env does not block branch dispatch runs.
+    environment: release
+    permissions:
+      contents: read
+    env:
+      APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install cmake
+        run: brew install cmake
+
+      - name: Install Rust (host stable)
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install pinned nightly for the vendored cr-sqlite bundle
+        # crates/yapstack-sync/build.rs builds vendor/cr-sqlite/.../bundle_static, whose
+        # rust-toolchain.toml pins nightly-2023-10-05 (channel only, no components).
+        run: rustup toolchain install nightly-2023-10-05 --profile minimal
+
+      - name: Xcode fingerprint for cache key
+        id: xcode
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: sync-test-macos
+          key: ${{ steps.xcode.outputs.version }}
+          cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@10.28.2 --activate
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Create sidecar + framework placeholders
+        # tauri.conf.json declares an externalBin (sidecar) and a macOS framework dylib
+        # (libwebgpu_dawn.dylib). The Tauri build validates both paths exist before
+        # linking; this is a SYNC test build, so we stub them (transcription won't work).
+        run: |
+          mkdir -p apps/desktop/src-tauri/binaries
+          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
+          touch apps/desktop/src-tauri/binaries/libwebgpu_dawn.dylib
+
+      - name: Import code signing certificate (only when signing)
+        if: ${{ inputs.mac_signed }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          rm certificate.p12
+
+      - name: Build Tauri app (--features sync)
+        # -f sync forwards the cargo feature to the app crate. When mac_signed=false the
+        # Apple identity vars are empty -> tauri produces an unsigned/ad-hoc .app (no
+        # notarization). When true, the imported cert + identity drive sign + notarize.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ inputs.mac_signed && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ inputs.mac_signed && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ inputs.mac_signed && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.mac_signed && secrets.APPLE_TEAM_ID || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
+
+      - name: Upload macOS sync artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sync-test-macos-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            target/aarch64-apple-darwin/release/bundle/macos/*.app
+
+  build-windows-sync:
+    name: Build Windows (sync)
+    if: ${{ inputs.windows }}
+    runs-on: windows-latest
+    # Same rationale as the macOS job: createUpdaterArtifacts needs the Tauri signing key.
+    environment: release
+    permissions:
+      contents: read
+    env:
+      APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check cmake
+        run: cmake --version
+
+      - name: Install Rust (host stable)
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install pinned nightly for the vendored cr-sqlite bundle
+        # crates/yapstack-sync/build.rs builds the vendored cr-sqlite static bundle pinned
+        # to nightly-2023-10-05 (channel only, no components).
+        run: rustup toolchain install nightly-2023-10-05 --profile minimal
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: sync-test-windows
+          cache-directories: ~/AppData/Local/ort.pyke.io
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@10.28.2 --activate
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Create sidecar placeholder
+        # tauri.conf.json declares an externalBin whose path Tauri validates before
+        # linking. Stub it (0-byte) — this is a SYNC test build, not transcription.
+        shell: bash
+        run: |
+          mkdir -p apps/desktop/src-tauri/binaries
+          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
+
+      - name: Build Tauri app (--features sync)
+        # Restrict to NSIS (matching release.yml): tauri.conf.json targets "all" also
+        # builds MSI/WiX, which hard-fails on the non-numeric pre-release version.
+        # Unsigned NSIS is fine for own-machine UAT (SmartScreen click-through).
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync
+
+      - name: Upload Windows sync artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sync-test-windows-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
