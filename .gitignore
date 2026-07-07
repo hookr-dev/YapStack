@@ -26,9 +26,16 @@ tests/fixtures/*.wav
 models/
 *.bin
 
-# Databases
+# Databases — never commit personal/local DBs or their sidecars/backups
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.backup
+spike.db*
 
 # Environment
 .env
