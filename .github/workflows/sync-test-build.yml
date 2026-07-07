@@ -59,6 +59,14 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Disable release LTO for this TEST build only. The root [profile.release] uses
+  # lto="thin", but the vendored cr-sqlite static bundle is compiled by the pinned
+  # nightly-2023-10-05 rustc — its objects lack a bitcode section the host rustc's
+  # thin-LTO expects ("failed to get bitcode from object file for LTO / Can't find
+  # section __bitcode"). Turning LTO off here (env override, not a Cargo.toml change)
+  # links cleanly. Production release.yml is unaffected. LTO is size/perf only —
+  # irrelevant for a UAT artifact.
+  CARGO_PROFILE_RELEASE_LTO: "false"
 
 jobs:
   build-macos-sync:
