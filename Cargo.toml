@@ -8,8 +8,14 @@ members = [
     "crates/yapstack-crypto",
     "crates/yapstack-entitlements",
     "crates/yapstack-server",
+    "crates/yapstack-sync",
     "apps/desktop/src-tauri",
 ]
+
+# Vendored cr-sqlite (pinned v0.16.3) keeps its own MIT/Apache license and its own
+# pinned nightly toolchain; it is built standalone by yapstack-sync/build.rs and must
+# NOT be pulled into this workspace's stable-toolchain graph.
+exclude = ["vendor/cr-sqlite"]
 
 [workspace.package]
 license = "AGPL-3.0-only"

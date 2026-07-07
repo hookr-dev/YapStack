@@ -8868,6 +8868,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "yapstack-sync"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "cc",
+ "rand 0.8.5",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yapstack-common",
+ "yapstack-crypto",
+]
+
+[[package]]
 name = "yapstack-transcription"
 version = "0.1.0"
 dependencies = [
