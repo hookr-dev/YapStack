@@ -15,6 +15,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::db;
 use crate::error::AppError;
@@ -87,8 +88,14 @@ pub async fn signup(
     State(st): State<AppState>,
     Json(req): Json<SignupRequest>,
 ) -> Result<Json<TokenResponse>, AppError> {
-    let auth_key = b64_decode("auth_key", &req.auth_key)?;
+    // auth_key is secret key material (§2.3); hold it in memory that zeroizes on drop.
+    let auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
     let salt_enc = b64_decode("salt_enc", &req.salt_enc)?;
+    // Pin the client salt_enc length: real accounts store exactly 16 bytes, matching the
+    // login/begin decoy salt, so a decoy can never be length-distinguished from a real one.
+    if salt_enc.len() != 16 {
+        return Err(AppError::BadRequest("salt_enc: expected 16 bytes".into()));
+    }
     let wrapped_pw = b64_decode(
         "wrapped_vault_key_password",
         &req.wrapped_vault_key_password,
@@ -104,7 +111,7 @@ pub async fn signup(
     let server_salt = gen_salt();
     let verifier = yapstack_crypto::kdf::server_verifier(&auth_key, &server_salt)
         .map_err(|e| AppError::Internal(format!("verifier: {e}")))?;
-    // auth_key is now spent; drop it explicitly (never persisted, §3.2).
+    // auth_key is now spent; drop it (Zeroizing wipes the bytes, never persisted §3.2).
     drop(auth_key);
 
     let user_id = Uuid::new_v4();
@@ -266,7 +273,8 @@ pub async fn login_finish(
     State(st): State<AppState>,
     Json(req): Json<LoginFinishRequest>,
 ) -> Result<Json<LoginFinishResponse>, AppError> {
-    let auth_key = b64_decode("auth_key", &req.auth_key)?;
+    // Secret key material (§2.3): zeroize on drop rather than leaving it in a plain Vec.
+    let auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
 
     let row: Option<AuthRow> = sqlx::query_as(
         "SELECT u.id, m.workspace_id, u.verifier, u.server_salt, u.salt_enc, \
@@ -343,9 +351,15 @@ pub async fn refresh(
 
     let mut tx = db::begin_tenant_tx(&st.pool, claims.tenant).await?;
 
+    // FOR UPDATE serializes concurrent uses of the SAME token within their txs: the
+    // row lock is taken here and held to commit alongside the rotate/revoke below.
+    // Two concurrent uses of a still-fresh token can no longer both read
+    // rotated_at=NULL — the second blocks until the first commits, then (READ
+    // COMMITTED re-reads the locked row) sees rotated_at set → reuse detected →
+    // whole family revoked. Prevents a stolen fresh token forking an undetected chain.
     let existing: Option<(Option<chrono::DateTime<Utc>>, bool, Uuid)> = sqlx::query_as(
         "SELECT rotated_at, revoked, family_id FROM refresh_tokens \
-         WHERE id = $1 AND workspace_id = $2",
+         WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
     )
     .bind(claims.jti)
     .bind(claims.tenant)

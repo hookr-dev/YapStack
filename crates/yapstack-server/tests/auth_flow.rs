@@ -136,6 +136,69 @@ async fn signup_login_refresh_and_reuse_detection() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn concurrent_reuse_of_same_fresh_token_revokes_family() {
+    // Regression for F3: without `FOR UPDATE` on the refresh_tokens read, two
+    // concurrent uses of the SAME still-fresh token both read rotated_at=NULL and both
+    // rotate, evading reuse detection. With the row lock, the second use blocks until
+    // the first commits, then sees rotated_at set → reuse detected → family revoked.
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({ "email": email, "auth_key": auth_key }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let refresh1 = body_json(resp).await["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Fire two refreshes for the SAME fresh token concurrently.
+    let (r_a, r_b) = tokio::join!(
+        post(&app, "/auth/refresh", json!({ "refresh_token": refresh1 })),
+        post(&app, "/auth/refresh", json!({ "refresh_token": refresh1 })),
+    );
+    let (sa, sb) = (r_a.status(), r_b.status());
+
+    // Exactly one winner (rotates) and one loser (reuse detected) — never two winners.
+    let oks = [sa, sb].iter().filter(|s| **s == StatusCode::OK).count();
+    let unauth = [sa, sb]
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert_eq!(oks, 1, "exactly one concurrent refresh may win");
+    assert_eq!(
+        unauth, 1,
+        "the second concurrent use must be reuse-detected"
+    );
+
+    // The winner minted a child, but the loser's reuse detection revoked the WHOLE
+    // family — so that freshly minted child is already dead.
+    let winner = if sa == StatusCode::OK { r_a } else { r_b };
+    let child = body_json(winner).await["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = post(&app, "/auth/refresh", json!({ "refresh_token": child })).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn login_with_wrong_password_is_unauthorized() {
     let st = setup().await;
     let app = build_router(st);

@@ -144,17 +144,52 @@ pub async fn presign(
         }));
     }
 
-    // NEW blob: meter the declared size at the choke point, then presign.
-    choke::admit(&mut tx, auth.tenant_id, &limits, q.size, &help_url).await?;
-    sqlx::query(
+    // NEW blob (as this tx saw it). Insert FIRST so two concurrent identical new-blob
+    // presigns serialize on the PK: exactly one INSERT wins; the loser sees the
+    // conflict and degrades to a dedup hit instead of a spurious 500.
+    let inserted = sqlx::query(
         "INSERT INTO audio_blobs (workspace_id, ciphertext_sha256, size_bytes, refcount) \
-         VALUES ($1, $2, $3, 1)",
+         VALUES ($1, $2, $3, 1) \
+         ON CONFLICT (workspace_id, ciphertext_sha256) DO NOTHING",
     )
     .bind(auth.tenant_id)
     .bind(&hash)
     .bind(i64::try_from(q.size).unwrap_or(i64::MAX))
     .execute(&mut *tx)
     .await?;
+
+    if inserted.rows_affected() == 0 {
+        // Lost the race: the winning tx committed this blob. Behave as a DEDUP HIT —
+        // add a reference, meter NOTHING (no choke → no reservation leak), and point
+        // the client at the existing object.
+        let stored: Option<(i64,)> = sqlx::query_as(
+            "SELECT size_bytes FROM audio_blobs \
+             WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
+        )
+        .bind(auth.tenant_id)
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE audio_blobs SET refcount = refcount + 1 \
+             WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
+        )
+        .bind(auth.tenant_id)
+        .bind(&hash)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Json(PresignResponse {
+            already_exists: true,
+            upload_url: None,
+            object_key: key,
+            content_length: stored.map_or(0, |(s,)| s.max(0) as u64),
+        }));
+    }
+
+    // We created the blob: meter the declared size at the choke point. If it rejects,
+    // the whole tx — including the INSERT above — rolls back (no phantom blob, no leak).
+    choke::admit(&mut tx, auth.tenant_id, &limits, q.size, &help_url).await?;
     tx.commit().await?;
 
     // Presigned PUT with content-length PINNED to the declared size.

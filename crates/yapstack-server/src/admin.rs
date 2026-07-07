@@ -23,6 +23,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::Utc;
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use yapstack_entitlements::wire::{LimitWire, StateWire, TenantLimitsUpdate, UsageResponse};
@@ -68,7 +69,11 @@ async fn verify_admin(
     // Canonical signed message.
     let body_hash = hex::encode(Sha256::digest(body));
     let message = format!("{ts}\n{nonce}\n{}\n{path}\n{body_hash}", method.as_str());
-    yapstack_crypto::sign::verify_detached(&admin_key, message.as_bytes(), &sig)
+    // verify_strict (defense-in-depth): rejects non-canonical / small-order points, so a
+    // captured admin signature cannot be malleated into an alternate accepted encoding.
+    let vk = VerifyingKey::from_bytes(&admin_key).map_err(|_| AppError::Unauthorized)?;
+    let signature = Signature::from_bytes(&sig);
+    vk.verify_strict(message.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized)?;
 
     // Single-use nonce (replay guard). admin_nonces is non-RLS; use the pool directly.

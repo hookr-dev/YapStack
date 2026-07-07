@@ -8864,6 +8864,7 @@ dependencies = [
  "yapstack-common",
  "yapstack-crypto",
  "yapstack-entitlements",
+ "zeroize",
 ]
 
 [[package]]
