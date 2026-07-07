@@ -131,6 +131,11 @@ export const syncCommands = {
   approveDevice: (fingerprint: string): Promise<SyncStatus> =>
     invoke("sync_approve_device", { fingerprint }),
 
+  /** `GET /devices`: the account's device index (pending + active), fingerprinted for
+   *  out-of-band comparison (§7.5). Membership truth is the client-verified signed
+   *  roster; this is the relay's advisory view used to surface pending approvals. */
+  deviceList: (): Promise<DeviceRosterEntry[]> => invoke("sync_device_list"),
+
   signOut: (): Promise<void> => invoke("sync_sign_out"),
 
   /** Vault-wrap a plaintext secret (AI apiKey) under the vault key before it can

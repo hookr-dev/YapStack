@@ -272,6 +272,11 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
 }
 
 pub fn run() {
+    // The sync ceremony commands (T010e) are registered ONLY when the off-by-default
+    // `sync` feature is on — the module and its deps (cr-sqlite/yapstack-crypto) exist
+    // only there. `collect_commands!` cannot `#[cfg]` individual entries, so the builder
+    // is constructed per-feature; the base command list is identical in both branches.
+    #[cfg(not(feature = "sync"))]
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -320,6 +325,67 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
+        ]);
+    #[cfg(feature = "sync")]
+    let specta_builder =
+        tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
+            commands::health_check,
+            commands::backend_ready,
+            commands::audio::list_audio_devices,
+            commands::audio::get_default_input_device,
+            commands::audio::start_capture,
+            commands::audio::stop_capture,
+            commands::audio::get_capture_status,
+            commands::audio::check_system_audio_permission,
+            commands::audio::get_buffer_info,
+            commands::audio::peek_capture_energy,
+            commands::capture::delete_session_wav,
+            commands::capture::delete_audio_files,
+            commands::transcription::get_available_models,
+            commands::transcription::download_model,
+            commands::transcription::delete_model,
+            commands::transcription::init_transcription_client,
+            commands::transcription::shutdown_transcription_client,
+            commands::transcription::get_transcription_status,
+            commands::transcription::get_engine_catalogue,
+            commands::transcription::get_parakeet_models,
+            commands::transcription::get_recommended_parakeet_variant,
+            commands::transcription::download_parakeet_model,
+            commands::transcription::delete_parakeet_model,
+            commands::transcription::get_sortformer_status,
+            commands::transcription::download_sortformer_model,
+            commands::transcription::delete_sortformer_model,
+            commands::live_transcription::start_live_transcription,
+            commands::live_transcription::stop_live_transcription,
+            commands::live_transcription::get_live_transcription_status,
+            commands::live_transcription::update_vocabulary_hints,
+            commands::dictation::clipboard_paste,
+            commands::system_volume::apply_volume_duck,
+            commands::system_volume::restore_volume,
+            commands::permissions::check_screen_capture_permission,
+            commands::permissions::request_screen_capture_permission,
+            commands::get_autostart_enabled,
+            commands::set_autostart_enabled,
+            commands::show_overlay_panel,
+            commands::hide_overlay_panel,
+            commands::get_cursor_position,
+            commands::set_overlay_ignore_cursor_events,
+            commands::logs::get_recent_logs,
+            commands::logs::clear_logs,
+            commands::logs::get_log_dir,
+            commands::logs::reveal_log_dir,
+            commands::logs::log_frontend,
+            sync::sync_info,
+            sync::sync_status,
+            sync::sync_signup,
+            sync::sync_login_begin,
+            sync::sync_login_finish,
+            sync::sync_recover,
+            sync::sync_enable,
+            sync::sync_approve_device,
+            sync::sync_device_list,
+            sync::sync_sign_out,
+            sync::sync_wrap_secret,
         ]);
 
     #[cfg(debug_assertions)]

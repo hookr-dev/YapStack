@@ -75,6 +75,12 @@ rand = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# Device fingerprint (SHA-256(ed25519_pub)[..10] → base32, CRYPTO_SPEC §7.5.5) and
+# recovery-code base32 decode (§6.1). `ed25519-dalek` mints the per-install device
+# identity keypair (§7.1); the vault-derived roster signing key lives in yapstack-crypto.
+sha2 = { workspace = true, optional = true }
+data-encoding = { version = "2", optional = true }
+ed25519-dalek = { version = "2", optional = true }
 
 [features]
 # Off by default. See the sync deps block above and src/sync.rs for why.
@@ -86,6 +92,9 @@ sync = [
     "dep:base64",
     "dep:uuid",
     "dep:reqwest",
+    "dep:sha2",
+    "dep:data-encoding",
+    "dep:ed25519-dalek",
 ]
 
 [dev-dependencies]

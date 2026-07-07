@@ -1272,6 +1272,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8800,6 +8806,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "coreaudio-sys",
+ "data-encoding",
+ "ed25519-dalek",
  "futures-util",
  "hound",
  "keyring",
@@ -8810,6 +8818,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "silero",
  "specta",
  "specta-typescript",
