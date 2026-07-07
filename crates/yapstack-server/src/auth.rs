@@ -12,10 +12,19 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{Duration, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+// The auth request/response DTOs are the ONE shared definition in
+// `yapstack-common` (architecture §14): the desktop client and this relay compile
+// against the same shapes so the wire contract can never skew. The handler logic —
+// second-hash verifier, decoy salt, two-round login, JWT rotation/reuse — is
+// unchanged; only the DTO's home moved.
+use yapstack_common::auth::{
+    LoginBeginRequest, LoginBeginResponse, LoginFinishRequest, LoginFinishResponse, RefreshRequest,
+    SignupRequest, TokenResponse,
+};
 
 use crate::db;
 use crate::error::AppError;
@@ -49,39 +58,6 @@ fn gen_salt() -> [u8; 16] {
 }
 
 // --------------------------------------------------------------------- signup
-
-#[derive(Debug, Deserialize)]
-pub struct SignupRequest {
-    pub email: String,
-    /// base64 of the 32-byte `auth_key` (§2.3). Discarded after computing `verifier`.
-    pub auth_key: String,
-    pub salt_enc: String,
-    pub wrapped_vault_key_password: String,
-    pub wrapped_vault_key_recovery: String,
-    /// First-device self-enrolled signed roster (§3.2 C2): counter 0, epoch 0.
-    pub device_list: RosterEnvelope,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RosterEnvelope {
-    /// Opaque signed roster body (§7.3). Stored verbatim; the server never authors it.
-    pub device_list: Value,
-    pub signature: String, // base64 Ed25519 signature
-    pub counter: i64,
-    pub vault_key_epoch: i64,
-    /// The enrolling device (§7.1 fresh UUIDv4) and its Ed25519 public key.
-    pub client_id: Uuid,
-    pub ed25519_pub: String, // base64
-    #[serde(default)]
-    pub label: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub tenant_id: Uuid,
-}
 
 /// `POST /auth/signup`
 pub async fn signup(
@@ -198,18 +174,6 @@ pub async fn signup(
 
 // ----------------------------------------------------------------- login begin
 
-#[derive(Debug, Deserialize)]
-pub struct LoginBeginRequest {
-    pub email: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LoginBeginResponse {
-    /// base64 of the account's `salt_enc`, OR a deterministic DECOY salt for an
-    /// unknown email (no account-existence oracle, §3.2).
-    pub salt_enc: String,
-}
-
 /// `POST /auth/login/begin` — round 1 of §3.2.
 pub async fn login_begin(
     State(st): State<AppState>,
@@ -239,24 +203,6 @@ pub async fn login_begin(
 }
 
 // ---------------------------------------------------------------- login finish
-
-#[derive(Debug, Deserialize)]
-pub struct LoginFinishRequest {
-    pub email: String,
-    pub auth_key: String,
-    #[serde(default)]
-    pub client_id: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LoginFinishResponse {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub tenant_id: Uuid,
-    pub salt_enc: String,
-    pub wrapped_vault_key_password: String,
-    pub device_list: Option<Value>,
-}
 
 #[derive(sqlx::FromRow)]
 struct AuthRow {
@@ -332,11 +278,6 @@ async fn db_fetch_roster(st: &AppState, workspace_id: Uuid) -> Result<Option<(Va
 }
 
 // --------------------------------------------------------------------- refresh
-
-#[derive(Debug, Deserialize)]
-pub struct RefreshRequest {
-    pub refresh_token: String,
-}
 
 /// `POST /auth/refresh` — rotation + reuse detection, per-device families
 /// (architecture §5/§10). `tenant` comes from the validated token, never the request.
