@@ -32,6 +32,13 @@ pub struct SignupRequest {
     pub email: String,
     /// base64 of the 32-byte `auth_key` (§2.3). Discarded after computing `verifier`.
     pub auth_key: String,
+    /// base64 of the recovery auth key: a SECOND, independent second-hash input derived
+    /// client-side from the 160-bit recovery code (§6). The server second-hashes it into
+    /// a `recovery_verifier` (exactly like the password `verifier`, §3.1) and discards
+    /// it — the recovery code itself never leaves the device, and no password-equivalent
+    /// is ever stored. This is what `POST /auth/recover` authenticates against before it
+    /// serves `wrapped_vault_key_recovery`.
+    pub recovery_auth_key: String,
     pub salt_enc: String,
     pub wrapped_vault_key_password: String,
     pub wrapped_vault_key_recovery: String,
@@ -93,6 +100,14 @@ pub struct LoginFinishRequest {
     pub auth_key: String,
     #[serde(default)]
     pub client_id: Option<Uuid>,
+    /// A NEW (unknown) device bootstrapping via password login (§7.5 step 1) presents
+    /// its fresh Ed25519 public key so the relay can enroll it as a PENDING device row
+    /// (authenticated, but NOT yet a signed-roster sync peer — no auto-promotion). Absent
+    /// for an already-known device; when absent the login never mutates the roster.
+    #[serde(default)]
+    pub ed25519_pub: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// Round-2 success response: the token pair plus the bootstrap material — `salt_enc`,
@@ -106,6 +121,10 @@ pub struct LoginFinishResponse {
     pub salt_enc: String,
     pub wrapped_vault_key_password: String,
     pub device_list: Option<Value>,
+    /// base64 Ed25519 signature over the served roster (§7.5 step 2). A bootstrapping
+    /// device verifies `device_list` against this using the vault-derived roster key it
+    /// unwraps locally; the relay never authors or verifies it (it holds no vault key).
+    pub signature: Option<String>,
 }
 
 // --------------------------------------------------------------------- refresh
@@ -114,6 +133,85 @@ pub struct LoginFinishResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
+}
+
+// --------------------------------------------------------------------- recover
+
+/// `POST /auth/recover` body (§6.2). Authenticate with the recovery code so the relay
+/// will serve `wrapped_vault_key_recovery`. `recovery_auth_key` is derived client-side
+/// from the recovery code and second-hashed server-side against the stored
+/// `recovery_verifier` (constant-time), EXACTLY like the password verifier (§3.1) — no
+/// account-existence or recovery oracle. The raw recovery code never leaves the device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverRequest {
+    pub email: String,
+    pub recovery_auth_key: String,
+}
+
+/// `POST /auth/recover` success (§6.2). Carries the RECOVERY-wrapped vault key — the
+/// blob the relay stores at signup but NEVER serves on the login path — so the client
+/// can unwrap the vault key with the recovery code and then re-wrap under a new
+/// password. `device_list`/`signature` let the recovering device verify the roster
+/// (§7.5). Tokens log the recovering device in (client_id bound at issuance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub tenant_id: Uuid,
+    pub salt_enc: String,
+    pub wrapped_vault_key_recovery: String,
+    pub device_list: Option<Value>,
+    pub signature: Option<String>,
+}
+
+// --------------------------------------------------------------------- devices
+
+/// One device as seen by the relay's advisory device index (§7.5). `status` is a UI
+/// hint the relay maintains from client-supplied metadata; the CRYPTOGRAPHIC source of
+/// truth for membership is always the signed roster (`device_list`), which clients
+/// verify — the relay never reads it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub client_id: Uuid,
+    /// base64 of the device's 32-byte Ed25519 public key.
+    pub ed25519_pub: String,
+    pub label: String,
+    /// `"pending"` (enrolled, awaiting approval) or `"active"` (in an accepted roster).
+    pub status: String,
+    pub added_at: String,
+}
+
+/// `GET /devices` — the account's device index (pending + active) for the approving
+/// device to review (§7.5 step 3). RLS-scoped to the caller's workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicesResponse {
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// `PUT /devices/roster` — upload a re-signed device roster (§7.5 step 3, §7.4). The
+/// `device_list`/`signature` are stored VERBATIM and opaquely (the relay holds no vault
+/// key and never reads them). `counter` is the plaintext anti-rollback watermark (§7.4):
+/// the relay accepts the upload ONLY if `counter` STRICTLY EXCEEDS the stored counter,
+/// enforced under a row lock — no roster content is read to do this. `active_devices`
+/// is plaintext metadata naming the client_ids the new roster lists as active, used to
+/// advance the advisory `devices.status` (pending→active); it is NEVER derived from the
+/// opaque roster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterUploadRequest {
+    pub device_list: Value,
+    pub signature: String,
+    pub counter: i64,
+    pub vault_key_epoch: i64,
+    #[serde(default)]
+    pub active_devices: Vec<Uuid>,
+}
+
+/// `PUT /devices/roster` success: the accepted anti-rollback watermarks, echoed back so
+/// the client can confirm the relay advanced to exactly its `counter`/`vault_key_epoch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterUploadResponse {
+    pub counter: i64,
+    pub vault_key_epoch: i64,
 }
 
 #[cfg(test)]

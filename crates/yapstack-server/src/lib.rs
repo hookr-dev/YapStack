@@ -18,6 +18,7 @@ pub mod auth;
 pub mod choke;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod error;
 pub mod extract;
 pub mod jwt;
@@ -46,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/login/begin", post(auth::login_begin))
         .route("/auth/login/finish", post(auth::login_finish))
         .route("/auth/refresh", post(auth::refresh))
+        .route("/auth/recover", post(auth::recover))
+        // --- device authorization (§7.3/§7.4/§7.5) ---
+        .route("/devices", get(devices::list))
+        .route("/devices/roster", put(devices::put_roster))
         // --- changeset relay (§7) ---
         .route("/sync/push", post(sync::push::push))
         .route("/sync/pull", get(sync::pull::pull))

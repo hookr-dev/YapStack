@@ -22,12 +22,13 @@ use zeroize::Zeroizing;
 // second-hash verifier, decoy salt, two-round login, JWT rotation/reuse — is
 // unchanged; only the DTO's home moved.
 use yapstack_common::auth::{
-    LoginBeginRequest, LoginBeginResponse, LoginFinishRequest, LoginFinishResponse, RefreshRequest,
-    SignupRequest, TokenResponse,
+    LoginBeginRequest, LoginBeginResponse, LoginFinishRequest, LoginFinishResponse, RecoverRequest,
+    RecoverResponse, RefreshRequest, SignupRequest, TokenResponse,
 };
 
 use crate::db;
 use crate::error::AppError;
+use crate::extract::ClientIp;
 use crate::jwt::REFRESH_TTL_SECS;
 use crate::state::AppState;
 
@@ -66,6 +67,10 @@ pub async fn signup(
 ) -> Result<Json<TokenResponse>, AppError> {
     // auth_key is secret key material (§2.3); hold it in memory that zeroizes on drop.
     let auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
+    // recovery_auth_key is likewise a second-hash INPUT (§6.2), not a stored secret;
+    // zeroize it too and discard after computing the recovery verifier below.
+    let recovery_auth_key =
+        Zeroizing::new(b64_decode("recovery_auth_key", &req.recovery_auth_key)?);
     let salt_enc = b64_decode("salt_enc", &req.salt_enc)?;
     // Pin the client salt_enc length: real accounts store exactly 16 bytes, matching the
     // login/begin decoy salt, so a decoy can never be length-distinguished from a real one.
@@ -87,8 +92,16 @@ pub async fn signup(
     let server_salt = gen_salt();
     let verifier = yapstack_crypto::kdf::server_verifier(&auth_key, &server_salt)
         .map_err(|e| AppError::Internal(format!("verifier: {e}")))?;
-    // auth_key is now spent; drop it (Zeroizing wipes the bytes, never persisted §3.2).
+    // The recovery code authenticates the SAME way (§6.2): an independent per-account
+    // salt + second hash of the client-derived recovery auth key. Stored, then discarded
+    // — the relay can verify a presented recovery code but never recover it or the code.
+    let recovery_salt = gen_salt();
+    let recovery_verifier =
+        yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &recovery_salt)
+            .map_err(|e| AppError::Internal(format!("recovery_verifier: {e}")))?;
+    // Both inputs are now spent; drop them (Zeroizing wipes the bytes, never persisted).
     drop(auth_key);
+    drop(recovery_auth_key);
 
     let user_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
@@ -98,8 +111,9 @@ pub async fn signup(
     // Identity bootstrap tables (non-RLS). Unique(lower(email)) enforces one account.
     let inserted = sqlx::query(
         "INSERT INTO users (id, email, verifier, server_salt, salt_enc, \
-         wrapped_vault_key_password, wrapped_vault_key_recovery) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         wrapped_vault_key_password, wrapped_vault_key_recovery, \
+         recovery_salt, recovery_verifier) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT ((lower(email))) DO NOTHING",
     )
     .bind(user_id)
@@ -109,6 +123,8 @@ pub async fn signup(
     .bind(&salt_enc)
     .bind(&wrapped_pw)
     .bind(&wrapped_rec)
+    .bind(recovery_salt.as_slice())
+    .bind(recovery_verifier.as_slice())
     .execute(&mut *tx)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -245,36 +261,151 @@ pub async fn login_finish(
         return Err(AppError::Unauthorized);
     }
 
-    // Fetch the signed roster for bootstrap (§7.5).
-    let roster: Option<(Value,)> = db_fetch_roster(&st, row.workspace_id).await?;
+    // Fetch the signed roster + its signature for bootstrap (§7.5 step 2).
+    let roster: Option<(Value, Vec<u8>)> = db_fetch_roster(&st, row.workspace_id).await?;
 
     let mut tx = st.pool.begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(row.workspace_id.to_string())
         .execute(&mut *tx)
         .await?;
+
+    // Enroll-as-PENDING (§7.5 step 1): a NEW device that presents an Ed25519 pubkey and
+    // is not already in the devices table is inserted PENDING — authenticated to the
+    // account but NOT yet a signed-roster sync peer. No auto-promotion; ON CONFLICT DO
+    // NOTHING never demotes an already-active/pending device. The roster (the crypto
+    // source of truth) is untouched here — promotion happens only via PUT /devices/roster.
+    if let (Some(cid), Some(pub_b64)) = (req.client_id, req.ed25519_pub.as_deref()) {
+        let ed_pub = b64_decode("ed25519_pub", pub_b64)?;
+        if ed_pub.len() != 32 {
+            return Err(AppError::BadRequest(
+                "ed25519_pub: expected 32 bytes".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, status) \
+             VALUES ($1, $2, $3, $4, $5, 'pending') \
+             ON CONFLICT (client_id) DO NOTHING",
+        )
+        .bind(cid)
+        .bind(row.workspace_id)
+        .bind(row.id)
+        .bind(&ed_pub)
+        .bind(req.label.clone().unwrap_or_default())
+        .execute(&mut *tx)
+        .await?;
+    }
+
     let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, req.client_id).await?;
     tx.commit().await?;
 
+    let (device_list, signature) = match roster {
+        Some((v, sig)) => (Some(v), Some(B64.encode(sig))),
+        None => (None, None),
+    };
     Ok(Json(LoginFinishResponse {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         tenant_id: row.workspace_id,
         salt_enc: B64.encode(&row.salt_enc),
         wrapped_vault_key_password: B64.encode(&row.wrapped_vault_key_password),
-        device_list: roster.map(|(v,)| v),
+        device_list,
+        signature,
     }))
 }
 
-async fn db_fetch_roster(st: &AppState, workspace_id: Uuid) -> Result<Option<(Value,)>, AppError> {
+async fn db_fetch_roster(
+    st: &AppState,
+    workspace_id: Uuid,
+) -> Result<Option<(Value, Vec<u8>)>, AppError> {
     let mut tx = db::begin_tenant_tx(&st.pool, workspace_id).await?;
-    let roster: Option<(Value,)> =
-        sqlx::query_as("SELECT device_list FROM device_roster WHERE workspace_id = $1")
+    let roster: Option<(Value, Vec<u8>)> =
+        sqlx::query_as("SELECT device_list, signature FROM device_roster WHERE workspace_id = $1")
             .bind(workspace_id)
             .fetch_optional(&mut *tx)
             .await?;
     tx.commit().await?;
     Ok(roster)
+}
+
+// --------------------------------------------------------------------- recover
+
+#[derive(sqlx::FromRow)]
+struct RecoverRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    recovery_salt: Option<Vec<u8>>,
+    recovery_verifier: Option<Vec<u8>>,
+    salt_enc: Vec<u8>,
+    wrapped_vault_key_recovery: Vec<u8>,
+}
+
+/// `POST /auth/recover` — authenticate with the recovery code (§6.2) and serve
+/// `wrapped_vault_key_recovery` (the blob the relay stores at signup but NEVER serves on
+/// the login path). Recovery auth is the SAME second-hash/constant-time check as the
+/// password verifier (§3.1): no recovery/account-existence oracle. Per-IP rate limited.
+pub async fn recover(
+    State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, AppError> {
+    // Defense-in-depth throttle on recovery attempts (recovery codes are 160-bit and not
+    // brute-forceable, but rate-limit anyway). A stable per-IP bucket (nil workspace).
+    if !st.ratelimit.check(Uuid::nil(), &ip) {
+        return Err(AppError::RateLimited);
+    }
+
+    let recovery_auth_key =
+        Zeroizing::new(b64_decode("recovery_auth_key", &req.recovery_auth_key)?);
+
+    let row: Option<RecoverRow> = sqlx::query_as(
+        "SELECT u.id, m.workspace_id, u.recovery_salt, u.recovery_verifier, u.salt_enc, \
+         u.wrapped_vault_key_recovery \
+         FROM users u JOIN workspace_members m ON m.user_id = u.id \
+         WHERE lower(u.email) = lower($1)",
+    )
+    .bind(&req.email)
+    .fetch_optional(&st.pool)
+    .await?;
+
+    // Uniform failure for unknown user AND bad recovery code (no oracle), computing a
+    // dummy hash on every reject path to flatten timing.
+    let Some(row) = row else {
+        let _ = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &gen_salt());
+        return Err(AppError::Unauthorized);
+    };
+    let (Some(rec_salt), Some(rec_verifier)) = (row.recovery_salt, row.recovery_verifier) else {
+        let _ = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &gen_salt());
+        return Err(AppError::Unauthorized);
+    };
+
+    let computed = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &rec_salt)
+        .map_err(|e| AppError::Internal(format!("recovery_verifier: {e}")))?;
+    if !ct_eq(&computed, &rec_verifier) {
+        return Err(AppError::Unauthorized);
+    }
+
+    // Authenticated. Serve the recovery-wrapped vault key + roster for the client to
+    // unwrap locally and re-establish. The relay never unwraps it (no vault key).
+    let roster: Option<(Value, Vec<u8>)> = db_fetch_roster(&st, row.workspace_id).await?;
+
+    let mut tx = db::begin_tenant_tx(&st.pool, row.workspace_id).await?;
+    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, None).await?;
+    tx.commit().await?;
+
+    let (device_list, signature) = match roster {
+        Some((v, sig)) => (Some(v), Some(B64.encode(sig))),
+        None => (None, None),
+    };
+    Ok(Json(RecoverResponse {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        tenant_id: row.workspace_id,
+        salt_enc: B64.encode(&row.salt_enc),
+        wrapped_vault_key_recovery: B64.encode(&row.wrapped_vault_key_recovery),
+        device_list,
+        signature,
+    }))
 }
 
 // --------------------------------------------------------------------- refresh

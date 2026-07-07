@@ -29,6 +29,13 @@ fn client_auth_key(password: &str, salt_enc: &[u8]) -> String {
     B64.encode(auth)
 }
 
+/// A stand-in for the client-side recovery auth key derived from the 160-bit recovery
+/// code (§6). The server only ever second-hashes it; the exact derivation is the
+/// client's (T010e). Here we just use the recovery bytes as the second-hash input.
+fn client_recovery_auth_key(recovery_bytes: &[u8; 20]) -> String {
+    B64.encode(recovery_bytes)
+}
+
 async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -45,17 +52,28 @@ async fn setup() -> AppState {
     AppState::new(pool, cfg)
 }
 
+const RECOVERY_BYTES: [u8; 20] = [0x5au8; 20];
+
 fn signup_body(email: &str, salt_enc: &[u8], auth_key_b64: &str) -> Value {
+    signup_body_with_client(email, salt_enc, auth_key_b64, uuid::Uuid::new_v4())
+}
+
+fn signup_body_with_client(
+    email: &str,
+    salt_enc: &[u8],
+    auth_key_b64: &str,
+    client_id: uuid::Uuid,
+) -> Value {
     // Placeholder committing-envelope blobs (the server stores them opaquely).
     let wrapped = B64.encode([0x01u8; 73]);
     let vault_key = [0x33u8; 32];
-    let client_id = uuid::Uuid::new_v4();
     let sk = yapstack_crypto::sign::roster_signing_key(&vault_key);
     let roster = json!({ "version": 1, "counter": 0, "vault_key_epoch": 0 });
     let sig = yapstack_crypto::sign::sign_roster(&vault_key, roster.to_string().as_bytes());
     json!({
         "email": email,
         "auth_key": auth_key_b64,
+        "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
         "salt_enc": B64.encode(salt_enc),
         "wrapped_vault_key_password": wrapped,
         "wrapped_vault_key_recovery": wrapped,
@@ -69,6 +87,46 @@ fn signup_body(email: &str, salt_enc: &[u8], auth_key_b64: &str) -> Value {
             "label": "test-device"
         }
     })
+}
+
+fn signed_roster(vault_key: &[u8; 32], counter: i64, epoch: i64) -> (Value, String) {
+    let roster = json!({ "version": 1, "counter": counter, "vault_key_epoch": epoch });
+    let sig = yapstack_crypto::sign::sign_roster(vault_key, roster.to_string().as_bytes());
+    (roster, B64.encode(sig))
+}
+
+async fn put_auth(
+    app: &axum::Router,
+    path: &str,
+    access: &str,
+    body: Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn get_auth(app: &axum::Router, path: &str, access: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 async fn post(app: &axum::Router, path: &str, body: Value) -> axum::response::Response {
@@ -217,4 +275,289 @@ async fn login_with_wrong_password_is_unauthorized() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// --------------------------------------------------------------- T010d: recover
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn recover_round_trip_serves_recovery_wrap() {
+    // The recovery-wrapped vault key is stored at signup but NEVER served on the login
+    // path; only /auth/recover, after a valid recovery-code second-hash check, serves it.
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // login/finish never carries the recovery wrap.
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({ "email": email, "auth_key": auth_key }),
+    )
+    .await;
+    let login = body_json(resp).await;
+    assert!(login.get("wrapped_vault_key_recovery").is_none());
+
+    // Correct recovery code -> serves the recovery wrap.
+    let good_rec = client_recovery_auth_key(&RECOVERY_BYTES);
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({ "email": email, "recovery_auth_key": good_rec }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recovered = body_json(resp).await;
+    assert!(
+        recovered["wrapped_vault_key_recovery"].as_str().is_some(),
+        "recover must serve the recovery-wrapped vault key"
+    );
+
+    // Wrong recovery code -> uniform unauthorized (no oracle).
+    let bad_rec = client_recovery_auth_key(&[0x00u8; 20]);
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({ "email": email, "recovery_auth_key": bad_rec }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Unknown email -> same uniform unauthorized.
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({ "email": "nobody@example.com", "recovery_auth_key": good_rec }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ------------------------------------------------- T010d: pending enroll + roster
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn unknown_device_enrolls_pending_then_roster_promotes() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A NEW device logs in presenting its own client_id + Ed25519 pubkey -> enrolled
+    // PENDING (not auto-promoted). It also receives the roster signature (§7.5 step 2).
+    let new_client = uuid::Uuid::new_v4();
+    let new_pub = B64.encode([0x07u8; 32]);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email,
+            "auth_key": auth_key,
+            "client_id": new_client,
+            "ed25519_pub": new_pub,
+            "label": "new-laptop"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let login = body_json(resp).await;
+    let access = login["access_token"].as_str().unwrap().to_string();
+    assert!(
+        login["signature"].as_str().is_some(),
+        "login must return the roster signature for §7.5 verification"
+    );
+
+    // GET /devices shows the new device as PENDING, the first as ACTIVE.
+    let resp = get_auth(&app, "/devices", &access).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let devices = body_json(resp).await;
+    let list = devices["devices"].as_array().unwrap();
+    let new_dev = list
+        .iter()
+        .find(|d| d["client_id"] == json!(new_client.to_string()))
+        .expect("new device present");
+    assert_eq!(new_dev["status"], json!("pending"));
+    let first_dev = list
+        .iter()
+        .find(|d| d["client_id"] == json!(first_client.to_string()))
+        .expect("first device present");
+    assert_eq!(first_dev["status"], json!("active"));
+
+    // The approving device uploads a re-signed roster (counter 0 -> 1) naming the new
+    // device active -> promotion pending->active.
+    let vault_key = [0x33u8; 32];
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster,
+            "signature": sig,
+            "counter": 1,
+            "vault_key_epoch": 0,
+            "active_devices": [first_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = get_auth(&app, "/devices", &access).await;
+    let devices = body_json(resp).await;
+    let new_dev = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(new_client.to_string()))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        new_dev["status"],
+        json!("active"),
+        "roster promoted the device"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn roster_counter_anti_rollback_rejects_stale_or_equal() {
+    // §7.4 / C2: the relay accepts a roster ONLY if its counter STRICTLY exceeds the
+    // stored one — a replayed old/equal counter (re-admitting an evicted device) is
+    // rejected, WITHOUT the relay reading roster content.
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let vault_key = [0x33u8; 32];
+
+    // Advance to counter 1 (stored is 0 from signup).
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0, "active_devices": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Equal counter -> rejected.
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0, "active_devices": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Stale (lower) counter -> rejected.
+    let (roster, sig) = signed_roster(&vault_key, 0, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": sig, "counter": 0, "vault_key_epoch": 0, "active_devices": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Lower vault_key_epoch -> rejected even with a higher counter.
+    let (roster, sig) = signed_roster(&vault_key, 5, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": sig, "counter": 5, "vault_key_epoch": -1, "active_devices": [] }),
+    )
+    .await;
+    // vault_key_epoch is i64; a negative is < stored 0 -> rejected.
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // A malformed (short) signature is rejected as a bad request (presence check).
+    let (roster, _sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": B64.encode([0u8; 10]), "counter": 2, "vault_key_epoch": 0, "active_devices": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn concurrent_roster_uploads_are_compare_and_set_safe() {
+    // Two concurrent uploads with the same next counter: exactly one wins (FOR UPDATE
+    // serializes; the loser re-reads the advanced counter and is rejected).
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let vault_key = [0x33u8; 32];
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let body = json!({ "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0, "active_devices": [] });
+
+    let (r_a, r_b) = tokio::join!(
+        put_auth(&app, "/devices/roster", &access, body.clone()),
+        put_auth(&app, "/devices/roster", &access, body.clone()),
+    );
+    let (sa, sb) = (r_a.status(), r_b.status());
+    let oks = [sa, sb].iter().filter(|s| **s == StatusCode::OK).count();
+    let conflicts = [sa, sb]
+        .iter()
+        .filter(|s| **s == StatusCode::CONFLICT)
+        .count();
+    assert_eq!(oks, 1, "exactly one concurrent roster upload may win");
+    assert_eq!(conflicts, 1, "the second must be rejected by anti-rollback");
 }
