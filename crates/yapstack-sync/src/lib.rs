@@ -59,6 +59,17 @@ pub enum SyncError {
     CrrUnavailable(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// The relay rejected the access token (HTTP 401). Distinct from a generic
+    /// [`SyncError::Http`] so the drain can refresh-and-retry ONCE instead of
+    /// hot-looping on a dead token (Bug A). Carries no token material.
+    #[error("relay rejected the access token (401 unauthorized)")]
+    Unauthorized,
+    /// A single unacked outbox entry is larger than the per-request wire budget and
+    /// can never be pushed as-is (Bug B). Distinct from a transient network error so
+    /// the drain surfaces it ONCE instead of retrying a guaranteed 413 every cycle.
+    /// `size` is the base64 wire size (what the relay body limit measures).
+    #[error("outbox entry client_seq={client_seq} is {size} base64 bytes on the wire, exceeding the per-request push budget")]
+    Oversized { client_seq: i64, size: usize },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 }

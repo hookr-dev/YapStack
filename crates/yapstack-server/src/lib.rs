@@ -30,11 +30,23 @@ pub mod state;
 pub mod storage;
 pub mod sync;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::Router;
+use yapstack_common::sync::MAX_PUSH_BYTES;
 
 pub use config::Config;
 pub use state::AppState;
+
+/// Request-body limit for `POST /sync/push`. axum's default body limit is 2 MiB, which
+/// a legal maximal push (up to [`MAX_PUSH_BYTES`] = 5 MiB of RAW ciphertext) blows
+/// through as `413 Payload Too Large` LONG before the application-level 5 MiB check in
+/// `sync::push` is even reached — the live "413 forever" symptom. The body is base64
+/// (≈ 4/3 expansion of the raw ciphertext) plus a JSON envelope, so the limit is sized
+/// to base64(MAX_PUSH_BYTES) + 1 MiB of envelope headroom. That makes the raw-byte
+/// check in the handler the ACTUAL gate while still bounding memory. The client keeps
+/// `PUSH_WIRE_BUDGET` (1.5 MB) conservative, well under this.
+const PUSH_BODY_LIMIT: usize = (MAX_PUSH_BYTES / 3) * 4 + 1024 * 1024;
 
 /// Assemble the full router. Kept separate from `main` so integration tests can mount
 /// it against a test pool. The admin routes are mounted ONLY when a valid
@@ -53,7 +65,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/devices", get(devices::list))
         .route("/devices/roster", put(devices::put_roster))
         // --- changeset relay (§7) ---
-        .route("/sync/push", post(sync::push::push))
+        // The push route raises the default 2 MiB body limit to admit a maximal legal
+        // batch (base64 of MAX_PUSH_BYTES + envelope) so the handler's own byte cap is
+        // the real gate, not the transport limit. Applied per-route so the small-body
+        // endpoints (auth, presign) keep the tight default.
+        .route(
+            "/sync/push",
+            post(sync::push::push).layer(DefaultBodyLimit::max(PUSH_BODY_LIMIT)),
+        )
         .route("/sync/pull", get(sync::pull::pull))
         .route("/sync/completeness", get(sync::completeness::completeness))
         .route("/sync/stream", get(sync::stream::stream))

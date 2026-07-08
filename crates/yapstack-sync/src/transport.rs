@@ -9,9 +9,10 @@
 //! by the desktop runtime (wired in T010b).
 
 use async_trait::async_trait;
+use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use yapstack_common::sync::{
     ClientTail, CompletenessResponse, PullResponse, PulledChange, PushAck, PushRequest,
@@ -65,13 +66,39 @@ struct SnapshotHeadResponse {
     download_url: Option<String>,
 }
 
+/// Classify an HTTP status the drain must react to differently. A 401 becomes
+/// [`SyncError::Unauthorized`] (the drain refreshes the token and retries once,
+/// Bug A) instead of collapsing into a generic error via `error_for_status`.
+/// Returns `Ok(resp)` for any non-401 outcome (2xx passes through; other non-2xx
+/// is left for the caller's `error_for_status`). Kept a pure function of the
+/// status so it is unit-testable without a live server.
+fn classify_status(status: StatusCode) -> Option<SyncError> {
+    if status == StatusCode::UNAUTHORIZED {
+        Some(SyncError::Unauthorized)
+    } else {
+        None
+    }
+}
+
+/// Map a relay response to a distinct-401 result before decoding: a 401 is the
+/// refreshable auth-expiry path, everything else keeps the existing
+/// `error_for_status` behaviour.
+fn check_auth(resp: Response) -> Result<Response, SyncError> {
+    if let Some(e) = classify_status(resp.status()) {
+        return Err(e);
+    }
+    Ok(resp.error_for_status()?)
+}
+
 // --------------------------------------------------------------- HTTP transport
 
 /// Real relay client. `base_url` is the server root (e.g. `https://sync.example`);
-/// `bearer` is the access token from the auth flow (CRYPTO_SPEC §3).
+/// the bearer is the access token from the auth flow (CRYPTO_SPEC §3). The bearer
+/// is held behind a `RwLock` so the drain can swap in a rotated access token after
+/// a refresh WITHOUT tearing down the transport (Bug A). The token is never logged.
 pub struct HttpTransport {
     base_url: String,
-    bearer: String,
+    bearer: RwLock<String>,
     client: reqwest::Client,
 }
 
@@ -79,46 +106,61 @@ impl HttpTransport {
     pub fn new(base_url: impl Into<String>, bearer: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            bearer: bearer.into(),
+            bearer: RwLock::new(bearer.into()),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Current access token, cloned for one request. Never logged.
+    fn bearer(&self) -> String {
+        self.bearer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace the access token after a successful refresh (Bug A). Interior
+    /// mutability so the shared `&HttpTransport` the drain holds can be updated
+    /// between cycles. Never logs the token.
+    pub fn set_bearer(&self, bearer: &str) {
+        *self.bearer.write().unwrap_or_else(|e| e.into_inner()) = bearer.to_string();
     }
 }
 
 #[async_trait]
 impl SyncTransport for HttpTransport {
     async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError> {
-        let r = self
-            .client
-            .post(format!("{}/sync/push", self.base_url))
-            .bearer_auth(&self.bearer)
-            .json(&req)
-            .send()
-            .await?
-            .error_for_status()?;
+        let r = check_auth(
+            self.client
+                .post(format!("{}/sync/push", self.base_url))
+                .bearer_auth(self.bearer())
+                .json(&req)
+                .send()
+                .await?,
+        )?;
         Ok(r.json().await?)
     }
 
     async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
-        let r = self
-            .client
-            .get(format!("{}/sync/pull", self.base_url))
-            .bearer_auth(&self.bearer)
-            .query(&[("since", since), ("limit", limit)])
-            .send()
-            .await?
-            .error_for_status()?;
+        let r = check_auth(
+            self.client
+                .get(format!("{}/sync/pull", self.base_url))
+                .bearer_auth(self.bearer())
+                .query(&[("since", since), ("limit", limit)])
+                .send()
+                .await?,
+        )?;
         Ok(r.json().await?)
     }
 
     async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
-        let r = self
-            .client
-            .get(format!("{}/sync/completeness", self.base_url))
-            .bearer_auth(&self.bearer)
-            .send()
-            .await?
-            .error_for_status()?;
+        let r = check_auth(
+            self.client
+                .get(format!("{}/sync/completeness", self.base_url))
+                .bearer_auth(self.bearer())
+                .send()
+                .await?,
+        )?;
         Ok(r.json().await?)
     }
 
@@ -126,21 +168,21 @@ impl SyncTransport for HttpTransport {
         // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
         // and byte-free — the bytes go directly to object storage).
         let sha = crate::snapshot::ciphertext_sha256_hex(ciphertext);
-        let presign: SnapshotPresignResponse = self
-            .client
-            .post(format!("{}/snapshot/presign", self.base_url))
-            .bearer_auth(&self.bearer)
-            .json(&SnapshotPresignRequest {
-                sha256: sha,
-                size: ciphertext.len() as u64,
-                generation: meta.generation,
-                baseline_seq: meta.baseline_seq,
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let presign: SnapshotPresignResponse = check_auth(
+            self.client
+                .post(format!("{}/snapshot/presign", self.base_url))
+                .bearer_auth(self.bearer())
+                .json(&SnapshotPresignRequest {
+                    sha256: sha,
+                    size: ciphertext.len() as u64,
+                    generation: meta.generation,
+                    baseline_seq: meta.baseline_seq,
+                })
+                .send()
+                .await?,
+        )?
+        .json()
+        .await?;
         if presign.already_exists {
             return Ok(());
         }
@@ -159,15 +201,15 @@ impl SyncTransport for HttpTransport {
     }
 
     async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-        let head: SnapshotHeadResponse = self
-            .client
-            .get(format!("{}/snapshot", self.base_url))
-            .bearer_auth(&self.bearer)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let head: SnapshotHeadResponse = check_auth(
+            self.client
+                .get(format!("{}/snapshot", self.base_url))
+                .bearer_auth(self.bearer())
+                .send()
+                .await?,
+        )?
+        .json()
+        .await?;
         if !head.present {
             return Ok(None);
         }
@@ -322,5 +364,80 @@ impl SyncTransport for MockRelay {
     async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
         let g = self.inner.lock().unwrap();
         Ok(g.snapshot.clone())
+    }
+}
+
+// --------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn classify_status_isolates_401() {
+        // The pure classifier is the load-bearing distinction (Bug A): only 401 is the
+        // refreshable auth-expiry path; every other status falls through to the caller's
+        // `error_for_status`.
+        assert!(matches!(
+            classify_status(StatusCode::UNAUTHORIZED),
+            Some(SyncError::Unauthorized)
+        ));
+        assert!(classify_status(StatusCode::OK).is_none());
+        assert!(classify_status(StatusCode::INTERNAL_SERVER_ERROR).is_none());
+        assert!(classify_status(StatusCode::PAYLOAD_TOO_LARGE).is_none());
+        assert!(classify_status(StatusCode::FORBIDDEN).is_none());
+    }
+
+    /// End-to-end proof over a real socket that `push` maps a 401 to
+    /// `SyncError::Unauthorized` while a 500 stays a generic (non-Unauthorized) error —
+    /// the property the drain relies on to refresh-and-retry vs. warn-and-continue. A
+    /// tiny raw HTTP responder (no extra deps) serves the two canned statuses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_distinguishes_401_from_other_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for status_line in ["401 Unauthorized", "500 Internal Server Error"] {
+                let (mut sock, _) = listener.accept().unwrap();
+                // Drain the request until end-of-headers so the client's write completes
+                // before we reply+close (the body here is a tiny empty PushRequest).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        let e401 = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            matches!(e401, SyncError::Unauthorized),
+            "401 must map to Unauthorized, got {e401:?}"
+        );
+        let e500 = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            !matches!(e500, SyncError::Unauthorized),
+            "500 must NOT map to Unauthorized, got {e500:?}"
+        );
+
+        // set_bearer swaps the token used on the next request without rebuilding.
+        t.set_bearer("rotated-token");
+        assert_eq!(t.bearer(), "rotated-token");
+
+        server.join().unwrap();
     }
 }

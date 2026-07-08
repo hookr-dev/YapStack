@@ -93,6 +93,52 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Split `rows` into bounded chunks (each ≤ [`CHUNK_ROWS`] rows AND ≤
+/// [`CHUNK_PLAINTEXT_BUDGET`] serialized bytes) and insert each as its own encrypted
+/// outbox entry, in row order, returning the assigned `client_seq`s. This is the ONE
+/// capture-time chunking policy, shared by [`enqueue_local`] (fresh local writes) and
+/// [`repair_oversized_entries`] (re-chunking a pre-chunking-fix poison entry) so both
+/// paths produce byte-identical chunk boundaries. The caller supplies the transaction.
+fn chunk_and_insert(
+    tx: &Connection,
+    cipher: &ChangesetCipher,
+    client_id: uuid::Uuid,
+    schema_version: i32,
+    engine_version: i32,
+    rows: Vec<ChangeRow>,
+) -> Result<Vec<i64>, SyncError> {
+    let mut assigned = Vec::new();
+    let mut buf: Vec<ChangeRow> = Vec::new();
+    let mut acc = 4usize; // Changeset::encode row-count header
+    for row in rows {
+        let sz = row_encoded_size(&row);
+        if !buf.is_empty() && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
+            assigned.push(insert_chunk(
+                tx,
+                cipher,
+                client_id,
+                schema_version,
+                engine_version,
+                std::mem::take(&mut buf),
+            )?);
+            acc = 4;
+        }
+        acc += sz;
+        buf.push(row);
+    }
+    if !buf.is_empty() {
+        assigned.push(insert_chunk(
+            tx,
+            cipher,
+            client_id,
+            schema_version,
+            engine_version,
+            buf,
+        )?);
+    }
+    Ok(assigned)
+}
+
 /// Encrypt one chunk of rows into a fresh outbox entry under the next `client_seq`.
 fn insert_chunk(
     tx: &Connection,
@@ -141,38 +187,124 @@ pub fn enqueue_local(
     let max_dbv = cs.rows.iter().map(|r| r.db_version).max().unwrap_or(wm);
 
     let tx = conn.unchecked_transaction()?;
-    let mut assigned = Vec::new();
-    let mut buf: Vec<ChangeRow> = Vec::new();
-    let mut acc = 4usize; // Changeset::encode row-count header
-    for row in cs.rows {
-        let sz = row_encoded_size(&row);
-        if !buf.is_empty() && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
-            assigned.push(insert_chunk(
-                &tx,
-                cipher,
-                client_id,
-                schema_version,
-                engine_version,
-                std::mem::take(&mut buf),
-            )?);
-            acc = 4;
-        }
-        acc += sz;
-        buf.push(row);
-    }
-    if !buf.is_empty() {
-        assigned.push(insert_chunk(
-            &tx,
-            cipher,
-            client_id,
-            schema_version,
-            engine_version,
-            buf,
-        )?);
-    }
+    let assigned = chunk_and_insert(
+        &tx,
+        cipher,
+        client_id,
+        schema_version,
+        engine_version,
+        cs.rows,
+    )?;
     state::set_push_watermark(&tx, max_dbv)?;
     tx.commit()?;
     Ok(assigned)
+}
+
+/// Outcome of a [`repair_oversized_entries`] pass (diagnostics / the drain's one-shot
+/// surfacing).
+#[derive(Debug, Default, Clone)]
+pub struct RepairReport {
+    /// Oversized entries successfully re-chunked into multiple in-budget entries.
+    pub repaired: usize,
+    /// Total in-budget entries produced by re-chunking.
+    pub new_entries: usize,
+    /// `client_seq`s of oversized entries that could NOT be repaired (decrypt/decode
+    /// failed). These are LEFT in place (never dropped — no silent data loss); the push
+    /// guard then refuses to send them so they cannot re-trigger the 413 loop.
+    pub failed: Vec<i64>,
+}
+
+impl RepairReport {
+    /// True when the pass changed nothing (the common steady-state case).
+    pub fn is_noop(&self) -> bool {
+        self.repaired == 0 && self.failed.is_empty()
+    }
+}
+
+/// Repair pass (Bug B), run ONCE when the runtime opens the outbox, BEFORE any push:
+/// every UNACKED entry whose base64 wire size exceeds [`PUSH_WIRE_BUDGET`] predates the
+/// capture-time chunking fix (T021) and can never be pushed as a single request. For
+/// each such entry we decrypt it with the runtime's key material, decode the changes
+/// batch, re-chunk it through the SAME [`chunk_and_insert`] policy, re-encrypt each
+/// chunk (fresh `client_seq`s — these were never acked, so the server has never seen the
+/// old seq and re-numbering is safe), and ATOMICALLY replace the one oversized row with
+/// the chunked rows (single transaction per entry, so a crash mid-repair never loses
+/// data or half-splits). Row order is preserved: the chunks decrypt+concat back to the
+/// original row sequence.
+///
+/// If an oversized entry fails to decrypt/decode it is LEFT in place and recorded in
+/// [`RepairReport::failed`] — never dropped silently (§11.3). The push guard in
+/// [`push_outbox`] then refuses to send it, so it cannot wedge the drain on a 413.
+pub fn repair_oversized_entries(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    client_id: uuid::Uuid,
+    schema_version: i32,
+    engine_version: i32,
+) -> Result<RepairReport, SyncError> {
+    ensure_meta_table_and_outbox(conn)?;
+    let mut report = RepairReport::default();
+
+    // Plan from cheap (seq, length) metadata; only touch entries actually over budget.
+    let metas: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT client_seq, length(ciphertext) FROM _yapstack_outbox \
+             WHERE acked=0 ORDER BY client_seq",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let oversized: Vec<i64> = metas
+        .into_iter()
+        .filter(|(_, len)| b64_len((*len).max(0) as usize) > PUSH_WIRE_BUDGET)
+        .map(|(seq, _)| seq)
+        .collect();
+
+    for seq in oversized {
+        let blob: Vec<u8> = conn.query_row(
+            "SELECT ciphertext FROM _yapstack_outbox WHERE client_seq=?1",
+            [seq],
+            |r| r.get(0),
+        )?;
+
+        // Decrypt+decode. Decryption AAD binds the CURRENT (schema, engine) — the same
+        // `cipher` config used everywhere on this device — so any entry that decrypts was
+        // authored under it, and re-chunking under `schema_version`/`engine_version`
+        // stays consistent. A failure here is SURFACED (recorded), never a silent drop:
+        // the entry is left untouched and the push guard keeps it off the wire.
+        let rows = match cipher
+            .decrypt(client_id, seq, &blob)
+            .and_then(|pt| Changeset::decode(&pt))
+        {
+            Ok(cs) => cs.rows,
+            Err(_) => {
+                report.failed.push(seq);
+                continue;
+            }
+        };
+
+        // Atomically swap the one oversized row for its in-budget chunks (single tx, so a
+        // crash mid-repair never half-splits or loses data).
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM _yapstack_outbox WHERE client_seq=?1", [seq])?;
+        let new_seqs =
+            chunk_and_insert(&tx, cipher, client_id, schema_version, engine_version, rows)?;
+        tx.commit()?;
+
+        report.repaired += 1;
+        report.new_entries += new_seqs.len();
+    }
+
+    Ok(report)
+}
+
+/// Ensure both the meta table (holds the `client_seq` counter used when re-chunking)
+/// and the outbox table exist before a repair pass.
+fn ensure_meta_table_and_outbox(conn: &Connection) -> Result<(), SyncError> {
+    state::ensure_meta_table(conn)?;
+    ensure_outbox_table(conn)
 }
 
 /// Push unacked outbox entries in as many back-to-back batches as it takes to drain them
@@ -210,14 +342,32 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
             break;
         }
 
+        // Push GUARD (Bug B): the smallest-seq unacked entry is the one that MUST go
+        // first (order + idempotency). If IT ALONE exceeds the wire budget (or the raw
+        // byte cap) it can never be pushed as a single request — sending it is a
+        // guaranteed 413. That only happens for a pre-chunking-fix poison entry that the
+        // repair pass could not re-chunk (e.g. decrypt failed). Refuse to make the HTTP
+        // call and return a DISTINCT error so the drain surfaces it once instead of
+        // hot-looping every 5s. (Capture + repair keep every other entry in budget.)
+        let (first_seq, first_len) = metas[0];
+        let first_raw = first_len.max(0) as usize;
+        let first_wire = b64_len(first_raw);
+        if first_wire > PUSH_WIRE_BUDGET || first_raw > MAX_PUSH_BYTES {
+            return Err(SyncError::Oversized {
+                client_seq: first_seq,
+                size: first_wire,
+            });
+        }
+
         let mut batch_seqs: Vec<i64> = Vec::new();
         let mut wire = 0usize;
         let mut raw = 0usize;
         for (seq, len) in &metas {
             let raw_len = (*len).max(0) as usize;
             let b64 = b64_len(raw_len);
-            // The first entry always goes (even if it alone exceeds a soft budget) so a
-            // single large entry can never wedge the outbox — capture keeps entries small.
+            // The first (guard-checked, in-budget) entry always goes; subsequent entries
+            // are added only while the batch stays under BOTH the wire budget and the raw
+            // byte cap.
             if !batch_seqs.is_empty()
                 && (batch_seqs.len() >= MAX_PUSH_CHANGES
                     || wire + b64 > PUSH_WIRE_BUDGET
@@ -452,6 +602,158 @@ mod tests {
         let reqs = t.requests.lock().unwrap();
         assert_eq!(reqs.len(), 3);
         assert_eq!((reqs[0].0, reqs[1].0, reqs[2].0), (1000, 1000, 500));
+    }
+
+    /// Build a synthetic changes batch whose serialized size spans several capture
+    /// chunks, with distinguishable per-row content so ordering can be asserted.
+    fn big_changeset(n_rows: usize, blob_len: usize) -> Changeset {
+        let rows = (0..n_rows)
+            .map(|i| ChangeRow {
+                table: "notes".into(),
+                pk: (i as u32).to_be_bytes().to_vec(),
+                cid: "body".into(),
+                val: Value::Blob(vec![(i % 251) as u8; blob_len]),
+                col_version: i as i64,
+                db_version: i as i64,
+                site_id: Some(vec![7u8; 16]),
+                cl: 1,
+                seq: i as i64,
+            })
+            .collect();
+        Changeset { rows }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repair_rechunks_oversized_entry_and_push_then_sends_it() {
+        // Reproduces the live poison-entry (Bug B): one pre-chunking-fix unacked entry
+        // that alone blows the wire budget. Repair must split it into in-budget entries
+        // that round-trip to the original rows in order, and push_outbox must then send
+        // them all without ever exceeding a limit.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_outbox_table(&conn).unwrap();
+        state::ensure_meta_table(&conn).unwrap();
+        let cipher = ChangesetCipher::new([9u8; 32], 0, Uuid::from_u128(1), 1, 16003);
+        let client_id = Uuid::from_u128(1);
+
+        // ~2.4 MiB plaintext → over budget as ONE entry, several chunks after repair.
+        let original = big_changeset(300, 8 * 1024);
+        let seq1 = state::next_client_seq(&conn).unwrap();
+        assert_eq!(seq1, 1);
+        let blob = cipher.encrypt(client_id, seq1, &original.encode()).unwrap();
+        conn.execute(
+            "INSERT INTO _yapstack_outbox \
+             (client_seq, ciphertext, schema_version, engine_version, acked) \
+             VALUES (?1,?2,1,16003,0)",
+            rusqlite::params![seq1, blob],
+        )
+        .unwrap();
+
+        let raw_len: i64 = conn
+            .query_row(
+                "SELECT length(ciphertext) FROM _yapstack_outbox WHERE client_seq=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            b64_len(raw_len as usize) > PUSH_WIRE_BUDGET,
+            "precondition: the single entry must exceed the wire budget"
+        );
+
+        let report = repair_oversized_entries(&conn, &cipher, client_id, 1, 16003).unwrap();
+        assert_eq!(report.repaired, 1);
+        assert!(report.new_entries > 1, "must split into multiple entries");
+        assert!(report.failed.is_empty());
+
+        let entries: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT client_seq, ciphertext FROM _yapstack_outbox \
+                     WHERE acked=0 ORDER BY client_seq",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(entries.len(), report.new_entries);
+        for (_seq, ct) in &entries {
+            assert!(
+                b64_len(ct.len()) <= PUSH_WIRE_BUDGET,
+                "every repaired entry must fit the wire budget"
+            );
+        }
+
+        // Contents + ordering: decrypt+decode each in client_seq order, concat → original.
+        let mut recovered = Vec::new();
+        for (seq, ct) in &entries {
+            let pt = cipher.decrypt(client_id, *seq, ct).unwrap();
+            recovered.extend(Changeset::decode(&pt).unwrap().rows);
+        }
+        assert_eq!(recovered, original.rows, "rows must round-trip in order");
+
+        // push_outbox now drains them all (LimitAssertingTransport asserts every limit).
+        let t = LimitAssertingTransport::default();
+        let acked = push_outbox(&conn, client_id, &t).await.unwrap();
+        assert_eq!(acked, entries.len());
+        let unacked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM _yapstack_outbox WHERE acked=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unacked, 0, "outbox fully drained after repair");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_guard_refuses_oversized_entry_without_http_call() {
+        // With repair skipped, an oversized first entry must yield SyncError::Oversized
+        // and NEVER reach the transport (no guaranteed-413 HTTP call).
+        struct NeverPush;
+        #[async_trait]
+        impl SyncTransport for NeverPush {
+            async fn push(&self, _r: PushRequest) -> Result<PushResponse, SyncError> {
+                panic!("push_outbox must NOT call the transport for an oversized entry");
+            }
+            async fn pull(&self, _s: i64, _l: i64) -> Result<PullResponse, SyncError> {
+                Ok(PullResponse::default())
+            }
+            async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+                Ok(CompletenessResponse::default())
+            }
+            async fn put_snapshot(&self, _m: SnapshotMeta, _c: &[u8]) -> Result<(), SyncError> {
+                Ok(())
+            }
+            async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+                Ok(None)
+            }
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_outbox_table(&conn).unwrap();
+        // Opaque bytes whose base64 wire size exceeds the budget (guard checks size only).
+        let blob = vec![0u8; PUSH_WIRE_BUDGET];
+        assert!(b64_len(blob.len()) > PUSH_WIRE_BUDGET);
+        conn.execute(
+            "INSERT INTO _yapstack_outbox \
+             (client_seq, ciphertext, schema_version, engine_version, acked) \
+             VALUES (1,?1,1,16003,0)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+
+        let err = push_outbox(&conn, Uuid::from_u128(1), &NeverPush)
+            .await
+            .unwrap_err();
+        match err {
+            SyncError::Oversized { client_seq, size } => {
+                assert_eq!(client_seq, 1);
+                assert!(size > PUSH_WIRE_BUDGET);
+            }
+            other => panic!("expected Oversized, got {other:?}"),
+        }
     }
 
     #[test]

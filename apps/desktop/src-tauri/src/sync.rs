@@ -48,8 +48,8 @@ use uuid::Uuid;
 
 use yapstack_common::auth::{
     DevicesResponse, LoginBeginRequest, LoginBeginResponse, LoginFinishRequest,
-    LoginFinishResponse, RecoverRequest, RecoverResponse, RosterEnvelope, RosterUploadRequest,
-    RosterUploadResponse, SignupRequest, TokenResponse,
+    LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest, RosterEnvelope,
+    RosterUploadRequest, RosterUploadResponse, SignupRequest, TokenResponse,
 };
 use yapstack_sync::crypto::{ChangesetCipher, SnapshotCipher};
 use yapstack_sync::snapshot::{self, SnapshotMeta};
@@ -96,8 +96,15 @@ struct Session {
     epoch: u32,
     /// Workspace/tenant id bound into changeset AAD (§5.2).
     tenant_id: Uuid,
-    /// Access bearer token (§3.2). Rotated by the auth flow.
+    /// Access bearer token (§3.2). Short-lived (15 min); rotated by the refresh flow.
     bearer: String,
+    /// Long-lived (30 d) refresh token (§5/§10). Used to mint a fresh access token when
+    /// the drain sees a 401 (Bug A). `Option` with a serde default so an EXISTING
+    /// persisted session written before this field existed still deserializes: a missing
+    /// refresh token degrades to "needs re-login" (the drain surfaces auth-expired), it
+    /// is NEVER a deserialization failure that would sign the owner out. NEVER logged.
+    #[serde(default)]
+    refresh_token: Option<String>,
     /// This device's fingerprint, base32 4×4 (§7.5.5).
     device_fingerprint: Option<String>,
     /// True once `crr_migrate` has run and the drain is live.
@@ -426,6 +433,9 @@ fn migrate_identity_from_session() {
 fn clear_session() -> Result<(), String> {
     migrate_identity_from_session();
     store_delete(KEYCHAIN_ACCOUNT)?;
+    // A signed-out state has no drain; clear any lingering auth-expired/blocked health so
+    // a subsequent sign-in does not inherit a stale status.
+    set_drain_health(DrainHealth::Ok);
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -595,6 +605,106 @@ impl DrainHandle {
 /// Managed Tauri state holding the live drain handle (None until sync enabled).
 pub type SyncRuntimeState = Arc<Mutex<Option<DrainHandle>>>;
 
+// ----- Drain health (Bug A/B status surfacing) -----
+//
+// The drain runs on its own thread; `sync_status` runs on the command thread. This
+// process-global cell is the one-way channel between them: the drain writes its latest
+// health, and `build_status_dto` reads it to surface an auth-expired phase or a
+// distinct oversized/blocked `last_error` — the "existing sync status mechanism" the
+// frontend already renders (phase string + last_error). Never carries token material.
+
+/// The drain's latest self-reported health.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum DrainHealth {
+    /// Cycling normally (or not started).
+    #[default]
+    Ok,
+    /// The relay rejected the access token AND a refresh was impossible (no refresh
+    /// token) or also rejected — the owner must sign in again. The drain has STOPPED
+    /// (it never hot-loops on a dead token).
+    AuthExpired,
+    /// A queued entry cannot be pushed (e.g. an unrepairable oversized poison entry).
+    /// Carries a human message for `last_error`. The drain keeps pulling but this entry
+    /// stays put — surfaced ONCE, never a 5s 413 hot-loop.
+    Blocked(String),
+}
+
+fn drain_health_cell() -> &'static RwLock<DrainHealth> {
+    static CELL: OnceLock<RwLock<DrainHealth>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(DrainHealth::Ok))
+}
+
+/// Set the drain health, returning true if it CHANGED (so the caller logs only on a
+/// transition, never every 5s cycle).
+fn set_drain_health(next: DrainHealth) -> bool {
+    let mut g = drain_health_cell()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if *g != next {
+        *g = next;
+        true
+    } else {
+        false
+    }
+}
+
+fn drain_health() -> DrainHealth {
+    drain_health_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// The `exp` (unix seconds) claim of a JWT, decoded WITHOUT verifying the signature.
+/// This is only used to schedule a proactive refresh (A5) — a scheduling hint, not a
+/// trust decision — so an unverified read of the public claim is acceptable client-side.
+/// Returns `None` if the token is not a well-formed JWT with a numeric `exp`.
+fn jwt_exp_unverified(token: &str) -> Option<i64> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp")?.as_i64()
+}
+
+/// True if the access token is expired or within `skew` seconds of expiry (so the drain
+/// should refresh proactively rather than eat a first-cycle 401).
+fn access_token_stale(token: &str, skew_secs: i64) -> bool {
+    match jwt_exp_unverified(token) {
+        Some(exp) => chrono::Utc::now().timestamp() + skew_secs >= exp,
+        None => false, // unknown shape → let the 401 path handle it.
+    }
+}
+
+/// Attempt a SINGLE token refresh (Bug A) against `POST /auth/refresh` using the
+/// persisted refresh token, and persist the ROTATED pair (new access + new refresh) to
+/// the store AND the in-memory cache BEFORE returning the new access token. Rotation
+/// kills the old refresh token on use, so losing the new one would lock the account out
+/// — hence persist-before-use. Returns the new access token on success, or an error when
+/// there is no refresh token / the relay rejects it (the caller then stops the drain and
+/// surfaces auth-expired). NEVER logs any token.
+async fn refresh_access_token() -> Result<String, String> {
+    let mut session = load_session()?.ok_or_else(|| "not signed in".to_string())?;
+    let refresh_token = session
+        .refresh_token
+        .clone()
+        .ok_or_else(|| "no refresh token on this session — sign in again".to_string())?;
+    let url = format!("{}/auth/refresh", base_url(&session.server_url));
+    let tokens: TokenResponse = send_json(
+        reqwest::Client::new()
+            .post(&url)
+            .json(&RefreshRequest { refresh_token }),
+    )
+    .await?;
+    // Persist the rotated pair FIRST (see doc comment) — then hand the new access token
+    // to the caller / transport.
+    session.bearer = tokens.access_token.clone();
+    session.refresh_token = Some(tokens.refresh_token);
+    store_session(&session)?;
+    Ok(tokens.access_token)
+}
+
 /// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds
 /// an enabled session and the prepared CRR copy exists, start the drain on its
 /// dedicated thread. No-op when signed out or sync not yet enabled. This is the
@@ -656,6 +766,9 @@ fn spawn_drain(
     // that AUTHORS changesets is the SAME device listed in the signed roster (§7.5).
     client_id: Uuid,
 ) -> Result<DrainHandle, String> {
+    // A fresh drain starts from a clean health slate (clears any lingering auth-expired
+    // / blocked state from a previously stopped drain, e.g. after a re-login).
+    set_drain_health(DrainHealth::Ok);
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = shutdown.clone();
 
@@ -686,7 +799,6 @@ fn spawn_drain(
                 tracing::error!("sync drain: outbox table: {e}");
                 return;
             }
-            let transport = HttpTransport::new(server_url, bearer);
             let cipher = ChangesetCipher::new(
                 vault_key,
                 epoch,
@@ -697,11 +809,72 @@ fn spawn_drain(
             let sv = SYNC_SCHEMA_VERSION as i32;
             let ev = CRSQLITE_ENGINE_VERSION as i32;
 
+            // Bug B repair: re-chunk any pre-chunking-fix oversized poison entry BEFORE
+            // the first push, so it can no longer wedge the outbox on a 413. Unrepairable
+            // entries (decrypt failed) are held back and surfaced — never dropped.
+            match outbox::repair_oversized_entries(conn, &cipher, client_id, sv, ev) {
+                Ok(report) => {
+                    if report.repaired > 0 {
+                        tracing::info!(
+                            "sync repair: re-chunked {} oversized outbox entry(ies) into {} in-budget entries",
+                            report.repaired,
+                            report.new_entries
+                        );
+                    }
+                    if !report.failed.is_empty() {
+                        let msg = format!(
+                            "{} queued change(s) are too large to sync and could not be repaired (decrypt failed); they are held back.",
+                            report.failed.len()
+                        );
+                        tracing::warn!("sync repair: {msg}");
+                        set_drain_health(DrainHealth::Blocked(msg));
+                    }
+                }
+                Err(e) => tracing::warn!("sync repair pass failed: {e}"),
+            }
+
+            // A5: if the persisted access token is already expired/near-expiry, refresh
+            // proactively so the first cycle doesn't have to eat a 401 first. Staleness is
+            // only a scheduling hint (unverified `exp`); a failure here is non-fatal — the
+            // in-loop 401 path is the authority.
+            let stale = access_token_stale(&bearer, 60);
+            let transport = HttpTransport::new(server_url, bearer);
+            if stale {
+                match rt.block_on(refresh_access_token()) {
+                    Ok(new_access) => transport.set_bearer(&new_access),
+                    Err(e) => tracing::warn!("sync drain: proactive token refresh skipped: {e}"),
+                }
+            }
+
             while !stop.load(Ordering::SeqCst) {
-                match rt.block_on(outbox::drain_once(
-                    conn, &cipher, &transport, client_id, sv, ev,
-                )) {
+                let mut outcome =
+                    rt.block_on(outbox::drain_once(conn, &cipher, &transport, client_id, sv, ev));
+
+                // Bug A: distinguish a 401 from other errors and refresh-and-retry ONCE.
+                if matches!(outcome, Err(yapstack_sync::SyncError::Unauthorized)) {
+                    match rt.block_on(refresh_access_token()) {
+                        Ok(new_access) => {
+                            transport.set_bearer(&new_access);
+                            outcome = rt.block_on(outbox::drain_once(
+                                conn, &cipher, &transport, client_id, sv, ev,
+                            ));
+                        }
+                        Err(_) => {
+                            // No refresh token / relay rejected it → stop the drain and
+                            // surface auth-expired. NEVER hot-loop on a dead token.
+                            if set_drain_health(DrainHealth::AuthExpired) {
+                                tracing::warn!(
+                                    "sync drain: token refresh failed — auth expired; stopping drain (sign in again)"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                match outcome {
                     Ok(report) => {
+                        set_drain_health(DrainHealth::Ok);
                         if report.applied + report.replayed > 0 {
                             // Reinstate the stripped FK cascade + UNIQUE invariants
                             // deterministically after a merge (R4/R5).
@@ -713,10 +886,31 @@ fn spawn_drain(
                             }
                         }
                     }
-                    // Surface, never crash the thread — a transient relay/auth
-                    // error must not tear down sync; retry next cycle.
+                    // Refresh succeeded but the retry STILL 401'd → the token is truly dead.
+                    Err(yapstack_sync::SyncError::Unauthorized) => {
+                        if set_drain_health(DrainHealth::AuthExpired) {
+                            tracing::warn!(
+                                "sync drain: refreshed token still rejected — auth expired; stopping drain"
+                            );
+                        }
+                        break;
+                    }
+                    // Bug B4: a guaranteed-413 entry the repair pass could not fix. Surface
+                    // ONCE (no 5s HTTP hot-loop — the push guard already blocked the call).
+                    Err(yapstack_sync::SyncError::Oversized { client_seq, size }) => {
+                        let msg = format!(
+                            "A queued change (#{client_seq}, ~{} MiB on the wire) is too large to sync and was held back.",
+                            size / (1024 * 1024)
+                        );
+                        if set_drain_health(DrainHealth::Blocked(msg.clone())) {
+                            tracing::warn!("sync drain: {msg}");
+                        }
+                    }
+                    // Surface, never crash the thread — a transient relay error must not
+                    // tear down sync; retry next cycle.
                     Err(e) => tracing::warn!("sync drain cycle failed: {e}"),
                 }
+
                 std::thread::sleep(DRAIN_INTERVAL);
             }
             tracing::info!("sync drain stopped");
@@ -1014,12 +1208,24 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         }
         Err(e) => last_error = Some(e),
     }
+    // Fold in the drain's self-reported health (Bug A/B): an expired session becomes a
+    // distinct `auth_expired` phase with an actionable message; a held-back oversized
+    // entry surfaces as `last_error` without changing the connected phase.
+    let connected_phase = if session.sync_enabled {
+        "connected".to_string()
+    } else {
+        "connecting".to_string()
+    };
+    let (phase, last_error) = match drain_health() {
+        DrainHealth::AuthExpired => (
+            "auth_expired".to_string(),
+            Some("Your session expired. Sign in again to resume sync.".to_string()),
+        ),
+        DrainHealth::Blocked(msg) => (connected_phase, Some(msg)),
+        DrainHealth::Ok => (connected_phase, last_error),
+    };
     SyncStatusDto {
-        phase: if session.sync_enabled {
-            "connected".into()
-        } else {
-            "connecting".into()
-        },
+        phase,
         server_url: session.server_url.clone(),
         email: Some(session.email.clone()),
         device_fingerprint: session.device_fingerprint.clone(),
@@ -1248,6 +1454,7 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
         epoch: 0,
         tenant_id: tokens.tenant_id,
         bearer: tokens.access_token,
+        refresh_token: Some(tokens.refresh_token),
         device_fingerprint: Some(device_fingerprint.clone()),
         sync_enabled: false,
         client_id,
@@ -1377,6 +1584,7 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
         epoch,
         tenant_id: resp.tenant_id,
         bearer: resp.access_token,
+        refresh_token: Some(resp.refresh_token),
         device_fingerprint: Some(device_fingerprint),
         // A newly-enrolled device is PENDING (not yet a roster member) and must not run
         // the drain until approved; keep sync disabled until this device is active.
@@ -1456,6 +1664,7 @@ pub async fn sync_recover(
         epoch,
         tenant_id: resp.tenant_id,
         bearer: resp.access_token,
+        refresh_token: Some(resp.refresh_token),
         device_fingerprint: Some(device_fingerprint(&dev_pub)),
         sync_enabled: false,
         client_id,
@@ -1908,6 +2117,7 @@ mod tests {
             epoch: 0,
             tenant_id: Uuid::nil(),
             bearer: "t".into(),
+            refresh_token: None,
             device_fingerprint: None,
             sync_enabled: false,
             client_id,
