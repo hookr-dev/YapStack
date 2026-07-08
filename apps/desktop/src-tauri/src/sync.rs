@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
@@ -515,6 +515,69 @@ pub struct SyncStatusDto {
 struct SyncInfoResponse {
     engine_version: String,
     billing_url: Option<String>,
+}
+
+// ----- Typed relay connection probe (T025) -----
+//
+// `sync_info` above collapses every failure into one `String`; the redesigned Sync
+// page needs to branch on *why* a probe failed. `sync_probe` returns a TYPED result:
+// reachability / TLS / not-a-relay are distinct error classes, and a version gap is
+// advisory metadata on SUCCESS (never a failure). `sync_info` stays untouched — its
+// callers (signup/billing) keep their current contract; the UI migrates in T026/T027.
+
+/// Sentinel body for the probe. A 2xx counts as a YapStack relay ONLY if the body
+/// deserializes here with BOTH `protocol_version` and `engine_version` present
+/// (crates/yapstack-server/src/routes.rs `SyncInfoResponse` — note there is no
+/// `server_version` field). serde treats a missing required field as a parse error, so
+/// the caller maps a bare proxy 200 or a `{"res":"pong"}` health stub to `NotARelay`.
+#[derive(Deserialize)]
+struct RelayProbeBody {
+    protocol_version: u32,
+    engine_version: String,
+    #[serde(default)]
+    min_client_version: Option<String>,
+}
+
+/// `sync_probe` success payload (mirrors `RelayProbeOk` in `lib/sync.ts`).
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayProbeOk {
+    engine_version: String,
+    protocol_version: u32,
+    /// Elapsed from request start to response head, milliseconds.
+    latency_ms: u64,
+    /// The URL actually probed after normalization, so the UI can echo/persist it.
+    normalized_url: String,
+    /// Populated ONLY when this client is older than the relay's published minimum.
+    /// Advisory — the probe still succeeds ("update this app", never blocking, §0.3).
+    version_advisory: Option<VersionAdvisory>,
+}
+
+/// Advisory that this client is behind the relay's published minimum (mirrors
+/// `RelayVersionAdvisory` in `lib/sync.ts`). Rides on probe SUCCESS, never a failure.
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionAdvisory {
+    /// Minimum client version the relay publishes.
+    min_client_version: String,
+    /// Verbatim human-readable advisory line.
+    raw: String,
+}
+
+/// Typed probe failure classes (mirrors `RelayProbeError` in `lib/sync.ts`). Serialized
+/// tagged on `kind` (kebab-case) so TS can discriminate. Every variant carries the
+/// verbatim `raw` detail — errors are surfaced to the user, never swallowed.
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RelayProbeError {
+    /// DNS failure / connection refused / timeout (5s budget), or TLS that could not be
+    /// distinguished from a plain connect failure.
+    Unreachable { raw: String },
+    /// TLS certificate or handshake failure.
+    TlsError { raw: String },
+    /// An HTTP response arrived but this is not a YapStack relay: non-2xx status, or a 2xx
+    /// whose body is missing the `protocol_version` + `engine_version` sentinel.
+    NotARelay { raw: String },
 }
 
 // ----- crr_migrate on a COPY (deliverable F) -----
@@ -1410,6 +1473,223 @@ pub async fn sync_info(server_url: String) -> Result<SyncInfoDto, String> {
         version: resp.engine_version,
         billing_url: resp.billing_url,
     })
+}
+
+/// Normalize a user-entered relay URL before probing: trim, prepend `https://` when
+/// schemeless (never downgrade an explicit scheme — an http retry is the user's choice,
+/// §1a), and strip trailing slashes so `{url}/sync/info` is well-formed.
+fn normalize_relay_url(input: &str) -> String {
+    let trimmed = input.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Parse `major.minor.patch` plus a "has pre-release tag" flag from a semver-ish string,
+/// tolerating a missing minor/patch. Build metadata (`+…`) is ignored. Returns `None` on a
+/// non-numeric core so an unparseable value yields NO advisory rather than a fake one.
+fn parse_semver_core(v: &str) -> Option<(u64, u64, u64, bool)> {
+    let core = v.split('+').next().unwrap_or(v);
+    let (core, has_pre) = match core.split_once('-') {
+        Some((c, pre)) => (c, !pre.is_empty()),
+        None => (core, false),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
+    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
+    Some((major, minor, patch, has_pre))
+}
+
+/// True when `app_version` is strictly older than the relay's published
+/// `min_client_version` (→ "update this app"). Same-core pre-releases (e.g.
+/// `1.0.0-alpha` vs `1.0.0`) count the pre-release as older, per semver §11. Unparseable
+/// inputs → `false` (no advisory); we never manufacture an advisory from garbage.
+fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
+    let (Some(a), Some(m)) = (
+        parse_semver_core(app_version),
+        parse_semver_core(min_client_version),
+    ) else {
+        return false;
+    };
+    let (acore, mcore) = ((a.0, a.1, a.2), (m.0, m.1, m.2));
+    if acore != mcore {
+        return acore < mcore;
+    }
+    // Same numeric core: a pre-release of the required release is older than the release.
+    a.3 && !m.3
+}
+
+/// Build the version advisory when this client is behind the relay's minimum. Advisory
+/// only — the direction is "update this app" because the relay publishes the MINIMUM
+/// client version (§0.3), never "the server is behind".
+fn compute_version_advisory(
+    app_version: &str,
+    min_client_version: &str,
+) -> Option<VersionAdvisory> {
+    if client_is_older(app_version, min_client_version) {
+        Some(VersionAdvisory {
+            min_client_version: min_client_version.to_string(),
+            raw: format!(
+                "This app is version {app_version}; the relay requires at least \
+                 {min_client_version}. Update YapStack to keep syncing."
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+/// Flatten a reqwest error's full source chain into one verbatim string. The hard product
+/// rule is that the underlying detail (rustls alert, refused syscall, …) always reaches the
+/// UI, so we never collapse to just the top-level `Display`.
+fn error_chain(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(s) = source {
+        parts.push(s.to_string());
+        source = s.source();
+    }
+    parts.join(": ")
+}
+
+/// Heuristic TLS classifier over the flattened error chain.
+///
+/// TLS DISTINGUISHABILITY (verified for this dep config): reqwest is built with
+/// `default-features = false, features = ["json", "rustls-tls"]` (Cargo.toml). In that
+/// config reqwest exposes NO typed TLS-error variant — a handshake/cert failure surfaces as
+/// a *connect* error (`err.is_connect() == true`) whose SOURCE chain terminates in a
+/// `rustls::Error`. So `is_connect()` alone cannot separate "certificate rejected" from
+/// "port refused"; the only signal available without adding a rustls dependency is the
+/// chain text. We match rustls' documented alert/cert phrasings here. When the chain
+/// carries none of these markers we fall back to `Unreachable` but keep the verbatim chain
+/// — per T025, TLS that is genuinely indistinguishable degrades to Unreachable, never to a
+/// swallowed error.
+fn chain_looks_like_tls(chain: &str) -> bool {
+    let c = chain.to_ascii_lowercase();
+    [
+        "certificate",
+        "tls handshake",
+        "handshakefailure",
+        "invalid peer certificate",
+        "unknownissuer",
+        "notvalidforname",
+        "received fatal alert",
+        "corrupt message",
+        "self-signed",
+        "self signed",
+        "rustls",
+        "bad certificate",
+    ]
+    .iter()
+    .any(|m| c.contains(m))
+}
+
+/// Map a send-time reqwest error to a typed probe error. Order matters: timeout first
+/// (explicit 5s budget), then TLS (chain heuristic), then everything else → Unreachable.
+fn classify_send_error(err: &reqwest::Error) -> RelayProbeError {
+    let raw = error_chain(err);
+    if err.is_timeout() {
+        return RelayProbeError::Unreachable { raw };
+    }
+    if chain_looks_like_tls(&raw) {
+        return RelayProbeError::TlsError { raw };
+    }
+    // `is_connect()` covers DNS/refused; anything else at send time (redirect loop, etc.)
+    // is still "couldn't complete the request" → Unreachable with the verbatim chain.
+    RelayProbeError::Unreachable { raw }
+}
+
+/// Cap a response body for inclusion in a verbatim `raw` message so an HTML error page
+/// can't blow up the surfaced string; the status/endpoint context is always kept.
+fn body_snippet(body: &str) -> String {
+    const MAX: usize = 300;
+    let trimmed = body.trim();
+    if trimmed.chars().count() > MAX {
+        let head: String = trimmed.chars().take(MAX).collect();
+        format!("{head}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Core of `sync_probe`, parameterized on the app version + request budget so tests can
+/// drive it against a local socket with a short timeout. See `sync_probe` for the contract.
+async fn probe_relay(
+    server_url: &str,
+    app_version: &str,
+    timeout: Duration,
+) -> Result<RelayProbeOk, RelayProbeError> {
+    let normalized_url = normalize_relay_url(server_url);
+    let endpoint = format!("{normalized_url}/sync/info");
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| RelayProbeError::Unreachable { raw: e.to_string() })?;
+
+    let started = Instant::now();
+    let resp = match client.get(&endpoint).send().await {
+        Ok(r) => r,
+        Err(e) => return Err(classify_send_error(&e)),
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let status = resp.status();
+    // Read the body verbatim regardless of status so `raw` can carry the real detail.
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(RelayProbeError::NotARelay {
+            raw: format!("HTTP {status} from {endpoint}: {}", body_snippet(&body)),
+        });
+    }
+
+    // Sentinel: a 2xx is a relay ONLY if the body carries protocol_version + engine_version.
+    let parsed: RelayProbeBody = match serde_json::from_str(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(RelayProbeError::NotARelay {
+                raw: format!(
+                    "2xx from {endpoint} but the body is not a YapStack relay info document \
+                     ({e}): {}",
+                    body_snippet(&body)
+                ),
+            });
+        }
+    };
+
+    let version_advisory = parsed
+        .min_client_version
+        .as_deref()
+        .and_then(|min| compute_version_advisory(app_version, min));
+
+    Ok(RelayProbeOk {
+        engine_version: parsed.engine_version,
+        protocol_version: parsed.protocol_version,
+        latency_ms,
+        normalized_url,
+        version_advisory,
+    })
+}
+
+/// Typed relay connection probe (T025). Unlike `sync_info` (which collapses every failure
+/// into one string and remains the caller for signup/billing), this returns a TYPED result
+/// the UI branches on: `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a
+/// version gap is advisory metadata on SUCCESS — never a failure. 5s request budget; the app
+/// version is read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`,
+/// kept in lockstep with tauri.conf.json by the build).
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_probe(server_url: String) -> Result<RelayProbeOk, RelayProbeError> {
+    probe_relay(
+        &server_url,
+        env!("CARGO_PKG_VERSION"),
+        Duration::from_secs(5),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2335,5 +2615,240 @@ mod tests {
             5,
         )
         .is_err());
+    }
+
+    // ----- Typed relay connection probe (T025) -----
+    //
+    // Live-server cases use a one-shot raw-HTTP responder over a loopback socket (no extra
+    // deps; mirrors the `yapstack-sync` transport.rs idiom). Plain-HTTP servers are probed
+    // via explicit `http://` URLs so URL normalization does not force `https` onto them;
+    // normalization itself is covered by a pure unit test.
+    mod probe {
+        use super::super::*;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        const APP: &str = "1.0.0";
+
+        /// Read the request until end-of-headers so the client's write completes before we
+        /// reply and close.
+        fn drain_request(sock: &mut TcpStream) {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+
+        /// Spawn a one-shot responder that serves `response` to the first connection.
+        fn serve_once(response: String) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    drain_request(&mut sock);
+                    let _ = sock.write_all(response.as_bytes());
+                    let _ = sock.flush();
+                }
+            });
+            (format!("http://{addr}"), handle)
+        }
+
+        fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
+            format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: {content_type}\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ok_returns_versions_latency_and_normalized_url() {
+            let body =
+                r#"{"protocol_version":1,"min_client_version":"1.0.0","engine_version":"0.16.3"}"#;
+            let (base, handle) = serve_once(http_response("200 OK", "application/json", body));
+            // Pass a trailing slash: normalization must strip it before `/sync/info`.
+            let ok = probe_relay(&format!("{base}/"), APP, Duration::from_secs(5))
+                .await
+                .expect("a valid relay must probe ok");
+            assert_eq!(ok.engine_version, "0.16.3");
+            assert_eq!(ok.protocol_version, 1);
+            assert_eq!(ok.normalized_url, base);
+            assert!(ok.latency_ms < 5_000);
+            assert!(ok.version_advisory.is_none());
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn version_gap_is_advisory_not_failure() {
+            let body =
+                r#"{"protocol_version":1,"min_client_version":"2.0.0","engine_version":"0.16.3"}"#;
+            let (base, handle) = serve_once(http_response("200 OK", "application/json", body));
+            let ok = probe_relay(&base, "1.0.0", Duration::from_secs(5))
+                .await
+                .expect("a version gap must still succeed (advisory, not failure)");
+            let adv = ok
+                .version_advisory
+                .expect("older client than min_client_version → advisory");
+            assert_eq!(adv.min_client_version, "2.0.0");
+            assert!(adv.raw.contains("2.0.0"));
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn html_200_is_not_a_relay() {
+            let (base, handle) =
+                serve_once(http_response("200 OK", "text/html", "<html>hello</html>"));
+            let err = probe_relay(&base, APP, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            match err {
+                RelayProbeError::NotARelay { raw } => assert!(raw.contains("html")),
+                other => panic!("expected NotARelay for an HTML 200, got {other:?}"),
+            }
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn wrong_json_200_is_not_a_relay() {
+            let (base, handle) = serve_once(http_response(
+                "200 OK",
+                "application/json",
+                r#"{"res":"pong"}"#,
+            ));
+            let err = probe_relay(&base, APP, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelayProbeError::NotARelay { .. }));
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn partial_sentinel_200_is_not_a_relay() {
+            // engine_version present but protocol_version missing → sentinel must still fail.
+            let (base, handle) = serve_once(http_response(
+                "200 OK",
+                "application/json",
+                r#"{"engine_version":"0.16.3"}"#,
+            ));
+            let err = probe_relay(&base, APP, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelayProbeError::NotARelay { .. }));
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn non_2xx_is_not_a_relay() {
+            let (base, handle) = serve_once(http_response("404 Not Found", "text/plain", "nope"));
+            let err = probe_relay(&base, APP, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            match err {
+                RelayProbeError::NotARelay { raw } => assert!(raw.contains("404")),
+                other => panic!("expected NotARelay for a 404, got {other:?}"),
+            }
+            handle.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn connection_refused_is_unreachable() {
+            // Bind then immediately drop → a closed port on loopback (refused on connect).
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let err = probe_relay(&format!("http://{addr}"), APP, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RelayProbeError::Unreachable { .. }),
+                "refused connect must be Unreachable, got {err:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn hanging_handler_times_out_as_unreachable() {
+            // Accept but never respond; a short budget must trip reqwest's is_timeout().
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    drain_request(&mut sock);
+                    thread::sleep(Duration::from_millis(500));
+                    // Drop without responding — the client times out first.
+                    drop(sock);
+                }
+            });
+            let err = probe_relay(&format!("http://{addr}"), APP, Duration::from_millis(150))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RelayProbeError::Unreachable { .. }),
+                "timeout must be Unreachable, got {err:?}"
+            );
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn normalize_prepends_https_and_strips_trailing_slashes() {
+            assert_eq!(
+                normalize_relay_url("sync.yapstack.app"),
+                "https://sync.yapstack.app"
+            );
+            assert_eq!(
+                normalize_relay_url("  sync.yapstack.app/  "),
+                "https://sync.yapstack.app"
+            );
+            assert_eq!(
+                normalize_relay_url("https://relay.test///"),
+                "https://relay.test"
+            );
+            // An explicit http scheme is a deliberate user choice — never silently upgraded.
+            assert_eq!(
+                normalize_relay_url("http://192.168.1.9:8080/"),
+                "http://192.168.1.9:8080"
+            );
+        }
+
+        #[test]
+        fn version_advisory_direction_and_edges() {
+            // Older core → advisory ("update this app").
+            assert!(compute_version_advisory("0.9.0", "1.0.0").is_some());
+            // Equal or newer → no advisory (never "the server is behind").
+            assert!(compute_version_advisory("1.0.0", "1.0.0").is_none());
+            assert!(compute_version_advisory("1.2.0", "1.0.0").is_none());
+            // Same-core pre-release is older than the release (semver §11).
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_some());
+            // A release is NOT older than its own pre-release.
+            assert!(compute_version_advisory("1.0.0", "1.0.0-alpha.1").is_none());
+            // Unparseable server value → no manufactured advisory.
+            assert!(compute_version_advisory("1.0.0", "not-a-version").is_none());
+        }
+
+        #[test]
+        fn tls_classifier_matches_rustls_phrasings_only() {
+            assert!(chain_looks_like_tls(
+                "error sending request: invalid peer certificate: UnknownIssuer"
+            ));
+            assert!(chain_looks_like_tls(
+                "received fatal alert: HandshakeFailure"
+            ));
+            assert!(chain_looks_like_tls("rustls: corrupt message"));
+            // A plain refused / DNS connect error must NOT be read as TLS.
+            assert!(!chain_looks_like_tls(
+                "tcp connect error: Connection refused (os error 61)"
+            ));
+            assert!(!chain_looks_like_tls(
+                "dns error: failed to lookup address information"
+            ));
+        }
     }
 }

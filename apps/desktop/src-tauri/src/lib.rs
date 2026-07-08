@@ -376,6 +376,7 @@ pub fn run() {
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
             sync::sync_info,
+            sync::sync_probe,
             sync::sync_status,
             sync::sync_signup,
             sync::sync_login_begin,

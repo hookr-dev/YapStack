@@ -482,6 +482,22 @@ async syncInfo(serverUrl: string) : Promise<Result<SyncInfoDto, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Typed relay connection probe (T025). Unlike `sync_info` (which collapses every failure
+ * into one string and remains the caller for signup/billing), this returns a TYPED result
+ * the UI branches on: `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a
+ * version gap is advisory metadata on SUCCESS — never a failure. 5s request budget; the app
+ * version is read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`,
+ * kept in lockstep with tauri.conf.json by the build).
+ */
+async syncProbe(serverUrl: string) : Promise<Result<RelayProbeOk, RelayProbeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_probe", { serverUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async syncStatus() : Promise<Result<SyncStatusDto, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_status") };
@@ -862,6 +878,43 @@ export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unav
  * equals the join's local row count — the no-silent-loss guarantee, surfaced to the UI.
  */
 export type ReconcileReportDto = { inserted_local_only: number; matched_identical: number; collisions: CollisionDto[] }
+/**
+ * Typed probe failure classes (mirrors `RelayProbeError` in `lib/sync.ts`). Serialized
+ * tagged on `kind` (kebab-case) so TS can discriminate. Every variant carries the
+ * verbatim `raw` detail — errors are surfaced to the user, never swallowed.
+ */
+export type RelayProbeError =
+/**
+ * DNS failure / connection refused / timeout (5s budget), or TLS that could not be
+ * distinguished from a plain connect failure.
+ */
+{ kind: "unreachable"; raw: string } |
+/**
+ * TLS certificate or handshake failure.
+ */
+{ kind: "tls-error"; raw: string } |
+/**
+ * An HTTP response arrived but this is not a YapStack relay: non-2xx status, or a 2xx
+ * whose body is missing the `protocol_version` + `engine_version` sentinel.
+ */
+{ kind: "not-a-relay"; raw: string }
+/**
+ * `sync_probe` success payload (mirrors `RelayProbeOk` in `lib/sync.ts`).
+ */
+export type RelayProbeOk = { engineVersion: string; protocolVersion: number;
+/**
+ * Elapsed from request start to response head, milliseconds.
+ */
+latencyMs: number;
+/**
+ * The URL actually probed after normalization, so the UI can echo/persist it.
+ */
+normalizedUrl: string;
+/**
+ * Populated ONLY when this client is older than the relay's published minimum.
+ * Advisory — the probe still succeeds ("update this app", never blocking, §0.3).
+ */
+versionAdvisory: VersionAdvisory | null }
 export type ResumeConfig = {
 /**
  * The index of the new part being recorded — equals the count of
@@ -906,6 +959,19 @@ ackedThisSession: number;
  */
 lastSuccess: string | null }
 export type TranscriptionStatusDto = { initialized: boolean }
+/**
+ * Advisory that this client is behind the relay's published minimum (mirrors
+ * `RelayVersionAdvisory` in `lib/sync.ts`). Rides on probe SUCCESS, never a failure.
+ */
+export type VersionAdvisory = {
+/**
+ * Minimum client version the relay publishes.
+ */
+minClientVersion: string;
+/**
+ * Verbatim human-readable advisory line.
+ */
+raw: string }
 
 /** tauri-specta globals **/
 

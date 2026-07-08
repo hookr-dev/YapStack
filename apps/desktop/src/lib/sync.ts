@@ -30,6 +30,36 @@ export interface SyncInfo {
   billingUrl: string | null;
 }
 
+/** `sync_probe` success (T025). A version gap rides here as `versionAdvisory` — it is
+ *  advisory ("update this app"), never a probe failure. */
+export interface RelayProbeOk {
+  engineVersion: string;
+  protocolVersion: number;
+  /** Elapsed request→response head, milliseconds. */
+  latencyMs: number;
+  /** The URL actually probed after normalization (scheme prepended when schemeless,
+   *  trailing slashes stripped) — echo/persist this, not the raw input. */
+  normalizedUrl: string;
+  /** Present ONLY when this client is behind the relay's published minimum. */
+  versionAdvisory: RelayVersionAdvisory | null;
+}
+
+export interface RelayVersionAdvisory {
+  /** Minimum client version the relay publishes (§0.3). */
+  minClientVersion: string;
+  /** Verbatim advisory line to surface. */
+  raw: string;
+}
+
+/** Typed `sync_probe` failure. The `invoke` promise REJECTS with this object (not the ok
+ *  payload); `kind` discriminates and `raw` is always the verbatim detail, surfaced to the
+ *  user. `unreachable` also absorbs TLS errors that rustls cannot distinguish from a plain
+ *  connect failure (the verbatim chain still rides in `raw`). */
+export type RelayProbeError =
+  | { kind: "unreachable"; raw: string }
+  | { kind: "tls-error"; raw: string }
+  | { kind: "not-a-relay"; raw: string };
+
 export type SyncPhase =
   | "disconnected"
   | "connecting"
@@ -106,6 +136,14 @@ export const syncCommands = {
   /** `GET /sync/info` against `serverUrl`; surfaces `billingUrl` when advertised. */
   info: (serverUrl: string): Promise<SyncInfo> =>
     invoke("sync_info", { serverUrl }),
+
+  /** Typed relay probe (T025): reachability / TLS / not-a-relay are distinct classes and a
+   *  version gap is advisory metadata on success. Normalizes the URL, enforces a 5s budget,
+   *  and applies the 2xx-sentinel check (protocol_version + engine_version) so a bare proxy
+   *  200 never reads as connected. Resolves with `RelayProbeOk`; REJECTS with a
+   *  `RelayProbeError` the caller discriminates on `kind`. Leaves `info` untouched. */
+  probe: (serverUrl: string): Promise<RelayProbeOk> =>
+    invoke("sync_probe", { serverUrl }),
 
   status: (): Promise<SyncStatus> => invoke("sync_status"),
 
