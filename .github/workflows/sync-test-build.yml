@@ -18,10 +18,16 @@
 #   * `-f sync` on the tauri build — forwards the cargo feature to the app crate
 #     (apps/desktop/src-tauri/Cargo.toml [features] sync).
 #
-# Transcription sidecars are TOUCH placeholders (same as ci-checks.yml): this build
-# targets sync UAT, not transcription. The bundled sidecar is a 0-byte placeholder
-# so the Tauri build links; transcribing NEW audio will not work in these artifacts.
-# Syncing EXISTING data (the UAT path) is unaffected.
+# Transcription sidecars are REAL builds here, identical to release.yml (they run the
+# same ./scripts/build-sidecars.sh). These artifacts are COMPLETE apps: recording +
+# transcription work, and you can safely install one OVER a working install. This
+# reverses the old 0-byte-placeholder tradeoff — that stub sidecar, when installed on
+# top of a real install, replaced the working exe and broke transcription with
+# "%1 is not a valid Win32 application (os error 193)". Two-device sync UAT needs
+# recording on BOTH machines, so completeness wins.
+# COST: each platform now compiles the sidecar (whisper-rs + parakeet-rs cmake builds)
+# and stages the WebGPU Dawn lib. This adds meaningful build time vs the touch stub;
+# the Swatinem rust-cache below amortizes it across runs.
 #
 # Signing caveats (expected for own-machine UAT):
 #   * Windows: UNSIGNED NSIS — SmartScreen warns on first run (click "More info" ->
@@ -134,14 +140,19 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Create sidecar + framework placeholders
-        # tauri.conf.json declares an externalBin (sidecar) and a macOS framework dylib
-        # (libwebgpu_dawn.dylib). The Tauri build validates both paths exist before
-        # linking; this is a SYNC test build, so we stub them (transcription won't work).
-        run: |
-          mkdir -p apps/desktop/src-tauri/binaries
-          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
-          touch apps/desktop/src-tauri/binaries/libwebgpu_dawn.dylib
+      - name: Build sidecars
+        # Real transcription sidecar + libwebgpu_dawn.dylib, staged exactly as
+        # release.yml's build-macos does. No target arg: build-sidecars.sh's
+        # detect_host_triple resolves the arm64 macos-latest runner to
+        # aarch64-apple-darwin, builds -p yapstack-transcription-sidecar with
+        # whisper,parakeet,metal,coreml,webgpu, copies the binary into
+        # apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin,
+        # and stages libwebgpu_dawn.dylib (which tauri.conf.json bundles as a macOS
+        # framework). Uses no secrets — pure unsigned build. SOURCE_DATE_EPOCH matches
+        # release.yml for reproducibility.
+        env:
+          SOURCE_DATE_EPOCH: "1"
+        run: ./scripts/build-sidecars.sh
 
       - name: Import code signing certificate (only when signing)
         if: ${{ inputs.mac_signed }}
@@ -250,23 +261,22 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Create sidecar + Dawn DLL placeholders
-        # Two Windows-specific paths the Tauri build resolves before bundling:
-        #   * tauri.conf.json externalBin — the transcription sidecar (0-byte stub;
-        #     transcription won't work, but sync UAT doesn't need it).
-        #   * tauri.windows.conf.json bundle.resources glob "binaries/*.dll" — the
-        #     Parakeet Dawn WebGPU DLL (release.yml's build-sidecars.sh stages the
-        #     real webgpu_dawn.dll here). Tauri resolves the glob at bundle time and
-        #     hard-fails ("path not found or didn't match any files") if NOTHING
-        #     matches. This is a SYNC test build (no WebGPU), so we drop a 0-byte
-        #     placeholder DLL to satisfy the glob — resources are copied verbatim,
-        #     not loaded/PE-validated, so an empty file matches. Matches the exact
-        #     name release.yml stages (webgpu_dawn.dll).
+      - name: Build sidecars
+        # Real transcription sidecar exe + real binaries/webgpu_dawn.dll, staged exactly
+        # as release.yml's build-windows does. The explicit x86_64-pc-windows-msvc target
+        # runs build-sidecars.sh's Windows branch (features: whisper,parakeet,webgpu),
+        # emitting the triple-suffixed exe Tauri's externalBin requires
+        # (yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe) and copying every
+        # *.dll from target/ — including webgpu_dawn.dll — into binaries/, which satisfies
+        # tauri.windows.conf.json's bundle.resources "binaries/*.dll" glob with the REAL
+        # DLL. Uses no secrets. shell: bash and SOURCE_DATE_EPOCH match release.yml.
+        # NOTE: no RUSTFLAGS=/FORCE:MULTIPLE here (as in release.yml) — that flag is only
+        # needed by the sync-feature app link (cr-sqlite duplicate symbol); the sidecar
+        # crate does not link cr-sqlite, so it builds clean without it.
         shell: bash
-        run: |
-          mkdir -p apps/desktop/src-tauri/binaries
-          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
-          touch apps/desktop/src-tauri/binaries/webgpu_dawn.dll
+        env:
+          SOURCE_DATE_EPOCH: "1"
+        run: ./scripts/build-sidecars.sh x86_64-pc-windows-msvc
 
       - name: Build Tauri app (--features sync)
         # Restrict to NSIS (matching release.yml): tauri.conf.json targets "all" also
