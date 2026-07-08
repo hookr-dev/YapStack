@@ -68,7 +68,17 @@ fn b64_len(raw: usize) -> usize {
 }
 
 /// One drain cycle's outcome (diagnostics / tests).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// A cycle attempts BOTH directions independently (F1): a push failure never prevents the
+/// pull, and a pull failure never masks the push's progress. Each direction's error rides
+/// on `push_error` / `pull_error` rather than aborting the cycle, so the caller can surface
+/// each failure yet still credit whatever the other direction accomplished. `drain_once`
+/// returns `Err` ONLY for a cycle-fatal LOCAL condition (a replay/DB error) — a transport
+/// error on either direction is non-fatal and reported here instead.
+///
+/// Not `Clone`/`Copy`: `SyncError` is not `Clone`, and a report is consumed by-value in the
+/// single drain loop that produces it.
+#[derive(Debug, Default)]
 pub struct DrainReport {
     pub pushed: usize,
     pub applied: usize,
@@ -77,6 +87,27 @@ pub struct DrainReport {
     /// Changesets skipped because they failed to decrypt/decode (§11.3
     /// crypto-quarantine — surfaced, never silently dropped, never fatal).
     pub crypto_skipped: usize,
+    /// The push direction's non-fatal error this cycle (a transport 401 / oversized-guard /
+    /// network error, or a local capture/outbox error), if any. `None` on a clean push.
+    pub push_error: Option<SyncError>,
+    /// The pull direction's non-fatal error this cycle, if any. `None` on a clean pull.
+    pub pull_error: Option<SyncError>,
+}
+
+impl DrainReport {
+    /// True when EITHER direction failed with a 401. The desktop drain refreshes the access
+    /// token once and retries the WHOLE cycle (both directions) on this (T023, now covering
+    /// pull as well as push).
+    pub fn has_unauthorized(&self) -> bool {
+        matches!(self.push_error, Some(SyncError::Unauthorized))
+            || matches!(self.pull_error, Some(SyncError::Unauthorized))
+    }
+
+    /// The first non-fatal transport error observed this cycle (push preferred over pull),
+    /// for the caller to surface. `None` when both directions were clean.
+    pub fn first_transport_error(&self) -> Option<&SyncError> {
+        self.push_error.as_ref().or(self.pull_error.as_ref())
+    }
 }
 
 /// A cheap point-in-time view of the outbox backlog, read straight from
@@ -349,6 +380,12 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
 
 /// One full drain cycle: enqueue local writes, push, pull+decrypt+merge, replay.
 ///
+/// F1 — the two directions are DECOUPLED. Push (capture + upload) and pull (download +
+/// merge) are each attempted every cycle: a push failure never aborts the pull, and a pull
+/// failure never masks the push's progress. Each direction's error is preserved on the
+/// returned [`DrainReport`] (`push_error` / `pull_error`) instead of short-circuiting the
+/// cycle. Only a cycle-fatal LOCAL condition (a replay/DB error) returns `Err`.
+///
 /// Runs on a single-threaded runtime (it holds `&Connection` across awaits, so the
 /// future is intentionally `!Send` — the desktop runs this on a dedicated thread).
 pub async fn drain_once<T: SyncTransport + ?Sized>(
@@ -360,9 +397,63 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
     engine_version: i32,
 ) -> Result<DrainReport, SyncError> {
     let mut report = DrainReport::default();
-    enqueue_local(conn, cipher, client_id, schema_version, engine_version)?;
-    report.pushed = push_outbox(conn, client_id, transport).await?;
 
+    // PUSH direction: capture fresh local writes, then upload the outbox. A failure in EITHER
+    // step rides on `push_error` and MUST NOT prevent the pull below (F1).
+    match push_direction(
+        conn,
+        cipher,
+        transport,
+        client_id,
+        schema_version,
+        engine_version,
+    )
+    .await
+    {
+        Ok(pushed) => report.pushed = pushed,
+        Err(e) => report.push_error = Some(e),
+    }
+
+    // PULL direction: always attempted, even when push failed. A transport/pull error rides
+    // on `pull_error`; whatever it managed to apply before failing is retained (F1).
+    if let Err(e) = pull_direction(conn, cipher, transport, client_id, &mut report).await {
+        report.pull_error = Some(e);
+    }
+
+    // Replay quarantined rows now this cycle's merges have landed. A failure here is a LOCAL
+    // (DB-level) fault, hence cycle-fatal — surfaced as `Err`, not a per-direction error.
+    report.replayed = replay_pending(conn)?;
+    Ok(report)
+}
+
+/// Capture this device's local writes, then push the outbox. The push half of one
+/// [`drain_once`] cycle; its error is captured into `DrainReport::push_error` so it cannot
+/// abort the pull. Preserves the capture-before-push ordering and the [`SyncError::Oversized`]
+/// push guard.
+async fn push_direction<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    transport: &T,
+    client_id: uuid::Uuid,
+    schema_version: i32,
+    engine_version: i32,
+) -> Result<usize, SyncError> {
+    enqueue_local(conn, cipher, client_id, schema_version, engine_version)?;
+    push_outbox(conn, client_id, transport).await
+}
+
+/// Pull new changesets, decrypt, and merge them, advancing the pull watermark only AFTER a
+/// page's merges succeed. The pull half of one [`drain_once`] cycle; its error is captured
+/// into `DrainReport::pull_error` so a download failure cannot mask push progress. Own-echo
+/// changes (matching `client_id`) are skipped; undecryptable/undecodable changes are
+/// crypto-quarantined (`crypto_skipped`), never fatal.
+async fn pull_direction<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    transport: &T,
+    client_id: uuid::Uuid,
+    report: &mut DrainReport,
+) -> Result<(), SyncError> {
     loop {
         let since = state::pull_watermark(conn)?;
         let resp = transport.pull(since, PULL_LIMIT).await?;
@@ -398,14 +489,13 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
             report.applied += a;
             report.quarantined += q;
         }
+        // Watermark advances only after this page merged successfully.
         state::set_pull_watermark(conn, resp.next_seq)?;
         if !resp.has_more {
             break;
         }
     }
-
-    report.replayed = replay_pending(conn)?;
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -654,5 +744,169 @@ mod tests {
             est, actual,
             "row_encoded_size must mirror the codec exactly"
         );
+    }
+
+    // ----- F1: push and pull are decoupled within one drain cycle -----
+
+    use crate::transport::MockRelay;
+    use crate::{CrsqlDb, CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION};
+    use std::sync::Arc;
+
+    const F1_TENANT: Uuid = Uuid::from_u128(0x2222_3333_4444_5555_6666_7777_8888_9999);
+    const F1_VAULT: [u8; 32] = [11u8; 32];
+
+    fn f1_cipher() -> ChangesetCipher {
+        ChangesetCipher::new(
+            F1_VAULT,
+            0,
+            F1_TENANT,
+            SYNC_SCHEMA_VERSION,
+            CRSQLITE_ENGINE_VERSION,
+        )
+    }
+
+    fn make_kv(db: &CrsqlDb) {
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE kv(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT '');",
+            )
+            .unwrap();
+        db.conn()
+            .query_row("SELECT crsql_as_crr('kv')", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    /// Wraps a real [`MockRelay`] but ALWAYS fails push, delegating every other call — proves
+    /// F1's "a push failure never prevents the pull".
+    struct PushFails(Arc<MockRelay>);
+    #[async_trait]
+    impl SyncTransport for PushFails {
+        async fn push(&self, _r: PushRequest) -> Result<PushResponse, SyncError> {
+            Err(SyncError::Transport("push boom (test)".into()))
+        }
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            self.0.pull(since, limit).await
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            self.0.completeness().await
+        }
+        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
+            self.0.put_snapshot(m, c).await
+        }
+        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+            self.0.get_snapshot().await
+        }
+    }
+
+    /// Wraps a real [`MockRelay`] but ALWAYS fails pull, delegating every other call — proves
+    /// F1's "a pull failure never masks push success".
+    struct PullFails(Arc<MockRelay>);
+    #[async_trait]
+    impl SyncTransport for PullFails {
+        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
+            self.0.push(r).await
+        }
+        async fn pull(&self, _s: i64, _l: i64) -> Result<PullResponse, SyncError> {
+            Err(SyncError::Transport("pull boom (test)".into()))
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            self.0.completeness().await
+        }
+        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
+            self.0.put_snapshot(m, c).await
+        }
+        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+            self.0.get_snapshot().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_fails_pull_proceeds() {
+        // F1: with a transport whose push always errors but whose pull returns changesets,
+        // one cycle STILL applies the pulled changes and advances the watermark — and the
+        // push error is preserved on the report rather than aborting the cycle.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // A publishes k1 to the relay through a healthy drain.
+        a.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k1','A-val')", [])
+            .unwrap();
+        drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+            .await
+            .unwrap();
+
+        // B has a local write (so the push half has real work to fail on), then drains
+        // through the push-failing transport.
+        b.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k2','B-val')", [])
+            .unwrap();
+        let failing = PushFails(relay.clone());
+        let report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
+            .await
+            .unwrap();
+
+        // Push failed and is reported; pull was clean and made progress.
+        assert!(
+            report.push_error.is_some(),
+            "push error preserved on the report"
+        );
+        assert!(report.pull_error.is_none(), "pull was clean");
+        assert_eq!(report.pushed, 0, "nothing acked (push errored)");
+        assert!(
+            report.applied > 0,
+            "A's change applied despite the push failure"
+        );
+        let bk1: String = b
+            .conn()
+            .query_row("SELECT v FROM kv WHERE id='k1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bk1, "A-val", "the pulled change merged");
+        assert!(
+            state::pull_watermark(b.conn()).unwrap() > 0,
+            "watermark advanced after the successful merge"
+        );
+        // B's local k2 never reached the relay (push failed): it still holds only A's entry.
+        assert_eq!(relay.completeness().await.unwrap().count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_fails_push_proceeds() {
+        // F1 (inverse): with a transport whose pull always errors, the push half STILL
+        // uploads local writes — the pull error is preserved rather than masking the push.
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&b);
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        b.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k9','B-only')", [])
+            .unwrap();
+        let failing = PullFails(relay.clone());
+        let report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
+            .await
+            .unwrap();
+
+        // Push succeeded and is credited; pull failed and is reported.
+        assert!(
+            report.pull_error.is_some(),
+            "pull error preserved on the report"
+        );
+        assert!(report.push_error.is_none(), "push was clean");
+        assert_eq!(
+            report.pushed, 1,
+            "the local write was pushed despite the pull failure"
+        );
+        // B's change is durably on the relay.
+        assert_eq!(relay.completeness().await.unwrap().count, 1);
     }
 }

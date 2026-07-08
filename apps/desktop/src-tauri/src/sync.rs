@@ -103,6 +103,14 @@ const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v1";
 /// later; a fixed poll is correct and simplest for v1.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How many CONSECUTIVE drain cycles must hit a (non-fatal) push/pull error before the
+/// panel flips to a distinct "Sync error" state (F2). A single blip — relay restart, laptop
+/// sleep, a momentary network drop — is common and self-heals next cycle, so we require a
+/// short run before nagging the owner; the verbatim error is then surfaced honestly. A later
+/// clean cycle clears it. Value 2: the smallest run that distinguishes a real outage from a
+/// one-cycle transient.
+const DRAIN_FAIL_SURFACE_THRESHOLD: u32 = 2;
+
 // ----- Persisted session (OS keychain — never localStorage / plaintext SQLite) -----
 
 /// The signed-in session held in the OS keychain (macOS Keychain / Windows
@@ -895,6 +903,13 @@ enum DrainHealth {
     /// Carries a human message for `last_error`. The drain keeps pulling but this entry
     /// stays put — surfaced ONCE, never a 5s 413 hot-loop.
     Blocked(String),
+    /// [`DRAIN_FAIL_SURFACE_THRESHOLD`] CONSECUTIVE drain cycles hit a (non-fatal) transport
+    /// error in push OR pull (F2). Surfaces the VERBATIM latest error as `last_error` so the
+    /// frontend's `deriveSyncDisplay` renders the distinct "Sync error" state — before F2 the
+    /// owner watched "syncing" with nothing moving and zero feedback. The drain keeps
+    /// retrying (not fatal); a single transient blip stays quiet, and a later clean cycle
+    /// clears it.
+    Failing(String),
 }
 
 fn drain_health_cell() -> &'static RwLock<DrainHealth> {
@@ -921,6 +936,37 @@ fn drain_health() -> DrainHealth {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// What the F2 threshold step decided this cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailSurface {
+    /// A failure, but not enough consecutive ones yet — stay quiet (a single blip).
+    Quiet,
+    /// The consecutive-failure run reached [`DRAIN_FAIL_SURFACE_THRESHOLD`] — surface the
+    /// verbatim error as a distinct failing state.
+    Surface,
+    /// A clean cycle — reset the run and clear any prior failing state.
+    Clear,
+}
+
+/// Fold one cycle's success/failure into the running consecutive-failure count and decide
+/// whether to surface a failing state, stay quiet, or clear (F2). Pure — extracted so the
+/// "1 blip stays quiet, 2-in-a-row surfaces, a later success clears" contract is unit-tested
+/// without spinning up the drain thread. `cycle_failed` is true for any non-fatal transport
+/// error or a cycle-fatal local fault; the sticky Oversized state manages its own reset.
+fn fail_surface_step(consecutive_errors: &mut u32, cycle_failed: bool) -> FailSurface {
+    if cycle_failed {
+        *consecutive_errors = consecutive_errors.saturating_add(1);
+        if *consecutive_errors >= DRAIN_FAIL_SURFACE_THRESHOLD {
+            FailSurface::Surface
+        } else {
+            FailSurface::Quiet
+        }
+    } else {
+        *consecutive_errors = 0;
+        FailSurface::Clear
+    }
 }
 
 // ----- Drain progress (T024 push-progress surfacing) -----
@@ -1173,19 +1219,47 @@ fn spawn_drain(
                 }
             };
             let mut acked_session: u64 = 0;
+            // F2: consecutive cycles that hit a (non-fatal) transport error in either
+            // direction. Flips the panel to a distinct failing state past the threshold; any
+            // clean cycle (or a sticky Oversized) resets it.
+            let mut consecutive_errors: u32 = 0;
 
             while !stop.load(Ordering::SeqCst) {
-                let mut outcome =
-                    rt.block_on(outbox::drain_once(conn, &cipher, &transport, client_id, sv, ev));
+                // A cycle now ALWAYS attempts BOTH push and pull (F1); a per-direction
+                // transport error rides on the report rather than aborting the cycle. Only a
+                // cycle-fatal LOCAL (sqlite/replay) fault returns `Err` — never crash the
+                // thread on it; count it toward the failing threshold and retry next cycle.
+                let mut report =
+                    match rt.block_on(outbox::drain_once(conn, &cipher, &transport, client_id, sv, ev)) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if fail_surface_step(&mut consecutive_errors, true) == FailSurface::Surface
+                                && set_drain_health(DrainHealth::Failing(msg.clone()))
+                            {
+                                tracing::warn!("sync drain cycle failed: {msg}");
+                            }
+                            std::thread::sleep(DRAIN_INTERVAL);
+                            continue;
+                        }
+                    };
 
-                // Bug A: distinguish a 401 from other errors and refresh-and-retry ONCE.
-                if matches!(outcome, Err(yapstack_sync::SyncError::Unauthorized)) {
+                // Bug A (T023), now covering BOTH directions (F1): a 401 in push OR pull →
+                // refresh the access token once and retry the whole cycle.
+                if report.has_unauthorized() {
                     match rt.block_on(refresh_access_token()) {
                         Ok(new_access) => {
                             transport.set_bearer(&new_access);
-                            outcome = rt.block_on(outbox::drain_once(
+                            report = match rt.block_on(outbox::drain_once(
                                 conn, &cipher, &transport, client_id, sv, ev,
-                            ));
+                            )) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!("sync drain cycle failed after refresh: {e}");
+                                    std::thread::sleep(DRAIN_INTERVAL);
+                                    continue;
+                                }
+                            };
                         }
                         Err(_) => {
                             // No refresh token / relay rejected it → stop the drain and
@@ -1199,78 +1273,36 @@ fn spawn_drain(
                         }
                     }
                 }
+                // Refresh succeeded but a direction STILL 401'd → the token is truly dead.
+                if report.has_unauthorized() {
+                    if set_drain_health(DrainHealth::AuthExpired) {
+                        tracing::warn!(
+                            "sync drain: refreshed token still rejected — auth expired; stopping drain"
+                        );
+                    }
+                    break;
+                }
 
-                match outcome {
-                    Ok(report) => {
-                        set_drain_health(DrainHealth::Ok);
-                        if report.applied + report.replayed > 0 {
-                            // Reinstate the stripped FK cascade + UNIQUE invariants
-                            // deterministically after a merge (R4/R5).
-                            if let Err(e) = cascade::cascade_gc(conn) {
-                                tracing::warn!("sync drain: cascade_gc: {e}");
-                            }
-                            if let Err(e) = uniqueness::enforce_uniqueness(conn) {
-                                tracing::warn!("sync drain: enforce_uniqueness: {e}");
-                            }
-                        }
-                        // T024 progress: recompute the backlog from the outbox after this
-                        // cycle's push, accumulate the session ack count, and log ONLY on
-                        // real progress / transitions — never every idle 5s cycle.
-                        acked_session += report.pushed as u64;
-                        match outbox::pending(conn) {
-                            Ok(p) => {
-                                if report.pushed > 0 {
-                                    tracing::info!(
-                                        "sync: pushed {} {}, {} remaining",
-                                        report.pushed,
-                                        if report.pushed == 1 { "entry" } else { "entries" },
-                                        p.entries
-                                    );
-                                    had_backlog = true;
-                                } else if !had_backlog && p.entries > 0 {
-                                    // Fresh local writes appeared this cycle but could not
-                                    // be pushed yet — announce the new backlog once.
-                                    tracing::info!(
-                                        "sync: pushing {} pending {} ({:.1} MiB)",
-                                        p.entries,
-                                        if p.entries == 1 { "entry" } else { "entries" },
-                                        p.bytes as f64 / (1024.0 * 1024.0)
-                                    );
-                                    had_backlog = true;
-                                }
-                                let last_success = if p.entries == 0 {
-                                    if had_backlog {
-                                        tracing::info!("sync: up to date");
-                                        had_backlog = false;
-                                    }
-                                    Some(chrono::Utc::now().to_rfc3339())
-                                } else {
-                                    drain_progress().last_success
-                                };
-                                set_drain_progress(DrainProgress {
-                                    pending_entries: p.entries,
-                                    pending_bytes: p.bytes,
-                                    acked_this_session: acked_session,
-                                    syncing: p.entries > 0,
-                                    last_success,
-                                });
-                            }
-                            Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
-                        }
+                if report.applied + report.replayed > 0 {
+                    // Reinstate the stripped FK cascade + UNIQUE invariants deterministically
+                    // after a merge (R4/R5).
+                    if let Err(e) = cascade::cascade_gc(conn) {
+                        tracing::warn!("sync drain: cascade_gc: {e}");
                     }
-                    // Refresh succeeded but the retry STILL 401'd → the token is truly dead.
-                    Err(yapstack_sync::SyncError::Unauthorized) => {
-                        if set_drain_health(DrainHealth::AuthExpired) {
-                            tracing::warn!(
-                                "sync drain: refreshed token still rejected — auth expired; stopping drain"
-                            );
-                        }
-                        break;
+                    if let Err(e) = uniqueness::enforce_uniqueness(conn) {
+                        tracing::warn!("sync drain: enforce_uniqueness: {e}");
                     }
-                    // Bug B4: a guaranteed-413 pre-chunking-fix entry too large to push as a
-                    // single request. Surface ONCE (no 5s HTTP hot-loop — the push guard
-                    // already blocked the call).
-                    Err(yapstack_sync::SyncError::Oversized { client_seq, size }) => {
+                }
+
+                // F2: surface the tolerated push/pull transport errors via the existing
+                // DrainHealth channel — before this the owner had ZERO feedback while a push or
+                // pull silently failed every cycle.
+                match report.first_transport_error() {
+                    // Bug B4: a guaranteed-413 entry too large to push as a single request. Its
+                    // own sticky Blocked state (not a transient flap), surfaced ONCE — the push
+                    // guard already blocked the HTTP call, so no 5s hot-loop.
+                    Some(yapstack_sync::SyncError::Oversized { client_seq, size }) => {
+                        consecutive_errors = 0;
                         let msg = format!(
                             "A queued change (#{client_seq}, ~{} MiB on the wire) is too large to sync and was held back.",
                             size / (1024 * 1024)
@@ -1279,9 +1311,71 @@ fn spawn_drain(
                             tracing::warn!("sync drain: {msg}");
                         }
                     }
-                    // Surface, never crash the thread — a transient relay error must not
-                    // tear down sync; retry next cycle.
-                    Err(e) => tracing::warn!("sync drain cycle failed: {e}"),
+                    // Any other transient relay error (push OR pull): count it, and after a
+                    // short run flip the panel to a failing state carrying the VERBATIM error.
+                    Some(e) => {
+                        let msg = e.to_string();
+                        if fail_surface_step(&mut consecutive_errors, true) == FailSurface::Surface
+                            && set_drain_health(DrainHealth::Failing(msg.clone()))
+                        {
+                            tracing::warn!(
+                                "sync drain: relay error on {consecutive_errors} consecutive cycles: {msg}"
+                            );
+                        }
+                    }
+                    // A fully clean cycle — clear the run and any prior failing/blocked state.
+                    None => {
+                        fail_surface_step(&mut consecutive_errors, false);
+                        set_drain_health(DrainHealth::Ok);
+                    }
+                }
+
+                // T024 progress: recompute the backlog from the outbox after this cycle's
+                // push, accumulate the session ack count, and log ONLY on real progress /
+                // transitions — never every idle 5s cycle.
+                acked_session += report.pushed as u64;
+                match outbox::pending(conn) {
+                    Ok(p) => {
+                        if report.pushed > 0 {
+                            tracing::info!(
+                                "sync: pushed {} {}, {} remaining",
+                                report.pushed,
+                                if report.pushed == 1 { "entry" } else { "entries" },
+                                p.entries
+                            );
+                            had_backlog = true;
+                        } else if !had_backlog && p.entries > 0 {
+                            // Fresh local writes appeared this cycle but could not be pushed
+                            // yet — announce the new backlog once.
+                            tracing::info!(
+                                "sync: pushing {} pending {} ({:.1} MiB)",
+                                p.entries,
+                                if p.entries == 1 { "entry" } else { "entries" },
+                                p.bytes as f64 / (1024.0 * 1024.0)
+                            );
+                            had_backlog = true;
+                        }
+                        // "Up to date" only counts when the outbox is empty AND no transport
+                        // error occurred this cycle (else we'd claim success mid-failure).
+                        let clean = report.first_transport_error().is_none();
+                        let last_success = if p.entries == 0 && clean {
+                            if had_backlog {
+                                tracing::info!("sync: up to date");
+                                had_backlog = false;
+                            }
+                            Some(chrono::Utc::now().to_rfc3339())
+                        } else {
+                            drain_progress().last_success
+                        };
+                        set_drain_progress(DrainProgress {
+                            pending_entries: p.entries,
+                            pending_bytes: p.bytes,
+                            acked_this_session: acked_session,
+                            syncing: p.entries > 0,
+                            last_success,
+                        });
+                    }
+                    Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
                 }
 
                 std::thread::sleep(DRAIN_INTERVAL);
@@ -1600,6 +1694,10 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
             Some("Your session expired. Sign in again to resume sync.".to_string()),
         ),
         DrainHealth::Blocked(msg) => (connected_phase, Some(msg)),
+        // A persistently failing relay (F2) surfaces its verbatim error as `last_error` on
+        // the connected phase; `deriveSyncDisplay` renders any set `last_error` as the
+        // distinct "Sync error — needs attention" state, no DTO/contract change needed.
+        DrainHealth::Failing(msg) => (connected_phase, Some(msg)),
         DrainHealth::Ok if session.sync_enabled && progress.syncing => {
             ("syncing".to_string(), last_error)
         }
@@ -2549,6 +2647,31 @@ fn start_and_store_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fail_surface_threshold_gates_a_single_blip_but_surfaces_a_run() {
+        // F2 contract: one failed cycle stays QUIET (a transient blip self-heals); the
+        // SECOND consecutive failure (== DRAIN_FAIL_SURFACE_THRESHOLD) surfaces; a later
+        // clean cycle CLEARS the run so the next single blip is quiet again.
+        assert_eq!(DRAIN_FAIL_SURFACE_THRESHOLD, 2, "test assumes threshold 2");
+        let mut n: u32 = 0;
+
+        // 1st failure — below threshold, quiet.
+        assert_eq!(fail_surface_step(&mut n, true), FailSurface::Quiet);
+        assert_eq!(n, 1);
+        // 2nd consecutive failure — reaches threshold, surface the verbatim error.
+        assert_eq!(fail_surface_step(&mut n, true), FailSurface::Surface);
+        assert_eq!(n, 2);
+        // 3rd consecutive failure — stays surfaced (still at/over threshold).
+        assert_eq!(fail_surface_step(&mut n, true), FailSurface::Surface);
+        assert_eq!(n, 3);
+        // A clean cycle clears the run.
+        assert_eq!(fail_surface_step(&mut n, false), FailSurface::Clear);
+        assert_eq!(n, 0);
+        // A single blip after recovery is quiet again (no flap).
+        assert_eq!(fail_surface_step(&mut n, true), FailSurface::Quiet);
+        assert_eq!(n, 1);
+    }
 
     #[test]
     fn recovery_wrap_block_matches_kdf_recovery_key() {
