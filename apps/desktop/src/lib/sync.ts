@@ -60,6 +60,34 @@ export type RelayProbeError =
   | { kind: "tls-error"; raw: string }
   | { kind: "not-a-relay"; raw: string };
 
+/**
+ * Store-side connection health for the relay URL field — a SEPARATE axis from
+ * the sync `phase` (§1b two-tier rule: connection health short-circuits sync
+ * phase in `deriveSyncDisplay`). Driven only by explicit probes today:
+ *
+ *   idle     — never probed / field just edited (reset).
+ *   testing  — a probe is in flight.
+ *   ok       — reachable relay; carries the T025 success payload. A version gap
+ *              rides as `versionAdvisory` (advisory, still saveable) — it is NOT
+ *              a failure kind (the §1b sketch predates T025; T025's shape wins).
+ *   unreachable / tls-error / not-a-relay — the three typed probe failures, each
+ *              with the verbatim `raw` chain (must-preserve).
+ */
+export type RelayConnState =
+  | { kind: "idle" }
+  | { kind: "testing" }
+  | {
+      kind: "ok";
+      engineVersion: string;
+      protocolVersion: number;
+      latencyMs: number;
+      normalizedUrl: string;
+      versionAdvisory: RelayVersionAdvisory | null;
+    }
+  | { kind: "unreachable"; raw: string }
+  | { kind: "tls-error"; raw: string }
+  | { kind: "not-a-relay"; raw: string };
+
 export type SyncPhase =
   | "disconnected"
   | "connecting"

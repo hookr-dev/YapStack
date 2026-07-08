@@ -104,6 +104,8 @@ import type { AIConfig } from "@/lib/ai";
 import {
   DEFAULT_SYNC_SERVER_URL,
   syncCommands,
+  type RelayConnState,
+  type RelayProbeError,
   type SyncStatus,
 } from "@/lib/sync";
 import {
@@ -455,15 +457,30 @@ interface AppState {
   // Settings (persisted)
   settings: Settings;
 
-  // Sync (config persisted; live status runtime-only). See lib/sync.ts.
+  // Sync (config persisted; live status + connection health runtime-only).
+  // See lib/sync.ts.
   syncConfig: SyncConfig;
   syncStatus: SyncStatus | null;
+  /** Probe-derived relay connection health — a SEPARATE axis from sync phase
+   *  (§1b). Runtime-only and never latched/persisted: recomputed from live
+   *  probes so a stale "unreachable" can't linger (plan §3). */
+  relayConn: RelayConnState;
   setSyncConfig: (partial: Partial<SyncConfig>) => void;
   setSyncStatus: (status: SyncStatus | null) => void;
   /** Fetch live sync/auth status from the Rust runtime. Surfaces connection
    *  errors verbatim into `syncStatus.lastError` — never auto-routes or falls
    *  back (repo posture: the user fixes a broken connection). */
   refreshSyncStatus: () => Promise<void>;
+  /** Probe `url` (the Test-connection button and the one-shot blur/paste in
+   *  T027 both call this). Single-flight via a monotonic token: a stale
+   *  response from a superseded probe is discarded. On success auto-persists
+   *  `syncConfig.serverUrl = normalizedUrl` — but ONLY when signed out (a
+   *  signed-in URL is locked; changing it is an explicit sign-out flow). */
+  probeRelay: (url: string) => Promise<void>;
+  /** Return connection health to `idle` and bump the probe token so any
+   *  in-flight probe's response is discarded (cancel-on-edit). Called when the
+   *  user edits the URL field. Re-probing the same URL twice is cheap + safe. */
+  resetProbe: () => void;
 
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
@@ -632,6 +649,14 @@ interface AppState {
  */
 let segmentQueueTail: Promise<void> = Promise.resolve();
 let lastSessionsRefreshTime = 0;
+
+/**
+ * Monotonic single-flight token for relay probes. Each `probeRelay` bumps it;
+ * a resolving/rejecting probe whose token no longer matches the latest is stale
+ * (the user re-fired or edited the field) and its result is discarded.
+ * `resetProbe` bumps it too, cancelling any in-flight probe.
+ */
+let relayProbeToken = 0;
 function enqueueSegmentWork(fn: () => Promise<void>): void {
   segmentQueueTail = segmentQueueTail.then(fn, fn);
 }
@@ -797,6 +822,7 @@ function createAppStore() {
       settings: defaultSettings,
       syncConfig: defaultSyncConfig,
       syncStatus: null,
+      relayConn: { kind: "idle" },
       devices: [],
       models: [],
       engineCatalogue: [],
@@ -1540,6 +1566,11 @@ function createAppStore() {
           // broken connection is the user's to fix (feedback_surface_ai_errors).
           const msg = e instanceof Error ? e.message : String(e);
           console.error("Failed to fetch sync status:", msg);
+          // TODO(T02x): plumb drain-level connectivity — a NETWORK drain
+          // failure lands here as phase="error"/lastError, but we deliberately
+          // do NOT fabricate `relayConn = unreachable` from it (no error-string
+          // parsing). Connection health stays probe-driven until the drain
+          // surfaces a typed connectivity signal we can map cleanly.
           const prev = get().syncStatus;
           set({
             syncStatus: {
@@ -1562,6 +1593,62 @@ function createAppStore() {
             },
           });
         }
+      },
+
+      probeRelay: async (url: string) => {
+        const token = ++relayProbeToken;
+        set({ relayConn: { kind: "testing" } });
+        try {
+          const ok = await syncCommands.probe(url);
+          // Single-flight: a newer probe (or a resetProbe) superseded us while
+          // the request was in flight — discard this now-stale result.
+          if (token !== relayProbeToken) return;
+          set({
+            relayConn: {
+              kind: "ok",
+              engineVersion: ok.engineVersion,
+              protocolVersion: ok.protocolVersion,
+              latencyMs: ok.latencyMs,
+              normalizedUrl: ok.normalizedUrl,
+              versionAdvisory: ok.versionAdvisory,
+            },
+          });
+          // Test-and-save (plan §0.1): persist the server's normalized URL on a
+          // successful probe — but ONLY when signed out. A signed-in device's
+          // URL is locked (changing it signs the device out; that's an explicit
+          // AlertDialog flow in T027), so never mutate it from an ambient probe.
+          const signedIn = get().syncConfig.email != null;
+          if (!signedIn) {
+            get().setSyncConfig({ serverUrl: ok.normalizedUrl });
+          }
+        } catch (e) {
+          if (token !== relayProbeToken) return;
+          // The T025 contract rejects with a tagged RelayProbeError; map it
+          // straight through (verbatim `raw` preserved). Any non-tagged throw
+          // (e.g. the sync feature not built) is treated as a connection-level
+          // failure with its message surfaced verbatim — never swallowed.
+          const err = e as Partial<RelayProbeError> | undefined;
+          if (
+            err &&
+            typeof err === "object" &&
+            (err.kind === "unreachable" ||
+              err.kind === "tls-error" ||
+              err.kind === "not-a-relay") &&
+            typeof err.raw === "string"
+          ) {
+            set({ relayConn: { kind: err.kind, raw: err.raw } });
+          } else {
+            const raw = e instanceof Error ? e.message : String(e);
+            set({ relayConn: { kind: "unreachable", raw } });
+          }
+        }
+      },
+
+      resetProbe: () => {
+        // Bump the token so any in-flight probe's response is discarded
+        // (cancel-on-edit), then return health to idle.
+        relayProbeToken++;
+        set({ relayConn: { kind: "idle" } });
       },
 
       setListFilter: (filter) => {
