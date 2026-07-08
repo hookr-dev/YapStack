@@ -27,9 +27,9 @@
 //! CRR tables, which do not exist until the A3 cutover (and cutover requires
 //! sync). See [`ManagedConn`].
 
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
@@ -121,20 +121,20 @@ pub struct DbExecuteResult {
 /// One selected row as an ordered-by-name JSON object, matching the plugin.
 pub type DbRow = serde_json::Map<String, JsonValue>;
 
-/// The command backend: one writer + a ring of readers over `yapstack.db`.
-pub struct DbService {
+/// One writer connection + a ring of reader connections, all open on the same
+/// on-disk file. Held inside [`DbService`] behind an `RwLock<Option<Pool>>` so the
+/// A3 CRR cutover can drop **every** connection (`None`) for the file swap and
+/// reopen a fresh pool afterwards.
+struct Pool {
     writer: Mutex<ManagedConn>,
     readers: Vec<Mutex<ManagedConn>>,
     next_reader: AtomicUsize,
 }
 
-/// Managed Tauri state handle.
-pub type DbServiceState = Arc<DbService>;
-
-impl DbService {
-    /// Open the pool for `path`, run pending migrations on the writer BEFORE any
-    /// reader is opened or any command can be served, then open the readers.
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+impl Pool {
+    /// Open the writer, run pending migrations on it BEFORE any reader is opened,
+    /// then open the reader ring.
+    fn open(path: &Path) -> rusqlite::Result<Self> {
         let writer = ManagedConn::open(path)?;
         // Migrations run first, on the writer, so readers open on the migrated
         // schema and the first command observes a fully-migrated DB.
@@ -150,8 +150,7 @@ impl DbService {
         })
     }
 
-    /// Run a write (INSERT/UPDATE/DELETE/DDL) on the serialized writer.
-    pub fn execute(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<DbExecuteResult> {
+    fn execute(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<DbExecuteResult> {
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let conn = guard.conn();
         let rows_affected =
@@ -163,8 +162,7 @@ impl DbService {
         })
     }
 
-    /// Run a read on the next reader connection (round-robin).
-    pub fn select(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<Vec<DbRow>> {
+    fn select(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<Vec<DbRow>> {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
         let guard = self.readers[idx].lock().unwrap_or_else(|e| e.into_inner());
         let conn = guard.conn();
@@ -181,6 +179,123 @@ impl DbService {
             out.push(map);
         }
         Ok(out)
+    }
+}
+
+/// The command backend: one writer + a ring of readers over `yapstack.db`.
+///
+/// ## Cutover-time quiesce (A3)
+/// The pool is `RwLock<Option<Pool>>` plus a `swapping` fast-path flag. During the
+/// enable-time CRR cutover the sync layer calls [`DbService::close_for_swap`]: it
+/// raises `swapping` (so new `execute`/`select` fail-fast, never blocking), waits
+/// for in-flight commands to finish (the write lock), checkpoints the writer, and
+/// drops every connection so `crsql_finalize()` runs and the file can be renamed.
+/// [`DbService::reopen`] rebuilds the pool on the swapped-in file. During the
+/// (sub-second) window, `db_execute`/`db_select` return a retryable `SQLITE_BUSY`
+/// (`DB_SWAP_IN_PROGRESS`); the frontend's Enable flow shows a "Preparing…" state
+/// and the app's polling queries retry — we deliberately **fail-fast rather than
+/// queue** (queueing across the swap risks holding connections we must drop).
+pub struct DbService {
+    /// The served file — read only by [`DbService::reopen`] (sync-only cutover), so
+    /// it is otherwise dead in the no-sync build.
+    #[cfg_attr(not(feature = "sync"), allow(dead_code))]
+    path: PathBuf,
+    /// Fast-path gate: set true for the swap window so callers fail-fast before ever
+    /// contending on the pool lock (prevents reader-preferring `RwLock` starvation of
+    /// the swap writer).
+    swapping: AtomicBool,
+    /// `None` only during the swap window (between `close_for_swap` and `reopen`).
+    pool: RwLock<Option<Pool>>,
+}
+
+/// Managed Tauri state handle.
+pub type DbServiceState = Arc<DbService>;
+
+/// Retryable error surfaced to `db_execute`/`db_select` callers during the cutover
+/// swap window. `SQLITE_BUSY` marks it retryable; the message is a stable sentinel
+/// the frontend can recognize.
+fn swap_in_progress_err() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(
+            "DB_SWAP_IN_PROGRESS: the database is briefly unavailable while sync is being \
+             enabled; retry shortly"
+                .to_string(),
+        ),
+    )
+}
+
+impl DbService {
+    /// Open the pool for `path`, running migrations on the writer before serving.
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        let pool = Pool::open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            swapping: AtomicBool::new(false),
+            pool: RwLock::new(Some(pool)),
+        })
+    }
+
+    /// Run a write (INSERT/UPDATE/DELETE/DDL) on the serialized writer.
+    pub fn execute(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<DbExecuteResult> {
+        if self.swapping.load(Ordering::Acquire) {
+            return Err(swap_in_progress_err());
+        }
+        let guard = self.pool.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(pool) => pool.execute(query, values),
+            None => Err(swap_in_progress_err()),
+        }
+    }
+
+    /// Run a read on the next reader connection (round-robin).
+    pub fn select(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<Vec<DbRow>> {
+        if self.swapping.load(Ordering::Acquire) {
+            return Err(swap_in_progress_err());
+        }
+        let guard = self.pool.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(pool) => pool.select(query, values),
+            None => Err(swap_in_progress_err()),
+        }
+    }
+
+    /// Quiesce the pool for the A3 file swap: raise the fast-path gate, wait for
+    /// in-flight commands (write lock), checkpoint the writer so the `-wal` merges
+    /// into the main file, then drop every connection (`crsql_finalize()` runs on
+    /// drop). After this returns, the on-disk file has no live handles and can be
+    /// renamed. Pairs with [`DbService::reopen`].
+    ///
+    /// Only exists under the `sync` feature — the cutover it serves is sync-only.
+    /// The short-lived per-call connections in [`crate::db`] (`open_managed`) are
+    /// opened+dropped within a single function and hold no persistent handle across
+    /// the window; they are not tracked here (a rare concurrent open during the
+    /// sub-second window is best-effort and self-heals on retry).
+    #[cfg(feature = "sync")]
+    pub fn close_for_swap(&self) -> rusqlite::Result<()> {
+        self.swapping.store(true, Ordering::Release);
+        let mut guard = self.pool.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = guard.as_ref() {
+            let w = pool.writer.lock().unwrap_or_else(|e| e.into_inner());
+            // Best-effort: sidecars are also removed by the cutover after this returns.
+            let _ = w.conn().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        *guard = None; // drop Pool -> drop every ManagedConn -> crsql_finalize.
+        Ok(())
+    }
+
+    /// Rebuild the pool on the (possibly swapped) file and lower the fast-path gate.
+    /// Runs migrations again; on a CRR-prepared live DB every migration is already
+    /// recorded so this is a no-op. Pairs with [`DbService::close_for_swap`].
+    #[cfg(feature = "sync")]
+    pub fn reopen(&self) -> rusqlite::Result<()> {
+        let pool = Pool::open(&self.path)?;
+        {
+            let mut guard = self.pool.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(pool);
+        }
+        self.swapping.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -237,7 +352,33 @@ fn value_ref_to_json(v: ValueRef<'_>) -> JsonValue {
 ///
 /// Returns the list of versions applied by this call (empty when already
 /// up-to-date).
+///
+/// ## Note for future migration authors (A3 CRR ownership)
+/// After the enable-time cutover the live `yapstack.db` **is** the cr-sqlite CRR
+/// database. A schema change to a synced table (see
+/// [`yapstack_sync::schema::SYNC_TABLES`]) must NOT be a bare `ALTER TABLE`: that
+/// desyncs the per-row clock/pks shadow tables cr-sqlite maintains. This runner
+/// detects a CRR-prepared DB and automatically routes a **single-statement
+/// `ALTER TABLE <sync_table> …`** migration through
+/// [`yapstack_sync::schema::crsql_alter`] (`crsql_begin_alter`/`crsql_commit_alter`),
+/// which rebuilds the shadow tables and backfills the new column at
+/// `col_version=1`. What you must know:
+///   * Keep a sync-table schema migration to ONE `ALTER TABLE` statement so the
+///     auto-wrap applies; split multi-step changes across migration versions.
+///   * `CREATE INDEX`/trigger changes and any migration touching a NON-sync table
+///     are applied plainly (unchanged) — only sync-table `ALTER`s are wrapped.
+///   * On a non-CRR DB (fresh install before cutover, or the `no-sync` build) every
+///     migration is applied plainly, exactly as before.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    run_migrations_list(conn, &crate::db::migrations())
+}
+
+/// Migration runner over an explicit list (so tests can drive the CRR-wrap path
+/// with a synthetic migration). See [`run_migrations`].
+pub fn run_migrations_list(
+    conn: &Connection,
+    migrations: &[crate::db::Migration],
+) -> rusqlite::Result<Vec<i64>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
             version BIGINT PRIMARY KEY,
@@ -256,29 +397,13 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
     };
 
     let mut newly_applied = Vec::new();
-    for m in crate::db::migrations() {
+    for m in migrations {
         if applied.contains(&m.version) {
             continue;
         }
-        let start = std::time::Instant::now();
-        conn.execute_batch("BEGIN;")?;
-        match conn.execute_batch(m.sql) {
-            Ok(()) => {
-                let elapsed = start.elapsed().as_nanos() as i64;
-                // Empty checksum: the runner never validates it (sqlx is gone),
-                // and dev DBs have divergent history we must not re-check.
-                let checksum: Vec<u8> = Vec::new();
-                conn.execute(
-                    "INSERT INTO _sqlx_migrations
-                       (version, description, success, checksum, execution_time)
-                     VALUES (?, ?, 1, ?, ?)",
-                    rusqlite::params![m.version, m.description, checksum, elapsed],
-                )?;
-                conn.execute_batch("COMMIT;")?;
-                newly_applied.push(m.version);
-            }
+        match apply_migration(conn, m) {
+            Ok(()) => newly_applied.push(m.version),
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK;");
                 tracing::error!(
                     "migration v{} ({}) failed; skipping (runtime schema patches will \
                      backfill if applicable): {e}",
@@ -289,6 +414,108 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
         }
     }
     Ok(newly_applied)
+}
+
+/// Insert the sqlx-compatible bookkeeping row for an applied migration. Empty
+/// checksum: the runner never validates it (sqlx is gone) and dev DBs have
+/// divergent history we must not re-check.
+fn record_migration(
+    conn: &Connection,
+    m: &crate::db::Migration,
+    elapsed_nanos: i64,
+) -> rusqlite::Result<()> {
+    let checksum: Vec<u8> = Vec::new();
+    conn.execute(
+        "INSERT INTO _sqlx_migrations
+           (version, description, success, checksum, execution_time)
+         VALUES (?, ?, 1, ?, ?)",
+        rusqlite::params![m.version, m.description, checksum, elapsed_nanos],
+    )?;
+    Ok(())
+}
+
+/// Apply one migration and record its bookkeeping. On a CRR-prepared DB a single
+/// `ALTER TABLE <sync_table>` is routed through cr-sqlite's alter-wrapping; every
+/// other migration is applied plainly in a transaction with its bookkeeping row.
+fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Result<()> {
+    let start = std::time::Instant::now();
+
+    #[cfg(feature = "sync")]
+    {
+        if let Some(table) = crr_alter_target(conn, m.sql)? {
+            // CRR-prepared DB + a single ALTER on a CRR sync table: wrap in
+            // crsql_begin_alter/crsql_commit_alter so the clock/pks shadow tables are
+            // rebuilt and the new column backfills at col_version=1. crsql_alter runs
+            // its own transaction, so the bookkeeping row is recorded immediately
+            // after (autocommit). The only non-atomic window — the alter commits but
+            // the (local, single-row) bookkeeping insert fails — is vanishingly
+            // unlikely; on a re-run the ALTER would fail loudly (duplicate column)
+            // rather than corrupt, and the column is already present.
+            yapstack_sync::schema::crsql_alter(conn, &table, m.sql).map_err(sync_to_rusqlite)?;
+            return record_migration(conn, m, start.elapsed().as_nanos() as i64);
+        }
+    }
+
+    conn.execute_batch("BEGIN;")?;
+    let res = conn
+        .execute_batch(m.sql)
+        .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
+    match res {
+        Ok(()) => conn.execute_batch("COMMIT;"),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// If `conn` is a CRR-prepared DB and `sql` is a single `ALTER TABLE <t>` on a
+/// synced table, return that table (routing it through `crsql_alter`). Otherwise
+/// `None` (apply plainly).
+#[cfg(feature = "sync")]
+fn crr_alter_target(conn: &Connection, sql: &str) -> rusqlite::Result<Option<String>> {
+    // "sessions" is CRRified together with every other sync table by crr_migrate,
+    // so its clock table existing proves the DB is CRR-prepared.
+    if !yapstack_sync::schema::is_crr(conn, "sessions").map_err(sync_to_rusqlite)? {
+        return Ok(None);
+    }
+    Ok(parse_single_alter_table(sql)
+        .filter(|t| yapstack_sync::schema::SYNC_TABLES.contains(&t.as_str())))
+}
+
+/// Extract the table name from a single `ALTER TABLE <name> …` statement, or
+/// `None` if `sql` is not exactly one ALTER TABLE statement.
+#[cfg(feature = "sync")]
+fn parse_single_alter_table(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.contains(';') {
+        return None; // multi-statement batch: apply plainly
+    }
+    let mut it = trimmed.split_whitespace();
+    if !it.next()?.eq_ignore_ascii_case("ALTER") {
+        return None;
+    }
+    if !it.next()?.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+    let name = it
+        .next()?
+        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']' || c == '\'');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Convert a `yapstack_sync::SyncError` into a `rusqlite::Error` so the CRR-wrapped
+/// migration path fits the runner's `rusqlite::Result`.
+#[cfg(feature = "sync")]
+fn sync_to_rusqlite(e: yapstack_sync::SyncError) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(e.to_string()),
+    )
 }
 
 /// Open a single managed connection for the ad-hoc Rust-side writers in
@@ -549,5 +776,90 @@ mod tests {
             .select("SELECT COUNT(*) AS c FROM sessions", &[])
             .unwrap();
         assert_eq!(rows[0]["c"], json!(1 + 8 * 50));
+    }
+
+    /// A3 migration ownership: on a CRR-prepared DB, a single `ALTER TABLE
+    /// <sync_table>` migration is routed through cr-sqlite's begin/commit_alter, so
+    /// the alter succeeds, is recorded, AND the CRR clock shadow table survives (a
+    /// bare ALTER would desync it). A non-sync-table migration is applied plainly.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn crr_prepared_alter_on_sync_table_routes_through_crsql_alter() {
+        let (_dir, path) = temp_db();
+        // Fresh CRR-capable connection; apply the real schema, then CRRify it.
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        run_migrations(conn).unwrap();
+        // Mirror the frontend db.ts out-of-band ALTERs (the columns rebuild_body
+        // expects), skipping any already present in the migrated schema.
+        for (table, col, coldef) in yapstack_sync::schema::OUT_OF_BAND_ALTERS {
+            if !yapstack_sync::schema::column_exists(conn, table, col).unwrap() {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {coldef};"))
+                    .unwrap();
+            }
+        }
+        yapstack_sync::schema::crr_migrate(conn).unwrap();
+        assert!(yapstack_sync::schema::is_crr(conn, "segments").unwrap());
+
+        // A synthetic v900 migration: a single ALTER on a synced table.
+        let alter = crate::db::Migration {
+            version: 900,
+            description: "test: add column to a CRR sync table",
+            sql: "ALTER TABLE segments ADD COLUMN a3_test_col TEXT",
+        };
+        // A synthetic v901 migration: touches a NON-sync table (applied plainly).
+        let plain = crate::db::Migration {
+            version: 901,
+            description: "test: create a local (non-sync) table",
+            sql: "CREATE TABLE a3_local (id TEXT PRIMARY KEY)",
+        };
+        let applied = run_migrations_list(conn, &[alter, plain]).unwrap();
+        assert_eq!(applied, vec![900, 901]);
+
+        // The column landed and the CRR clock shadow table still exists (proof the
+        // ALTER went through crsql_alter, not a bare ALTER that would drop the clock).
+        assert!(yapstack_sync::schema::column_exists(conn, "segments", "a3_test_col").unwrap());
+        assert!(
+            yapstack_sync::schema::is_crr(conn, "segments").unwrap(),
+            "CRR clock must survive the wrapped ALTER"
+        );
+        // A write to the altered CRR table still captures to crsql_changes.
+        conn.execute(
+            "INSERT INTO segments (id, session_id, a3_test_col) VALUES ('x', 's', 'v')",
+            [],
+        )
+        .unwrap();
+        let changes: i64 = conn
+            .query_row("SELECT count(*) FROM crsql_changes", [], |r| r.get(0))
+            .unwrap();
+        assert!(changes > 0, "CRR clock must record the post-alter write");
+        // The plain migration created the local table.
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='a3_local'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        assert!(exists);
+    }
+
+    /// Post-swap re-entry: `reopen` rebuilds a working pool on the same file and
+    /// clears the swap gate (queries fail-fast while the pool is closed).
+    #[cfg(feature = "sync")]
+    #[test]
+    fn close_for_swap_then_reopen_restores_service() {
+        let (_dir, svc) = service_with_schema();
+        svc.execute("INSERT INTO sessions (id, source) VALUES ('a', 'Mic')", &[])
+            .unwrap();
+        svc.close_for_swap().unwrap();
+        // Closed window: commands fail-fast with the retryable sentinel.
+        let err = svc
+            .select("SELECT 1", &[])
+            .expect_err("closed pool must reject");
+        assert!(err.to_string().contains("DB_SWAP_IN_PROGRESS"));
+        svc.reopen().unwrap();
+        let rows = svc.select("SELECT id FROM sessions", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

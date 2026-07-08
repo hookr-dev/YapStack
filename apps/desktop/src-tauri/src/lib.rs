@@ -661,11 +661,11 @@ pub fn run() {
             // before `backend_ready` unblocks the frontend. Migration continuity
             // with the removed tauri-plugin-sql is preserved via the existing
             // `_sqlx_migrations` bookkeeping (see `db_service::run_migrations`).
-            let db_service = Arc::new(
+            let db_service: db_service::DbServiceState = Arc::new(
                 db_service::DbService::open(&db_path)
                     .expect("failed to open repo-owned DB service"),
             );
-            app.manage(db_service as db_service::DbServiceState);
+            app.manage(db_service.clone());
 
             // YapStack Sync runtime (deliverable A): manage the drain handle and,
             // if the keychain holds an enabled session, start the encrypted
@@ -684,7 +684,7 @@ pub fn run() {
                 let sync_runtime: sync::SyncRuntimeState =
                     Arc::new(StdMutex::new(None));
                 app.manage(sync_runtime.clone());
-                sync::start_drain_if_enabled(&db_path, &sync_runtime);
+                sync::start_drain_if_enabled(&db_path, &sync_runtime, &db_service);
             }
 
             let model_manager = ModelManager::new(app_data_dir.clone());

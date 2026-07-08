@@ -210,8 +210,8 @@ export function SyncTab() {
           <CardHeader className={HEAD}>
             <CardTitle className="text-sm">Enable sync</CardTitle>
             <CardDescription className="text-xs">
-              Prepares a copy of your library for encrypted sync. Your original
-              data is untouched during preparation.
+              Upgrades this library in place for encrypted sync and keeps a full
+              backup alongside it (yapstack.db.pre-sync-backup) as a safety net.
             </CardDescription>
           </CardHeader>
           <CardContent className={BODY}>
@@ -219,7 +219,7 @@ export function SyncTab() {
               {enabling ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Preparing your library for sync…
+                  Upgrading your library for sync…
                 </>
               ) : (
                 "Enable sync on this device"

@@ -14,17 +14,19 @@
 //! Responsibilities here: (A) start the `yapstack-sync` drain on a dedicated
 //! single-thread runtime (`drain_once` holds `&Connection` across awaits →
 //! `!Send`) and schedule `cascade_gc` + `enforce_uniqueness` after merges;
-//! (F) run `crr_migrate` once, against a `.backup` COPY of the live DB (never
-//! the live DB), gated on `SYNC_SCHEMA_VERSION`; plus the OS-keychain vault key
-//! at rest (CRYPTO_SPEC §10).
+//! (A3 cutover) `perform_cutover` turns the LIVE `yapstack.db` INTO the CRR
+//! database (the copy architecture is gone) so the drain captures every UI write —
+//! run at Enable and, once, on drain start for a device enabled under the old copy
+//! architecture; plus the OS-keychain vault key at rest (CRYPTO_SPEC §10).
 //!
 //! Command surface (all registered live in `lib.rs`, `lib/sync.ts` is the TS
 //! contract): the relay probe (`sync_probe`), the status poll (`sync_status`),
 //! the auth ceremony round-trips (`sync_signup` / `sync_login_begin` /
 //! `sync_login_finish` / `sync_recover` / `sync_approve_device` / `sync_sign_out`),
-//! and enable (`sync_enable`, THE single enable path — crr_migrate a copy then
-//! start the drain). `start_drain_if_enabled` is the deliverable-A boot wiring
-//! invoked from the `setup` hook.
+//! and enable (`sync_enable`, THE single enable path — cutover the live DB to CRR
+//! then start the drain). `start_drain_if_enabled` is the deliverable-A boot wiring
+//! invoked from the `setup` hook (and runs the one-time cutover for an already-
+//! enabled device on a non-CRR live DB).
 //!
 //! Session store layout (three logical entries under one keychain service): the
 //! persistent device identity (`identity-v1`, survives sign-out) holds the §7.1
@@ -1134,6 +1136,301 @@ fn mark_prepared(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+// ----- Enable-time CRR cutover (Option A′ final stage, A3) -----
+//
+// The copy architecture is gone: `sync_enable` (and the already-enabled migration on
+// drain start) turn the LIVE `yapstack.db` INTO the cr-sqlite CRR database, so the
+// drain captures every write the UI makes. The proven A1-spike sequence is:
+//   1. idempotency gate  2. VACUUM INTO live→staging  3. CRRify staging (crr_migrate +
+//   cascade_gc + enforce_uniqueness + mark_prepared + reset watermarks + checkpoint)
+//   4. quiesce + drop ALL live handles  5. remove stale sidecars  6. atomic rename
+//   live→backup, staging→live  7. reopen pool + assert row counts == pre-swap
+//   8. on ANY failure: roll back (backup→live) and report verbatim.
+// Extension-less writes to CRR tables fail loudly (never corrupt) — the safety net.
+
+/// The pre-cutover backup of the live DB — the escape hatch (§5). Kept forever;
+/// NEVER auto-deleted. Restore by copying it back over `yapstack.db` with sync off.
+fn backup_db_path(live_db: &Path) -> PathBuf {
+    live_db.with_file_name("yapstack.db.pre-sync-backup")
+}
+
+/// Scratch path for the CRRified staging copy built during a cutover.
+fn cutover_staging_path(live_db: &Path) -> PathBuf {
+    live_db.with_file_name("yapstack.db.crr-staging")
+}
+
+/// True once the live DB is itself CRR-prepared at the current schema version (the
+/// idempotency gate). Inspected via a read-only connection — extension-less reads on
+/// a CRR DB are safe (A1 spike) and never create/mutate anything.
+fn live_is_crr_prepared(live_db: &Path) -> bool {
+    if !live_db.exists() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        live_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return false;
+    };
+    let clock: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions__crsql_clock'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !clock {
+        return false;
+    }
+    let ver: Option<i64> = conn
+        .query_row(
+            "SELECT schema_version FROM _yapstack_sync_prep LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    ver.unwrap_or(0) == SYNC_SCHEMA_VERSION as i64
+}
+
+/// Per-table row counts for every synced table (read-only). Used to assert the swap
+/// preserved data exactly (step 7). Sorted for a stable comparison.
+fn synced_table_row_counts(db: &Path) -> rusqlite::Result<Vec<(String, i64)>> {
+    let conn = Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut out = Vec::new();
+    for t in schema::SYNC_TABLES {
+        // A table may legitimately be absent on an old dev DB; treat as 0 rows.
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [t],
+                |_| Ok(()),
+            )
+            .is_ok();
+        let n: i64 = if exists {
+            conn.query_row(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))?
+        } else {
+            0
+        };
+        out.push((t.to_string(), n));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Remove a DB file plus its `-wal`/`-shm` sidecars (best-effort).
+fn remove_db_files(db: &Path) {
+    let _ = std::fs::remove_file(db);
+    remove_sidecars(db);
+}
+
+/// Remove only the `-wal`/`-shm` sidecars for `db` (best-effort).
+fn remove_sidecars(db: &Path) {
+    for ext in ["-wal", "-shm"] {
+        let mut s = db.as_os_str().to_owned();
+        s.push(ext);
+        let _ = std::fs::remove_file(PathBuf::from(s));
+    }
+}
+
+/// Discard the legacy copy-architecture database (`yapstack.sync.db`) and its stale
+/// `_yapstack_sync_meta` watermarks. Uniform-reset (§3): the pre-cutover copy on an
+/// already-enabled device holds merged data that is discarded and re-pulled into the
+/// now-CRR live DB (where it is finally visible). Idempotent / best-effort.
+fn discard_legacy_sync_copy(live_db: &Path) {
+    let legacy = sync_db_path(live_db);
+    if legacy.exists() {
+        tracing::info!(
+            "sync: discarding legacy copy-architecture DB at {} (data re-captured/re-pulled into the CRR live DB)",
+            legacy.display()
+        );
+    }
+    remove_db_files(&legacy);
+}
+
+/// Test-only fault injection points for the cutover sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CutoverFault {
+    None,
+    /// Fail right after the VACUUM INTO (before any live handle is closed): the live
+    /// DB is untouched and must be byte-identical, no backup produced.
+    AfterVacuum,
+    /// Fail after the staging→live rename + reopen (exercises the backup→live
+    /// rollback that restores the byte-identical original live DB).
+    AfterRename,
+}
+
+/// Perform the enable-time CRR cutover on the LIVE DB. See the module section above
+/// for the full sequence. Idempotent: a no-op (returns `Ok`) if the live DB is
+/// already CRR-prepared. On ANY failure the live DB is restored byte-identically and
+/// the verbatim error is returned; the app's DB pool is always left reopened.
+fn perform_cutover(
+    live_db: &Path,
+    db_service: &crate::db_service::DbServiceState,
+) -> Result<(), String> {
+    cutover_with_fault(live_db, db_service, CutoverFault::None)
+}
+
+fn cutover_with_fault(
+    live_db: &Path,
+    db_service: &crate::db_service::DbServiceState,
+    fault: CutoverFault,
+) -> Result<(), String> {
+    // Step 1: idempotency gate. An already-CRR live DB just needs its legacy copy gone.
+    if live_is_crr_prepared(live_db) {
+        discard_legacy_sync_copy(live_db);
+        return Ok(());
+    }
+
+    let staging = cutover_staging_path(live_db);
+    let backup = backup_db_path(live_db);
+    remove_db_files(&staging); // clear any partial staging from a prior aborted run
+
+    // Step 2: pre-swap counts (for the post-swap assertion).
+    let pre_counts =
+        synced_table_row_counts(live_db).map_err(|e| format!("pre-swap row counts: {e}"))?;
+
+    // Step 2 (spike): VACUUM INTO reads the live DB and writes a fresh compacted copy;
+    // the live DB is never opened for write.
+    {
+        let live = Connection::open(live_db).map_err(|e| e.to_string())?;
+        let target = staging
+            .to_str()
+            .ok_or_else(|| "non-UTF8 staging path".to_string())?;
+        live.execute("VACUUM INTO ?1", [target])
+            .map_err(|e| format!("VACUUM INTO staging: {e}"))?;
+    }
+
+    if fault == CutoverFault::AfterVacuum {
+        remove_db_files(&staging);
+        return Err("injected cutover fault after VACUUM (live DB untouched)".to_string());
+    }
+
+    // Step 3: transform the staging copy into CRR form, reinstate the app-layer
+    // invariants, reset watermarks to zero (§3 uniform reset), checkpoint, drop handle.
+    let prep = (|| -> Result<(), String> {
+        let db = CrsqlDb::open(&staging).map_err(|e| e.to_string())?;
+        let conn = db.conn();
+        schema::crr_migrate(conn).map_err(|e| format!("crr_migrate: {e}"))?;
+        cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
+        uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
+        mark_prepared(conn).map_err(|e| e.to_string())?;
+        // Uniform state reset: full re-capture/re-push (0) + full re-pull (0). cr-sqlite
+        // merge is idempotent/convergent so re-applying pulled changes is safe.
+        state::ensure_meta_table(conn).map_err(|e| e.to_string())?;
+        state::set_push_watermark(conn, 0).map_err(|e| e.to_string())?;
+        state::set_pull_watermark(conn, 0).map_err(|e| e.to_string())?;
+        // Step 4a: merge the -wal into the file before we drop the handle + rename.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = prep {
+        remove_db_files(&staging);
+        return Err(format!(
+            "cutover staging prep failed (live DB untouched): {e}"
+        ));
+    }
+
+    // Step 4b: quiesce + drop ALL live handles so the file can be renamed.
+    if let Err(e) = db_service.close_for_swap() {
+        let _ = db_service.reopen();
+        remove_db_files(&staging);
+        return Err(format!("cutover could not quiesce the DB pool: {e}"));
+    }
+
+    // Step 5: remove stale sidecars for both files.
+    remove_sidecars(live_db);
+    remove_sidecars(&staging);
+
+    // Step 6: atomic rename live→backup, staging→live.
+    if backup.exists() {
+        // A stale backup from an earlier rolled-back run; the CURRENT (non-CRR) live is
+        // the real pre-sync data, so free the target.
+        remove_db_files(&backup);
+    }
+    if let Err(e) = std::fs::rename(live_db, &backup) {
+        let _ = db_service.reopen();
+        remove_db_files(&staging);
+        return Err(format!(
+            "cutover rename live→backup failed (live DB in place): {e}"
+        ));
+    }
+    if let Err(e) = std::fs::rename(&staging, live_db) {
+        // Roll back: restore the original.
+        let _ = std::fs::rename(&backup, live_db);
+        let _ = db_service.reopen();
+        remove_db_files(&staging);
+        return Err(format!(
+            "cutover rename staging→live failed; rolled back: {e}"
+        ));
+    }
+
+    // Step 7: reopen on the now-CRR live DB.
+    if let Err(e) = db_service.reopen() {
+        rollback_to_backup(live_db, &backup, db_service);
+        return Err(format!(
+            "cutover reopen failed; rolled back to pre-sync DB: {e}"
+        ));
+    }
+
+    if fault == CutoverFault::AfterRename {
+        rollback_to_backup(live_db, &backup, db_service);
+        return Err("injected cutover fault after rename; rolled back".to_string());
+    }
+
+    // Step 7: assert row counts survived exactly.
+    match synced_table_row_counts(live_db) {
+        Ok(post) if post == pre_counts => {}
+        Ok(post) => {
+            rollback_to_backup(live_db, &backup, db_service);
+            return Err(format!(
+                "cutover row-count mismatch (pre {pre_counts:?} != post {post:?}); rolled back"
+            ));
+        }
+        Err(e) => {
+            rollback_to_backup(live_db, &backup, db_service);
+            return Err(format!(
+                "cutover post-swap count read failed; rolled back: {e}"
+            ));
+        }
+    }
+
+    // Success. The legacy copy (if any) is now redundant; discard it.
+    discard_legacy_sync_copy(live_db);
+    tracing::info!(
+        "sync: CRR cutover complete — live DB is now the sync DB; pre-sync backup kept at {}",
+        backup.display()
+    );
+    Ok(())
+}
+
+/// Restore the original live DB from its backup after a post-rename failure, then
+/// reopen the pool. Best-effort: the backup is the source of truth for recovery.
+fn rollback_to_backup(
+    live_db: &Path,
+    backup: &Path,
+    db_service: &crate::db_service::DbServiceState,
+) {
+    // Move the (now-CRR) failed live aside, then restore the byte-identical backup.
+    let failed = live_db.with_file_name("yapstack.db.crr-cutover-failed");
+    remove_db_files(&failed);
+    let _ = std::fs::rename(live_db, &failed);
+    remove_sidecars(live_db);
+    if let Err(e) = std::fs::rename(backup, live_db) {
+        tracing::error!(
+            "sync: CRITICAL — cutover rollback could not restore the backup {} → {}: {e}; \
+             the pre-sync data is intact at the backup path",
+            backup.display(),
+            live_db.display()
+        );
+    }
+    remove_db_files(&failed);
+    let _ = db_service.reopen();
+}
+
 // ----- Dedicated single-thread drain runtime (deliverable A) -----
 
 /// Handle to the running drain thread. Dropping/`stop`-ing sets the shutdown
@@ -1460,11 +1757,16 @@ fn expire_session_terminally() -> bool {
     set_drain_health(DrainHealth::AuthExpired)
 }
 
-/// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds
-/// an enabled session and the prepared CRR copy exists, start the drain on its
-/// dedicated thread. No-op when signed out or sync not yet enabled. This is the
-/// concrete deliverable-A wiring into src-tauri startup.
-pub fn start_drain_if_enabled(live_db: &Path, runtime: &SyncRuntimeState) {
+/// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds an
+/// enabled session, ensure the live DB is CRR-prepared (running the one-time A3
+/// cutover if this device was enabled under the old copy architecture — the owner's
+/// Mac migrates itself on next restart with no re-click) and start the drain on the
+/// LIVE CRR DB. No-op when signed out or sync not yet enabled.
+pub fn start_drain_if_enabled(
+    live_db: &Path,
+    runtime: &SyncRuntimeState,
+    db_service: &crate::db_service::DbServiceState,
+) {
     let session = match load_session() {
         Ok(Some(s)) if s.sync_enabled => s,
         Ok(_) => return,
@@ -1480,13 +1782,20 @@ pub fn start_drain_if_enabled(live_db: &Path, runtime: &SyncRuntimeState) {
             return;
         }
     };
-    let sync_db = sync_db_path(live_db);
-    if !sync_db.exists() {
-        tracing::warn!("sync enabled but prepared DB missing; re-run enable");
-        return;
+    // Already-enabled migration (A3): if this device is enabled but the live DB is not
+    // yet CRR (old copy architecture, or enabled before this build), run the cutover
+    // ONCE now — same backup + rollback discipline as the Enable button.
+    if !live_is_crr_prepared(live_db) {
+        tracing::info!("sync: enabled device with a non-CRR live DB — running one-time A3 cutover");
+        if let Err(e) = perform_cutover(live_db, db_service) {
+            tracing::error!("sync: auto-cutover failed at boot; drain not started: {e}");
+            return;
+        }
+    } else {
+        discard_legacy_sync_copy(live_db);
     }
     match spawn_drain(
-        sync_db,
+        live_db.to_path_buf(),
         session.server_url,
         session.bearer,
         vault_key,
@@ -2435,14 +2744,25 @@ pub async fn sync_enable(
         .inner()
         .as_ref()
         .clone();
+    let db_service = app
+        .try_state::<crate::db_service::DbServiceState>()
+        .ok_or_else(|| "db service unavailable".to_string())?
+        .inner()
+        .clone();
 
-    // Deliverable F: crr_migrate on a COPY, gated on SYNC_SCHEMA_VERSION.
-    let sync_db = prepare_library_for_sync(&db_path)?;
+    // A3 cutover: turn the LIVE yapstack.db INTO the CRR database (backup kept), so the
+    // drain captures every UI write. Runs on a blocking thread (VACUUM/checkpoint/rename).
+    {
+        let live = db_path.clone();
+        tokio::task::spawn_blocking(move || perform_cutover(&live, &db_service))
+            .await
+            .map_err(|e| e.to_string())??;
+    }
 
-    // Deliverable A: start the drain on its dedicated thread.
+    // Deliverable A: start the drain on its dedicated thread — now on the LIVE CRR DB.
     let vault_key = session.vault_key()?;
     let handle = spawn_drain(
-        sync_db,
+        db_path.clone(),
         session.server_url.clone(),
         session.bearer.clone(),
         vault_key,
@@ -3291,6 +3611,199 @@ mod tests {
             device_sk_b64: "not-base64!!".into(),
         };
         assert!(bad.seed().is_err());
+    }
+
+    // ----- A3 enable-time CRR cutover -----
+
+    /// Build a populated NON-CRR live DB (real schema + FTS-backed segments) served by
+    /// a `DbService`, returning the temp dir (kept alive), its path, and the service.
+    fn cutover_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::db_service::DbServiceState,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yapstack.db");
+        let svc = crate::db_service::DbService::open(&path).expect("open service");
+        // Mirror the frontend db.ts startup out-of-band ALTERs so the fixture matches a
+        // real production live schema (the columns crr_migrate's rebuild_body expects).
+        // Skip any already present in the migrated schema (as db.ts does).
+        for (table, col, coldef) in schema::OUT_OF_BAND_ALTERS {
+            let present = svc
+                .select(
+                    &format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'"),
+                    &[],
+                )
+                .unwrap();
+            if present.is_empty() {
+                svc.execute(&format!("ALTER TABLE {table} ADD COLUMN {coldef}"), &[])
+                    .unwrap();
+            }
+        }
+        svc.execute(
+            "INSERT INTO sessions (id, title, source) VALUES ('s1','First','Mic')",
+            &[],
+        )
+        .unwrap();
+        svc.execute(
+            "INSERT INTO sessions (id, title, source) VALUES ('s2','Second','Mic')",
+            &[],
+        )
+        .unwrap();
+        // The segments AFTER INSERT trigger populates segments_fts.
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+             VALUES ('g1','s1','Mic','hello searchable world',0,1)",
+            &[],
+        )
+        .unwrap();
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+             VALUES ('g2','s1','Mic','another segment here',1,1)",
+            &[],
+        )
+        .unwrap();
+        (dir, path, std::sync::Arc::new(svc))
+    }
+
+    #[test]
+    fn cutover_full_sequence_preserves_data_fts_and_prepares_crr() {
+        let (_dir, path, svc) = cutover_fixture();
+        assert!(!live_is_crr_prepared(&path), "starts non-CRR");
+        let pre = synced_table_row_counts(&path).unwrap();
+
+        perform_cutover(&path, &svc).expect("cutover");
+
+        // Live DB is now CRR-prepared; the backup escape hatch exists.
+        assert!(live_is_crr_prepared(&path), "live DB is now CRR");
+        assert!(backup_db_path(&path).exists(), "pre-sync backup kept");
+
+        // Row counts intact.
+        assert_eq!(synced_table_row_counts(&path).unwrap(), pre);
+        let rows = svc
+            .select("SELECT count(*) AS c FROM sessions", &[])
+            .unwrap();
+        assert_eq!(rows[0]["c"], serde_json::json!(2));
+
+        // FTS survives and MATCH works through the reopened pool.
+        let hits = svc
+            .select(
+                "SELECT segment_id FROM segments_fts WHERE segments_fts MATCH 'searchable'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["segment_id"], serde_json::json!("g1"));
+
+        // Watermarks reset to zero on the new CRR live DB.
+        let db = CrsqlDb::open(&path).unwrap();
+        assert_eq!(state::push_watermark(db.conn()).unwrap(), 0);
+        assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0);
+        drop(db);
+
+        // Second run is a no-op (idempotency gate) — no error, still CRR.
+        perform_cutover(&path, &svc).expect("second cutover is a no-op");
+        assert!(live_is_crr_prepared(&path));
+    }
+
+    #[test]
+    fn cutover_discards_legacy_copy_and_zeroes_watermarks() {
+        let (_dir, path, svc) = cutover_fixture();
+        // Simulate a device enabled under the OLD copy architecture: a stale
+        // yapstack.sync.db with non-zero watermarks beside the live DB.
+        let legacy = sync_db_path(&path);
+        {
+            let db = CrsqlDb::open(&legacy).unwrap();
+            state::ensure_meta_table(db.conn()).unwrap();
+            state::set_push_watermark(db.conn(), 137).unwrap();
+            state::set_pull_watermark(db.conn(), 99).unwrap();
+        }
+        assert!(legacy.exists());
+
+        perform_cutover(&path, &svc).expect("cutover");
+
+        // Legacy copy discarded; new live CRR watermarks are zero.
+        assert!(!legacy.exists(), "legacy copy removed");
+        let db = CrsqlDb::open(&path).unwrap();
+        assert_eq!(state::push_watermark(db.conn()).unwrap(), 0);
+        assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0);
+    }
+
+    #[test]
+    fn already_enabled_non_crr_live_triggers_cutover() {
+        // The drain-start decision: an enabled device whose live DB is not CRR must run
+        // the cutover once. This asserts that exact guard + its effect.
+        let (_dir, path, svc) = cutover_fixture();
+        assert!(
+            !live_is_crr_prepared(&path),
+            "enabled-but-non-CRR: needs cutover"
+        );
+        perform_cutover(&path, &svc).expect("auto-cutover");
+        assert!(
+            live_is_crr_prepared(&path),
+            "after auto-cutover the guard is satisfied (no re-run)"
+        );
+        assert!(backup_db_path(&path).exists());
+    }
+
+    #[test]
+    fn cutover_rollback_before_close_leaves_live_untouched() {
+        // A failure BEFORE any live handle is dropped: live DB byte-identical, no backup.
+        let (_dir, path, svc) = cutover_fixture();
+        // Quiesce+reopen once so the file is checkpointed and stable for byte comparison.
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = cutover_with_fault(&path, &svc, CutoverFault::AfterVacuum)
+            .expect_err("injected fault must fail");
+        assert!(err.contains("after VACUUM"));
+        assert!(
+            !backup_db_path(&path).exists(),
+            "no backup on pre-close failure"
+        );
+        assert!(!live_is_crr_prepared(&path), "live DB still non-CRR");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "live DB byte-identical"
+        );
+        // Service still works.
+        assert_eq!(
+            svc.select("SELECT count(*) AS c FROM sessions", &[])
+                .unwrap()[0]["c"],
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn cutover_rollback_after_rename_restores_byte_identical_live() {
+        // A failure AFTER the swap exercises the backup→live rollback (step 8).
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = cutover_with_fault(&path, &svc, CutoverFault::AfterRename)
+            .expect_err("injected fault must fail");
+        assert!(err.contains("after rename"));
+        // The backup was renamed back to live; live is the original, non-CRR.
+        assert!(!backup_db_path(&path).exists(), "backup restored into live");
+        assert!(
+            !live_is_crr_prepared(&path),
+            "rolled back to non-CRR original"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "rollback restores byte-identical live DB"
+        );
+        // Service reopened and functional on the restored DB.
+        assert_eq!(
+            svc.select("SELECT count(*) AS c FROM sessions", &[])
+                .unwrap()[0]["c"],
+            serde_json::json!(2)
+        );
     }
 
     /// End-to-end identity lifecycle against the REAL backing store (OS keychain in release,
