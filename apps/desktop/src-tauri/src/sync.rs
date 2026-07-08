@@ -34,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -156,30 +156,244 @@ impl DeviceIdentity {
     }
 }
 
-fn keychain_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+// ----- Credential storage backend (release = OS keychain; debug = local file) -----
+//
+// A thin get/set/delete abstraction over the two logical entries (`session-v1`,
+// `identity-v1`). RELEASE routes to the OS keychain (CRYPTO_SPEC §10 — the vault key +
+// bearer live at rest in the platform secret store). DEBUG routes to a plaintext JSON
+// file under the app config dir instead.
+//
+// WHY (T020): in a dev build the code signature changes on every `tauri dev` rebuild, so
+// macOS never persists the "Always Allow" ACL and re-prompts on EVERY keychain read. The
+// frontend polls `sync_status` ~1/s → a Keychain prompt per second, unusable. In debug we
+// therefore make ZERO keychain calls.
+//
+// DEBUG-ONLY. The file store is compiled out of release entirely (`cfg(debug_assertions)`);
+// it is plaintext because it only ever exists on a developer's own machine. The RELEASE
+// keychain path MUST be exercised before shipping — it is the only at-rest store that
+// satisfies CRYPTO_SPEC §10.
+
+#[cfg(debug_assertions)]
+static DEV_STORE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+fn dev_store_path() -> PathBuf {
+    DEV_STORE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("sync-dev-creds.json")
 }
 
-fn identity_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_IDENTITY).map_err(|e| e.to_string())
+#[cfg(debug_assertions)]
+fn dev_read_map() -> Result<std::collections::BTreeMap<String, String>, String> {
+    match std::fs::read_to_string(dev_store_path()) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-fn load_identity() -> Result<Option<DeviceIdentity>, String> {
-    match identity_entry()?.get_password() {
-        Ok(json) => serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        // No identity entry yet = fresh install (or pre-upgrade session-only install).
+#[cfg(debug_assertions)]
+fn dev_write_map(map: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    let path = dev_store_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn store_get(account: &str) -> Result<Option<String>, String> {
+    Ok(dev_read_map()?.get(account).cloned())
+}
+
+#[cfg(not(debug_assertions))]
+fn store_get(account: &str) -> Result<Option<String>, String> {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        .map_err(|e| e.to_string())?
+        .get_password()
+    {
+        Ok(v) => Ok(Some(v)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
 
-fn store_identity(id: &DeviceIdentity) -> Result<(), String> {
-    let json = serde_json::to_string(id).map_err(|e| e.to_string())?;
-    identity_entry()?
-        .set_password(&json)
+#[cfg(debug_assertions)]
+fn store_set(account: &str, value: &str) -> Result<(), String> {
+    let mut map = dev_read_map()?;
+    map.insert(account.to_string(), value.to_string());
+    dev_write_map(&map)
+}
+
+#[cfg(not(debug_assertions))]
+fn store_set(account: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        .map_err(|e| e.to_string())?
+        .set_password(value)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn store_delete(account: &str) -> Result<(), String> {
+    let mut map = dev_read_map()?;
+    map.remove(account);
+    dev_write_map(&map)
+}
+
+#[cfg(not(debug_assertions))]
+fn store_delete(account: &str) -> Result<(), String> {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        .map_err(|e| e.to_string())?
+        .delete_credential()
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// ----- Backing-store (de)serialisation of the two logical entries -----
+
+fn load_session_from_store() -> Result<Option<Session>, String> {
+    match store_get(KEYCHAIN_ACCOUNT)? {
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+fn store_session_to_store(s: &Session) -> Result<(), String> {
+    let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    store_set(KEYCHAIN_ACCOUNT, &json)
+}
+
+fn load_identity_from_store() -> Result<Option<DeviceIdentity>, String> {
+    match store_get(KEYCHAIN_ACCOUNT_IDENTITY)? {
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+fn store_identity_to_store(id: &DeviceIdentity) -> Result<(), String> {
+    let json = serde_json::to_string(id).map_err(|e| e.to_string())?;
+    store_set(KEYCHAIN_ACCOUNT_IDENTITY, &json)
+}
+
+// ----- In-memory credential cache (T020) -----
+//
+// The backing store is read ONCE (at boot, and re-populated on each sign-in) into this
+// process-wide cache; every subsequent READ (the polled `sync_status`, the drain's
+// `client_id`, roster building) is served from here, NOT from the store. WRITES update the
+// store AND this cache in lock-step, so a freshly signed-in / signed-out / enabled state is
+// reflected immediately with no staleness. Net effect: the keychain is touched ~once per
+// launch / sign-in rather than ~once per status poll (the macOS prompt SPAM this fixes).
+//
+// A module-global (mirroring `pending_login_cell`) so the boot hook and the free identity
+// helpers reach it without threading `State` through every command; the same handle is also
+// registered as Tauri managed state in lib.rs setup.
+
+#[derive(Default)]
+pub struct CredCacheInner {
+    loaded: bool,
+    session: Option<Session>,
+    identity: Option<DeviceIdentity>,
+}
+
+/// Process-wide credential cache handle (also registered as Tauri managed state).
+pub type SyncCredCache = Arc<RwLock<CredCacheInner>>;
+
+fn cred_cache() -> &'static SyncCredCache {
+    static CACHE: OnceLock<SyncCredCache> = OnceLock::new();
+    CACHE.get_or_init(|| Arc::new(RwLock::new(CredCacheInner::default())))
+}
+
+/// A clone of the shared cache handle, for registration as Tauri managed state in lib.rs.
+pub fn cred_cache_handle() -> SyncCredCache {
+    cred_cache().clone()
+}
+
+/// Populate the cache from the backing store ONCE. Subsequent calls are a cheap flag check
+/// and never touch the store (hence never the keychain). Safe to call from any thread.
+fn ensure_cache_loaded() {
+    if cred_cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .loaded
+    {
+        return;
+    }
+    let session = load_session_from_store().ok().flatten();
+    let identity = load_identity_from_store().ok().flatten();
+    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+    if !g.loaded {
+        g.session = session;
+        g.identity = identity;
+        g.loaded = true;
+    }
+}
+
+/// Boot hook (lib.rs setup): point the DEBUG file store at the app config dir and warm the
+/// cache once, so the first `sync_status` poll never blocks on the store. In release the
+/// path arg is unused (the keychain needs no directory).
+pub fn init_credential_store(config_dir: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let _ = DEV_STORE_DIR.set(config_dir.to_path_buf());
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = config_dir;
+    }
+    ensure_cache_loaded();
+}
+
+/// Signed-in session, served from the in-memory cache (loaded from the store on first use).
+/// Reads NEVER hit the keychain after the initial warm-up (T020).
+fn load_session() -> Result<Option<Session>, String> {
+    ensure_cache_loaded();
+    Ok(cred_cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .session
+        .clone())
+}
+
+/// Persist the session to the backing store AND refresh the cache in lock-step.
+fn store_session(s: &Session) -> Result<(), String> {
+    store_session_to_store(s)?;
+    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+    g.session = Some(s.clone());
+    g.loaded = true;
+    Ok(())
+}
+
+/// Device identity, served from the cache (loaded from the store on first use).
+fn load_identity() -> Result<Option<DeviceIdentity>, String> {
+    ensure_cache_loaded();
+    Ok(cred_cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .identity
+        .clone())
+}
+
+/// Persist the identity to the backing store AND refresh the cache in lock-step.
+fn store_identity(id: &DeviceIdentity) -> Result<(), String> {
+    store_identity_to_store(id)?;
+    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+    g.identity = Some(id.clone());
+    g.loaded = true;
+    Ok(())
+}
+
+#[cfg(test)]
+fn reset_cache_for_test() {
+    *cred_cache().write().unwrap_or_else(|e| e.into_inner()) = CredCacheInner::default();
 }
 
 /// Best-effort migration: if the identity entry is absent but the session entry still
@@ -192,7 +406,7 @@ fn migrate_identity_from_session() {
     match load_identity() {
         Ok(Some(_)) => return, // identity already authoritative — nothing to migrate.
         Ok(None) => {}
-        Err(_) => return, // keychain unreadable — don't risk a partial write.
+        Err(_) => return, // store unreadable — don't risk a partial write.
     }
     if let Ok(Some(s)) = load_session() {
         if !s.device_sk_b64.is_empty() {
@@ -204,34 +418,18 @@ fn migrate_identity_from_session() {
     }
 }
 
-fn load_session() -> Result<Option<Session>, String> {
-    match keychain_entry()?.get_password() {
-        Ok(json) => serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        // No entry yet = signed out.
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn store_session(s: &Session) -> Result<(), String> {
-    let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    keychain_entry()?
-        .set_password(&json)
-        .map_err(|e| e.to_string())
-}
-
-/// Sign-out: delete ONLY the session entry. The persistent device identity (§7.1) is
-/// preserved — first migrated out of the session entry if the identity entry does not yet
-/// hold it — so a subsequent sign-in on the SAME install presents the SAME `client_id` and
-/// is recognised as the existing device, NOT re-enrolled as a phantom PENDING one (§7.5).
+/// Sign-out: delete ONLY the session entry (store + cache). The persistent device identity
+/// (§7.1) is preserved — first migrated out of the session entry if the identity entry does
+/// not yet hold it — so a subsequent sign-in on the SAME install presents the SAME
+/// `client_id` and is recognised as the existing device, NOT re-enrolled as a phantom
+/// PENDING one (§7.5). The cache's session is cleared in lock-step so status → disconnected.
 fn clear_session() -> Result<(), String> {
     migrate_identity_from_session();
-    match keychain_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    store_delete(KEYCHAIN_ACCOUNT)?;
+    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+    g.session = None;
+    g.loaded = true;
+    Ok(())
 }
 
 // ----- Wire DTOs (camelCase to match lib/sync.ts) -----
@@ -1684,18 +1882,21 @@ mod tests {
         assert!(bad.seed().is_err());
     }
 
-    /// End-to-end identity lifecycle against the REAL OS keychain: migration out of a
-    /// session-only install, survival across sign-out, and a stable id on re-login. Gated
-    /// `#[ignore]` because keychain access is unavailable/headless in CI; run explicitly with
-    /// `cargo test --features sync -- --ignored`. Non-destructive: it backs up and restores
-    /// whatever entries the machine already holds.
+    /// End-to-end identity lifecycle against the REAL backing store (OS keychain in release,
+    /// the dev file store in debug): migration out of a session-only install, survival across
+    /// sign-out, and a stable id on re-login. Gated `#[ignore]` because store access is
+    /// unavailable/headless in CI; run explicitly with `cargo test --features sync -- --ignored`.
+    /// Non-destructive: it backs up and restores whatever entries the machine already holds. The
+    /// cache is reset at each checkpoint so the assertions exercise the persistent store, not
+    /// just the in-memory cache.
     #[test]
-    #[ignore = "touches the real OS keychain (backs up + restores); run with --ignored"]
+    #[ignore = "touches the real credential store (backs up + restores); run with --ignored"]
     fn identity_survives_session_clear() {
-        let orig_session = load_session().ok().flatten();
-        let orig_identity = load_identity().ok().flatten();
-        let _ = keychain_entry().unwrap().delete_credential();
-        let _ = identity_entry().unwrap().delete_credential();
+        let orig_session = load_session_from_store().ok().flatten();
+        let orig_identity = load_identity_from_store().ok().flatten();
+        let _ = store_delete(KEYCHAIN_ACCOUNT);
+        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY);
+        reset_cache_for_test();
 
         // A pre-upgrade install: identity lives ONLY in the session entry.
         let seed = [7u8; 32];
@@ -1721,10 +1922,13 @@ mod tests {
         let (got_seed, got_id) = load_or_create_device_identity().unwrap();
         assert_eq!(got_id, client_id);
         assert_eq!(got_seed, seed);
+        // Re-read from the persistent store (not just the cache) to prove it was written.
+        reset_cache_for_test();
         assert_eq!(load_identity().unwrap().unwrap().client_id, client_id);
 
         // Sign out clears the session but MUST preserve the identity.
         clear_session().unwrap();
+        reset_cache_for_test();
         assert!(load_session().unwrap().is_none());
         assert_eq!(load_identity().unwrap().unwrap().client_id, client_id);
 
@@ -1732,9 +1936,10 @@ mod tests {
         let (_, relogin_id) = load_or_create_device_identity().unwrap();
         assert_eq!(relogin_id, client_id);
 
-        // Restore the machine's original keychain state.
-        let _ = identity_entry().unwrap().delete_credential();
-        let _ = keychain_entry().unwrap().delete_credential();
+        // Restore the machine's original credential-store state.
+        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY);
+        let _ = store_delete(KEYCHAIN_ACCOUNT);
+        reset_cache_for_test();
         if let Some(s) = orig_session {
             let _ = store_session(&s);
         }

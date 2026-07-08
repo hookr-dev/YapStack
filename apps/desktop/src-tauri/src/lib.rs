@@ -660,6 +660,14 @@ pub fn run() {
             // when signed out. Entirely behind the `sync` cargo feature.
             #[cfg(feature = "sync")]
             {
+                // T020: point the credential store at the app config dir (DEBUG file store;
+                // no-op for the release keychain) and warm the in-memory credential cache
+                // ONCE, so the polled `sync_status` never re-reads the keychain per call
+                // (which SPAMMED a macOS prompt every poll in unsigned dev builds).
+                if let Ok(config_dir) = app.path().app_config_dir() {
+                    sync::init_credential_store(&config_dir);
+                }
+                app.manage(sync::cred_cache_handle());
                 let sync_runtime: sync::SyncRuntimeState =
                     Arc::new(StdMutex::new(None));
                 app.manage(sync_runtime.clone());
