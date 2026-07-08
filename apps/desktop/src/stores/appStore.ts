@@ -1553,6 +1553,12 @@ function createAppStore() {
               syncEnabled: get().syncConfig.syncEnabled,
               lastError: msg,
               billingUrl: prev?.billingUrl ?? null,
+              // Preserve the last-known progress snapshot; a status-fetch failure
+              // is a connection problem, not evidence the backlog changed (T024).
+              pendingEntries: prev?.pendingEntries ?? 0,
+              pendingBytes: prev?.pendingBytes ?? 0,
+              ackedThisSession: prev?.ackedThisSession ?? 0,
+              lastSuccess: prev?.lastSuccess ?? null,
             },
           });
         }

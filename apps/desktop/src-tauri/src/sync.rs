@@ -433,9 +433,10 @@ fn migrate_identity_from_session() {
 fn clear_session() -> Result<(), String> {
     migrate_identity_from_session();
     store_delete(KEYCHAIN_ACCOUNT)?;
-    // A signed-out state has no drain; clear any lingering auth-expired/blocked health so
-    // a subsequent sign-in does not inherit a stale status.
+    // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
+    // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
     set_drain_health(DrainHealth::Ok);
+    reset_drain_progress();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -498,6 +499,15 @@ pub struct SyncStatusDto {
     sync_enabled: bool,
     last_error: Option<String>,
     billing_url: Option<String>,
+    /// T024 push progress. Unacked outbox entries still to push (0 == up to date).
+    pending_entries: u64,
+    /// Total ciphertext bytes of those unacked entries (base64 upload is ~4/3 of this).
+    pending_bytes: u64,
+    /// Entries acked since the current drain thread started (cumulative this session).
+    acked_this_session: u64,
+    /// RFC3339 of the last time the outbox fully drained with the relay reachable;
+    /// null before the first successful drain. The panel renders it relative to now.
+    last_success: Option<String>,
 }
 
 /// `/sync/info` server response (mirror of `yapstack_server` `SyncInfoResponse`).
@@ -655,6 +665,58 @@ fn drain_health() -> DrainHealth {
         .clone()
 }
 
+// ----- Drain progress (T024 push-progress surfacing) -----
+//
+// A second one-way channel from the drain thread to the polled `sync_status`, alongside
+// `DrainHealth`. Where health carries the exceptional states (auth-expired / blocked),
+// this carries the NORMAL push progress the owner had no way to see: how many entries /
+// bytes are still queued, how many have been acked this drain session, whether a push is
+// in flight, and when the outbox was last fully drained. Read straight from the cheap
+// `outbox::pending` view each cycle — no counter to keep in step with the table. Carries
+// only counts/bytes/timestamps: never token, key, or plaintext material.
+
+/// The drain's latest self-reported push progress.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DrainProgress {
+    /// Unacked entries still to push as of the last cycle (0 == up to date).
+    pending_entries: u64,
+    /// Total ciphertext bytes of those unacked entries.
+    pending_bytes: u64,
+    /// Entries acked since THIS drain thread started (cumulative across cycles). Resets
+    /// when a fresh drain spawns (re-login / enable), so it reads as "this session".
+    acked_this_session: u64,
+    /// True while a backlog remains (`pending_entries > 0`) — drives the `syncing` phase.
+    syncing: bool,
+    /// RFC3339 of the last cycle that completed with the outbox fully drained AND the
+    /// relay reachable — the "last synced" time the panel shows relative to now.
+    last_success: Option<String>,
+}
+
+fn drain_progress_cell() -> &'static RwLock<DrainProgress> {
+    static CELL: OnceLock<RwLock<DrainProgress>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(DrainProgress::default()))
+}
+
+fn drain_progress() -> DrainProgress {
+    drain_progress_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Overwrite the whole progress snapshot (the drain rebuilds it each cycle).
+fn set_drain_progress(next: DrainProgress) {
+    *drain_progress_cell()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = next;
+}
+
+/// Clear progress back to "nothing pending, never synced" — used when a drain stops or
+/// the session is cleared so a subsequent poll never shows a stale backlog.
+fn reset_drain_progress() {
+    set_drain_progress(DrainProgress::default());
+}
+
 /// The `exp` (unix seconds) claim of a JWT, decoded WITHOUT verifying the signature.
 /// This is only used to schedule a proactive refresh (A5) — a scheduling hint, not a
 /// trust decision — so an unverified read of the public claim is acceptable client-side.
@@ -767,8 +829,10 @@ fn spawn_drain(
     client_id: Uuid,
 ) -> Result<DrainHandle, String> {
     // A fresh drain starts from a clean health slate (clears any lingering auth-expired
-    // / blocked state from a previously stopped drain, e.g. after a re-login).
+    // / blocked state from a previously stopped drain, e.g. after a re-login) and a clean
+    // progress slate (session ack count resets; no stale backlog shown, T024).
     set_drain_health(DrainHealth::Ok);
+    reset_drain_progress();
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = shutdown.clone();
 
@@ -846,6 +910,37 @@ fn spawn_drain(
                 }
             }
 
+            // T024: measure the pre-existing backlog ONCE so a big initial sync announces
+            // itself in the log and shows "syncing" in the UI immediately (the repair pass
+            // above may have just re-chunked a poison entry into many in-budget entries).
+            // `had_backlog` gates the one-shot "up to date" transition log; `acked_session`
+            // is the cumulative this-session ack count surfaced in the status payload.
+            let mut had_backlog = match outbox::pending(conn) {
+                Ok(p) => {
+                    if p.entries > 0 {
+                        tracing::info!(
+                            "sync: pushing {} pending {} ({:.1} MiB)",
+                            p.entries,
+                            if p.entries == 1 { "entry" } else { "entries" },
+                            p.bytes as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    set_drain_progress(DrainProgress {
+                        pending_entries: p.entries,
+                        pending_bytes: p.bytes,
+                        acked_this_session: 0,
+                        syncing: p.entries > 0,
+                        last_success: None,
+                    });
+                    p.entries > 0
+                }
+                Err(e) => {
+                    tracing::warn!("sync: initial backlog read failed: {e}");
+                    false
+                }
+            };
+            let mut acked_session: u64 = 0;
+
             while !stop.load(Ordering::SeqCst) {
                 let mut outcome =
                     rt.block_on(outbox::drain_once(conn, &cipher, &transport, client_id, sv, ev));
@@ -884,6 +979,50 @@ fn spawn_drain(
                             if let Err(e) = uniqueness::enforce_uniqueness(conn) {
                                 tracing::warn!("sync drain: enforce_uniqueness: {e}");
                             }
+                        }
+                        // T024 progress: recompute the backlog from the outbox after this
+                        // cycle's push, accumulate the session ack count, and log ONLY on
+                        // real progress / transitions — never every idle 5s cycle.
+                        acked_session += report.pushed as u64;
+                        match outbox::pending(conn) {
+                            Ok(p) => {
+                                if report.pushed > 0 {
+                                    tracing::info!(
+                                        "sync: pushed {} {}, {} remaining",
+                                        report.pushed,
+                                        if report.pushed == 1 { "entry" } else { "entries" },
+                                        p.entries
+                                    );
+                                    had_backlog = true;
+                                } else if !had_backlog && p.entries > 0 {
+                                    // Fresh local writes appeared this cycle but could not
+                                    // be pushed yet — announce the new backlog once.
+                                    tracing::info!(
+                                        "sync: pushing {} pending {} ({:.1} MiB)",
+                                        p.entries,
+                                        if p.entries == 1 { "entry" } else { "entries" },
+                                        p.bytes as f64 / (1024.0 * 1024.0)
+                                    );
+                                    had_backlog = true;
+                                }
+                                let last_success = if p.entries == 0 {
+                                    if had_backlog {
+                                        tracing::info!("sync: up to date");
+                                        had_backlog = false;
+                                    }
+                                    Some(chrono::Utc::now().to_rfc3339())
+                                } else {
+                                    drain_progress().last_success
+                                };
+                                set_drain_progress(DrainProgress {
+                                    pending_entries: p.entries,
+                                    pending_bytes: p.bytes,
+                                    acked_this_session: acked_session,
+                                    syncing: p.entries > 0,
+                                    last_success,
+                                });
+                            }
+                            Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
                         }
                     }
                     // Refresh succeeded but the retry STILL 401'd → the token is truly dead.
@@ -1216,12 +1355,20 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
     } else {
         "connecting".to_string()
     };
+    // T024: read the drain's push-progress snapshot and, when the drain is healthy and a
+    // backlog remains, surface a distinct `syncing` phase (the owner had no way to tell a
+    // push was in flight). auth_expired / blocked keep their T023 treatment (they take
+    // precedence over syncing — an expired session is not "syncing").
+    let progress = drain_progress();
     let (phase, last_error) = match drain_health() {
         DrainHealth::AuthExpired => (
             "auth_expired".to_string(),
             Some("Your session expired. Sign in again to resume sync.".to_string()),
         ),
         DrainHealth::Blocked(msg) => (connected_phase, Some(msg)),
+        DrainHealth::Ok if session.sync_enabled && progress.syncing => {
+            ("syncing".to_string(), last_error)
+        }
         DrainHealth::Ok => (connected_phase, last_error),
     };
     SyncStatusDto {
@@ -1235,6 +1382,10 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         sync_enabled: session.sync_enabled,
         last_error,
         billing_url: None,
+        pending_entries: progress.pending_entries,
+        pending_bytes: progress.pending_bytes,
+        acked_this_session: progress.acked_this_session,
+        last_success: progress.last_success,
     }
 }
 
@@ -1276,6 +1427,10 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             sync_enabled: false,
             last_error: None,
             billing_url: None,
+            pending_entries: 0,
+            pending_bytes: 0,
+            acked_this_session: 0,
+            last_success: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),

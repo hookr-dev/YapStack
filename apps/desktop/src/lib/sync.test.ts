@@ -7,6 +7,9 @@ import {
   formatFingerprint,
   isValidRecoveryCode,
   isValidServerUrl,
+  formatSyncProgress,
+  formatBytes,
+  formatLastSynced,
 } from "./sync";
 
 describe("shouldShowUpgrade", () => {
@@ -65,5 +68,40 @@ describe("isValidServerUrl", () => {
   it("rejects junk and non-http schemes", () => {
     expect(isValidServerUrl("not a url")).toBe(false);
     expect(isValidServerUrl("ftp://x")).toBe(false);
+  });
+});
+
+describe("formatSyncProgress", () => {
+  it("pluralizes and omits size below ~1 MiB", () => {
+    expect(formatSyncProgress(1, 500)).toBe("1 item remaining");
+    expect(formatSyncProgress(3, 1024)).toBe("3 items remaining");
+  });
+  it("appends the byte size once it is meaningfully large", () => {
+    // 68 MiB across a big initial sync.
+    expect(formatSyncProgress(137, 68 * 1024 * 1024)).toBe(
+      "137 items remaining · 68.0 MB",
+    );
+  });
+});
+
+describe("formatBytes", () => {
+  it("renders MB below a GB and GB above", () => {
+    expect(formatBytes(0)).toBe("0 MB");
+    expect(formatBytes(5 * 1024 * 1024)).toBe("5.0 MB");
+    expect(formatBytes(2 * 1024 * 1024 * 1024)).toBe("2.0 GB");
+  });
+});
+
+describe("formatLastSynced", () => {
+  const now = Date.parse("2026-07-07T12:00:00Z");
+  it("returns empty string when never synced", () => {
+    expect(formatLastSynced(null, now)).toBe("");
+    expect(formatLastSynced("not-a-date", now)).toBe("");
+  });
+  it("phrases sub-minute as just now, then m/h/d", () => {
+    expect(formatLastSynced("2026-07-07T11:59:30Z", now)).toBe("just now");
+    expect(formatLastSynced("2026-07-07T11:58:00Z", now)).toBe("2m ago");
+    expect(formatLastSynced("2026-07-07T09:00:00Z", now)).toBe("3h ago");
+    expect(formatLastSynced("2026-07-05T12:00:00Z", now)).toBe("2d ago");
   });
 });

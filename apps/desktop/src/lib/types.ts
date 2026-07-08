@@ -473,6 +473,164 @@ async logFrontend(level: FrontendLogLevel, module: string | null, message: strin
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async syncInfo(serverUrl: string) : Promise<Result<SyncInfoDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_info", { serverUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async syncStatus() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create the account (§3.2 signup). Derives auth+master keys from the password, mints a
+ * random vault key and a CSPRNG recovery code, wraps the vault key under BOTH the master
+ * key and the recovery key (committing envelopes, §4.2/§6.2), authors the epoch-0 signed
+ * roster (§7.5 first-device self-enrollment), and POSTs the verifier inputs + wraps +
+ * roster. Returns the one-time recovery code (for forced capture) + this device's
+ * fingerprint. NEVER sends the password / master_key / vault_key / recovery code.
+ */
+async syncSignup(req: SignupArgs) : Promise<Result<SignupResultDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_signup", { req }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Round 1 of two-round login (§3.2): fetch `salt_enc`, run the §3.2-C3 known-device
+ * salt-mismatch check (a changed salt for an established account = hostile-relay signal),
+ * and cache the round-1 state for `sync_login_finish`.
+ */
+async syncLoginBegin(serverUrl: string, email: string) : Promise<Result<LoginBeginResultDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_login_begin", { serverUrl, email }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Round 2 of login (§3.2): derive `auth_key`, present this device's Ed25519 pubkey +
+ * client_id (so an unknown device enrolls PENDING, §7.5 step 1), authenticate, unwrap the
+ * vault key, VERIFY the served roster signature (§7.5 step 2), and store the session. A
+ * device not yet in the roster is PENDING and surfaces as such (needs approval).
+ */
+async syncLoginFinish(password: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_login_finish", { password }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Recover access with the base32 recovery code (§6.2) when the password is lost:
+ * authenticate via `recovery_auth_key`, receive `wrapped_vault_key_recovery`, unwrap the
+ * vault key with the recovery key, verify the roster, and store the session (vault key →
+ * keychain). The raw recovery code and recovery key never leave this process.
+ */
+async syncRecover(serverUrl: string, email: string, recoveryCode: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_recover", { serverUrl, email, recoveryCode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async syncEnable() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_enable") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * SEED (deliverable R2 seed side): CRRify a COPY of the primary DB, publish it as one
+ * encrypted snapshot, and suppress re-pushing the whole history as changesets (the
+ * snapshot carries it). Then start the drain. This device holds the authoritative
+ * library; the other device joins from the snapshot.
+ */
+async syncSeed() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_seed") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * JOIN (deliverable R1 + R2 join side): re-bootstrap from the seed's snapshot into a
+ * fresh CRR base, RECONCILE this device's own local-only rows into it (preserved, with
+ * ambiguous collisions surfaced), then start the drain. NEVER independently
+ * CRRifies-and-merges the live DB (silently lossy). The live DB is only ever READ.
+ */
+async syncJoin() : Promise<Result<ReconcileReportDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_join") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Approve a pending device (§7.5 step 3/4). The human has already compared the
+ * fingerprint OUT-OF-BAND in the UI (DeviceApprovalDialog); this existing active device
+ * re-verifies the fingerprint matches a real pending device, adds it to the roster,
+ * bumps the monotonic counter, re-signs with the vault-derived roster key, and uploads.
+ */
+async syncApproveDevice(fingerprint: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_approve_device", { fingerprint }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * `GET /devices` for the UI: the account's device index (pending + active), fingerprinted
+ * for out-of-band comparison (§7.5). Membership truth is the signed roster (client-verified
+ * at login); this index is the relay's advisory view for surfacing pending approvals.
+ */
+async syncDeviceList() : Promise<Result<DeviceRosterEntryDto[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_device_list") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async syncSignOut() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_sign_out") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Vault-wrap a plaintext secret (AI apiKey / baseUrl) under the vault key held
+ * in the OS keychain, before it can reach any syncable surface (deliverable E).
+ * The plaintext is consumed here and never persisted; the caller stores only
+ * the returned committing envelope (CRYPTO_SPEC §1.4 / §4).
+ */
+async syncWrapSecret(plaintext: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_wrap_secret", { plaintext }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -501,12 +659,22 @@ export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
 export type CaptureStateDto = "Idle" | "Capturing" | "Error"
 export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; system_audio_active: boolean; error_message: string | null }
 /**
+ * One surfaced reconciliation collision (an ambiguous local row that was NOT silently
+ * dropped — the owner reviews these before discarding the old local DB).
+ */
+export type CollisionDto = { table: string; pk: string;
+/**
+ * "content_diverged" (same PK, different values) or "logical_duplicate".
+ */
+kind: string }
+/**
  * Unified error type for all Tauri commands.
  *
  * Serializes to `{ "kind": "...", "message": "..." }` via `#[serde(tag = "kind")]`.
  * Auto-generated TypeScript types via specta.
  */
 export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
+export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**
  * Engine capabilities + supported languages for the cascading UI in Settings.
@@ -672,6 +840,10 @@ export type LogEntry = { ts_ms: number; level: LogLevel; target: string; message
  * typed union instead of an unchecked string.
  */
 export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
+/**
+ * `sync_login_begin` result (mirrors `LoginBeginResult` in `lib/sync.ts`).
+ */
+export type LoginBeginResultDto = { saltMismatch: boolean }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
@@ -685,6 +857,11 @@ export type ParakeetVariantDto = "TdtV3" |
  */
 "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
+/**
+ * Result of a join reconciliation. `accounted == inserted + matched + collisions` and
+ * equals the join's local row count — the no-silent-loss guarantee, surfaced to the UI.
+ */
+export type ReconcileReportDto = { inserted_local_only: number; matched_identical: number; collisions: CollisionDto[] }
 export type ResumeConfig = {
 /**
  * The index of the new part being recorded — equals the count of
@@ -699,8 +876,35 @@ part_index: number;
 offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
+/**
+ * Args for `sync_signup` (mirrors `SignupRequest` in `lib/sync.ts`).
+ */
+export type SignupArgs = { serverUrl: string; email: string; password: string }
+/**
+ * One-time `sync_signup` result (mirrors `SignupResult` in `lib/sync.ts`).
+ */
+export type SignupResultDto = { recoveryCode: string; deviceFingerprint: string }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
+export type SyncInfoDto = { serverUrl: string; version: string; billingUrl: string | null }
+export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null; billingUrl: string | null;
+/**
+ * T024 push progress. Unacked outbox entries still to push (0 == up to date).
+ */
+pendingEntries: number;
+/**
+ * Total ciphertext bytes of those unacked entries (base64 upload is ~4/3 of this).
+ */
+pendingBytes: number;
+/**
+ * Entries acked since the current drain thread started (cumulative this session).
+ */
+ackedThisSession: number;
+/**
+ * RFC3339 of the last time the outbox fully drained with the relay reachable;
+ * null before the first successful drain. The panel renders it relative to now.
+ */
+lastSuccess: string | null }
 export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/

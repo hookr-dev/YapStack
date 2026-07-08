@@ -79,6 +79,39 @@ pub struct DrainReport {
     pub crypto_skipped: usize,
 }
 
+/// A cheap point-in-time view of the outbox backlog, read straight from
+/// `_yapstack_outbox` with a single `COUNT(*)` + `SUM(length(ciphertext))` over the
+/// UNACKED rows. At this scale (a full initial sync is ~hundreds of in-budget entries)
+/// this is a trivial scan, so it is cheap enough to call every drain cycle — no separate
+/// stateful counter to keep in step with the table. Drives the desktop's push-progress
+/// indicator (unacked count + unacked bytes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxPending {
+    /// Number of unacked (captured-but-not-yet-acked) entries still to push.
+    pub entries: u64,
+    /// Total ciphertext bytes across those unacked entries. The base64 upload is
+    /// ~4/3 of this; it is the honest on-device backlog size for a progress read.
+    pub bytes: u64,
+}
+
+/// Read the current unacked backlog — count of entries AND total ciphertext bytes —
+/// directly from the outbox. Returns zeroes when there is nothing pending. Ensures the
+/// table exists first so a call before the first capture is a clean `{0,0}` rather than
+/// an error.
+pub fn pending(conn: &Connection) -> Result<OutboxPending, SyncError> {
+    ensure_outbox_table(conn)?;
+    let (entries, bytes): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(length(ciphertext)), 0) \
+         FROM _yapstack_outbox WHERE acked=0",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(OutboxPending {
+        entries: entries.max(0) as u64,
+        bytes: bytes.max(0) as u64,
+    })
+}
+
 pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _yapstack_outbox (\
@@ -754,6 +787,49 @@ mod tests {
             }
             other => panic!("expected Oversized, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pending_counts_and_sums_only_unacked_entries() {
+        // Insert five entries of known ciphertext lengths, ack two, and assert the
+        // pending() view reports exactly the unacked count AND the unacked byte sum
+        // (acked entries excluded from both). This is the progress read the desktop
+        // surfaces as "N items / X MiB remaining".
+        let lens = [10usize, 20, 30, 40, 50];
+        let blobs: Vec<Vec<u8>> = lens.iter().map(|&n| vec![0u8; n]).collect();
+        let conn = seed_outbox(&blobs);
+
+        // Fresh outbox: everything is unacked.
+        let all = pending(&conn).unwrap();
+        assert_eq!(all.entries, 5);
+        assert_eq!(all.bytes, lens.iter().sum::<usize>() as u64); // 150
+
+        // Ack the first two (client_seq 1 and 2, lengths 10 + 20).
+        conn.execute(
+            "UPDATE _yapstack_outbox SET acked=1 WHERE client_seq IN (1, 2)",
+            [],
+        )
+        .unwrap();
+        let after = pending(&conn).unwrap();
+        assert_eq!(after.entries, 3, "only the three unacked entries remain");
+        assert_eq!(
+            after.bytes,
+            (30 + 40 + 50) as u64,
+            "sum excludes acked bytes"
+        );
+
+        // Ack the rest → fully drained reads as zero.
+        conn.execute("UPDATE _yapstack_outbox SET acked=1", [])
+            .unwrap();
+        let drained = pending(&conn).unwrap();
+        assert_eq!(drained, OutboxPending::default());
+    }
+
+    #[test]
+    fn pending_on_empty_outbox_is_zero() {
+        // A call before any capture must ensure the table and return {0,0}, never error.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(pending(&conn).unwrap(), OutboxPending::default());
     }
 
     #[test]

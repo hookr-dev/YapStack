@@ -22,8 +22,11 @@ import {
   shouldShowUpgrade,
   isValidServerUrl,
   formatFingerprint,
+  formatSyncProgress,
+  formatLastSynced,
   DEFAULT_SYNC_SERVER_URL,
 } from "@/lib/sync";
+import type { SyncStatus } from "@/lib/sync";
 import { SignupDialog } from "./SignupDialog";
 import { LoginDialog } from "./LoginDialog";
 import { DeviceApprovalDialog } from "./DeviceApprovalDialog";
@@ -51,6 +54,20 @@ export function SyncTab() {
 
   const signedIn = !!syncStatus?.email;
   const phase = syncStatus?.phase ?? "disconnected";
+
+  // Poll while the panel is open so progress feels live. During an active push
+  // (phase === "syncing") poll faster; otherwise a gentle interval keeps the
+  // "Up to date" relative time fresh and catches the transition INTO syncing.
+  // The effect re-subscribes when the phase flips, swapping the cadence. This
+  // only runs while the Sync settings tab is mounted (T024).
+  useEffect(() => {
+    if (!signedIn) return;
+    const intervalMs = phase === "syncing" ? 1500 : 5000;
+    const id = window.setInterval(() => {
+      void refreshSyncStatus();
+    }, intervalMs);
+    return () => window.clearInterval(id);
+  }, [signedIn, phase, refreshSyncStatus]);
   const serverDirty = serverUrl.trim() !== syncConfig.serverUrl;
   const serverValid = isValidServerUrl(serverUrl);
 
@@ -283,10 +300,7 @@ export function SyncTab() {
               </Button>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <ShieldCheck className="h-3.5 w-3.5 text-primary" />
-              Sync is enabled on this device.
-            </div>
+            <SyncProgressLine status={syncStatus} />
           )}
 
           {/* Upgrade — only when a billing_url is advertised. */}
@@ -320,6 +334,30 @@ export function SyncTab() {
   );
 }
 
+/**
+ * The enabled-device status line: an in-flight push shows a compact spinner +
+ * "Syncing — N items remaining"; a drained outbox shows "Up to date" with the
+ * relative last-synced time. Both match the existing muted `text-xs` treatment —
+ * no new chrome. auth_expired/error keep their T023 Alert/badge treatment above.
+ */
+function SyncProgressLine({ status }: { status: SyncStatus }) {
+  if (status.phase === "syncing") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+        Syncing — {formatSyncProgress(status.pendingEntries, status.pendingBytes)}
+      </div>
+    );
+  }
+  const synced = formatLastSynced(status.lastSuccess);
+  return (
+    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <ShieldCheck className="h-3.5 w-3.5 text-primary" />
+      Up to date{synced ? ` · synced ${synced}` : ""}
+    </div>
+  );
+}
+
 function StatusBadge({
   phase,
   signedIn,
@@ -338,6 +376,13 @@ function StatusBadge({
     return (
       <Badge variant="secondary" className="text-[10px]">
         preparing
+      </Badge>
+    );
+  }
+  if (phase === "syncing") {
+    return (
+      <Badge variant="secondary" className="text-[10px]">
+        syncing
       </Badge>
     );
   }

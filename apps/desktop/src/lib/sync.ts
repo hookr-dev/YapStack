@@ -35,6 +35,8 @@ export type SyncPhase =
   | "connecting"
   | "connected"
   | "preparing" // crr_migrate running: "preparing your library for sync"
+  | "syncing" // a push is in flight — unacked entries remain in the outbox (T024)
+  | "auth_expired" // session expired; the drain stopped and needs a fresh sign-in (T023)
   | "error";
 
 export interface DeviceRosterEntry {
@@ -65,6 +67,16 @@ export interface SyncStatus {
   /** Last connection / auth error surfaced verbatim (never auto-routed). */
   lastError: string | null;
   billingUrl: string | null;
+  /** Unacked outbox entries still to push (0 == up to date). Drives the
+   *  "Syncing — N remaining" indicator (T024). */
+  pendingEntries: number;
+  /** Total ciphertext bytes of those unacked entries (base64 upload is ~4/3). */
+  pendingBytes: number;
+  /** Entries acked since the current drain thread started (this session). */
+  ackedThisSession: number;
+  /** RFC3339 of the last fully-drained-and-reachable moment; null before the
+   *  first successful drain. Rendered relative to now ("synced 2m ago"). */
+  lastSuccess: string | null;
 }
 
 export interface SignupRequest {
@@ -210,4 +222,50 @@ export function isValidServerUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Compact "N items remaining" line for the in-flight push indicator (T024). The
+ * byte figure is folded in only once it is meaningfully large so the line reads
+ * naturally for a small handful of changes ("Syncing — 2 items remaining") vs a
+ * big initial sync ("Syncing — 137 items remaining · 68.0 MB").
+ */
+export function formatSyncProgress(
+  pendingEntries: number,
+  pendingBytes: number,
+): string {
+  const noun = pendingEntries === 1 ? "item" : "items";
+  const head = `${pendingEntries} ${noun} remaining`;
+  // Only append a size once it clears ~1 MiB — below that it is noise.
+  if (pendingBytes >= 1024 * 1024) {
+    return `${head} · ${formatBytes(pendingBytes)}`;
+  }
+  return head;
+}
+
+/** Human byte size (MB/GB) for the sync backlog line. Base-1024, one decimal. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(1)} GB`;
+}
+
+/**
+ * Relative "last synced" phrasing from an RFC3339 timestamp, for the "Up to date"
+ * line. Returns "just now" under a minute, then minutes / hours / days. `null`
+ * (never synced) yields an empty string so the caller can omit the suffix.
+ */
+export function formatLastSynced(iso: string | null, now: number = Date.now()): string {
+  if (!iso) return "";
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const secs = Math.max(0, Math.round((now - then) / 1000));
+  if (secs < 60) return "just now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
 }
