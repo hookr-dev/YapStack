@@ -7,11 +7,25 @@
 //! cr-sqlite init on a plain DB is harmless and dormant until CRR tables exist
 //! (A3), which is why we do it from day one: A3 becomes a file swap only.
 //!
-//! ## Pool (A1 spike verdict)
-//! ONE writer connection behind a mutex (all writes serialize; writer-writer
-//! `SQLITE_BUSY` impossible) plus a small ring of reader connections
-//! round-robined for `select`. WAL + `busy_timeout` on every connection; every
-//! SQLite call runs on a blocking thread (`spawn_blocking`).
+//! ## Pool + the real concurrency invariant (F4)
+//! This service owns ONE writer connection behind a mutex plus a small ring of
+//! reader connections round-robined for `select`. WAL + `busy_timeout` on every
+//! connection; every SQLite call runs on a blocking thread (`spawn_blocking`).
+//!
+//! It is tempting to call this "single-writer", but that is NOT the post-cutover
+//! reality. After the A3 CRR cutover there are **three writer classes on the one
+//! `yapstack.db` WAL file**: (1) this service's serialized writer (UI reads/writes),
+//! (2) the sync drain's long-lived `CrsqlDb` connection (push/pull merge), and
+//! (3) short-lived `open_managed` connections (audio-part inserts, runtime schema
+//! patches, reconciliation) opened+dropped inside a single function.
+//!
+//! The real invariant is therefore **serialization via WAL + `busy_timeout`**, not
+//! a single writer: SQLite permits one writer at a time on a WAL file and blocks
+//! the others until the lock frees. With `BUSY_TIMEOUT` = 10s, the worst-case
+//! observable stall for a contended write is ~10s before it would surface
+//! `SQLITE_BUSY`; in practice writes are sub-millisecond so overlap serializes
+//! transparently. (writer-writer `SQLITE_BUSY` is thus possible only if a peer
+//! held the write lock for >10s, which no code path does.)
 //!
 //! ## Read-your-writes
 //! `execute` always uses the writer and fully commits (autocommit per command)
@@ -153,8 +167,9 @@ impl Pool {
     fn execute(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<DbExecuteResult> {
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let conn = guard.conn();
-        let rows_affected =
-            conn.execute(query, rusqlite::params_from_iter(values.iter().map(Bind)))?;
+        let mut stmt = conn.prepare(query)?;
+        bind_all(&mut stmt, values)?;
+        let rows_affected = stmt.raw_execute()?;
         let last_insert_id = conn.last_insert_rowid();
         Ok(DbExecuteResult {
             rows_affected: rows_affected as u64,
@@ -169,7 +184,8 @@ impl Pool {
         let mut stmt = conn.prepare(query)?;
         let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let col_count = col_names.len();
-        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter().map(Bind)))?;
+        bind_all(&mut stmt, values)?;
+        let mut rows = stmt.raw_query();
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let mut map = serde_json::Map::with_capacity(col_count);
@@ -180,6 +196,40 @@ impl Pool {
         }
         Ok(out)
     }
+}
+
+/// Bind `values` to a prepared statement by **explicit placeholder number**, not by
+/// first-appearance order (F7). SQLite assigns a named/numbered placeholder
+/// (`$N`, `?N`, `:N`, `@N`) its bind index by first appearance, so `params_from_iter`
+/// mis-binds a query like `SELECT $2, $1` (it would feed `values[0]` to `$2`). db.ts
+/// treats `$N` as "the Nth bind value", so we honour that: for each real SQLite
+/// parameter slot we read its name, parse the trailing integer `N`, and bind
+/// `values[N-1]`. Anonymous `?` (no name) falls back to slot order. Using
+/// `parameter_name` means SQLite's own parser decides what is a placeholder — a `$`
+/// inside a string literal is never mistaken for one.
+fn bind_all(stmt: &mut rusqlite::Statement<'_>, values: &[JsonValue]) -> rusqlite::Result<()> {
+    let count = stmt.parameter_count();
+    for slot in 1..=count {
+        let value_index = match stmt.parameter_name(slot) {
+            // "$2" / "?2" / ":2" / "@2" -> bind value #2 (1-based) regardless of where
+            // it appears in the SQL text.
+            Some(name) => {
+                let digits: String = name.chars().filter(|c| c.is_ascii_digit()).collect();
+                match digits.parse::<usize>() {
+                    Ok(n) if n >= 1 => n - 1,
+                    // A non-numeric named param ($foo): bind by appearance slot.
+                    _ => slot - 1,
+                }
+            }
+            // Anonymous "?" has no name: positional by appearance.
+            None => slot - 1,
+        };
+        let v = values
+            .get(value_index)
+            .ok_or_else(|| rusqlite::Error::InvalidParameterCount(values.len(), count))?;
+        stmt.raw_bind_parameter(slot, Bind(v))?;
+    }
+    Ok(())
 }
 
 /// The command backend: one writer + a ring of readers over `yapstack.db`.
@@ -222,6 +272,21 @@ fn swap_in_progress_err() -> rusqlite::Error {
              enabled; retry shortly"
                 .to_string(),
         ),
+    )
+}
+
+/// Error for an incomplete pre-swap checkpoint (F2). `busy != 0` → a concurrent
+/// lock blocked the checkpoint; `log != 0` → frames still in the -wal. Either way
+/// the main file is not self-contained and the swap must abort.
+#[cfg(feature = "sync")]
+fn checkpoint_incomplete_err(busy: i64, log: i64, checkpointed: i64) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(format!(
+            "cutover pre-swap checkpoint incomplete (busy={busy}, log_frames={log}, \
+             checkpointed={checkpointed}); the -wal did not fully fold into the main DB, \
+             so the swap was aborted and the live DB left untouched — retry shortly"
+        )),
     )
 }
 
@@ -276,9 +341,40 @@ impl DbService {
         self.swapping.store(true, Ordering::Release);
         let mut guard = self.pool.write().unwrap_or_else(|e| e.into_inner());
         if let Some(pool) = guard.as_ref() {
-            let w = pool.writer.lock().unwrap_or_else(|e| e.into_inner());
-            // Best-effort: sidecars are also removed by the cutover after this returns.
-            let _ = w.conn().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            // F2: the checkpoint result is load-bearing. `wal_checkpoint(TRUNCATE)`
+            // returns (busy, log, checkpointed): `busy != 0` means another connection
+            // held a read/write lock and the checkpoint could NOT run to completion;
+            // `log != 0` means frames remain in the -wal that did not fold into the
+            // main file. Either way the on-disk `yapstack.db` is NOT self-contained, so
+            // dropping the handle and force-deleting `-wal` (as the cutover does next)
+            // would LOSE those frames. Abort the swap cleanly: leave the pool intact,
+            // lower the fast-path gate, and surface the verbatim reason. The caller
+            // aborts the cutover with the live DB completely untouched.
+            let checkpoint = {
+                let w = pool.writer.lock().unwrap_or_else(|e| e.into_inner());
+                w.conn()
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+            };
+            match checkpoint {
+                // Fully self-contained: busy=0 and no frames remain. `log <= 0` covers both
+                // a full checkpoint (0) and a non-WAL DB (-1); `busy != 0` or `log > 0`
+                // means the -wal did not fully fold and the swap must abort.
+                Ok((0, log, _)) if log <= 0 => {}
+                Ok((busy, log, ckpt)) => {
+                    self.swapping.store(false, Ordering::Release);
+                    return Err(checkpoint_incomplete_err(busy, log, ckpt));
+                }
+                Err(e) => {
+                    self.swapping.store(false, Ordering::Release);
+                    return Err(e);
+                }
+            }
         }
         *guard = None; // drop Pool -> drop every ManagedConn -> crsql_finalize.
         Ok(())
@@ -442,17 +538,33 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
 
     #[cfg(feature = "sync")]
     {
-        if let Some(table) = crr_alter_target(conn, m.sql)? {
-            // CRR-prepared DB + a single ALTER on a CRR sync table: wrap in
-            // crsql_begin_alter/crsql_commit_alter so the clock/pks shadow tables are
-            // rebuilt and the new column backfills at col_version=1. crsql_alter runs
-            // its own transaction, so the bookkeeping row is recorded immediately
-            // after (autocommit). The only non-atomic window — the alter commits but
-            // the (local, single-row) bookkeeping insert fails — is vanishingly
-            // unlikely; on a re-run the ALTER would fail loudly (duplicate column)
-            // rather than corrupt, and the column is already present.
-            yapstack_sync::schema::crsql_alter(conn, &table, m.sql).map_err(sync_to_rusqlite)?;
-            return record_migration(conn, m, start.elapsed().as_nanos() as i64);
+        // On a CRR-prepared DB, sync-table schema changes MUST route through
+        // cr-sqlite's alter wrapping or they silently desync the clock/pks shadow
+        // tables. Enforce this (F3), don't merely document it.
+        if yapstack_sync::schema::is_crr(conn, "sessions").map_err(sync_to_rusqlite)? {
+            match parse_single_alter_table(m.sql) {
+                // A clean single `ALTER TABLE <sync_table>`: wrap in
+                // crsql_begin_alter/crsql_commit_alter so the clock/pks shadow tables are
+                // rebuilt and the new column backfills at col_version=1. crsql_alter runs
+                // its own transaction, so the bookkeeping row is recorded immediately
+                // after (autocommit). The only non-atomic window — the alter commits but
+                // the (local, single-row) bookkeeping insert fails — is vanishingly
+                // unlikely; on a re-run the ALTER would fail loudly (duplicate column)
+                // rather than corrupt, and the column is already present.
+                Some(table) if yapstack_sync::schema::SYNC_TABLES.contains(&table.as_str()) => {
+                    yapstack_sync::schema::crsql_alter(conn, &table, m.sql)
+                        .map_err(sync_to_rusqlite)?;
+                    return record_migration(conn, m, start.elapsed().as_nanos() as i64);
+                }
+                // NOT a clean wrapped single ALTER. If it nonetheless references a sync
+                // table (bare ALTER, multi-statement batch, DROP, etc.), applying it
+                // plainly would corrupt cr-sqlite's shadow tables — FAIL LOUDLY.
+                _ => {
+                    if let Some(t) = mentions_sync_table(m.sql) {
+                        return Err(crr_unsafe_migration_err(m, &t));
+                    }
+                }
+            }
         }
     }
 
@@ -469,18 +581,40 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     }
 }
 
-/// If `conn` is a CRR-prepared DB and `sql` is a single `ALTER TABLE <t>` on a
-/// synced table, return that table (routing it through `crsql_alter`). Otherwise
-/// `None` (apply plainly).
+/// If `sql` references any CRR sync table as a whole identifier token, return the
+/// first such table. Conservative word-boundary scan (F3): the SQL is tokenized on
+/// non-identifier characters, so `sessions` matches but `my_sessions_backup` does
+/// not. A comment or string literal that merely mentions a table name is a tolerable
+/// false positive (it fails a migration loudly); silent clock corruption is not.
 #[cfg(feature = "sync")]
-fn crr_alter_target(conn: &Connection, sql: &str) -> rusqlite::Result<Option<String>> {
-    // "sessions" is CRRified together with every other sync table by crr_migrate,
-    // so its clock table existing proves the DB is CRR-prepared.
-    if !yapstack_sync::schema::is_crr(conn, "sessions").map_err(sync_to_rusqlite)? {
-        return Ok(None);
-    }
-    Ok(parse_single_alter_table(sql)
-        .filter(|t| yapstack_sync::schema::SYNC_TABLES.contains(&t.as_str())))
+fn mentions_sync_table(sql: &str) -> Option<String> {
+    let tokens: std::collections::HashSet<String> = sql
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    yapstack_sync::schema::SYNC_TABLES
+        .iter()
+        .find(|t| tokens.contains(&t.to_ascii_lowercase()))
+        .map(|t| (*t).to_string())
+}
+
+/// The loud error for an unsafe sync-table migration on a CRR DB (F3): names the
+/// offending migration, the table, and the one-ALTER-per-version rule.
+#[cfg(feature = "sync")]
+fn crr_unsafe_migration_err(m: &crate::db::Migration, table: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!(
+            "migration v{} ({}) references CRR sync table `{table}` on a cr-sqlite database \
+             but is not a single wrapped `ALTER TABLE {table} …` statement. Applying it \
+             plainly would desync cr-sqlite's clock/pks shadow tables and corrupt sync. Rule: \
+             a sync-table schema change must be exactly ONE `ALTER TABLE <sync_table> …` per \
+             migration version (auto-routed through crsql_begin_alter/commit_alter); split \
+             multi-step changes across versions. Refusing to apply.",
+            m.version, m.description
+        )),
+    )
 }
 
 /// Extract the table name from a single `ALTER TABLE <name> …` statement, or
@@ -842,6 +976,138 @@ mod tests {
             )
             .is_ok();
         assert!(exists);
+    }
+
+    /// F7: `$N` placeholders must bind by their explicit number, not by first
+    /// appearance in the SQL. A query that references `$2` before `$1` must still
+    /// receive `values[1]` at `$2` and `values[0]` at `$1`.
+    #[test]
+    fn out_of_order_dollar_params_bind_by_number_not_appearance() {
+        let (_dir, path) = temp_db();
+        let svc = DbService::open(&path).unwrap();
+        let rows = svc
+            .select("SELECT $2 AS a, $1 AS b", &[json!("one"), json!("two")])
+            .unwrap();
+        // Correct: a = values[1] = "two", b = values[0] = "one".
+        assert_eq!(rows[0]["a"], json!("two"));
+        assert_eq!(rows[0]["b"], json!("one"));
+
+        // A repeated placeholder still binds by number.
+        let rows = svc
+            .select(
+                "SELECT $1 AS a, $1 AS b, $2 AS c",
+                &[json!("x"), json!("y")],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["a"], json!("x"));
+        assert_eq!(rows[0]["b"], json!("x"));
+        assert_eq!(rows[0]["c"], json!("y"));
+
+        // Out-of-order in an INSERT round-trips correctly through the writer.
+        svc.execute(
+            "INSERT INTO sessions (source, id) VALUES ($2, $1)",
+            &[json!("id-out-of-order"), json!("Mic")],
+        )
+        .unwrap();
+        let got = svc
+            .select(
+                "SELECT source FROM sessions WHERE id = $1",
+                &[json!("id-out-of-order")],
+            )
+            .unwrap();
+        assert_eq!(got[0]["source"], json!("Mic"));
+    }
+
+    /// F3 enforcement: a multi-statement migration that touches a sync table on a
+    /// CRR-prepared DB must FAIL LOUDLY (not be applied plainly, which would desync
+    /// the cr-sqlite clock). Nothing from the migration lands.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn crr_multi_statement_sync_table_migration_fails_loudly_and_applies_nothing() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        run_migrations(conn).unwrap();
+        for (table, col, coldef) in yapstack_sync::schema::OUT_OF_BAND_ALTERS {
+            if !yapstack_sync::schema::column_exists(conn, table, col).unwrap() {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {coldef};"))
+                    .unwrap();
+            }
+        }
+        yapstack_sync::schema::crr_migrate(conn).unwrap();
+        assert!(yapstack_sync::schema::is_crr(conn, "sessions").unwrap());
+
+        // A multi-statement migration that touches a sync table: unsafe on a CRR DB.
+        let bad = crate::db::Migration {
+            version: 950,
+            description: "test: unsafe multi-statement sync-table change",
+            sql: "ALTER TABLE sessions ADD COLUMN f3_bad TEXT; CREATE INDEX ix_f3 ON sessions(f3_bad)",
+        };
+        // apply_migration surfaces the loud, named error.
+        let err = apply_migration(conn, &bad).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("v950"), "names the migration: {msg}");
+        assert!(msg.contains("sessions"), "names the table: {msg}");
+        assert!(msg.contains("Refusing to apply"), "loud refusal: {msg}");
+
+        // run_migrations_list swallows the failure (skip-and-log) but applies NOTHING:
+        // no column, no bookkeeping row.
+        let applied = run_migrations_list(conn, &[bad]).unwrap();
+        assert!(applied.is_empty(), "nothing applied");
+        assert!(
+            !yapstack_sync::schema::column_exists(conn, "sessions", "f3_bad").unwrap(),
+            "the unsafe column must not exist"
+        );
+        let recorded: bool = conn
+            .query_row(
+                "SELECT 1 FROM _sqlx_migrations WHERE version = 950",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        assert!(!recorded, "no bookkeeping row for the refused migration");
+        // CRR clock intact (nothing corrupted it).
+        assert!(yapstack_sync::schema::is_crr(conn, "sessions").unwrap());
+    }
+
+    /// F2: if the pre-swap checkpoint cannot fully fold the -wal (a second connection
+    /// holds a read snapshot pinning frames), `close_for_swap` aborts cleanly — it
+    /// does NOT drop the pool, leaves the DB untouched, and the service keeps working.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn close_for_swap_aborts_when_checkpoint_cannot_complete() {
+        let (_dir, path) = temp_db();
+        let svc = DbService::open(&path).unwrap();
+        svc.execute("INSERT INTO sessions (id, source) VALUES ('a', 'Mic')", &[])
+            .unwrap();
+
+        // A separate connection with an open read transaction pins a WAL snapshot so a
+        // TRUNCATE checkpoint cannot reset the -wal (busy / frames remain).
+        let blocker = Connection::open(&path).unwrap();
+        blocker.busy_timeout(Duration::from_millis(50)).unwrap();
+        blocker.execute_batch("BEGIN").unwrap();
+        let _pin: i64 = blocker
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        // Advance the WAL past the blocker's snapshot so frames cannot be truncated.
+        svc.execute("INSERT INTO sessions (id, source) VALUES ('b', 'Mic')", &[])
+            .unwrap();
+
+        let err = svc
+            .close_for_swap()
+            .expect_err("checkpoint must not complete with a pinned reader");
+        assert!(
+            err.to_string().contains("checkpoint incomplete"),
+            "verbatim reason: {err}"
+        );
+        // Pool intact + gate lowered: the service still serves reads and writes.
+        let rows = svc.select("SELECT id FROM sessions", &[]).unwrap();
+        assert_eq!(rows.len(), 2, "live DB untouched, service still working");
+        svc.execute("INSERT INTO sessions (id, source) VALUES ('c', 'Mic')", &[])
+            .unwrap();
+
+        blocker.execute_batch("ROLLBACK").ok();
+        drop(blocker);
     }
 
     /// Post-swap re-entry: `reopen` rebuilds a working pool on the same file and

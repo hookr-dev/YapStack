@@ -655,6 +655,17 @@ pub fn run() {
             // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
 
+            // F1.2: recover any CRR cutover that was interrupted by a crash/kill
+            // BEFORE opening the DB. `DbService::open` would otherwise CREATE an empty
+            // `yapstack.db` over a mid-swap state (live renamed to backup, staging not
+            // yet swapped in) and the auto-cutover would then destroy the leftovers —
+            // silent total data loss. Recovery reads the durable cutover journal and
+            // completes or rolls back the swap deterministically, so `open` below always
+            // sees the real data (or a genuinely fresh install). Sync-feature-only: a
+            // cutover (and thus a journal) can only exist under the `sync` feature.
+            #[cfg(feature = "sync")]
+            sync::recover_interrupted_cutover(&db_path);
+
             // Repo-owned DB command backend (Option A′ stage 2). Opening the
             // service runs the in-repo migration list on its writer connection
             // BEFORE any `db_execute`/`db_select` command can be served, and

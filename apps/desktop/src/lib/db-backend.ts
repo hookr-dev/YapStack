@@ -26,18 +26,65 @@ export interface DbConnection {
   select<T>(query: string, bindValues?: unknown[]): Promise<T>;
 }
 
+/**
+ * Sentinel the Rust backend returns while the DB is briefly unavailable during the
+ * A3 CRR cutover file swap (see `db_service::swap_in_progress_err`). The swap window
+ * is sub-second, so instead of failing the caller we retry with a short backoff.
+ */
+const SWAP_SENTINEL = "DB_SWAP_IN_PROGRESS";
+const SWAP_RETRY_DELAY_MS = 250;
+const SWAP_MAX_RETRIES = 10;
+
+function isSwapInProgress(err: unknown): boolean {
+  const msg =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? err.message
+        : String(err ?? "");
+  return msg.includes(SWAP_SENTINEL);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Invoke a DB command, transparently retrying while the backend reports the cutover
+ * swap window (F6). Any other error rejects immediately; after `SWAP_MAX_RETRIES`
+ * the last swap error is surfaced so a genuinely stuck swap still fails loudly.
+ */
+async function invokeWithSwapRetry<T>(
+  command: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= SWAP_MAX_RETRIES; attempt++) {
+    try {
+      return await invoke<T>(command, args);
+    } catch (err) {
+      lastError = err;
+      if (!isSwapInProgress(err) || attempt === SWAP_MAX_RETRIES) {
+        throw err;
+      }
+      await sleep(SWAP_RETRY_DELAY_MS);
+    }
+  }
+  throw lastError;
+}
+
 const connection: DbConnection = {
   async execute(query: string, bindValues: unknown[] = []): Promise<QueryResult> {
-    return await invoke<QueryResult>("db_execute", {
+    return await invokeWithSwapRetry<QueryResult>("db_execute", {
       query,
       values: bindValues,
     });
   },
   async select<T>(query: string, bindValues: unknown[] = []): Promise<T> {
-    return (await invoke("db_select", {
+    return await invokeWithSwapRetry<T>("db_select", {
       query,
       values: bindValues,
-    })) as T;
+    });
   },
 };
 

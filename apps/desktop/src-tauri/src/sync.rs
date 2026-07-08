@@ -1159,6 +1159,290 @@ fn cutover_staging_path(live_db: &Path) -> PathBuf {
     live_db.with_file_name("yapstack.db.crr-staging")
 }
 
+// ----- Durable cutover journal + crash-safe boot recovery (F1) -----
+//
+// The cutover swaps two files with two non-atomic `rename`s (live→backup, then
+// staging→live). A crash BETWEEN them leaves the live path MISSING, which — before
+// this journal — let `DbService::open` create an empty DB on next boot and the
+// auto-cutover then delete the leftovers, silently destroying the library.
+//
+// Fix: write a durable journal BEFORE the first rename and fsync the directory after
+// each rename. On next boot, `recover_interrupted_cutover` runs BEFORE `DbService::open`
+// and derives the correct outcome from the JOURNAL (not from mere file presence),
+// completing or rolling back the interrupted swap. The journal is removed only after
+// the swap is fully verified. Recovery is total: every reachable disk state has a
+// defined outcome that never deletes the last copy of user data.
+
+/// Path of the durable cutover journal. Its presence at boot means a cutover was
+/// interrupted and must be recovered before the DB is opened.
+fn cutover_journal_path(live_db: &Path) -> PathBuf {
+    live_db.with_file_name("yapstack.db.cutover-journal")
+}
+
+const CUTOVER_JOURNAL_VERSION: u32 = 1;
+
+/// Which non-atomic step the cutover had reached when the journal was last written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum CutoverPhase {
+    /// Journal written; the first rename (live→backup) is NOT yet confirmed durable.
+    SwapStarted,
+    /// live→backup confirmed + dir fsynced; staging→live NOT yet confirmed.
+    BackupMoved,
+    /// staging→live confirmed + dir fsynced; only verify/cleanup remained.
+    SwapCompleted,
+}
+
+/// The durable source of truth for cutover recovery. Content markers (pre-swap
+/// per-table row counts + the live file size) let recovery validate a staging
+/// candidate before completing the swap onto it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CutoverJournal {
+    version: u32,
+    phase: CutoverPhase,
+    live_file: String,
+    backup_file: String,
+    staging_file: String,
+    /// Per-user-table row counts captured from the ORIGINAL live DB before the swap.
+    pre_counts: Vec<(String, i64)>,
+    /// The original live file's size in bytes (a cheap secondary content marker).
+    live_size: u64,
+}
+
+/// The bare file name of `p` (the journal records names, not absolute paths).
+fn file_name_string(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// fsync a file's contents + metadata to stable storage.
+fn fsync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// fsync a directory entry so a `rename`/create/remove within it is durable. On unix
+/// we open+fsync the directory. On non-unix (Windows) std cannot fsync a directory;
+/// this is a documented best-effort no-op — NTFS journals metadata and `MoveFileEx`
+/// renames are atomic, and boot recovery re-derives truth from the journal regardless.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// fsync the directory that holds the live DB (best-effort — logged, never fatal).
+fn fsync_live_dir(live_db: &Path) {
+    if let Some(dir) = live_db.parent() {
+        let _ = fsync_dir(dir);
+    }
+}
+
+/// Durably write (or overwrite) the cutover journal: write to a temp file, fsync it,
+/// atomically rename it over the journal path, then fsync the directory.
+fn write_journal(live_db: &Path, journal: &CutoverJournal) -> Result<(), String> {
+    let path = cutover_journal_path(live_db);
+    let mut tmp_os = path.clone().into_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    fsync_file(&tmp).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    fsync_live_dir(live_db);
+    Ok(())
+}
+
+/// Read + parse the cutover journal, if one exists and is well-formed.
+fn read_journal(live_db: &Path) -> Option<CutoverJournal> {
+    let bytes = std::fs::read(cutover_journal_path(live_db)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Remove the cutover journal (its absence tells the next boot there is nothing to do).
+fn remove_journal(live_db: &Path) {
+    let _ = std::fs::remove_file(cutover_journal_path(live_db));
+    fsync_live_dir(live_db);
+}
+
+/// Move a DB file (and any `-wal`/`-shm` sidecars) aside, NEVER deleting it (F1.3).
+fn move_db_aside(from: &Path, to: &Path) {
+    let _ = std::fs::rename(from, to);
+    for ext in ["-wal", "-shm"] {
+        let mut f = from.as_os_str().to_owned();
+        f.push(ext);
+        let mut t = to.as_os_str().to_owned();
+        t.push(ext);
+        let (fp, tp) = (PathBuf::from(f), PathBuf::from(t));
+        if fp.exists() {
+            let _ = std::fs::rename(&fp, &tp);
+        }
+    }
+}
+
+/// A monotonic-ish suffix (seconds since epoch) for a moved-aside backup filename.
+fn timestamp_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Crash-safe copy of `src` INTO the live path, KEEPING `src` (used to restore a
+/// backup we must preserve forever): stale live sidecars are cleared, the copy lands
+/// via a temp file + atomic rename, and the directory is fsynced.
+fn copy_into_live(src: &Path, live: &Path) -> std::io::Result<()> {
+    remove_sidecars(live);
+    let mut tmp_os = live.as_os_str().to_owned();
+    tmp_os.push(".recover-tmp");
+    let tmp = PathBuf::from(tmp_os);
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(src, &tmp)?;
+    fsync_file(&tmp)?;
+    std::fs::rename(&tmp, live)?;
+    fsync_live_dir(live);
+    Ok(())
+}
+
+/// Move `src` (a scratch staging file, safe to consume) INTO the live path atomically.
+fn rename_into_live(src: &Path, live: &Path) -> std::io::Result<()> {
+    remove_sidecars(live);
+    std::fs::rename(src, live)?;
+    fsync_live_dir(live);
+    Ok(())
+}
+
+/// True if any cutover recovery artifact is present beside the live DB.
+fn recovery_artifacts_present(live_db: &Path) -> bool {
+    cutover_journal_path(live_db).exists()
+        || backup_db_path(live_db).exists()
+        || cutover_staging_path(live_db).exists()
+}
+
+/// True if the live DB holds zero rows in every SYNC table — the signature of a
+/// freshly-auto-created DB (a genuine empty library, or the empty DB `DbService::open`
+/// would create over an interrupted swap). SYNC tables (not all-user-tables) are used
+/// deliberately: FTS `%_config` shadow tables always carry a version row, so an
+/// all-tables check is never zero even on a brand-new DB. Unreadable/absent → treated
+/// as empty (never cut over).
+fn live_has_no_user_rows(live_db: &Path) -> bool {
+    match synced_table_row_counts(live_db) {
+        Ok(counts) => counts.iter().all(|(_, n)| *n == 0),
+        Err(_) => true,
+    }
+}
+
+/// Complete or roll back an interrupted cutover from its durable journal (F1.2).
+///
+/// MUST run at boot BEFORE `DbService::open`, which would otherwise create an empty
+/// DB over a mid-swap state. Dead simple + total by construction: every reachable
+/// disk state maps to a defined outcome that NEVER deletes the last copy of user data.
+///
+/// Decision table (live/backup/staging are the three DB paths; "staging valid" means
+/// it exists and its per-user-table row counts match the journal's pre-swap marker):
+///
+/// ```text
+/// NO journal:
+///   live present                        -> normal boot, do nothing.
+///   live MISSING, backup present        -> restore backup->live (copy; keep backup).
+///   live MISSING, staging present only  -> restore staging->live (rename; only copy).
+///   live MISSING, nothing present       -> genuinely fresh; do nothing.
+/// journal SwapStarted, live present     -> first rename never landed; ORIGINAL data is
+///                                          at live -> do nothing (drop journal).
+/// journal SwapStarted(live missing) or BackupMoved:
+///   live present                        -> second rename landed; swap done, keep backup.
+///   live missing, staging valid         -> complete: rename staging->live.
+///   live missing, staging bad, backup   -> roll back: restore backup->live.
+///   live missing, nothing usable        -> leave as-is (should be unreachable).
+/// journal SwapCompleted:
+///   live present                        -> done; keep backup.
+///   live missing, backup present        -> restore backup->live.
+///   live missing, staging valid         -> complete: rename staging->live.
+/// ```
+///
+/// In every branch the journal is removed at the end (the only thing deleted).
+pub fn recover_interrupted_cutover(live_db: &Path) {
+    let backup = backup_db_path(live_db);
+    let staging = cutover_staging_path(live_db);
+
+    match read_journal(live_db) {
+        Some(journal) => {
+            recover_from_journal(live_db, &backup, &staging, &journal);
+            // The interrupted cutover is resolved: the journal is the ONLY thing deleted.
+            remove_journal(live_db);
+        }
+        None => {
+            // No journal. The only dangerous no-journal state is a MISSING live while a
+            // recovery copy exists (e.g. the journal write itself was lost). NEVER let the
+            // app proceed to create an empty live — restore the best available copy.
+            if !live_db.exists() {
+                if backup.exists() {
+                    let _ = copy_into_live(&backup, live_db); // keep the backup (kept forever)
+                } else if staging.exists() {
+                    let _ = rename_into_live(&staging, live_db); // staging is the only copy
+                }
+                // else: genuinely fresh (no data anywhere) — nothing to recover.
+            }
+        }
+    }
+}
+
+/// The journal-driven half of [`recover_interrupted_cutover`]. See its decision table.
+fn recover_from_journal(live_db: &Path, backup: &Path, staging: &Path, journal: &CutoverJournal) {
+    // "staging valid": it exists AND its user-table row counts match the pre-swap marker.
+    let staging_valid = staging.exists()
+        && all_user_table_row_counts(staging)
+            .map(|c| c == journal.pre_counts)
+            .unwrap_or(false);
+
+    match journal.phase {
+        // First rename never confirmed AND the original is still at live → nothing to do.
+        CutoverPhase::SwapStarted if live_db.exists() => {
+            tracing::info!(
+                "sync recovery: interrupted cutover (SwapStarted) — live DB intact, nothing to restore"
+            );
+        }
+        // SwapStarted-with-live-missing (crash before the phase advance) OR BackupMoved:
+        // the first rename landed; the second did not confirm.
+        CutoverPhase::SwapStarted | CutoverPhase::BackupMoved => {
+            if live_db.exists() {
+                // BackupMoved but live present → the second rename actually completed.
+                tracing::info!(
+                    "sync recovery: interrupted cutover — swap already completed; keeping backup"
+                );
+            } else if staging_valid {
+                tracing::warn!("sync recovery: completing interrupted cutover (staging→live)");
+                let _ = rename_into_live(staging, live_db);
+            } else if backup.exists() {
+                tracing::warn!(
+                    "sync recovery: staging missing/invalid — rolling interrupted cutover back (backup→live)"
+                );
+                let _ = copy_into_live(backup, live_db);
+            } else {
+                tracing::error!(
+                    "sync recovery: interrupted cutover with no usable copy of the live DB — leaving disk as-is"
+                );
+            }
+        }
+        // Second rename confirmed; only verify/cleanup remained.
+        CutoverPhase::SwapCompleted => {
+            if live_db.exists() {
+                tracing::info!("sync recovery: interrupted cutover (SwapCompleted) — live present, keeping backup");
+            } else if backup.exists() {
+                tracing::warn!("sync recovery: live vanished post-swap — restoring backup→live");
+                let _ = copy_into_live(backup, live_db);
+            } else if staging_valid {
+                let _ = rename_into_live(staging, live_db);
+            }
+        }
+    }
+}
+
 /// True once the live DB is itself CRR-prepared at the current schema version (the
 /// idempotency gate). Inspected via a read-only connection — extension-less reads on
 /// a CRR DB are safe (A1 spike) and never create/mutate anything.
@@ -1220,6 +1504,38 @@ fn synced_table_row_counts(db: &Path) -> rusqlite::Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
+/// Per-user-table row counts (F5): EVERY table in `sqlite_master` except SQLite
+/// internals (`sqlite_%`), our own underscore-prefixed bookkeeping (`_sqlx_migrations`,
+/// `_yapstack_sync_%`), and cr-sqlite's bookkeeping/shadow tables (`crsql_%`,
+/// `%__crsql_%`). This is the swap's data-preservation oracle — identical before and
+/// after the cutover — and is broader than [`synced_table_row_counts`] (which counts
+/// only the CRR tables) so a dropped/renamed local table is caught too. Sorted for a
+/// stable comparison.
+fn all_user_table_row_counts(db: &Path) -> rusqlite::Result<Vec<(String, i64)>> {
+    let conn = Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let names: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' \
+               AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+               AND name NOT LIKE '\\_%' ESCAPE '\\' \
+               AND name NOT LIKE 'crsql\\_%' ESCAPE '\\' \
+               AND name NOT LIKE '%\\_\\_crsql\\_%' ESCAPE '\\'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::new();
+    for t in names {
+        let n: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))?;
+        out.push((t, n));
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Remove a DB file plus its `-wal`/`-shm` sidecars (best-effort).
 fn remove_db_files(db: &Path) {
     let _ = std::fs::remove_file(db);
@@ -1260,6 +1576,10 @@ enum CutoverFault {
     /// Fail after the staging→live rename + reopen (exercises the backup→live
     /// rollback that restores the byte-identical original live DB).
     AfterRename,
+    /// Fail BETWEEN the two renames (live→backup done, staging→live not started),
+    /// leaving the mid-swap state on disk so a test can drive boot recovery (F1).
+    /// Does NOT roll back — the journal + `recover_interrupted_cutover` must.
+    BetweenRenames,
 }
 
 /// Perform the enable-time CRR cutover on the LIVE DB. See the module section above
@@ -1284,13 +1604,28 @@ fn cutover_with_fault(
         return Ok(());
     }
 
+    // F1.4 empty-live guard (belt-and-suspenders on top of boot recovery): refuse to cut
+    // over a live DB that looks freshly auto-created while recovery artifacts still exist —
+    // that exact pattern (an empty live created by DbService::open after an interrupted
+    // swap) is the data-loss trap. Boot recovery should have run first; if we still see
+    // this, surface an error rather than enshrining the empty DB as the new sync DB.
+    if recovery_artifacts_present(live_db) && live_has_no_user_rows(live_db) {
+        return Err(
+            "cutover refused: the live database looks freshly created while cutover recovery \
+             artifacts (journal/backup/staging) are present. Restart the app so boot recovery \
+             can restore your data before enabling sync."
+                .to_string(),
+        );
+    }
+
     let staging = cutover_staging_path(live_db);
     let backup = backup_db_path(live_db);
     remove_db_files(&staging); // clear any partial staging from a prior aborted run
 
-    // Step 2: pre-swap counts (for the post-swap assertion).
+    // Step 2: pre-swap counts across ALL user tables (F5) — the data-preservation oracle
+    // and the journal's content marker.
     let pre_counts =
-        synced_table_row_counts(live_db).map_err(|e| format!("pre-swap row counts: {e}"))?;
+        all_user_table_row_counts(live_db).map_err(|e| format!("pre-swap row counts: {e}"))?;
 
     // Step 2 (spike): VACUUM INTO reads the live DB and writes a fresh compacted copy;
     // the live DB is never opened for write.
@@ -1323,8 +1658,23 @@ fn cutover_with_fault(
         state::set_push_watermark(conn, 0).map_err(|e| e.to_string())?;
         state::set_pull_watermark(conn, 0).map_err(|e| e.to_string())?;
         // Step 4a: merge the -wal into the file before we drop the handle + rename.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        // F2: the checkpoint result is load-bearing — verify a FULL checkpoint (busy=0,
+        // 0 frames remaining) before we later force-remove the staging sidecars, or we
+        // would silently drop un-checkpointed frames.
+        // `log`/`checkpointed` are -1 when the DB is NOT in WAL mode (staging comes from
+        // `VACUUM INTO`, whose target defaults to rollback-journal mode) — that means
+        // there is no -wal to fold, which is fine. Only `busy != 0` (a lock blocked it) or
+        // `log > 0` (frames still in an active -wal) indicate a non-self-contained file.
+        let (busy, log, ckpt): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .map_err(|e| e.to_string())?;
+        if busy != 0 || log > 0 {
+            return Err(format!(
+                "staging checkpoint incomplete (busy={busy}, log_frames={log}, checkpointed={ckpt})"
+            ));
+        }
         Ok(())
     })();
     if let Err(e) = prep {
@@ -1341,32 +1691,86 @@ fn cutover_with_fault(
         return Err(format!("cutover could not quiesce the DB pool: {e}"));
     }
 
-    // Step 5: remove stale sidecars for both files.
+    // Step 5: remove stale sidecars for both files. Safe now: `close_for_swap` and the
+    // staging prep BOTH confirmed a FULL checkpoint (0 frames), so the main files are
+    // self-contained and the -wal/-shm hold nothing (F2).
     remove_sidecars(live_db);
     remove_sidecars(&staging);
 
-    // Step 6: atomic rename live→backup, staging→live.
+    // Step 5b: preserve any pre-existing backup by MOVING it aside with a timestamp
+    // suffix — NEVER delete a backup without positive proof it is stale (F1.3). Disk is
+    // cheap; a user's transcripts are not. The "kept forever, never auto-deleted" promise
+    // now holds.
     if backup.exists() {
-        // A stale backup from an earlier rolled-back run; the CURRENT (non-CRR) live is
-        // the real pre-sync data, so free the target.
-        remove_db_files(&backup);
+        let aside = live_db.with_file_name(format!(
+            "yapstack.db.pre-sync-backup.{}",
+            timestamp_suffix()
+        ));
+        tracing::info!(
+            "sync: pre-existing backup found — moving it aside to {} (never deleted)",
+            aside.display()
+        );
+        move_db_aside(&backup, &aside);
     }
+
+    // Step 5c: DURABLE CUTOVER JOURNAL (F1.1). Written + fsynced BEFORE the first rename.
+    // From here on, boot recovery — not file presence — is the source of truth: a crash
+    // between the two renames is completed or rolled back by `recover_interrupted_cutover`.
+    let mut journal = CutoverJournal {
+        version: CUTOVER_JOURNAL_VERSION,
+        phase: CutoverPhase::SwapStarted,
+        live_file: file_name_string(live_db),
+        backup_file: file_name_string(&backup),
+        staging_file: file_name_string(&staging),
+        pre_counts: pre_counts.clone(),
+        live_size: std::fs::metadata(live_db).map(|m| m.len()).unwrap_or(0),
+    };
+    if let Err(e) = write_journal(live_db, &journal) {
+        let _ = db_service.reopen();
+        remove_db_files(&staging);
+        return Err(format!(
+            "cutover could not write the recovery journal (live DB untouched): {e}"
+        ));
+    }
+
+    // Step 6a: rename live→backup, then fsync the directory so the rename is durable, then
+    // advance the journal phase. Recovery treats SwapStarted-with-live-missing identically
+    // to BackupMoved, so a crash before the phase write is still handled safely.
     if let Err(e) = std::fs::rename(live_db, &backup) {
+        remove_journal(live_db);
         let _ = db_service.reopen();
         remove_db_files(&staging);
         return Err(format!(
             "cutover rename live→backup failed (live DB in place): {e}"
         ));
     }
+    fsync_live_dir(live_db);
+    journal.phase = CutoverPhase::BackupMoved;
+    let _ = write_journal(live_db, &journal);
+
+    // Injected crash BETWEEN the two renames: leave the mid-swap state on disk (live
+    // missing, backup + staging present, journal at BackupMoved) for a boot-recovery test.
+    if fault == CutoverFault::BetweenRenames {
+        return Err(
+            "injected cutover fault between renames (mid-swap state left for recovery)".to_string(),
+        );
+    }
+
+    // Step 6b: rename staging→live, fsync the directory, advance the journal phase.
     if let Err(e) = std::fs::rename(&staging, live_db) {
-        // Roll back: restore the original.
+        // live→backup happened but staging→live failed: restore the original from backup.
         let _ = std::fs::rename(&backup, live_db);
+        fsync_live_dir(live_db);
+        remove_journal(live_db);
         let _ = db_service.reopen();
         remove_db_files(&staging);
         return Err(format!(
             "cutover rename staging→live failed; rolled back: {e}"
         ));
     }
+    fsync_live_dir(live_db);
+    journal.phase = CutoverPhase::SwapCompleted;
+    let _ = write_journal(live_db, &journal);
 
     // Step 7: reopen on the now-CRR live DB.
     if let Err(e) = db_service.reopen() {
@@ -1381,8 +1785,8 @@ fn cutover_with_fault(
         return Err("injected cutover fault after rename; rolled back".to_string());
     }
 
-    // Step 7: assert row counts survived exactly.
-    match synced_table_row_counts(live_db) {
+    // Step 8: verify EVERY user table's row count survived exactly (F5).
+    match all_user_table_row_counts(live_db) {
         Ok(post) if post == pre_counts => {}
         Ok(post) => {
             rollback_to_backup(live_db, &backup, db_service);
@@ -1397,6 +1801,10 @@ fn cutover_with_fault(
             ));
         }
     }
+
+    // Verified and durable. Remove the journal LAST — its absence is what tells boot
+    // recovery there is nothing to do. The backup is KEPT forever (never auto-deleted).
+    remove_journal(live_db);
 
     // Success. The legacy copy (if any) is now redundant; discard it.
     discard_legacy_sync_copy(live_db);
@@ -1428,6 +1836,10 @@ fn rollback_to_backup(
         );
     }
     remove_db_files(&failed);
+    // The interrupted cutover is resolved (rolled back); drop the journal so the next
+    // boot does not attempt recovery on a state we already restored.
+    remove_journal(live_db);
+    fsync_live_dir(live_db);
     let _ = db_service.reopen();
 }
 
@@ -3804,6 +4216,198 @@ mod tests {
                 .unwrap()[0]["c"],
             serde_json::json!(2)
         );
+    }
+
+    // ----- F1 crash-safety: durable journal + boot recovery -----
+
+    /// Build a journal for a test scenario at `phase` with the given content marker.
+    fn test_journal(live: &Path, phase: CutoverPhase, pre_counts: Vec<(String, i64)>) {
+        write_journal(
+            live,
+            &CutoverJournal {
+                version: CUTOVER_JOURNAL_VERSION,
+                phase,
+                live_file: file_name_string(live),
+                backup_file: file_name_string(&backup_db_path(live)),
+                staging_file: file_name_string(&cutover_staging_path(live)),
+                pre_counts,
+                live_size: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Crash-window simulation: an injected fault BETWEEN the two renames leaves a
+    /// mid-swap state on disk; boot recovery COMPLETES the swap from the durable journal
+    /// with zero data loss, a cleaned journal, and the backup kept.
+    #[test]
+    fn cutover_crash_between_renames_recovers_via_journal() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let pre = all_user_table_row_counts(&path).unwrap();
+
+        let err = cutover_with_fault(&path, &svc, CutoverFault::BetweenRenames)
+            .expect_err("injected mid-swap fault");
+        assert!(err.contains("between renames"), "{err}");
+
+        // Mid-swap on disk: live gone, backup + staging + journal present.
+        assert!(!path.exists(), "live renamed to backup");
+        assert!(backup_db_path(&path).exists(), "backup present");
+        assert!(cutover_staging_path(&path).exists(), "staging present");
+        assert!(cutover_journal_path(&path).exists(), "journal present");
+
+        recover_interrupted_cutover(&path);
+
+        assert!(path.exists(), "live restored");
+        assert!(!cutover_journal_path(&path).exists(), "journal cleaned");
+        assert!(backup_db_path(&path).exists(), "backup kept");
+        assert_eq!(
+            all_user_table_row_counts(&path).unwrap(),
+            pre,
+            "no data loss across the recovered swap"
+        );
+        assert!(
+            live_is_crr_prepared(&path),
+            "recovery completed the swap: live is the CRR DB"
+        );
+
+        // A fresh service opens the recovered live and sees the real data.
+        let svc2 = std::sync::Arc::new(crate::db_service::DbService::open(&path).unwrap());
+        assert_eq!(
+            svc2.select("SELECT count(*) AS c FROM sessions", &[])
+                .unwrap()[0]["c"],
+            serde_json::json!(2)
+        );
+    }
+
+    /// Boot-recovery matrix — (journal + BackupMoved, valid staging) → complete the swap.
+    #[test]
+    fn recovery_matrix_journal_backup_moved_valid_staging_completes() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap(); // drop handles + checkpoint
+        let counts = all_user_table_row_counts(&path).unwrap();
+        let backup = backup_db_path(&path);
+        let staging = cutover_staging_path(&path);
+        std::fs::copy(&path, &staging).unwrap(); // a valid staging candidate
+        std::fs::rename(&path, &backup).unwrap(); // live→backup done
+        test_journal(&path, CutoverPhase::BackupMoved, counts.clone());
+
+        recover_interrupted_cutover(&path);
+
+        assert!(path.exists(), "staging→live completed");
+        assert!(!staging.exists(), "valid staging consumed");
+        assert!(backup.exists(), "backup kept");
+        assert!(!cutover_journal_path(&path).exists(), "journal removed");
+        assert_eq!(all_user_table_row_counts(&path).unwrap(), counts);
+    }
+
+    /// Boot-recovery matrix — (no journal, live missing, backup present) → restore backup.
+    #[test]
+    fn recovery_matrix_no_journal_live_missing_backup_restores() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        let counts = all_user_table_row_counts(&path).unwrap();
+        let backup = backup_db_path(&path);
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(!path.exists());
+
+        recover_interrupted_cutover(&path);
+
+        assert!(path.exists(), "restored from backup");
+        assert!(backup.exists(), "backup kept (copied, not consumed)");
+        assert_eq!(all_user_table_row_counts(&path).unwrap(), counts);
+        assert!(!cutover_journal_path(&path).exists());
+    }
+
+    /// Boot-recovery matrix — (no journal, live missing, staging only) → restore staging.
+    #[test]
+    fn recovery_matrix_no_journal_live_missing_staging_only_restores() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        let counts = all_user_table_row_counts(&path).unwrap();
+        let staging = cutover_staging_path(&path);
+        std::fs::rename(&path, &staging).unwrap(); // staging is the only copy
+        assert!(!path.exists());
+
+        recover_interrupted_cutover(&path);
+
+        assert!(path.exists(), "restored from staging");
+        assert!(!staging.exists(), "staging consumed (it was the only copy)");
+        assert_eq!(all_user_table_row_counts(&path).unwrap(), counts);
+    }
+
+    /// Boot-recovery matrix — (journal present but staging corrupt) → roll back to backup,
+    /// deleting nothing except the completed journal.
+    #[test]
+    fn recovery_matrix_journal_present_staging_corrupt_rolls_back_to_backup() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        let counts = all_user_table_row_counts(&path).unwrap();
+        let backup = backup_db_path(&path);
+        let staging = cutover_staging_path(&path);
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::write(&staging, b"not a sqlite database").unwrap(); // corrupt staging
+        test_journal(&path, CutoverPhase::BackupMoved, counts.clone());
+
+        recover_interrupted_cutover(&path);
+
+        assert!(path.exists(), "restored from backup (staging was corrupt)");
+        assert!(backup.exists(), "backup kept");
+        assert!(staging.exists(), "corrupt staging NOT deleted");
+        assert!(
+            !cutover_journal_path(&path).exists(),
+            "only the journal was removed"
+        );
+        assert_eq!(
+            all_user_table_row_counts(&path).unwrap(),
+            counts,
+            "the real data is live"
+        );
+    }
+
+    /// F1.4 empty-live guard: refuse to cut over a freshly-created empty live DB while
+    /// recovery artifacts are present (rather than enshrining the empty DB).
+    #[test]
+    fn cutover_refuses_empty_live_with_recovery_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yapstack.db");
+        let svc = std::sync::Arc::new(crate::db_service::DbService::open(&path).unwrap());
+        // A leftover recovery artifact beside a fresh, empty live DB.
+        std::fs::write(backup_db_path(&path), b"pretend-prior-backup").unwrap();
+        assert!(!live_is_crr_prepared(&path));
+
+        let err = perform_cutover(&path, &svc).expect_err("must refuse an empty live");
+        assert!(err.contains("cutover refused"), "{err}");
+        // The empty live was NOT turned into a CRR DB.
+        assert!(!live_is_crr_prepared(&path));
+    }
+
+    /// F1.3 stale-backup preservation: a pre-existing backup is MOVED aside (timestamped),
+    /// never deleted; both files exist afterward and the old bytes survive verbatim.
+    #[test]
+    fn cutover_moves_existing_backup_aside_never_deletes_it() {
+        let (dir, path, svc) = cutover_fixture();
+        let backup = backup_db_path(&path);
+        std::fs::write(&backup, b"PRIOR-BACKUP-KEEP-ME").unwrap();
+
+        perform_cutover(&path, &svc).expect("cutover");
+
+        assert!(backup.exists(), "new pre-sync backup present");
+        let mut aside = None;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.starts_with("yapstack.db.pre-sync-backup.") {
+                aside = Some(dir.path().join(name));
+            }
+        }
+        let aside = aside.expect("moved-aside timestamped backup must exist");
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"PRIOR-BACKUP-KEEP-ME",
+            "the old backup was preserved verbatim, not deleted"
+        );
+        assert!(live_is_crr_prepared(&path), "cutover still completed");
     }
 
     /// End-to-end identity lifecycle against the REAL backing store (OS keychain in release,
