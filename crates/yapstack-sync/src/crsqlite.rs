@@ -1,42 +1,83 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Static registration of the vendored cr-sqlite v0.16.3 extension (R6).
+//! Per-connection initialization of the vendored cr-sqlite v0.16.3 extension (R6).
 //!
-//! `build.rs` statically links the extension. Here we register it with SQLite via
-//! `sqlite3_auto_extension` — a process-global hook SQLite runs on EVERY new
-//! connection. This is the load-extension-free path the desktop stack requires
-//! (`tauri-plugin-sql` / `rusqlite` disable `load_extension`).
+//! `build.rs` statically links the extension with `-DSQLITE_CORE`
+//! (`static,omit_load_extension`), so `sqlite3_crsqlite_init` treats its
+//! `sqlite3_api_routines` pointer as a no-op (`SQLITE_EXTENSION_INIT2`).
+//!
+//! We initialize cr-sqlite **directly on the sync runtime's own connection** and
+//! nowhere else. We deliberately do NOT use `sqlite3_auto_extension`: that is a
+//! process-global hook SQLite runs on EVERY new connection in the process, which
+//! would leak cr-sqlite onto the desktop app's main `tauri-plugin-sql` (sqlx)
+//! pool. sqlx never calls `crsql_finalize()` before closing a pooled connection,
+//! so cr-sqlite then aborts the whole process on close
+//! ("unable to close due to unfinalized statements"). Per-connection init keeps
+//! cr-sqlite confined to [`CrsqlDb`] and leaves every plain rusqlite/sqlx
+//! connection untouched.
 
-use std::ffi::c_void;
-use std::sync::Once;
+use std::ffi::{c_char, c_void, CStr};
+use std::ptr;
 
 use rusqlite::Connection;
 
 use crate::SyncError;
 
+// `SQLITE_OK_LOAD_PERMANENTLY` (not exported by `rusqlite::ffi`): some extension
+// entry points return this instead of `SQLITE_OK` to signal a permanent load.
+// cr-sqlite's static init returns `SQLITE_OK`, but we accept both like SQLite.
+const SQLITE_OK_LOAD_PERMANENTLY: i32 = 256;
+
 // Provided by the statically-linked C shim (`crsqlite.c`, compiled with
-// `-DSQLITE_CORE`) and `libsqlite3-sys` (bundled SQLite) respectively.
+// `-DSQLITE_CORE`). Signature is the standard SQLite extension entry point:
+// `(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi)`.
 extern "C" {
-    fn sqlite3_crsqlite_init(db: *mut c_void, err: *mut *mut i8, api: *const c_void) -> i32;
-    fn sqlite3_auto_extension(entry: Option<unsafe extern "C" fn()>) -> i32;
+    fn sqlite3_crsqlite_init(db: *mut c_void, err: *mut *mut c_char, api: *const c_void) -> i32;
 }
 
-static REGISTER: Once = Once::new();
-
-/// Register cr-sqlite as an auto-extension exactly once for this process. Idempotent
-/// and thread-safe. After this call every `rusqlite::Connection::open*` has the
-/// `crsql_*` functions and the `crsql_changes` virtual table available.
+/// Retained for API compatibility. cr-sqlite is now initialized **per connection**
+/// (see [`init_crsqlite_on`] / [`CrsqlDb::open`]); there is intentionally no
+/// process-global registration. Callers holding a plain [`rusqlite::Connection`]
+/// that need cr-sqlite must go through [`CrsqlDb`].
+///
+/// NOTE: retained as a no-op only so pre-existing callers/tests keep compiling; it
+/// registers nothing. Do not add new callers.
 pub fn register_crsqlite() {
-    REGISTER.call_once(|| {
-        // SAFETY: `sqlite3_crsqlite_init` has the SQLite extension-entry ABI;
-        // `sqlite3_auto_extension` takes an untyped fn pointer. cr-sqlite's own
-        // static builds register it exactly this way (`core_init.c`).
-        unsafe {
-            let entry: unsafe extern "C" fn() =
-                std::mem::transmute(sqlite3_crsqlite_init as *const ());
-            let rc = sqlite3_auto_extension(Some(entry));
-            debug_assert_eq!(rc, 0, "sqlite3_auto_extension failed");
-        }
-    });
+    // No-op: process-global auto-extension registration was removed (T022) to
+    // stop cr-sqlite from polluting the desktop app's sqlx connection pool.
+}
+
+/// Initialize the statically-linked cr-sqlite extension on a single connection.
+///
+/// Calls `sqlite3_crsqlite_init` directly on `conn`'s underlying `sqlite3*`. Under
+/// the `-DSQLITE_CORE` static build the `api` pointer is ignored, so we pass null.
+fn init_crsqlite_on(conn: &Connection) -> Result<(), SyncError> {
+    let mut errmsg: *mut c_char = ptr::null_mut();
+    // SAFETY: `handle()` returns this connection's live `sqlite3*`; we only use it
+    // for the duration of the call. `sqlite3_crsqlite_init` has the SQLite
+    // extension-entry ABI and, under `-DSQLITE_CORE`, ignores the (null) api arg.
+    let rc = unsafe {
+        let handle = conn.handle();
+        sqlite3_crsqlite_init(handle as *mut c_void, &mut errmsg, ptr::null())
+    };
+
+    let msg = if errmsg.is_null() {
+        None
+    } else {
+        // SAFETY: cr-sqlite allocated `errmsg` with sqlite3_malloc; copy then free.
+        let owned = unsafe { CStr::from_ptr(errmsg) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { rusqlite::ffi::sqlite3_free(errmsg as *mut c_void) };
+        Some(owned)
+    };
+
+    if rc != rusqlite::ffi::SQLITE_OK && rc != SQLITE_OK_LOAD_PERMANENTLY {
+        return Err(SyncError::CrrUnavailable(format!(
+            "sqlite3_crsqlite_init failed (rc={rc}){}",
+            msg.map(|m| format!(": {m}")).unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 /// A cr-sqlite-enabled connection. On drop it runs `crsql_finalize()` (required by
@@ -46,24 +87,26 @@ pub struct CrsqlDb {
 }
 
 impl CrsqlDb {
-    /// Open (registering the extension first) an on-disk database.
+    /// Open an on-disk database and initialize cr-sqlite on it (only this
+    /// connection gets the extension).
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, SyncError> {
-        register_crsqlite();
         let conn = Connection::open(path)?;
+        init_crsqlite_on(&conn)?;
         Self::confirm_crr(&conn)?;
         Ok(Self { conn })
     }
 
-    /// Open an in-memory database (tests, ephemeral verification).
+    /// Open an in-memory database (tests, ephemeral verification) and initialize
+    /// cr-sqlite on it.
     pub fn open_in_memory() -> Result<Self, SyncError> {
-        register_crsqlite();
         let conn = Connection::open_in_memory()?;
+        init_crsqlite_on(&conn)?;
         Self::confirm_crr(&conn)?;
         Ok(Self { conn })
     }
 
-    /// Prove the statically-linked extension registered on this connection: the
-    /// `crsql_site_id()` scalar (16-byte site id) must be callable. Fails closed.
+    /// Prove the extension initialized on this connection: the `crsql_site_id()`
+    /// scalar (16-byte site id) must be callable. Fails closed.
     fn confirm_crr(conn: &Connection) -> Result<(), SyncError> {
         let site: Vec<u8> = conn
             .query_row("SELECT crsql_site_id()", [], |r| r.get(0))
@@ -97,5 +140,44 @@ impl Drop for CrsqlDb {
     fn drop(&mut self) {
         // Best-effort: cr-sqlite requires finalize before close.
         let _ = self.conn.execute_batch("SELECT crsql_finalize();");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Isolation proof (T022): a [`CrsqlDb`] connection has `crsql_as_crr`, but a
+    /// PLAIN `rusqlite::Connection` opened in the SAME process does NOT — proving
+    /// per-connection init leaks nothing globally (no `sqlite3_auto_extension`).
+    #[test]
+    fn crsqlite_is_per_connection_not_global() {
+        // Sync connection: cr-sqlite must be present.
+        let db = CrsqlDb::open_in_memory().expect("sync connection opens");
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE t(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT '');",
+            )
+            .unwrap();
+        db.conn()
+            .query_row("SELECT crsql_as_crr('t')", [], |_| Ok(()))
+            .expect("crsql_as_crr available on the sync connection");
+
+        // Plain connection in the same process: cr-sqlite must be ABSENT.
+        let plain = Connection::open_in_memory().expect("plain connection opens");
+        let err = plain
+            .query_row("SELECT crsql_as_crr('t')", [], |_| Ok(()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("crsql_as_crr"),
+            "expected 'no such function: crsql_as_crr' on a plain connection, got: {err}"
+        );
+        // And crsql_site_id must likewise be unavailable on the plain connection.
+        assert!(
+            plain
+                .query_row("SELECT crsql_site_id()", [], |r| r.get::<_, Vec<u8>>(0))
+                .is_err(),
+            "crsql_site_id must NOT be callable on a plain connection"
+        );
     }
 }
