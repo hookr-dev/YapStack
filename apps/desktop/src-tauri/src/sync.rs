@@ -1216,8 +1216,18 @@ fn file_name_string(p: &Path) -> String {
 }
 
 /// fsync a file's contents + metadata to stable storage.
+///
+/// The handle MUST be opened for WRITE. On Windows `sync_all` calls
+/// `FlushFileBuffers`, which the kernel only honours on a handle holding
+/// `GENERIC_WRITE`; a read-only handle returns `ERROR_ACCESS_DENIED` (os error 5).
+/// On unix fsync on a read-only fd is legal, which is why a read-only open passed
+/// every macOS test yet broke the live Windows cutover — do NOT "simplify" this back
+/// to `File::open`. `write(true)` opens existing content without truncating.
 fn fsync_file(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 /// fsync a directory entry so a `rename`/create/remove within it is durable. On unix
@@ -1822,6 +1832,14 @@ fn rollback_to_backup(
     backup: &Path,
     db_service: &crate::db_service::DbServiceState,
 ) {
+    // Drop any live pool BEFORE renaming: this helper is reached after a SUCCESSFUL
+    // `reopen()` (post-rename fault / row-count mismatch), so the pool holds open
+    // handles on `live_db`. On Windows a `rename`/`remove_file` over a file SQLite
+    // still has open fails with a sharing violation (the VFS opens without
+    // FILE_SHARE_DELETE); unix tolerates it, which is why this was invisible on macOS.
+    // No checkpoint (`close_for_swap`) — the CRR live is being discarded, and a
+    // checkpoint gate could refuse to drop and re-strand the handles.
+    db_service.discard_pool();
     // Move the (now-CRR) failed live aside, then restore the byte-identical backup.
     let failed = live_db.with_file_name("yapstack.db.crr-cutover-failed");
     remove_db_files(&failed);
@@ -4279,6 +4297,20 @@ mod tests {
                 .unwrap()[0]["c"],
             serde_json::json!(2)
         );
+    }
+
+    /// `fsync_file` MUST open the file for WRITE before `sync_all`. On unix a read-only
+    /// open would also pass here, so this test's real job is to PIN the write-access open
+    /// (a read-only `File::open` returns ERROR_ACCESS_DENIED / os error 5 on Windows).
+    #[test]
+    fn fsync_file_succeeds_on_freshly_written_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        // The exact call `write_journal`/`copy_into_live` make: must not error.
+        fsync_file(&path).expect("fsync_file must succeed on a write-opened handle");
+        // Opening for write must not have truncated the existing content.
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
     /// Boot-recovery matrix — (journal + BackupMoved, valid staging) → complete the swap.

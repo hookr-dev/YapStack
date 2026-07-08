@@ -393,6 +393,22 @@ impl DbService {
         self.swapping.store(false, Ordering::Release);
         Ok(())
     }
+
+    /// Unconditionally drop the current pool WITHOUT checkpointing — raise the
+    /// fast-path gate and release every connection so the served file has no live
+    /// handles. Unlike [`DbService::close_for_swap`] there is no checkpoint gate: the
+    /// caller is DISCARDING the served file (e.g. a cutover rollback about to rename a
+    /// backup over it), so folding the `-wal` first is pointless. Load-bearing on
+    /// Windows: `std::fs::rename`/`remove_file` on a file SQLite still holds open fails
+    /// with a sharing violation (the SQLite VFS opens without `FILE_SHARE_DELETE`), so
+    /// the pool MUST be gone before the rollback renames. Pairs with
+    /// [`DbService::reopen`], which rebuilds the pool on the restored file.
+    #[cfg(feature = "sync")]
+    pub fn discard_pool(&self) {
+        self.swapping.store(true, Ordering::Release);
+        let mut guard = self.pool.write().unwrap_or_else(|e| e.into_inner());
+        *guard = None; // drop Pool -> drop every ManagedConn -> crsql_finalize.
+    }
 }
 
 /// Binds a JSON value as a SQLite parameter, matching tauri-plugin-sql's binding
