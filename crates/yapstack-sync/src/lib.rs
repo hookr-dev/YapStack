@@ -70,6 +70,24 @@ pub enum SyncError {
     /// `size` is the base64 wire size (what the relay body limit measures).
     #[error("outbox entry client_seq={client_seq} is {size} base64 bytes on the wire, exceeding the per-request push budget")]
     Oversized { client_seq: i64, size: usize },
+    /// The relay could not be reached at the transport layer — a connection failure or a
+    /// timeout (reqwest `is_connect()` / `is_timeout()`), NOT an HTTP-status error. Kept
+    /// distinct from [`SyncError::Http`] so the drain surfaces the amber "can't reach relay"
+    /// state (parity with the T025 probe classification) instead of the destructive "sync
+    /// error". Carries the reqwest display, which includes the relay URL only — never any
+    /// token material (the bearer travels as an HTTP header, not in the error).
+    #[error("relay unreachable: {0}")]
+    Network(String),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+}
+
+impl SyncError {
+    /// True for a transport-layer connectivity failure (an unreachable relay), as opposed
+    /// to an HTTP-status error or a local/crypto fault. Drives the drain's mapping of a
+    /// mid-session relay outage to the "unreachable" display state rather than "error".
+    #[must_use]
+    pub fn is_network(&self) -> bool {
+        matches!(self, SyncError::Network(_))
+    }
 }

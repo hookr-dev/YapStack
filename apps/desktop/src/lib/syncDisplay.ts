@@ -114,14 +114,16 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
 
   // 2. Connection health short-circuits sync phase (§1b two-tier rule). The
   //    three typed probe failures all render as "unreachable". We derive this
-  //    ONLY from probe results — never from parsing `lastError` strings.
-  //    TODO(T02x): plumb drain-level connectivity so a NETWORK drain failure
-  //    (surfaced today only as status.lastError/phase=="error") can also feed
-  //    the unreachable state without string-matching the verbatim error.
+  //    ONLY from probe results OR the drain's typed connectivity phase — never
+  //    from parsing `lastError` strings. (R3: the drain now classifies a
+  //    connect/timeout failure at the transport into phase=="unreachable", so a
+  //    relay that dies mid-session feeds this amber state without string-matching
+  //    the verbatim error.)
   if (
     conn.kind === "unreachable" ||
     conn.kind === "tls-error" ||
-    conn.kind === "not-a-relay"
+    conn.kind === "not-a-relay" ||
+    phase === "unreachable"
   ) {
     return {
       state: "unreachable",

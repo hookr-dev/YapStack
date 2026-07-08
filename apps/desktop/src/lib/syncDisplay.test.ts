@@ -89,6 +89,33 @@ describe("deriveSyncDisplay — connection health short-circuits sync phase", ()
     expect(d.tooltip).toBe("Can't reach relay.example.com:8443");
   });
 
+  it("R3: drain-level phase=='unreachable' renders amber unreachable even when the probe is ok", () => {
+    // A relay that died MID-SESSION: the last probe still reads "ok", but the drain
+    // classified a connect/timeout at the transport into phase=="unreachable". This must
+    // show the amber "Can't reach relay" state, NOT the destructive red "error", and it
+    // must beat a set lastError (which carries the verbatim network error).
+    const d = derive({
+      conn: {
+        kind: "ok",
+        engineVersion: "0.16.3",
+        protocolVersion: 1,
+        latencyMs: 42,
+        normalizedUrl: "https://relay.example.com",
+        versionAdvisory: null,
+      },
+      status: status({
+        phase: "unreachable",
+        serverUrl: "https://relay.example.com",
+        lastError: "relay unreachable: error sending request",
+      }),
+    });
+    expect(d.state).toBe("unreachable");
+    expect(d.label).toBe("Can't reach relay");
+    expect(d.tone).toBe("amber");
+    expect(d.icon).toBe("cloud-off");
+    expect(d.tooltip).toBe("Can't reach relay.example.com");
+  });
+
   it("an ok connection with a version advisory does NOT change state (still caught-up)", () => {
     const d = derive({
       conn: {

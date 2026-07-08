@@ -95,6 +95,7 @@ export type SyncPhase =
   | "preparing" // crr_migrate running: "preparing your library for sync"
   | "syncing" // a push is in flight — unacked entries remain in the outbox (T024)
   | "auth_expired" // session expired; the drain stopped and needs a fresh sign-in (T023)
+  | "unreachable" // drain hit a typed transport connectivity failure — relay unreachable (R3)
   | "error";
 
 export interface DeviceRosterEntry {

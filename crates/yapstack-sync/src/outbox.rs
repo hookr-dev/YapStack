@@ -249,7 +249,14 @@ pub fn enqueue_local(
     }
     let max_dbv = cs.rows.iter().map(|r| r.db_version).max().unwrap_or(wm);
 
-    let tx = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE: grab the write lock up front. This capture path READS then WRITES the
+    // `client_seq` counter (state::next_client_seq) AND the outbox, all in one transaction. A
+    // DEFERRED transaction takes the write lock only at the first write, so a second connection
+    // (drain vs. capture) that read the same counter could force a read-then-write upgrade into
+    // `SQLITE_BUSY` or a primary-key conflict on `client_seq`. IMMEDIATE + the connection's
+    // `busy_timeout` (crsqlite::apply_sync_pragmas) makes the two writers serialize cleanly
+    // (T023 Judge). `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let assigned = chunk_and_insert(
         &tx,
         cipher,
@@ -506,6 +513,53 @@ mod tests {
     use rusqlite::types::Value;
     use std::sync::Mutex;
     use uuid::Uuid;
+
+    /// Two connections to the SAME on-disk sync DB, each running `BEGIN IMMEDIATE` write
+    /// transactions that allocate `client_seq` (the exact read-then-write the capture path
+    /// performs), must BOTH complete without `SQLITE_BUSY`: the `busy_timeout` pragma makes the
+    /// second writer WAIT for the first to commit instead of erroring, and IMMEDIATE takes the
+    /// write lock up front so there is no read-then-write upgrade race (T023 Judge). The final
+    /// counter equals the total allocations — no lost or duplicated seq.
+    #[test]
+    fn concurrent_immediate_writers_serialize_without_busy() {
+        use rusqlite::{Transaction, TransactionBehavior};
+        let dir = std::env::temp_dir().join(format!("yapstack-busy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("contend.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            state::ensure_meta_table(&c).unwrap();
+        }
+
+        const PER_THREAD: i64 = 50;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&p).unwrap();
+                    crate::crsqlite::apply_sync_pragmas(&conn).unwrap();
+                    for _ in 0..PER_THREAD {
+                        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                            .expect("BEGIN IMMEDIATE must wait for the lock, not fail busy");
+                        // Read-then-write the shared counter, exactly like next_client_seq.
+                        state::next_client_seq(&tx).unwrap();
+                        tx.commit().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            state::client_seq(&conn).unwrap(),
+            PER_THREAD * 2,
+            "every allocation must commit exactly once (no busy error, no lost seq)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use yapstack_common::sync::{CompletenessResponse, PullResponse, PushAck, PushResponse};
 
     /// A transport that ASSERTS every push obeys the wire limits and records each

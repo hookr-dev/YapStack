@@ -80,6 +80,20 @@ fn classify_status(status: StatusCode) -> Option<SyncError> {
     }
 }
 
+/// Classify a reqwest error raised by `send()`: a connection failure or a timeout means the
+/// relay is UNREACHABLE (mirrors the T025 probe's `is_connect()`/`is_timeout()` split), so it
+/// becomes the distinct [`SyncError::Network`] the drain maps to the amber "can't reach relay"
+/// state. Every other reqwest error (body decode, or an HTTP status surfaced via
+/// `error_for_status`) stays a generic [`SyncError::Http`]. The reqwest display carries the
+/// relay URL only — never the bearer, which is sent as a header and is absent from the error.
+fn map_send_error(e: reqwest::Error) -> SyncError {
+    if e.is_connect() || e.is_timeout() {
+        SyncError::Network(e.to_string())
+    } else {
+        SyncError::Http(e)
+    }
+}
+
 /// Map a relay response to a distinct-401 result before decoding: a 401 is the
 /// refreshable auth-expiry path, everything else keeps the existing
 /// `error_for_status` behaviour.
@@ -136,7 +150,8 @@ impl SyncTransport for HttpTransport {
                 .bearer_auth(self.bearer())
                 .json(&req)
                 .send()
-                .await?,
+                .await
+                .map_err(map_send_error)?,
         )?;
         Ok(r.json().await?)
     }
@@ -148,7 +163,8 @@ impl SyncTransport for HttpTransport {
                 .bearer_auth(self.bearer())
                 .query(&[("since", since), ("limit", limit)])
                 .send()
-                .await?,
+                .await
+                .map_err(map_send_error)?,
         )?;
         Ok(r.json().await?)
     }
@@ -159,7 +175,8 @@ impl SyncTransport for HttpTransport {
                 .get(format!("{}/sync/completeness", self.base_url))
                 .bearer_auth(self.bearer())
                 .send()
-                .await?,
+                .await
+                .map_err(map_send_error)?,
         )?;
         Ok(r.json().await?)
     }
@@ -439,5 +456,25 @@ mod tests {
         assert_eq!(t.bearer(), "rotated-token");
 
         server.join().unwrap();
+    }
+
+    /// A connection failure (nothing listening) must map to the typed
+    /// [`SyncError::Network`] — the transport-layer "relay unreachable" signal the drain
+    /// turns into the amber "can't reach relay" state — and NOT a generic
+    /// [`SyncError::Http`]/`Unauthorized`. We bind a port, drop the listener so connects are
+    /// refused, and prove `push` classifies the refused connect as `Network`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_maps_connection_refused_to_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing is listening now → connect is refused
+
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        let err = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::Network(_)),
+            "a refused connection must classify as Network (relay unreachable), got {err:?}"
+        );
+        assert!(err.is_network(), "SyncError::is_network() must agree");
     }
 }

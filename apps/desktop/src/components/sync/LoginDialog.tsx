@@ -15,7 +15,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, ShieldAlert, KeyRound } from "lucide-react";
 import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
-import { syncCommands } from "@/lib/sync";
+import { isValidRecoveryCode, syncCommands } from "@/lib/sync";
 
 type Step = "email" | "password" | "recovery";
 
@@ -246,7 +246,7 @@ export function LoginDialog({ serverUrl }: { serverUrl: string }) {
               </Button>
               <Button
                 onClick={handleRecover}
-                disabled={recoveryCode.trim().length < 32 || busy}
+                disabled={!isValidRecoveryCode(recoveryCode) || busy}
               >
                 {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 Recover

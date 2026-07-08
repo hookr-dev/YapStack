@@ -1567,11 +1567,11 @@ function createAppStore() {
           // broken connection is the user's to fix (feedback_surface_ai_errors).
           const msg = e instanceof Error ? e.message : String(e);
           console.error("Failed to fetch sync status:", msg);
-          // TODO(T02x): plumb drain-level connectivity — a NETWORK drain
-          // failure lands here as phase="error"/lastError, but we deliberately
-          // do NOT fabricate `relayConn = unreachable` from it (no error-string
-          // parsing). Connection health stays probe-driven until the drain
-          // surfaces a typed connectivity signal we can map cleanly.
+          // R3: drain-level connectivity is now surfaced by the backend as a
+          // typed phase=="unreachable" on a successful status fetch (the drain
+          // classifies connect/timeout at the transport). This catch is only for
+          // a failed status COMMAND itself, so we still surface it verbatim as an
+          // error and never fabricate `relayConn = unreachable` by string-parsing.
           const prev = get().syncStatus;
           set({
             syncStatus: {

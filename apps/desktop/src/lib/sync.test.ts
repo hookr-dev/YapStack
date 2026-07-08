@@ -58,6 +58,18 @@ describe("isValidRecoveryCode", () => {
     // 0, 1, 8, 9 are not in the RFC 4648 base32 alphabet
     expect(isValidRecoveryCode("0".repeat(32))).toBe(false);
   });
+  it("R3/R1: gates out a long non-base32 string the old length-only check accepted", () => {
+    // The LoginDialog recover button previously gated only on `trim().length < 32`, so a 40-
+    // char string of invalid alphabet ("8" ∉ base32) would ENABLE recover and fail server-
+    // side. isValidRecoveryCode rejects it (right length AND alphabet), so the button stays
+    // disabled — the fix wired into LoginDialog.
+    expect("8".repeat(40).length >= 32).toBe(true); // the old gate would have passed this
+    expect(isValidRecoveryCode("8".repeat(40))).toBe(false);
+    // And a well-formed hyphen/lowercase code (normalized to 32 base32 chars) is accepted.
+    expect(isValidRecoveryCode("aaaa-bbbb-cccc-dddd-eeee-ffff-gggg-2345")).toBe(
+      true,
+    );
+  });
 });
 
 describe("isValidServerUrl", () => {

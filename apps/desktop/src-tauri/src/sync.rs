@@ -98,7 +98,13 @@ const WRAP_VAULT_REC_DOMAIN: &[u8] = b"yapstack.wrap.vault.rec.v1";
 /// changeset / setting domain so a session ciphertext can never be confused with another
 /// surface (CRYPTO_SPEC §5 domain separation). Bound as the second AAD field after the
 /// authenticated version byte.
-const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v1";
+///
+/// R3 anti-rollback: bumped `v1 → v2` when `vault_key_epoch` was added as a THIRD AAD field
+/// (`session_aad`). A `v1` blob (domain-only AAD, no epoch) can never open under the `v2` AAD,
+/// so any file sealed by an older build fails cleanly → signed-out degrade. This is safe by
+/// construction: there are ZERO production installs and dev builds use the plaintext debug
+/// store, so no migration path is owed (T029 compatibility call).
+const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v2";
 /// How often the drain cycles when idle. SSE wakeups (T008) can shorten this
 /// later; a fixed poll is correct and simplest for v1.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -320,31 +326,76 @@ fn store_delete(account: &str) -> Result<(), String> {
 // first, random 192-bit nonce, AAD = LP(version, domain)) and written to `sync-session.enc`.
 // `identity-v1` is UNCHANGED (small, and its survives-sign-out semantics from T019 must hold).
 
+/// The keychain / dev-store value backing the wrapped session: the random 32-byte wrapping
+/// key (base64) AND the `vault_key_epoch` of the session currently sealed under it. The epoch
+/// is bound into the sealed file's AAD (`session_aad`) and re-checked on open. This is the
+/// anti-rollback binding (T029 Judge): an attacker with FILE access but NOT keychain access
+/// cannot swap in an OLDER sealed session under the same wrapping key, because that older blob
+/// was sealed at a lower epoch and its AAD no longer matches the keychain-recorded epoch → the
+/// AEAD open fails → clean signed-out. The guarantee holds only against a file-only attacker;
+/// a full keychain compromise is out of scope (that adversary already holds the wrapping key).
+#[derive(Serialize, Deserialize)]
+struct WrapKeyEntry {
+    /// base64 of the 32-byte XChaCha20-Poly1305 wrapping key.
+    k: String,
+    /// `vault_key_epoch` of the session sealed under `k` (§7.4 anti-rollback binding).
+    #[serde(default)]
+    epoch: u32,
+}
+
+/// AAD for the at-rest session envelope: `LP(version, SESSION_STORE_DOMAIN, epoch_u32)`. The
+/// `epoch` is bound as the third field per the CRYPTO_SPEC `wrap.data` convention (§5) so a
+/// session sealed at one epoch cannot be opened as another — the rollback binding. Domain is
+/// `v2` (was `v1` without this field), so a `v1` blob fails to open here (clean degrade).
+fn session_aad(epoch: u32) -> Vec<u8> {
+    yapstack_crypto::aead::lp(&[
+        &[yapstack_crypto::VERSION],
+        SESSION_STORE_DOMAIN,
+        &epoch.to_be_bytes(),
+    ])
+}
+
 /// Seal the session JSON under the wrapping key. Standard envelope
 /// (`0x01 || nonce24 || ct||tag`) via `yapstack-crypto::aead::seal_standard`, AAD =
-/// `LP(version, SESSION_STORE_DOMAIN)` — same construction the changeset/setting surfaces use.
-fn seal_session(wrap_key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+/// `session_aad(epoch)` — same LP construction the changeset/setting surfaces use, now with
+/// the session's `vault_key_epoch` bound in (anti-rollback).
+fn seal_session(wrap_key: &[u8; 32], epoch: u32, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
-    let aad = yapstack_crypto::aead::lp(&[&[yapstack_crypto::VERSION], SESSION_STORE_DOMAIN]);
+    let aad = session_aad(epoch);
     yapstack_crypto::aead::seal_standard(wrap_key, &nonce, plaintext, &aad)
         .map_err(|e| e.to_string())
 }
 
-/// Open a sealed session file. Any failure (wrong key, tamper, truncation, version skew) is a
-/// clean `Err` the caller degrades to signed-out — never a panic.
-fn open_session(wrap_key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
-    let aad = yapstack_crypto::aead::lp(&[&[yapstack_crypto::VERSION], SESSION_STORE_DOMAIN]);
+/// Open a sealed session file, binding `expected_epoch` into the AAD. Any failure (wrong key,
+/// tamper, truncation, version/domain skew, OR an epoch that does not match the one recorded
+/// beside the wrapping key — i.e. a rollback) is a clean `Err` the caller degrades to
+/// signed-out — never a panic.
+fn open_session(wrap_key: &[u8; 32], expected_epoch: u32, blob: &[u8]) -> Result<Vec<u8>, String> {
+    let aad = session_aad(expected_epoch);
     yapstack_crypto::aead::open_standard(wrap_key, blob, &aad).map_err(|e| e.to_string())
 }
 
-fn decode_wrap_key(b64: &str) -> Result<[u8; 32], String> {
+/// Parse the wrapping-key entry (key + recorded epoch) from its stored JSON form.
+fn decode_wrap_entry(s: &str) -> Result<([u8; 32], u32), String> {
+    let entry: WrapKeyEntry =
+        serde_json::from_str(s).map_err(|_| "corrupt session wrapping-key entry".to_string())?;
     let bytes = B64
-        .decode(b64.as_bytes())
+        .decode(entry.k.as_bytes())
         .map_err(|_| "corrupt session wrapping key".to_string())?;
-    bytes
+    let key: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| "session wrapping key wrong length".to_string())
+        .map_err(|_| "session wrapping key wrong length".to_string())?;
+    Ok((key, entry.epoch))
+}
+
+/// Serialize the wrapping-key entry (key + the epoch of the session sealed under it).
+fn encode_wrap_entry(key: &[u8; 32], epoch: u32) -> Result<String, String> {
+    serde_json::to_string(&WrapKeyEntry {
+        k: B64.encode(key),
+        epoch,
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn new_wrap_key() -> [u8; 32] {
@@ -391,7 +442,30 @@ fn write_session_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
     // Write-then-rename so a crash mid-write never leaves a torn file that would decrypt-fail.
     let tmp = path.with_extension("enc.tmp");
     std::fs::write(&tmp, blob).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    // Owner-only permissions on unix: the file holds the sealed session ciphertext, and even
+    // ciphertext should not be world-readable (defence in depth against local snooping /
+    // offline attack surface). Applied to the TEMP file too so there is never a window where
+    // the pre-rename file is broader than 0600. Windows inherits the user-scoped AppData ACL,
+    // so this is a unix-only no-op elsewhere.
+    set_owner_only(&tmp)?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // rename preserves the mode; re-assert on the final path in case it pre-existed with a
+    // broader mode (e.g. an older build wrote it before this hardening landed).
+    set_owner_only(path)
+}
+
+/// Restrict a file to `0600` (owner read/write only) on unix. No-op on other platforms —
+/// Windows relies on the user-scoped AppData ACL and has no POSIX mode to set.
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn remove_session_blob(path: &Path) -> Result<(), String> {
@@ -411,17 +485,24 @@ fn load_session_wrapped(
     enc_path: &Path,
 ) -> Result<Option<Session>, String> {
     match (ks.get_key()?, read_session_blob(enc_path)?) {
-        (Some(key_b64), Some(blob)) => {
-            // Corrupt key or AEAD failure (wrong key / tamper / truncation) → signed-out. We do
-            // NOT delete here: a genuinely tampered file is unrecoverable and the next sign-in
-            // overwrites it, but a transient keychain read must never destroy a session file.
-            let Ok(key) = decode_wrap_key(&key_b64) else {
+        (Some(entry_str), Some(blob)) => {
+            // Corrupt entry or AEAD failure (wrong key / tamper / truncation / epoch rollback)
+            // → signed-out. We do NOT delete here: a genuinely tampered file is unrecoverable
+            // and the next sign-in overwrites it, but a transient keychain read must never
+            // destroy a session file.
+            let Ok((key, expected_epoch)) = decode_wrap_entry(&entry_str) else {
                 return Ok(None);
             };
-            match open_session(&key, &blob) {
+            match open_session(&key, expected_epoch, &blob) {
                 Ok(json) => match serde_json::from_slice::<Session>(&json) {
-                    Ok(s) => Ok(Some(s)),
-                    Err(_) => Ok(None),
+                    // Anti-rollback: the sealed session's own epoch MUST equal the epoch
+                    // recorded beside the wrapping key. The AAD binding already enforces this
+                    // cryptographically (we opened under `expected_epoch`; an older blob sealed
+                    // at a lower epoch fails the AEAD tag), so reaching here with a mismatch is
+                    // impossible for a file-only attacker — the explicit check is defence in
+                    // depth and pins the invariant.
+                    Ok(s) if s.epoch == expected_epoch => Ok(Some(s)),
+                    Ok(_) | Err(_) => Ok(None),
                 },
                 Err(_) => Ok(None),
             }
@@ -448,24 +529,22 @@ fn store_session_wrapped(
     s: &Session,
 ) -> Result<(), String> {
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    // Reuse the existing wrapping key if present and valid; otherwise mint a fresh one. (A
+    // corrupt existing entry would strand the new ciphertext, so we replace it.) The RECORDED
+    // epoch is always overwritten below with THIS session's epoch.
     let key = match ks.get_key()? {
-        Some(key_b64) => match decode_wrap_key(&key_b64) {
-            Ok(k) => k,
-            // A corrupt existing key would strand the new ciphertext — replace it.
-            Err(_) => {
-                let k = new_wrap_key();
-                ks.set_key(&B64.encode(k))?;
-                k
-            }
-        },
-        None => {
-            let k = new_wrap_key();
-            ks.set_key(&B64.encode(k))?;
-            k
-        }
+        Some(entry_str) => decode_wrap_entry(&entry_str)
+            .map(|(k, _prev_epoch)| k)
+            .unwrap_or_else(|_| new_wrap_key()),
+        None => new_wrap_key(),
     };
-    let blob = seal_session(&key, json.as_bytes())?;
+    // Seal + write the file FIRST, then commit the wrapping-key entry (key + this session's
+    // epoch). The entry is the load-time commit point: if a crash lands between the two, the
+    // entry's epoch will not match the (absent or older) file's AAD, so the next load degrades
+    // cleanly to signed-out rather than opening a stale session.
+    let blob = seal_session(&key, s.epoch, json.as_bytes())?;
     write_session_blob(enc_path, &blob)?;
+    ks.set_key(&encode_wrap_entry(&key, s.epoch)?)?;
     Ok(())
 }
 
@@ -910,6 +989,13 @@ enum DrainHealth {
     /// retrying (not fatal); a single transient blip stays quiet, and a later clean cycle
     /// clears it.
     Failing(String),
+    /// Like [`DrainHealth::Failing`] but the surfaced error is a transport-layer CONNECTIVITY
+    /// failure ([`yapstack_sync::SyncError::Network`] — the relay is unreachable), classified
+    /// at the transport (never by string-matching). Surfaced as the distinct `unreachable`
+    /// phase so the UI shows the amber "Can't reach relay" state instead of the destructive
+    /// red "Sync error" (R3, closes the TODO(T02x) pair). The drain keeps retrying; a later
+    /// clean cycle clears it.
+    Unreachable(String),
 }
 
 fn drain_health_cell() -> &'static RwLock<DrainHealth> {
@@ -1043,32 +1129,140 @@ fn access_token_stale(token: &str, skew_secs: i64) -> bool {
     }
 }
 
+/// Why a token refresh failed — the distinction that decides whether the drain SIGNS OUT or
+/// merely RETRIES. Conflating these is the R3 HIGH bug: a spent refresh token (crash-window
+/// lockout) must sign out, but a momentary relay outage must NOT.
+#[derive(Debug)]
+enum RefreshFailure {
+    /// The relay REJECTED the refresh token (HTTP 401) — or there is no refresh token to
+    /// present. This is TERMINAL for the session: rotation already spent the old token, and
+    /// the relay's reuse detection (server `auth.rs` `refresh()`: a rotated/revoked token
+    /// re-presented → the WHOLE token family is revoked → 401) means no retry can ever
+    /// recover it. Only a fresh sign-in does. Carries no token material.
+    Rejected(String),
+    /// The relay was UNREACHABLE (reqwest `is_connect()` / `is_timeout()`). The refresh token
+    /// is STILL VALID — this is a connectivity blip, not auth expiry. Retry next cycle; NEVER
+    /// sign out. Surfaced as the amber "can't reach relay" state.
+    Network(String),
+    /// Any other transient failure (5xx, body decode, a local store error). The refresh token
+    /// is presumed still valid; retry next cycle. Surfaced as the "sync error" state.
+    Transient(String),
+}
+
 /// Attempt a SINGLE token refresh (Bug A) against `POST /auth/refresh` using the
 /// persisted refresh token, and persist the ROTATED pair (new access + new refresh) to
 /// the store AND the in-memory cache BEFORE returning the new access token. Rotation
 /// kills the old refresh token on use, so losing the new one would lock the account out
-/// — hence persist-before-use. Returns the new access token on success, or an error when
-/// there is no refresh token / the relay rejects it (the caller then stops the drain and
-/// surfaces auth-expired). NEVER logs any token.
-async fn refresh_access_token() -> Result<String, String> {
-    let mut session = load_session()?.ok_or_else(|| "not signed in".to_string())?;
-    let refresh_token = session
-        .refresh_token
-        .clone()
-        .ok_or_else(|| "no refresh token on this session — sign in again".to_string())?;
+/// — hence persist-before-use. On failure returns a typed [`RefreshFailure`] so the caller
+/// distinguishes a REJECTED token (sign out) from an UNREACHABLE relay (retry). NEVER logs
+/// any token.
+async fn refresh_access_token() -> Result<String, RefreshFailure> {
+    let mut session = load_session()
+        .map_err(RefreshFailure::Transient)?
+        .ok_or_else(|| RefreshFailure::Rejected("not signed in".to_string()))?;
+    let refresh_token = session.refresh_token.clone().ok_or_else(|| {
+        RefreshFailure::Rejected("no refresh token on this session — sign in again".to_string())
+    })?;
     let url = format!("{}/auth/refresh", base_url(&session.server_url));
-    let tokens: TokenResponse = send_json(
-        reqwest::Client::new()
-            .post(&url)
-            .json(&RefreshRequest { refresh_token }),
-    )
-    .await?;
-    // Persist the rotated pair FIRST (see doc comment) — then hand the new access token
-    // to the caller / transport.
-    session.bearer = tokens.access_token.clone();
-    session.refresh_token = Some(tokens.refresh_token);
-    store_session(&session)?;
-    Ok(tokens.access_token)
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&RefreshRequest { refresh_token })
+        .send()
+        .await
+        // A connect/timeout failure means the relay is unreachable — NOT that the token is
+        // bad; the classification mirrors the T025 probe / transport layer (no string parse).
+        .map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                RefreshFailure::Network(e.to_string())
+            } else {
+                RefreshFailure::Transient(e.to_string())
+            }
+        })?;
+    match classify_refresh_status(resp.status()) {
+        // Clean status — decode the rotated pair and persist it before handing back the access
+        // token (persist-before-use: rotation already spent the presented refresh token).
+        None => {
+            let tokens: TokenResponse = resp
+                .json()
+                .await
+                .map_err(|e| RefreshFailure::Transient(e.to_string()))?;
+            session.bearer = tokens.access_token.clone();
+            session.refresh_token = Some(tokens.refresh_token);
+            store_session(&session).map_err(RefreshFailure::Transient)?;
+            Ok(tokens.access_token)
+        }
+        Some(fail) => Err(fail),
+    }
+}
+
+/// Classify a refresh response STATUS into the terminal-vs-transient decision (pure, so the
+/// "401 ⇒ sign out, 5xx ⇒ retry" rule is unit-tested without a live relay). `None` means the
+/// status is a success the caller should decode. A 401 is the relay rejecting the refresh
+/// token (reuse-detection family revocation on a spent token) → [`RefreshFailure::Rejected`];
+/// any other non-2xx is a server-side transient → [`RefreshFailure::Transient`].
+fn classify_refresh_status(status: reqwest::StatusCode) -> Option<RefreshFailure> {
+    if status.is_success() {
+        None
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        Some(RefreshFailure::Rejected(
+            "relay rejected the refresh token (401)".to_string(),
+        ))
+    } else {
+        Some(RefreshFailure::Transient(format!(
+            "relay error {}",
+            status.as_u16()
+        )))
+    }
+}
+
+/// The `DrainHealth` a failed refresh maps to WITHOUT signing out — i.e. for the retryable
+/// [`RefreshFailure::Network`] / [`RefreshFailure::Transient`] cases. Returns `None` for a
+/// [`RefreshFailure::Rejected`], which is terminal and handled by `expire_session_terminally`
+/// instead. Pure — makes the "network ⇒ unreachable, transient ⇒ failing, rejected ⇒ sign
+/// out" decision unit-testable.
+fn retryable_refresh_health(f: &RefreshFailure) -> Option<DrainHealth> {
+    match f {
+        RefreshFailure::Rejected(_) => None,
+        RefreshFailure::Network(m) => Some(DrainHealth::Unreachable(m.clone())),
+        RefreshFailure::Transient(m) => Some(DrainHealth::Failing(m.clone())),
+    }
+}
+
+/// Strip the spent credentials (access + refresh tokens) from a session while KEEPING
+/// everything else — email, server URL, vault handle, `sync_enabled`, device identity. Pure:
+/// the caller persists the result. This is what makes a terminal refresh failure recoverable
+/// WITHOUT a full sign-out: the session record survives so `sync_status` still surfaces the
+/// AuthExpired ("sign in again") state, but the already-spent refresh token is gone, so the
+/// next boot presents NO refresh token (an immediate local error) instead of re-presenting the
+/// rotated one to the relay's reuse detector.
+fn invalidate_session_credentials(mut s: Session) -> Session {
+    s.bearer = String::new();
+    s.refresh_token = None;
+    s
+}
+
+/// React to a TERMINAL refresh failure (the relay rejected the refresh token, or none exists):
+/// wipe the spent credentials from the persisted session (keeping the session record + device
+/// identity, T019) and raise [`DrainHealth::AuthExpired`] so the UI lands on the "Session
+/// expired — sign in again" surface (T023/R2) — never a retry loop, never a generic error.
+///
+/// We deliberately DO NOT call `clear_session` (which would drop the whole session and degrade
+/// the UI to the neutral "disconnected/off" state, NOT the AuthExpired surface the requirement
+/// names): instead we keep the record and null only the tokens. Order matters — the store
+/// write happens first, then `set_drain_health(AuthExpired)`. Returns whether AuthExpired newly
+/// transitioned (for one-shot logging). NEVER logs tokens.
+fn expire_session_terminally() -> bool {
+    match load_session() {
+        Ok(Some(s)) => {
+            let stripped = invalidate_session_credentials(s);
+            if let Err(e) = store_session(&stripped) {
+                tracing::warn!("sync drain: could not persist expired-session state: {e}");
+            }
+        }
+        Ok(None) => {} // already signed out — nothing to strip.
+        Err(e) => tracing::warn!("sync drain: reading session during expiry failed: {e}"),
+    }
+    set_drain_health(DrainHealth::AuthExpired)
 }
 
 /// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds
@@ -1179,14 +1373,32 @@ fn spawn_drain(
 
             // A5: if the persisted access token is already expired/near-expiry, refresh
             // proactively so the first cycle doesn't have to eat a 401 first. Staleness is
-            // only a scheduling hint (unverified `exp`); a failure here is non-fatal — the
-            // in-loop 401 path is the authority.
+            // only a scheduling hint (unverified `exp`).
             let stale = access_token_stale(&bearer, 60);
             let transport = HttpTransport::new(server_url, bearer);
             if stale {
                 match rt.block_on(refresh_access_token()) {
                     Ok(new_access) => transport.set_bearer(&new_access),
-                    Err(e) => tracing::warn!("sync drain: proactive token refresh skipped: {e}"),
+                    // R3 (HIGH — crash-window lockout): a stale access token we cannot refresh
+                    // at BOOT because the relay REJECTED the refresh token is terminal. This is
+                    // the exact crash-window case — the persisted refresh token was already
+                    // rotated before we could save its replacement, so the relay's reuse
+                    // detection revoked the family. Land on the AuthExpired surface and stop;
+                    // do NOT enter the loop just to hot-eat 401s against a dead token.
+                    Err(RefreshFailure::Rejected(e)) => {
+                        if expire_session_terminally() {
+                            tracing::warn!(
+                                "sync drain: refresh token rejected at start — session expired; sign in again ({e})"
+                            );
+                        }
+                        return;
+                    }
+                    // Unreachable / transient: the refresh token is still valid, so keep the
+                    // (stale) bearer and let the in-loop 401 path retry once connectivity is
+                    // back. A momentary outage must never sign the owner out.
+                    Err(RefreshFailure::Network(e)) | Err(RefreshFailure::Transient(e)) => {
+                        tracing::warn!("sync drain: proactive token refresh deferred (transient): {e}")
+                    }
                 }
             }
 
@@ -1261,23 +1473,46 @@ fn spawn_drain(
                                 }
                             };
                         }
-                        Err(_) => {
-                            // No refresh token / relay rejected it → stop the drain and
-                            // surface auth-expired. NEVER hot-loop on a dead token.
-                            if set_drain_health(DrainHealth::AuthExpired) {
+                        // R3 (HIGH): the relay REJECTED the refresh token (401 — reuse
+                        // detection revoked the family after the crash-rotation window), or
+                        // there is none. Terminal: strip the spent credentials + raise
+                        // AuthExpired ("sign in again"), then stop. NEVER hot-loop a dead token,
+                        // and never re-present the spent token on the next boot.
+                        Err(RefreshFailure::Rejected(e)) => {
+                            if expire_session_terminally() {
                                 tracing::warn!(
-                                    "sync drain: token refresh failed — auth expired; stopping drain (sign in again)"
+                                    "sync drain: refresh token rejected — session expired; stopping drain (sign in again) ({e})"
                                 );
                             }
                             break;
                         }
+                        // R3: couldn't refresh RIGHT NOW (relay unreachable / 5xx), but the
+                        // refresh token is still valid — a connectivity blip, not auth expiry.
+                        // Surface it (unreachable vs failing) and retry next cycle; do NOT sign
+                        // out. `retryable_refresh_health` never returns None here (Rejected is
+                        // handled above).
+                        Err(fail) => {
+                            if let Some(health) = retryable_refresh_health(&fail) {
+                                if fail_surface_step(&mut consecutive_errors, true)
+                                    == FailSurface::Surface
+                                    && set_drain_health(health)
+                                {
+                                    tracing::warn!(
+                                        "sync drain: token refresh deferred — {fail:?}"
+                                    );
+                                }
+                            }
+                            std::thread::sleep(DRAIN_INTERVAL);
+                            continue;
+                        }
                     }
                 }
                 // Refresh succeeded but a direction STILL 401'd → the token is truly dead.
+                // Terminal, same treatment as a rejected refresh.
                 if report.has_unauthorized() {
-                    if set_drain_health(DrainHealth::AuthExpired) {
+                    if expire_session_terminally() {
                         tracing::warn!(
-                            "sync drain: refreshed token still rejected — auth expired; stopping drain"
+                            "sync drain: refreshed token still rejected — session expired; stopping drain"
                         );
                     }
                     break;
@@ -1312,11 +1547,20 @@ fn spawn_drain(
                         }
                     }
                     // Any other transient relay error (push OR pull): count it, and after a
-                    // short run flip the panel to a failing state carrying the VERBATIM error.
+                    // short run flip the panel to a distinct state carrying the VERBATIM error.
+                    // R3: a transport-layer CONNECTIVITY failure (typed
+                    // `SyncError::Network`, classified in the transport — never by string
+                    // match) becomes the amber "unreachable" state; every other relay error
+                    // stays the destructive "failing" state.
                     Some(e) => {
                         let msg = e.to_string();
+                        let health = if e.is_network() {
+                            DrainHealth::Unreachable(msg.clone())
+                        } else {
+                            DrainHealth::Failing(msg.clone())
+                        };
                         if fail_surface_step(&mut consecutive_errors, true) == FailSurface::Surface
-                            && set_drain_health(DrainHealth::Failing(msg.clone()))
+                            && set_drain_health(health)
                         {
                             tracing::warn!(
                                 "sync drain: relay error on {consecutive_errors} consecutive cycles: {msg}"
@@ -1694,6 +1938,13 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
             Some("Your session expired. Sign in again to resume sync.".to_string()),
         ),
         DrainHealth::Blocked(msg) => (connected_phase, Some(msg)),
+        // R3: a mid-session relay that became UNREACHABLE (typed transport `Network` error,
+        // classified at the transport — no string parsing) surfaces as a distinct
+        // `unreachable` phase. `deriveSyncDisplay` maps it to the amber "Can't reach relay"
+        // state instead of the destructive red "Sync error". DTO vehicle: a new `phase` string
+        // value only — `SyncStatusDto.phase` is already `string`, so NO DTO shape / types.ts
+        // regen is needed.
+        DrainHealth::Unreachable(msg) => ("unreachable".to_string(), Some(msg)),
         // A persistently failing relay (F2) surfaces its verbatim error as `last_error` on
         // the connected phase; `deriveSyncDisplay` renders any set `last_error` as the
         // distinct "Sync error — needs attention" state, no DTO/contract change needed.
@@ -2674,6 +2925,82 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_session_credentials_drops_tokens_keeps_identity() {
+        // R3 (HIGH): a terminal refresh failure strips ONLY the spent tokens — the session
+        // record (so the AuthExpired "sign in again" surface still renders) and the device
+        // identity (T019) survive, and the next boot presents NO refresh token.
+        let s = Session {
+            server_url: "https://relay.test".into(),
+            email: "a@b.com".into(),
+            vault_key_b64: B64.encode([1u8; 32]),
+            epoch: 4,
+            tenant_id: Uuid::from_u128(9),
+            bearer: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            device_fingerprint: Some("FFFFGGGGHHHHJJJJ".into()),
+            sync_enabled: true,
+            client_id: Uuid::from_u128(1234),
+            device_sk_b64: B64.encode([7u8; 32]),
+            salt_enc_b64: None,
+            roster_counter: 2,
+            roster_fingerprint: None,
+        };
+        let stripped = invalidate_session_credentials(s);
+        assert!(stripped.bearer.is_empty(), "spent access token dropped");
+        assert!(
+            stripped.refresh_token.is_none(),
+            "spent refresh token dropped"
+        );
+        // Everything else preserved so the session still surfaces AuthExpired, not signed-out.
+        assert_eq!(stripped.email, "a@b.com");
+        assert_eq!(stripped.client_id, Uuid::from_u128(1234));
+        assert_eq!(stripped.device_sk_b64, B64.encode([7u8; 32]));
+        assert!(stripped.sync_enabled);
+        assert_eq!(stripped.vault_key_b64, B64.encode([1u8; 32]));
+    }
+
+    #[test]
+    fn refresh_status_401_is_terminal_others_transient() {
+        use reqwest::StatusCode;
+        // A success status is not a failure — the caller decodes the rotated pair.
+        assert!(classify_refresh_status(StatusCode::OK).is_none());
+        // 401 is the relay REJECTING the refresh token (reuse detection revoked the family on
+        // a spent token) — terminal, sign in again.
+        assert!(matches!(
+            classify_refresh_status(StatusCode::UNAUTHORIZED),
+            Some(RefreshFailure::Rejected(_))
+        ));
+        // Any other non-2xx is a server-side transient — retry; the refresh token is still valid.
+        assert!(matches!(
+            classify_refresh_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Some(RefreshFailure::Transient(_))
+        ));
+        assert!(matches!(
+            classify_refresh_status(StatusCode::BAD_GATEWAY),
+            Some(RefreshFailure::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn refresh_failure_maps_to_the_right_drain_health() {
+        // R3 decision: rejected ⇒ terminal (None here → the expire/AuthExpired path); a network
+        // failure ⇒ amber "unreachable"; any other transient ⇒ "failing". Network/transient
+        // NEVER sign out.
+        assert!(
+            retryable_refresh_health(&RefreshFailure::Rejected("x".into())).is_none(),
+            "a rejected refresh is terminal, not retried"
+        );
+        assert!(matches!(
+            retryable_refresh_health(&RefreshFailure::Network("x".into())),
+            Some(DrainHealth::Unreachable(_))
+        ));
+        assert!(matches!(
+            retryable_refresh_health(&RefreshFailure::Transient("x".into())),
+            Some(DrainHealth::Failing(_))
+        ));
+    }
+
+    #[test]
     fn recovery_wrap_block_matches_kdf_recovery_key() {
         // Block 1 of the 64-byte HKDF expansion MUST equal kdf::recovery_key (the vault
         // wrap key), so the recovery code still unwraps a vault key wrapped under it.
@@ -3000,6 +3327,107 @@ mod tests {
             assert!(
                 id_len < 2560,
                 "identity-v1 must stay under the Windows cap (was {id_len})"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn sealed_file_is_owner_only_0600() {
+            use std::os::unix::fs::PermissionsExt;
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "sealed session file must be owner read/write only"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn two_seals_use_distinct_nonces_and_ciphertexts() {
+            // T029 Judge (nonce uniqueness): every seal draws a fresh 192-bit nonce, so two
+            // seals of the SAME session under the SAME key/epoch differ in the nonce region
+            // AND the ciphertext — never a nonce reuse (which XChaCha20-Poly1305 forbids).
+            let key = [5u8; 32];
+            let pt = json_of(&sample_session());
+            let a = seal_session(&key, 3, pt.as_bytes()).unwrap();
+            let b = seal_session(&key, 3, pt.as_bytes()).unwrap();
+            // Envelope: version(1) || nonce(24) || ct||tag. Nonce is bytes [1..25).
+            assert_ne!(a[1..25], b[1..25], "nonces must differ across seals");
+            assert_ne!(a, b, "ciphertexts must differ across seals");
+            // Both still open back to the same plaintext under the same key+epoch.
+            assert_eq!(open_session(&key, 3, &a).unwrap(), pt.as_bytes());
+            assert_eq!(open_session(&key, 3, &b).unwrap(), pt.as_bytes());
+        }
+
+        #[test]
+        fn rollback_to_older_epoch_is_rejected() {
+            // Anti-rollback (T029 Judge): the current session is sealed at epoch 3 and the
+            // keychain records epoch 3. An attacker with FILE access (but not keychain access)
+            // re-seals an OLDER session (epoch 2) under the SAME wrapping key and overwrites the
+            // file, leaving the keychain entry untouched (still epoch 3). Loading must REJECT:
+            // the old blob's AAD binds epoch 2, but we open under the recorded epoch 3 → AEAD
+            // failure → signed-out. Guarantee: a file-only attacker cannot roll back to an
+            // older sealed session under the same wrapping key.
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let mut current = sample_session();
+            current.epoch = 3;
+            store_session_wrapped(&ks, &path, &current).unwrap();
+
+            // Recover the wrapping key the store minted (attacker has the FILE + can read the
+            // wrapping key only in this test harness; the real threat model is file-only, and
+            // even WITH the key the epoch binding blocks the rollback).
+            let (key, recorded_epoch) = decode_wrap_entry(&ks.get_key().unwrap().unwrap()).unwrap();
+            assert_eq!(recorded_epoch, 3);
+
+            // Forge an older (epoch 2) session sealed under the same key, overwrite the file.
+            let mut older = sample_session();
+            older.epoch = 2;
+            let forged = seal_session(&key, 2, json_of(&older).as_bytes()).unwrap();
+            write_session_blob(&path, &forged).unwrap();
+
+            // Keychain still says epoch 3 → open under epoch 3 → the epoch-2 blob is rejected.
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_none(),
+                "an older-epoch sealed session must not open under the recorded epoch"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn old_domain_aad_blob_fails_to_open_cleanly() {
+            // A file sealed by an OLDER build (domain `v1`, no epoch field in the AAD) must not
+            // open under the current `v2` epoch-bound AAD — it degrades to signed-out, never a
+            // panic. No migration is owed (zero production installs; dev uses the debug store).
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let s = sample_session();
+            let key = new_wrap_key();
+            // Reproduce the OLD v1 construction: AAD = LP(version, "yapstack.session.store.v1").
+            let mut nonce = [0u8; 24];
+            OsRng.fill_bytes(&mut nonce);
+            let old_aad = yapstack_crypto::aead::lp(&[
+                &[yapstack_crypto::VERSION],
+                b"yapstack.session.store.v1",
+            ]);
+            let old_blob = yapstack_crypto::aead::seal_standard(
+                &key,
+                &nonce,
+                json_of(&s).as_bytes(),
+                &old_aad,
+            )
+            .unwrap();
+            write_session_blob(&path, &old_blob).unwrap();
+            ks.set_key(&encode_wrap_entry(&key, s.epoch).unwrap())
+                .unwrap();
+
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_none(),
+                "a v1-AAD blob must fail cleanly under the v2 epoch-bound AAD"
             );
             let _ = std::fs::remove_file(&path);
         }
