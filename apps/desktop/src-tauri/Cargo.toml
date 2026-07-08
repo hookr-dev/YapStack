@@ -95,10 +95,27 @@ sync = [
     "dep:sha2",
     "dep:data-encoding",
     "dep:ed25519-dalek",
+    # Windows-only credential shim (R5); a no-op reference on non-Windows targets, where the
+    # optional dep is not present.
+    "dep:windows-sys",
 ]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# Windows credential shim (R5). `keyring` 3.x's Windows backend hardcodes
+# `Persist: CRED_PERSIST_ENTERPRISE` (keyring-3.6.3/src/windows.rs:246), which can fail to
+# survive logoff on some account/domain configurations — silently killing the owner's session
+# across app restarts. We write the wrap-key + identity entries DIRECTLY via
+# CredWriteW/CredReadW/CredDeleteW with `CRED_PERSIST_LOCAL_MACHINE`, keeping `keyring` for the
+# macOS `apple-native` path. Same `windows-sys` 0.60 + feature set `keyring` already pulls
+# (keyring-3.6.3/Cargo.toml:200), so cargo deduplicates — no new distinct crate build. Optional
+# and gated into the `sync` feature; absent on non-Windows targets.
+[target."cfg(target_os = \"windows\")".dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+], optional = true }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }

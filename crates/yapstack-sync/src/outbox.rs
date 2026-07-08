@@ -449,11 +449,19 @@ async fn push_direction<T: SyncTransport + ?Sized>(
     push_outbox(conn, client_id, transport).await
 }
 
-/// Pull new changesets, decrypt, and merge them, advancing the pull watermark only AFTER a
-/// page's merges succeed. The pull half of one [`drain_once`] cycle; its error is captured
-/// into `DrainReport::pull_error` so a download failure cannot mask push progress. Own-echo
-/// changes (matching `client_id`) are skipped; undecryptable/undecodable changes are
-/// crypto-quarantined (`crypto_skipped`), never fatal.
+/// Pull new changesets, decrypt, and merge them IN COMMIT ORDER, advancing the pull
+/// watermark only past changesets that were fully merged (or are our own echo). The pull
+/// half of one [`drain_once`] cycle; its error is captured into `DrainReport::pull_error`
+/// so a download failure cannot mask push progress. Own-echo changes (matching `client_id`)
+/// are skipped as already-local.
+///
+/// Honest crypto accounting (R5): a changeset we cannot decrypt/decode is NOT
+/// skipped-and-forgotten. Skipping it would silently DROP a peer's write while advancing the
+/// watermark past it — the "up to date" lie. Instead the pull STOPS at the first such
+/// changeset: the watermark is left at the last fully-merged seq (so the next cycle retries
+/// from exactly here) and no later, higher-seq changeset is merged out of order. The failure
+/// rides back as [`SyncError::CryptoSkip`] (→ `DrainReport::pull_error`), carrying only the
+/// seq / author `client_id` / a stage label — never key or plaintext material.
 async fn pull_direction<T: SyncTransport + ?Sized>(
     conn: &Connection,
     cipher: &ChangesetCipher,
@@ -467,42 +475,58 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
         if resp.changes.is_empty() {
             break;
         }
+        // Highest seq FULLY consumed so far this page — merged, or legitimately skipped as our
+        // own echo. On a crypto failure the watermark is pinned here so the retry resumes from
+        // the failed changeset and no later one is applied ahead of it.
+        let mut last_good = since;
         for pc in &resp.changes {
             if pc.client_id == client_id {
-                continue; // our own echo; already local.
+                last_good = pc.changeset_seq; // our own echo; already local.
+                continue;
             }
-            let blob = match B64.decode(pc.ciphertext.as_bytes()) {
-                Ok(b) => b,
-                Err(_) => {
-                    report.crypto_skipped += 1;
-                    continue;
-                }
-            };
-            let pt = match cipher.decrypt(pc.client_id, pc.client_seq, &blob) {
-                Ok(pt) => pt,
-                Err(_) => {
-                    report.crypto_skipped += 1;
-                    continue;
-                }
-            };
-            let cs = match crate::change::Changeset::decode(&pt) {
+            let cs = match decode_pulled_changeset(cipher, pc) {
                 Ok(cs) => cs,
-                Err(_) => {
+                Err(detail) => {
                     report.crypto_skipped += 1;
-                    continue;
+                    // Do NOT advance past this changeset. Pin the watermark at the last good
+                    // seq and stop the pull; the next cycle retries from here.
+                    state::set_pull_watermark(conn, last_good)?;
+                    return Err(SyncError::CryptoSkip {
+                        seq: pc.changeset_seq,
+                        author_client_id: pc.client_id,
+                        detail,
+                    });
                 }
             };
             let (a, q) = merge_changeset(conn, &cs)?;
             report.applied += a;
             report.quarantined += q;
+            last_good = pc.changeset_seq;
         }
-        // Watermark advances only after this page merged successfully.
+        // Whole page consumed cleanly — advance to the relay's reported next_seq.
         state::set_pull_watermark(conn, resp.next_seq)?;
         if !resp.has_more {
             break;
         }
     }
     Ok(())
+}
+
+/// Base64-decode, decrypt, and decode one pulled changeset. On failure returns a SHORT,
+/// non-sensitive label naming the stage that failed — deliberately NO ciphertext, plaintext,
+/// key, nonce, or error detail that could leak key/plaintext material — so the caller can log
+/// and surface it safely (R5).
+fn decode_pulled_changeset(
+    cipher: &ChangesetCipher,
+    pc: &yapstack_common::sync::PulledChange,
+) -> Result<Changeset, String> {
+    let blob = B64
+        .decode(pc.ciphertext.as_bytes())
+        .map_err(|_| "ciphertext base64".to_string())?;
+    let pt = cipher
+        .decrypt(pc.client_id, pc.client_seq, &blob)
+        .map_err(|_| "decrypt/authenticate".to_string())?;
+    Changeset::decode(&pt).map_err(|_| "changeset decode".to_string())
 }
 
 #[cfg(test)]
@@ -962,5 +986,188 @@ mod tests {
         );
         // B's change is durably on the relay.
         assert_eq!(relay.completeness().await.unwrap().count, 1);
+    }
+
+    // ----- R5: honest crypto accounting — a crypto skip stops the pull, never lies -----
+
+    /// Wraps a [`MockRelay`] and, on pull, replaces the ciphertext of the changeset at
+    /// `corrupt_seq` with a value that cannot be base64-decoded — modelling a peer write this
+    /// device cannot decrypt/decode. Every genuine changeset passes through untouched.
+    struct CorruptPullAt {
+        inner: Arc<MockRelay>,
+        corrupt_seq: i64,
+    }
+    #[async_trait]
+    impl SyncTransport for CorruptPullAt {
+        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
+            self.inner.push(r).await
+        }
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            let mut resp = self.inner.pull(since, limit).await?;
+            for c in &mut resp.changes {
+                if c.changeset_seq == self.corrupt_seq {
+                    c.ciphertext = "!!! not base64 !!!".to_string();
+                }
+            }
+            Ok(resp)
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            self.inner.completeness().await
+        }
+        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
+            self.inner.put_snapshot(m, c).await
+        }
+        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+            self.inner.get_snapshot().await
+        }
+    }
+
+    /// Publish three distinct changesets from `a` through a healthy `relay` → dense seq 1,2,3.
+    async fn publish_three(a: &CrsqlDb, relay: &MockRelay, cipher: &ChangesetCipher, ca: Uuid) {
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            a.conn()
+                .execute(
+                    "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                    rusqlite::params![k, v],
+                )
+                .unwrap();
+            drain_once(a.conn(), cipher, relay, ca, sv, ev)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_stops_at_first_crypto_failure_and_retries() {
+        // R5: three changesets where changeset #2 fails to decode. The pull must merge #1, STOP
+        // at #2 (never merging the later #3 out of order), leave the watermark at #1, and
+        // surface a typed CryptoSkip. A later readable cycle resumes from #2 and fully catches
+        // up. This is the "up to date" lie mechanism, defused.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        publish_three(&a, relay.as_ref(), &cipher, ca).await;
+        assert_eq!(relay.completeness().await.unwrap().count, 3);
+
+        let has = |k: &str| -> bool {
+            let n: i64 = b
+                .conn()
+                .query_row("SELECT count(*) FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap();
+            n > 0
+        };
+
+        // Cycle 1: pull through a transport that corrupts changeset seq=2.
+        let corrupt = CorruptPullAt {
+            inner: relay.clone(),
+            corrupt_seq: 2,
+        };
+        let report = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
+            .await
+            .unwrap();
+
+        match report.pull_error {
+            Some(SyncError::CryptoSkip {
+                seq,
+                author_client_id,
+                ..
+            }) => {
+                assert_eq!(seq, 2, "stopped at the FIRST failing changeset");
+                assert_eq!(author_client_id, ca, "surfaces the authoring client_id");
+            }
+            other => panic!("expected CryptoSkip pull_error, got {other:?}"),
+        }
+        assert_eq!(
+            report.crypto_skipped, 1,
+            "exactly one crypto skip this cycle"
+        );
+        assert!(report.applied > 0, "#1 merged before the failure");
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            1,
+            "watermark pinned at the last good seq, NOT advanced past the failure"
+        );
+        assert!(has("k1"), "#1 (before the failure) applied");
+        assert!(!has("k2"), "#2 (the failure) not applied");
+        assert!(!has("k3"), "#3 (after the failure) NOT merged out of order");
+
+        // Cycle 2: retry against the still-corrupt transport makes NO forward progress.
+        let report2 = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                report2.pull_error,
+                Some(SyncError::CryptoSkip { seq: 2, .. })
+            ),
+            "retry re-hits the same block"
+        );
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            1,
+            "still no progress past the block"
+        );
+
+        // Cycle 3: the changeset is readable again → resume from #2 and catch up fully.
+        let report3 = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(report3.pull_error.is_none(), "clean pull after recovery");
+        assert_eq!(report3.crypto_skipped, 0);
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            3,
+            "watermark fully caught up"
+        );
+        assert!(
+            has("k2") && has("k3"),
+            "the blocked and later changesets now applied"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_clean_pull_advances_fully() {
+        // The happy path is unchanged: no crypto failures → watermark advances to the last seq,
+        // every changeset merges, and the report is clean (no false crypto_skipped).
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        publish_three(&a, relay.as_ref(), &cipher, ca).await;
+
+        let report = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(report.pull_error.is_none());
+        assert_eq!(
+            report.crypto_skipped, 0,
+            "no crypto skips on the clean path"
+        );
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            3,
+            "advanced fully"
+        );
+        for k in ["k1", "k2", "k3"] {
+            let n: i64 = b
+                .conn()
+                .query_row("SELECT count(*) FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "changeset {k} merged");
+        }
     }
 }

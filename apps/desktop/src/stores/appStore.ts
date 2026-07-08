@@ -1546,12 +1546,22 @@ function createAppStore() {
         set({ syncStatus: status });
         // Mirror the non-secret handles the UI persists. Never store tokens or
         // the vault key here — those stay in the OS keychain (Rust side).
+        //
+        // Non-destructive mirror: a signed-out / disconnected status DTO returns
+        // serverUrl:"" and email:null (Rust `sync_status`). Blindly mirroring those into
+        // the PERSISTED syncConfig meant one signed-out poll wiped the relay URL the user
+        // configured (and their saved email) — so a later boot lost the relay entirely.
+        // Only mirror MEANINGFUL values: never clobber a non-empty saved serverUrl with an
+        // empty one, and never null a persisted email from a signed-out DTO. Sign-out
+        // clears the email deliberately through its OWN path (handleSignOut →
+        // setSyncConfig({ email: null })), not through a status poll.
         if (status) {
+          const prev = get().syncConfig;
           set({
             syncConfig: {
-              ...get().syncConfig,
-              serverUrl: status.serverUrl,
-              email: status.email,
+              ...prev,
+              serverUrl: status.serverUrl || prev.serverUrl,
+              email: status.email ?? prev.email,
               syncEnabled: status.syncEnabled,
               deviceFingerprint: status.deviceFingerprint,
             },

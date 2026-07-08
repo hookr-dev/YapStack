@@ -268,7 +268,9 @@ fn store_get(account: &str) -> Result<Option<String>, String> {
     Ok(dev_read_map()?.get(account).cloned())
 }
 
-#[cfg(not(debug_assertions))]
+// RELEASE, non-Windows (macOS `apple-native`): the `keyring` crate over the OS keychain,
+// UNCHANGED. macOS Keychain persists correctly and has no credential-blob limit issue.
+#[cfg(all(not(debug_assertions), not(target_os = "windows")))]
 fn store_get(account: &str) -> Result<Option<String>, String> {
     match keyring::Entry::new(KEYCHAIN_SERVICE, account)
         .map_err(|e| e.to_string())?
@@ -280,6 +282,14 @@ fn store_get(account: &str) -> Result<Option<String>, String> {
     }
 }
 
+// RELEASE, Windows: the direct `win_creds` shim (R5) writing with
+// `CRED_PERSIST_LOCAL_MACHINE` instead of keyring's hardcoded ENTERPRISE. Entry naming and
+// blob encoding are byte-compatible with keyring, so entries written by either are readable.
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+fn store_get(account: &str) -> Result<Option<String>, String> {
+    win_creds::get(account)
+}
+
 #[cfg(debug_assertions)]
 fn store_set(account: &str, value: &str) -> Result<(), String> {
     let mut map = dev_read_map()?;
@@ -287,12 +297,17 @@ fn store_set(account: &str, value: &str) -> Result<(), String> {
     dev_write_map(&map)
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(target_os = "windows")))]
 fn store_set(account: &str, value: &str) -> Result<(), String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, account)
         .map_err(|e| e.to_string())?
         .set_password(value)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+fn store_set(account: &str, value: &str) -> Result<(), String> {
+    win_creds::set(account, value)
 }
 
 #[cfg(debug_assertions)]
@@ -302,7 +317,7 @@ fn store_delete(account: &str) -> Result<(), String> {
     dev_write_map(&map)
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(target_os = "windows")))]
 fn store_delete(account: &str) -> Result<(), String> {
     match keyring::Entry::new(KEYCHAIN_SERVICE, account)
         .map_err(|e| e.to_string())?
@@ -310,6 +325,149 @@ fn store_delete(account: &str) -> Result<(), String> {
     {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+fn store_delete(account: &str) -> Result<(), String> {
+    win_creds::delete(account)
+}
+
+// ----- Windows credential shim (R5) — wire-format helpers + FFI backend -----
+//
+// `keyring` 3.x's Windows backend hardcodes `Persist: CRED_PERSIST_ENTERPRISE`
+// (keyring-3.6.3/src/windows.rs:246). ENTERPRISE credentials are roamable and, on some
+// account/domain configurations, have been observed NOT to survive a logoff — which silently
+// destroys the owner's session-wrapping key across restarts, forcing a fresh sign-in on every
+// launch. We instead write the wrap-key + identity entries DIRECTLY with
+// `CRED_PERSIST_LOCAL_MACHINE`, stored on the local machine and durable across logon sessions.
+// `keyring` is kept for the macOS `apple-native` path (no such issue, no blob-size cap).
+//
+// Wire compatibility with `keyring` is PRESERVED so any pre-existing entry stays readable:
+//   - target name = `{account}.{service}` — keyring's `{username}.{service}` convention
+//     (windows.rs:378), e.g. `session-key-v1.dev.yapstack.app.sync`
+//   - `UserName`   = account
+//   - blob        = the value as little-endian UTF-16 with no NUL — byte-identical to keyring's
+//     password encoding (windows.rs:86-88, extracted at 421-434)
+//   - `Type`       = `CRED_TYPE_GENERIC`
+// The ONLY behavioural change versus keyring is the persistence class.
+//
+// The pure wire-format transforms below are NOT cfg-gated so they compile and are unit-tested
+// on every platform (they are the compatibility-critical part). Only the `win_creds` FFI glue
+// is Windows-only; it cannot be compiled on this macOS host (a transitive C build-script,
+// `ring`, needs the Windows SDK), so that glue is verified by construction against the
+// keyring-3.6.3 + windows-sys 0.60 API and must be compiled by the Windows CI build.
+
+/// keyring's Windows target-name convention (windows.rs:378): `{account}.{service}`.
+fn cred_target_name(account: &str, service: &str) -> String {
+    format!("{account}.{service}")
+}
+
+/// Encode a value as keyring's credential blob: little-endian UTF-16, no NUL terminator
+/// (windows.rs:86-88).
+fn cred_encode_blob(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Decode a keyring credential blob (little-endian UTF-16) back to a `String`. Trailing odd
+/// byte (should never occur for a keyring-written blob) is ignored via `chunks_exact`.
+fn cred_decode_blob(bytes: &[u8]) -> String {
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&u16s)
+}
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+mod win_creds {
+    use super::{cred_decode_blob, cred_encode_blob, cred_target_name, KEYCHAIN_SERVICE};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND, FILETIME};
+    use windows_sys::Win32::Security::Credentials::{
+        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+
+    /// UTF-16 with a trailing NUL, for the wide C-string fields (`TargetName` / `UserName`).
+    fn to_wstr(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Read one entry. `ERROR_NOT_FOUND` → `Ok(None)` (parity with keyring's `NoEntry`); any
+    /// other Win32 failure surfaces as an `Err` naming the code (no secret material).
+    pub(super) fn get(account: &str) -> Result<Option<String>, String> {
+        let target = to_wstr(&cred_target_name(account, KEYCHAIN_SERVICE));
+        let mut p_cred: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: `target` is a valid NUL-terminated wide string; on success CredReadW
+        // allocates a CREDENTIALW we free with CredFree below.
+        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut p_cred) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(format!("CredReadW failed (win32 error {err})"));
+        }
+        // SAFETY: CredReadW returned success → p_cred is a valid, non-null allocation.
+        let cred = unsafe { &*p_cred };
+        let blob_len = cred.CredentialBlobSize as usize;
+        let value = if blob_len == 0 || cred.CredentialBlob.is_null() {
+            String::new()
+        } else {
+            // SAFETY: the blob is `blob_len` bytes at CredentialBlob for the lifetime of the
+            // allocation (until CredFree).
+            let bytes = unsafe { std::slice::from_raw_parts(cred.CredentialBlob, blob_len) };
+            cred_decode_blob(bytes)
+        };
+        // SAFETY: p_cred was allocated by CredReadW and has not been freed yet.
+        unsafe { CredFree(p_cred as *const core::ffi::c_void) };
+        Ok(Some(value))
+    }
+
+    /// Write (create or replace) one entry with `CRED_PERSIST_LOCAL_MACHINE`.
+    pub(super) fn set(account: &str, value: &str) -> Result<(), String> {
+        let mut target = to_wstr(&cred_target_name(account, KEYCHAIN_SERVICE));
+        let mut username = to_wstr(account);
+        let mut blob = cred_encode_blob(value);
+        let mut cred = CREDENTIALW {
+            Flags: CRED_FLAGS::default(),
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            Comment: std::ptr::null_mut(),
+            LastWritten: FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: username.as_mut_ptr(),
+        };
+        // SAFETY: all pointer fields reference the local buffers above, which outlive the call.
+        let ok = unsafe { CredWriteW(&mut cred as *const CREDENTIALW, 0) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(format!("CredWriteW failed (win32 error {err})"));
+        }
+        Ok(())
+    }
+
+    /// Delete one entry. `ERROR_NOT_FOUND` is a no-op success (parity with keyring's `NoEntry`).
+    pub(super) fn delete(account: &str) -> Result<(), String> {
+        let target = to_wstr(&cred_target_name(account, KEYCHAIN_SERVICE));
+        // SAFETY: `target` is a valid NUL-terminated wide string.
+        let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NOT_FOUND {
+                return Ok(());
+            }
+            return Err(format!("CredDeleteW failed (win32 error {err})"));
+        }
+        Ok(())
     }
 }
 
@@ -486,12 +644,21 @@ fn load_session_wrapped(
 ) -> Result<Option<Session>, String> {
     match (ks.get_key()?, read_session_blob(enc_path)?) {
         (Some(entry_str), Some(blob)) => {
-            // Corrupt entry or AEAD failure (wrong key / tamper / truncation / epoch rollback)
-            // → signed-out. We do NOT delete here: a genuinely tampered file is unrecoverable
-            // and the next sign-in overwrites it, but a transient keychain read must never
-            // destroy a session file.
-            let Ok((key, expected_epoch)) = decode_wrap_entry(&entry_str) else {
-                return Ok(None);
+            let (key, expected_epoch) = match decode_wrap_entry(&entry_str) {
+                Ok(v) => v,
+                // decode-fail arm: the wrapping-key ENTRY exists but is unparseable (e.g. a
+                // stale round-2 bare-base64 value from a pre-`WrapKeyEntry` build). Leaving it
+                // in place wedges the store — every boot re-reads the same undecodable entry and
+                // degrades, but the file can never be opened. DELETE the entry so a fresh
+                // sign-in can mint a clean one. The file is left alone (a new sign-in overwrites
+                // it under the new key). No secret is logged.
+                Err(_) => {
+                    tracing::warn!(
+                        "sync boot: session wrapping-key entry undecodable (decode-fail) — deleting stale entry, degrading signed-out"
+                    );
+                    let _ = ks.delete_key();
+                    return Ok(None);
+                }
             };
             match open_session(&key, expected_epoch, &blob) {
                 Ok(json) => match serde_json::from_slice::<Session>(&json) {
@@ -502,19 +669,47 @@ fn load_session_wrapped(
                     // impossible for a file-only attacker — the explicit check is defence in
                     // depth and pins the invariant.
                     Ok(s) if s.epoch == expected_epoch => Ok(Some(s)),
-                    Ok(_) | Err(_) => Ok(None),
+                    // The AEAD opened but the plaintext is not a current-epoch Session (bad
+                    // JSON or an epoch skew). Unusable, but we do NOT destroy the file: a fresh
+                    // sign-in overwrites it. Log the arm (no secrets).
+                    Ok(_) | Err(_) => {
+                        tracing::warn!(
+                            "sync boot: session opened but plaintext not a current-epoch Session (open-fail) — degrading signed-out, file preserved"
+                        );
+                        Ok(None)
+                    }
                 },
-                Err(_) => Ok(None),
+                // open-fail arm: AEAD open failed (wrong key / tamper / truncation / epoch
+                // rollback). We do NOT delete: a genuinely tampered file is unrecoverable and
+                // the next sign-in overwrites it, but a TRANSIENT keychain read returning a
+                // stale/other key must never destroy the session file. Log the arm (no secrets).
+                Err(_) => {
+                    tracing::warn!(
+                        "sync boot: session file AEAD open failed (open-fail) — degrading signed-out, file preserved"
+                    );
+                    Ok(None)
+                }
             }
         }
-        // Stray wrapping key with no file: clean it up, then signed-out.
+        // file-missing arm: a wrapping key with no file. The key alone is useless; clean it up
+        // (steady-state hygiene), then signed-out. Log the arm.
         (Some(_), None) => {
+            tracing::warn!(
+                "sync boot: wrapping key present but session file missing (file-missing) — clearing stray key, degrading signed-out"
+            );
             let _ = ks.delete_key();
             Ok(None)
         }
-        // Orphan file with no key: it can never be decrypted — remove it, then signed-out.
+        // entry-missing arm: a session file with NO wrapping-key entry. Previously we DELETED
+        // the file here — but a transient keychain miss (the exact Windows-persistence failure
+        // R5 fixes) presents identically to a truly orphaned file, and deleting destroys the
+        // ONLY recoverable artifact. Do NOT delete: leave the file, log, degrade signed-out.
+        // If the entry comes back next boot (transient miss resolved), the session recovers; if
+        // it was genuinely orphaned, a fresh sign-in overwrites the file harmlessly.
         (None, Some(_)) => {
-            let _ = remove_session_blob(enc_path);
+            tracing::warn!(
+                "sync boot: session file present but wrapping-key entry missing (entry-missing) — PRESERVING file (possible transient keychain miss), degrading signed-out"
+            );
             Ok(None)
         }
         (None, None) => Ok(None),
@@ -1600,8 +1795,15 @@ fn spawn_drain(
                             had_backlog = true;
                         }
                         // "Up to date" only counts when the outbox is empty AND no transport
-                        // error occurred this cycle (else we'd claim success mid-failure).
-                        let clean = report.first_transport_error().is_none();
+                        // error occurred this cycle (else we'd claim success mid-failure) AND no
+                        // pulled changeset failed to decrypt/decode this cycle (R5: a crypto skip
+                        // means a peer's write was NOT applied — claiming "up to date" then is the
+                        // lie this fixes). A crypto failure already rides on `pull_error`
+                        // (→ first_transport_error), so this is belt-and-suspenders, but it pins
+                        // the invariant explicitly against any future path that sets the count
+                        // without an error.
+                        let clean = report.first_transport_error().is_none()
+                            && report.crypto_skipped == 0;
                         let last_success = if p.entries == 0 && clean {
                             if had_backlog {
                                 tracing::info!("sync: up to date");
@@ -3292,15 +3494,90 @@ mod tests {
         }
 
         #[test]
-        fn missing_key_degrades_and_cleans_orphan_file() {
+        fn missing_key_degrades_but_preserves_the_file() {
+            // R5: a session file with NO wrapping-key entry degrades signed-out — but the file
+            // is PRESERVED, not deleted. A transient keychain miss (the Windows-persistence
+            // failure R5 fixes) is indistinguishable from a truly orphaned file at this point,
+            // and deleting would destroy the only recoverable artifact. If the key returns next
+            // boot, the session recovers.
             let ks = FakeKeyStore::default();
             let path = temp_enc_path();
             store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            // Snapshot the entry so we can restore it (modelling a keychain miss that resolves).
+            let saved_key = ks.get_key().unwrap().unwrap();
             ks.delete_key().unwrap();
 
             assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
-            // The undecryptable orphan file is removed.
-            assert!(read_session_blob(&path).unwrap().is_none());
+            // The file must SURVIVE the key-miss degrade.
+            assert!(
+                read_session_blob(&path).unwrap().is_some(),
+                "the session file must be preserved across a wrapping-key miss"
+            );
+            // And when the wrapping key comes back, the same file opens the session again.
+            ks.set_key(&saved_key).unwrap();
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_some(),
+                "the session recovers once the wrapping-key entry returns"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn windows_cred_target_name_matches_keyring_convention() {
+            // R5 wire-compat: keyring's Windows backend keys the credential by
+            // `{username}.{service}` (keyring-3.6.3/src/windows.rs:378). Our shim MUST produce
+            // the identical target so an entry written by either is readable by the other.
+            assert_eq!(
+                cred_target_name(KEYCHAIN_ACCOUNT_SESSION_KEY, KEYCHAIN_SERVICE),
+                "session-key-v1.dev.yapstack.app.sync"
+            );
+            assert_eq!(
+                cred_target_name(KEYCHAIN_ACCOUNT_IDENTITY, KEYCHAIN_SERVICE),
+                "identity-v1.dev.yapstack.app.sync"
+            );
+        }
+
+        #[test]
+        fn windows_cred_blob_is_keyring_utf16le_and_round_trips() {
+            // R5 wire-compat: keyring stores the value as little-endian UTF-16 with NO NUL
+            // terminator (keyring-3.6.3/src/windows.rs:86-88). Assert the exact byte layout and
+            // a decode round-trip over ASCII, multi-byte, and non-BMP (surrogate-pair) chars —
+            // the wrapping-key entry is base64 (ASCII) but the encoding must be fully general.
+            assert_eq!(cred_encode_blob("AB"), vec![0x41, 0x00, 0x42, 0x00]);
+            assert_eq!(cred_encode_blob(""), Vec::<u8>::new());
+            for v in ["", "session-key-b64==", "héllo 世界", "emoji 😀 tail"] {
+                assert_eq!(
+                    cred_decode_blob(&cred_encode_blob(v)),
+                    v,
+                    "UTF-16LE blob must round-trip for {v:?}"
+                );
+                // No NUL terminator: byte length is exactly 2 per UTF-16 code unit.
+                assert_eq!(cred_encode_blob(v).len(), v.encode_utf16().count() * 2);
+            }
+        }
+
+        #[test]
+        fn undecodable_wrap_entry_is_deleted_and_degrades() {
+            // R5 hygiene: a wrapping-key ENTRY that no longer parses (e.g. a stale round-2
+            // bare-base64 value from a pre-`WrapKeyEntry` build) must be DELETED so the store
+            // cannot wedge on the same undecodable entry every boot. The load degrades
+            // signed-out; a fresh sign-in then mints a clean entry.
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            // Overwrite the entry with a bare base64 string (not the `WrapKeyEntry` JSON).
+            ks.set_key(&B64.encode([4u8; 32])).unwrap();
+            assert!(
+                decode_wrap_entry(&ks.get_key().unwrap().unwrap()).is_err(),
+                "precondition: the entry is genuinely undecodable"
+            );
+
+            assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
+            assert!(
+                ks.get_key().unwrap().is_none(),
+                "the stale, undecodable wrapping-key entry must be deleted"
+            );
+            let _ = std::fs::remove_file(&path);
         }
 
         #[test]
