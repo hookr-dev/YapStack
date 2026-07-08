@@ -375,7 +375,6 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
-            sync::sync_info,
             sync::sync_probe,
             sync::sync_status,
             sync::sync_signup,
@@ -383,12 +382,8 @@ pub fn run() {
             sync::sync_login_finish,
             sync::sync_recover,
             sync::sync_enable,
-            sync::sync_seed,
-            sync::sync_join,
             sync::sync_approve_device,
-            sync::sync_device_list,
             sync::sync_sign_out,
-            sync::sync_wrap_secret,
         ]);
 
     #[cfg(debug_assertions)]

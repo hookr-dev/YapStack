@@ -474,21 +474,12 @@ async logFrontend(level: FrontendLogLevel, module: string | null, message: strin
     else return { status: "error", error: e  as any };
 }
 },
-async syncInfo(serverUrl: string) : Promise<Result<SyncInfoDto, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_info", { serverUrl }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 /**
- * Typed relay connection probe (T025). Unlike `sync_info` (which collapses every failure
- * into one string and remains the caller for signup/billing), this returns a TYPED result
- * the UI branches on: `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a
- * version gap is advisory metadata on SUCCESS — never a failure. 5s request budget; the app
- * version is read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`,
- * kept in lockstep with tauri.conf.json by the build).
+ * Typed relay connection probe (T025). Returns a TYPED result the UI branches on:
+ * `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a version gap is
+ * advisory metadata on SUCCESS — never a failure. 5s request budget; the app version is
+ * read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`, kept in
+ * lockstep with tauri.conf.json by the build).
  */
 async syncProbe(serverUrl: string) : Promise<Result<RelayProbeOk, RelayProbeError>> {
     try {
@@ -572,34 +563,6 @@ async syncEnable() : Promise<Result<SyncStatusDto, string>> {
 }
 },
 /**
- * SEED (deliverable R2 seed side): CRRify a COPY of the primary DB, publish it as one
- * encrypted snapshot, and suppress re-pushing the whole history as changesets (the
- * snapshot carries it). Then start the drain. This device holds the authoritative
- * library; the other device joins from the snapshot.
- */
-async syncSeed() : Promise<Result<SyncStatusDto, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_seed") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * JOIN (deliverable R1 + R2 join side): re-bootstrap from the seed's snapshot into a
- * fresh CRR base, RECONCILE this device's own local-only rows into it (preserved, with
- * ambiguous collisions surfaced), then start the drain. NEVER independently
- * CRRifies-and-merges the live DB (silently lossy). The live DB is only ever READ.
- */
-async syncJoin() : Promise<Result<ReconcileReportDto, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_join") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Approve a pending device (§7.5 step 3/4). The human has already compared the
  * fingerprint OUT-OF-BAND in the UI (DeviceApprovalDialog); this existing active device
  * re-verifies the fingerprint matches a real pending device, adds it to the roster,
@@ -613,36 +576,9 @@ async syncApproveDevice(fingerprint: string) : Promise<Result<SyncStatusDto, str
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * `GET /devices` for the UI: the account's device index (pending + active), fingerprinted
- * for out-of-band comparison (§7.5). Membership truth is the signed roster (client-verified
- * at login); this index is the relay's advisory view for surfacing pending approvals.
- */
-async syncDeviceList() : Promise<Result<DeviceRosterEntryDto[], string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_device_list") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async syncSignOut() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_sign_out") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Vault-wrap a plaintext secret (AI apiKey / baseUrl) under the vault key held
- * in the OS keychain, before it can reach any syncable surface (deliverable E).
- * The plaintext is consumed here and never persisted; the caller stores only
- * the returned committing envelope (CRYPTO_SPEC §1.4 / §4).
- */
-async syncWrapSecret(plaintext: string) : Promise<Result<string, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_wrap_secret", { plaintext }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -674,15 +610,6 @@ export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | nu
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
 export type CaptureStateDto = "Idle" | "Capturing" | "Error"
 export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; system_audio_active: boolean; error_message: string | null }
-/**
- * One surfaced reconciliation collision (an ambiguous local row that was NOT silently
- * dropped — the owner reviews these before discarding the old local DB).
- */
-export type CollisionDto = { table: string; pk: string;
-/**
- * "content_diverged" (same PK, different values) or "logical_duplicate".
- */
-kind: string }
 /**
  * Unified error type for all Tauri commands.
  *
@@ -874,11 +801,6 @@ export type ParakeetVariantDto = "TdtV3" |
 "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 /**
- * Result of a join reconciliation. `accounted == inserted + matched + collisions` and
- * equals the join's local row count — the no-silent-loss guarantee, surfaced to the UI.
- */
-export type ReconcileReportDto = { inserted_local_only: number; matched_identical: number; collisions: CollisionDto[] }
-/**
  * Typed probe failure classes (mirrors `RelayProbeError` in `lib/sync.ts`). Serialized
  * tagged on `kind` (kebab-case) so TS can discriminate. Every variant carries the
  * verbatim `raw` detail — errors are surfaced to the user, never swallowed.
@@ -939,7 +861,6 @@ export type SignupArgs = { serverUrl: string; email: string; password: string }
 export type SignupResultDto = { recoveryCode: string; deviceFingerprint: string }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
-export type SyncInfoDto = { serverUrl: string; version: string; billingUrl: string | null }
 export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null; billingUrl: string | null;
 /**
  * T024 push progress. Unacked outbox entries still to push (0 == up to date).

@@ -112,14 +112,15 @@ export function stripAiSecrets(
 
 /**
  * Vault-wrap every connection credential before the config can be synced. The
- * plaintext `apiKey`/`baseUrl` are wrapped via the Rust vault command
- * (`syncCommands.wrapSecret`) under the vault key held in the OS keychain — the
- * plaintext never enters a syncable payload. This is the enforcement point for
- * deliverable E: the AI apiKey is envelope-wrapped, not persisted raw, before
- * any path that could reach the relay.
+ * plaintext `apiKey`/`baseUrl` are wrapped under the vault key held in the OS
+ * keychain — the plaintext never enters a syncable payload. This is the
+ * enforcement point for deliverable E: the AI apiKey is envelope-wrapped, not
+ * persisted raw, before any path that could reach the relay.
  *
  * `wrap` is injected (not imported) so this stays pure/testable and callers
- * choose the vault binding. In the app that's `syncCommands.wrapSecret`.
+ * choose the vault binding. The Rust vault-wrap command seam was tree-shaken
+ * while unused (SYNC_REMEDIATION.md §3) and will be recreated when the AI-sync
+ * feature actually lands and needs it.
  */
 export async function prepareAiConfigForSync(
   config: AIConfig,

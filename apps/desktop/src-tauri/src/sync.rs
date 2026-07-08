@@ -16,20 +16,29 @@
 //! `!Send`) and schedule `cascade_gc` + `enforce_uniqueness` after merges;
 //! (F) run `crr_migrate` once, against a `.backup` COPY of the live DB (never
 //! the live DB), gated on `SYNC_SCHEMA_VERSION`; plus the OS-keychain vault key
-//! at rest (CRYPTO_SPEC §10) and `sync_wrap_secret` (deliverable E backend:
-//! envelope-wrap the AI apiKey under the vault key).
+//! at rest (CRYPTO_SPEC §10).
 //!
-//! NOT wired here (needs a live relay + two machines → T011/T012, owner UAT):
-//! the end-to-end auth ceremony HTTP round-trips (signup/login/recover/approve).
-//! Those command handlers exist so the frontend contract is complete and return
-//! an explicit "not yet wired" error rather than a silent stub.
+//! Command surface (all registered live in `lib.rs`, `lib/sync.ts` is the TS
+//! contract): the relay probe (`sync_probe`), the status poll (`sync_status`),
+//! the auth ceremony round-trips (`sync_signup` / `sync_login_begin` /
+//! `sync_login_finish` / `sync_recover` / `sync_approve_device` / `sync_sign_out`),
+//! and enable (`sync_enable`, THE single enable path — crr_migrate a copy then
+//! start the drain). `start_drain_if_enabled` is the deliverable-A boot wiring
+//! invoked from the `setup` hook.
 //!
-//! The `#[tauri::command]` handlers below are intentionally NOT yet registered
-//! in the (tauri-specta) invoke handler — that registration + Specta type
-//! generation lands with the T011 relay ceremony. They are the documented
-//! command seam the frontend `lib/sync.ts` targets, so `dead_code` is expected
-//! and allowed at the module level until then. `start_drain_if_enabled` (the
-//! deliverable-A boot wiring) IS live from the `setup` hook.
+//! Session store layout (three logical entries under one keychain service): the
+//! persistent device identity (`identity-v1`, survives sign-out) holds the §7.1
+//! `client_id` + Ed25519 seed; the session (tokens + vault key + roster metadata)
+//! is sealed under a random 32-byte wrapping key kept in `session-key-v1` and
+//! written to the `sync-session.enc` file (Windows credential-blob overflow fix,
+//! T029). In debug the whole store is a plaintext dev file (T020: dev-rebuild
+//! keychain re-prompt spam) keyed by `session-v1`.
+//!
+//! Parked (compiled, NOT registered as commands): `sync_seed` / `sync_join` — the
+//! future "migrate an existing library" (snapshot bootstrap + reconcile) feature.
+//! They stay in the tree with `reconcile.rs`; see SYNC_REMEDIATION.md §6b. The
+//! module keeps `#![allow(dead_code)]` because that parked surface (and the DTOs
+//! it alone returns) is intentionally unreferenced by the live command set.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -60,13 +69,12 @@ use yapstack_sync::{
 };
 
 const KEYCHAIN_SERVICE: &str = "dev.yapstack.app.sync";
-/// LEGACY session account (T019/T020): once held the FULL session JSON (access + refresh
-/// tokens + vault key) as one keychain BLOB. That blob exceeds the Windows Credential Manager
-/// limit (`CRED_MAX_CREDENTIAL_BLOB_SIZE` = 5120 bytes = 2560 UTF-16 chars), which fails
-/// sign-in on Windows release builds. It is NO LONGER written (T029): the session now lives in
-/// a key-wrapped file (see `KEYCHAIN_ACCOUNT_SESSION_KEY` + `session_enc_path`). This name is
-/// kept ONLY as the migration source (an existing macOS install signed in the old way) and as
-/// a best-effort delete target once the new scheme takes over.
+/// Session account name for the DEBUG plaintext dev-file store ONLY. In debug the whole
+/// session JSON lives under this key in `sync-dev-creds.json` (T020: a dev rebuild changes
+/// the code signature, so the macOS keychain re-prompts on every read — the dev store makes
+/// zero keychain calls). In RELEASE the session is NOT stored here at all: it lives in the
+/// key-wrapped `sync-session.enc` file with its wrapping key in `KEYCHAIN_ACCOUNT_SESSION_KEY`
+/// (T029, Windows credential-blob overflow fix).
 const KEYCHAIN_ACCOUNT: &str = "session-v1";
 /// Session wrapping-key account (T029). Holds ONLY a base64-encoded random 32-byte
 /// XChaCha20-Poly1305 key (~44 chars — far under every platform's credential limit). The
@@ -82,10 +90,6 @@ const KEYCHAIN_ACCOUNT_SESSION_KEY: &str = "session-key-v1";
 /// entry survives sign-out; only the session entry is cleared.
 const KEYCHAIN_ACCOUNT_IDENTITY: &str = "identity-v1";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
-/// AAD domain for a vault-wrapped device setting secret (AI apiKey). Distinct
-/// from the changeset / audio / share domains so a wrapped setting can never be
-/// confused with another surface (CRYPTO_SPEC §5).
-const SETTING_DOMAIN: &[u8] = b"yapstack.setting.v1";
 /// AAD domain for the password-wrapped vault key (CRYPTO_SPEC §4.2).
 const WRAP_VAULT_PW_DOMAIN: &[u8] = b"yapstack.wrap.vault.pw.v1";
 /// AAD domain for the recovery-wrapped vault key (CRYPTO_SPEC §4.2/§6.2).
@@ -349,9 +353,6 @@ trait SessionKeyStore {
     fn get_key(&self) -> Result<Option<String>, String>;
     fn set_key(&self, b64: &str) -> Result<(), String>;
     fn delete_key(&self) -> Result<(), String>;
-    /// The old-style full-session JSON blob (`session-v1`), read for one-shot migration.
-    fn get_legacy(&self) -> Result<Option<String>, String>;
-    fn delete_legacy(&self) -> Result<(), String>;
 }
 
 struct KeychainSessionKeyStore;
@@ -364,12 +365,6 @@ impl SessionKeyStore for KeychainSessionKeyStore {
     }
     fn delete_key(&self) -> Result<(), String> {
         store_delete(KEYCHAIN_ACCOUNT_SESSION_KEY)
-    }
-    fn get_legacy(&self) -> Result<Option<String>, String> {
-        store_get(KEYCHAIN_ACCOUNT)
-    }
-    fn delete_legacy(&self) -> Result<(), String> {
-        store_delete(KEYCHAIN_ACCOUNT)
     }
 }
 
@@ -399,29 +394,10 @@ fn remove_session_blob(path: &Path) -> Result<(), String> {
     }
 }
 
-/// One-shot transparent migration of an OLD-style `session-v1` full-JSON blob into the new
-/// key-wrapped file scheme. Preserves the owner's signed-in state across the upgrade (the
-/// Mac is signed in the old way right now) and deletes the old blob afterward. A legacy blob
-/// that does not parse as a session is left untouched and treated as signed-out.
-fn migrate_legacy_session(
-    ks: &impl SessionKeyStore,
-    enc_path: &Path,
-) -> Result<Option<Session>, String> {
-    let Some(legacy_json) = ks.get_legacy()? else {
-        return Ok(None);
-    };
-    let Ok(session) = serde_json::from_str::<Session>(&legacy_json) else {
-        return Ok(None);
-    };
-    store_session_wrapped(ks, enc_path, &session)?;
-    let _ = ks.delete_legacy();
-    Ok(Some(session))
-}
-
 /// Read the session: keychain key + encrypted file → decrypt → session. Missing file OR
 /// missing key OR decrypt failure → signed-out (clean degrade). Inconsistent components (a
-/// stray key without a file, or vice versa) are cleaned up best-effort, then a legacy blob is
-/// migrated if present.
+/// stray key without a file, or vice versa) are cleaned up best-effort — steady-state
+/// hygiene, then treated as signed-out.
 fn load_session_wrapped(
     ks: &impl SessionKeyStore,
     enc_path: &Path,
@@ -442,23 +418,22 @@ fn load_session_wrapped(
                 Err(_) => Ok(None),
             }
         }
-        // Stray wrapping key with no file: clean it up, then look for a legacy blob to migrate.
+        // Stray wrapping key with no file: clean it up, then signed-out.
         (Some(_), None) => {
             let _ = ks.delete_key();
-            migrate_legacy_session(ks, enc_path)
+            Ok(None)
         }
-        // Orphan file with no key: it can never be decrypted — remove it, then try migration.
+        // Orphan file with no key: it can never be decrypted — remove it, then signed-out.
         (None, Some(_)) => {
             let _ = remove_session_blob(enc_path);
-            migrate_legacy_session(ks, enc_path)
+            Ok(None)
         }
-        (None, None) => migrate_legacy_session(ks, enc_path),
+        (None, None) => Ok(None),
     }
 }
 
 /// Persist the session under the wrapping scheme: load-or-create the 32-byte wrapping key
-/// (generated on first persist), seal the JSON, write the file, and best-effort drop any stale
-/// legacy blob now that the new scheme owns the session.
+/// (generated on first persist), seal the JSON, and write the file.
 fn store_session_wrapped(
     ks: &impl SessionKeyStore,
     enc_path: &Path,
@@ -483,19 +458,15 @@ fn store_session_wrapped(
     };
     let blob = seal_session(&key, json.as_bytes())?;
     write_session_blob(enc_path, &blob)?;
-    // Best-effort: the old oversized keychain blob is now superseded (also handles the rename
-    // from `session-v1` → `session-key-v1` on first run).
-    let _ = ks.delete_legacy();
     Ok(())
 }
 
-/// Sign-out cleanup for the wrapped store: delete the file, the wrapping key, and any stale
-/// legacy blob. Best-effort (a keychain/file hiccup must never block sign-out). `identity-v1`
-/// is untouched here — its preservation is handled by the caller (`clear_session`, T019).
+/// Sign-out cleanup for the wrapped store: delete the file and the wrapping key. Best-effort
+/// (a keychain/file hiccup must never block sign-out). `identity-v1` is untouched here — its
+/// preservation is handled by the caller (`clear_session`, T019).
 fn clear_session_wrapped(ks: &impl SessionKeyStore, enc_path: &Path) -> Result<(), String> {
     let _ = remove_session_blob(enc_path);
     let _ = ks.delete_key();
-    let _ = ks.delete_legacy();
     Ok(())
 }
 
@@ -666,35 +637,12 @@ fn reset_cache_for_test() {
     *cred_cache().write().unwrap_or_else(|e| e.into_inner()) = CredCacheInner::default();
 }
 
-/// Best-effort migration: if the identity entry is absent but the session entry still
-/// carries this install's identity (a pre-upgrade session created before the identity
-/// entry existed), promote it into the identity entry so it survives the session being
-/// cleared. Errors are swallowed — a keychain hiccup here must never block sign-out, and
-/// we only ever WRITE the identity entry when it is currently absent, so we cannot clobber
-/// an authoritative identity.
-fn migrate_identity_from_session() {
-    match load_identity() {
-        Ok(Some(_)) => return, // identity already authoritative — nothing to migrate.
-        Ok(None) => {}
-        Err(_) => return, // store unreadable — don't risk a partial write.
-    }
-    if let Ok(Some(s)) = load_session() {
-        if !s.device_sk_b64.is_empty() {
-            let _ = store_identity(&DeviceIdentity {
-                client_id: s.client_id,
-                device_sk_b64: s.device_sk_b64,
-            });
-        }
-    }
-}
-
 /// Sign-out: delete ONLY the session entry (store + cache). The persistent device identity
-/// (§7.1) is preserved — first migrated out of the session entry if the identity entry does
-/// not yet hold it — so a subsequent sign-in on the SAME install presents the SAME
-/// `client_id` and is recognised as the existing device, NOT re-enrolled as a phantom
-/// PENDING one (§7.5). The cache's session is cleared in lock-step so status → disconnected.
+/// (§7.1) is preserved in its own `identity-v1` entry so a subsequent sign-in on the SAME
+/// install presents the SAME `client_id` and is recognised as the existing device, NOT
+/// re-enrolled as a phantom PENDING one (§7.5). The cache's session is cleared in lock-step
+/// so status → disconnected.
 fn clear_session() -> Result<(), String> {
-    migrate_identity_from_session();
     clear_session_from_store()?;
     // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
@@ -707,14 +655,6 @@ fn clear_session() -> Result<(), String> {
 }
 
 // ----- Wire DTOs (camelCase to match lib/sync.ts) -----
-
-#[derive(Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncInfoDto {
-    server_url: String,
-    version: String,
-    billing_url: Option<String>,
-}
 
 #[derive(Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -773,20 +713,12 @@ pub struct SyncStatusDto {
     last_success: Option<String>,
 }
 
-/// `/sync/info` server response (mirror of `yapstack_server` `SyncInfoResponse`).
-#[derive(Deserialize)]
-struct SyncInfoResponse {
-    engine_version: String,
-    billing_url: Option<String>,
-}
-
 // ----- Typed relay connection probe (T025) -----
 //
-// `sync_info` above collapses every failure into one `String`; the redesigned Sync
-// page needs to branch on *why* a probe failed. `sync_probe` returns a TYPED result:
-// reachability / TLS / not-a-relay are distinct error classes, and a version gap is
-// advisory metadata on SUCCESS (never a failure). `sync_info` stays untouched — its
-// callers (signup/billing) keep their current contract; the UI migrates in T026/T027.
+// `sync_probe` returns a TYPED result the redesigned Sync page branches on: reachability /
+// TLS / not-a-relay are distinct error classes, and a version gap is advisory metadata on
+// SUCCESS (never a failure). It is the ONLY relay-metadata call on the client — `billing_url`
+// (self-host vs hosted upgrade affordance) rides on `sync_status` (`SyncStatusDto.billing_url`).
 
 /// Sentinel body for the probe. A 2xx counts as a YapStack relay ONLY if the body
 /// deserializes here with BOTH `protocol_version` and `engine_version` present
@@ -1199,30 +1131,6 @@ fn spawn_drain(
             let sv = SYNC_SCHEMA_VERSION as i32;
             let ev = CRSQLITE_ENGINE_VERSION as i32;
 
-            // Bug B repair: re-chunk any pre-chunking-fix oversized poison entry BEFORE
-            // the first push, so it can no longer wedge the outbox on a 413. Unrepairable
-            // entries (decrypt failed) are held back and surfaced — never dropped.
-            match outbox::repair_oversized_entries(conn, &cipher, client_id, sv, ev) {
-                Ok(report) => {
-                    if report.repaired > 0 {
-                        tracing::info!(
-                            "sync repair: re-chunked {} oversized outbox entry(ies) into {} in-budget entries",
-                            report.repaired,
-                            report.new_entries
-                        );
-                    }
-                    if !report.failed.is_empty() {
-                        let msg = format!(
-                            "{} queued change(s) are too large to sync and could not be repaired (decrypt failed); they are held back.",
-                            report.failed.len()
-                        );
-                        tracing::warn!("sync repair: {msg}");
-                        set_drain_health(DrainHealth::Blocked(msg));
-                    }
-                }
-                Err(e) => tracing::warn!("sync repair pass failed: {e}"),
-            }
-
             // A5: if the persisted access token is already expired/near-expiry, refresh
             // proactively so the first cycle doesn't have to eat a 401 first. Staleness is
             // only a scheduling hint (unverified `exp`); a failure here is non-fatal — the
@@ -1237,10 +1145,9 @@ fn spawn_drain(
             }
 
             // T024: measure the pre-existing backlog ONCE so a big initial sync announces
-            // itself in the log and shows "syncing" in the UI immediately (the repair pass
-            // above may have just re-chunked a poison entry into many in-budget entries).
-            // `had_backlog` gates the one-shot "up to date" transition log; `acked_session`
-            // is the cumulative this-session ack count surfaced in the status payload.
+            // itself in the log and shows "syncing" in the UI immediately. `had_backlog`
+            // gates the one-shot "up to date" transition log; `acked_session` is the
+            // cumulative this-session ack count surfaced in the status payload.
             let mut had_backlog = match outbox::pending(conn) {
                 Ok(p) => {
                     if p.entries > 0 {
@@ -1360,8 +1267,9 @@ fn spawn_drain(
                         }
                         break;
                     }
-                    // Bug B4: a guaranteed-413 entry the repair pass could not fix. Surface
-                    // ONCE (no 5s HTTP hot-loop — the push guard already blocked the call).
+                    // Bug B4: a guaranteed-413 pre-chunking-fix entry too large to push as a
+                    // single request. Surface ONCE (no 5s HTTP hot-loop — the push guard
+                    // already blocked the call).
                     Err(yapstack_sync::SyncError::Oversized { client_seq, size }) => {
                         let msg = format!(
                             "A queued change (#{client_seq}, ~{} MiB on the wire) is too large to sync and was held back.",
@@ -1717,27 +1625,6 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
 
 // ----- Tauri commands (contract mirrors apps/desktop/src/lib/sync.ts) -----
 
-#[tauri::command]
-#[specta::specta]
-pub async fn sync_info(server_url: String) -> Result<SyncInfoDto, String> {
-    let url = format!("{}/sync/info", server_url.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json::<SyncInfoResponse>()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(SyncInfoDto {
-        server_url,
-        version: resp.engine_version,
-        billing_url: resp.billing_url,
-    })
-}
-
 /// Normalize a user-entered relay URL before probing: trim, prepend `https://` when
 /// schemeless (never downgrade an explicit scheme — an http retry is the user's choice,
 /// §1a), and strip trailing slashes so `{url}/sync/info` is well-formed.
@@ -1942,12 +1829,11 @@ async fn probe_relay(
     })
 }
 
-/// Typed relay connection probe (T025). Unlike `sync_info` (which collapses every failure
-/// into one string and remains the caller for signup/billing), this returns a TYPED result
-/// the UI branches on: `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a
-/// version gap is advisory metadata on SUCCESS — never a failure. 5s request budget; the app
-/// version is read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`,
-/// kept in lockstep with tauri.conf.json by the build).
+/// Typed relay connection probe (T025). Returns a TYPED result the UI branches on:
+/// `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a version gap is
+/// advisory metadata on SUCCESS — never a failure. 5s request budget; the app version is
+/// read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`, kept in
+/// lockstep with tauri.conf.json by the build).
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_probe(server_url: String) -> Result<RelayProbeOk, RelayProbeError> {
@@ -2026,24 +1912,6 @@ pub async fn sync_enable(
     session.sync_enabled = true;
     store_session(&session)?;
     Ok(build_status_dto(&session).await)
-}
-
-/// Vault-wrap a plaintext secret (AI apiKey / baseUrl) under the vault key held
-/// in the OS keychain, before it can reach any syncable surface (deliverable E).
-/// The plaintext is consumed here and never persisted; the caller stores only
-/// the returned committing envelope (CRYPTO_SPEC §1.4 / §4).
-#[tauri::command]
-#[specta::specta]
-pub fn sync_wrap_secret(plaintext: String) -> Result<String, String> {
-    let session = load_session()?.ok_or_else(|| "Sign in before wrapping secrets.".to_string())?;
-    let vault_key = session.vault_key()?;
-    let mut nonce = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let aad = yapstack_crypto::aead::lp(&[&[yapstack_crypto::VERSION], SETTING_DOMAIN]);
-    let blob =
-        yapstack_crypto::aead::seal_committing(&vault_key, &nonce, plaintext.as_bytes(), &aad)
-            .map_err(|e| e.to_string())?;
-    Ok(B64.encode(blob))
 }
 
 #[tauri::command]
@@ -2457,33 +2325,6 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
     Ok(build_status_dto(&session).await)
 }
 
-/// `GET /devices` for the UI: the account's device index (pending + active), fingerprinted
-/// for out-of-band comparison (§7.5). Membership truth is the signed roster (client-verified
-/// at login); this index is the relay's advisory view for surfacing pending approvals.
-#[tauri::command]
-#[specta::specta]
-pub async fn sync_device_list() -> Result<Vec<DeviceRosterEntryDto>, String> {
-    let session = load_session()?.ok_or_else(|| "Sign in first.".to_string())?;
-    let devices = http_get_devices(&session).await?;
-    Ok(devices
-        .devices
-        .into_iter()
-        .map(|d| {
-            let pk = B64.decode(d.ed25519_pub.as_bytes()).unwrap_or_default();
-            DeviceRosterEntryDto {
-                fingerprint: device_fingerprint(&pk),
-                is_self: d.client_id == session.client_id,
-                pending: d.status == "pending",
-                label: if d.label.is_empty() {
-                    None
-                } else {
-                    Some(d.label)
-                },
-            }
-        })
-        .collect())
-}
-
 // ----- R1/R2 two-populated-device onboarding (seed / join) -----
 //
 // OWNER DECISION: the Mac (primary ~41 MB DB) SEEDS; the Windows device JOINs. The seed
@@ -2521,8 +2362,11 @@ fn snapshot_scratch_dir(live_db: &Path) -> PathBuf {
 /// encrypted snapshot, and suppress re-pushing the whole history as changesets (the
 /// snapshot carries it). Then start the drain. This device holds the authoritative
 /// library; the other device joins from the snapshot.
-#[tauri::command]
-#[specta::specta]
+///
+/// PARKED — unregistered from the command builder (`lib.rs`), NOT a live command. This is the
+/// future "migrate an existing library" (snapshot bootstrap) feature; it stays compiled with
+/// `reconcile.rs` and re-enters the surface when that feature lands. See SYNC_REMEDIATION.md §6b.
+#[allow(dead_code)]
 pub async fn sync_seed(
     app: tauri::AppHandle,
     runtime: State<'_, SyncRuntimeState>,
@@ -2591,8 +2435,12 @@ pub async fn sync_seed(
 /// fresh CRR base, RECONCILE this device's own local-only rows into it (preserved, with
 /// ambiguous collisions surfaced), then start the drain. NEVER independently
 /// CRRifies-and-merges the live DB (silently lossy). The live DB is only ever READ.
-#[tauri::command]
-#[specta::specta]
+///
+/// PARKED — unregistered from the command builder (`lib.rs`), NOT a live command. This is the
+/// future "migrate an existing library" (snapshot bootstrap + reconcile) feature; it stays
+/// compiled with `reconcile.rs` and re-enters the surface when that feature lands. See
+/// SYNC_REMEDIATION.md §6b.
+#[allow(dead_code)]
 pub async fn sync_join(
     app: tauri::AppHandle,
     runtime: State<'_, SyncRuntimeState>,
@@ -2895,11 +2743,10 @@ mod tests {
         use std::cell::RefCell;
 
         /// In-memory stand-in for the keychain (release) / dev file (debug): holds the tiny
-        /// wrapping key and, optionally, a stale old-style `session-v1` blob for migration.
+        /// wrapping key.
         #[derive(Default)]
         struct FakeKeyStore {
             key: RefCell<Option<String>>,
-            legacy: RefCell<Option<String>>,
         }
         impl SessionKeyStore for FakeKeyStore {
             fn get_key(&self) -> Result<Option<String>, String> {
@@ -2911,13 +2758,6 @@ mod tests {
             }
             fn delete_key(&self) -> Result<(), String> {
                 *self.key.borrow_mut() = None;
-                Ok(())
-            }
-            fn get_legacy(&self) -> Result<Option<String>, String> {
-                Ok(self.legacy.borrow().clone())
-            }
-            fn delete_legacy(&self) -> Result<(), String> {
-                *self.legacy.borrow_mut() = None;
                 Ok(())
             }
         }
@@ -3011,28 +2851,6 @@ mod tests {
             assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
             // The undecryptable orphan file is removed.
             assert!(read_session_blob(&path).unwrap().is_none());
-        }
-
-        #[test]
-        fn legacy_blob_migrates_transparently_and_is_deleted() {
-            let ks = FakeKeyStore::default();
-            let path = temp_enc_path();
-            let s = sample_session();
-            // Simulate an existing macOS install signed in the OLD way (full JSON in `session-v1`)
-            // with no new key/file yet — the owner's Mac must NOT get signed out.
-            *ks.legacy.borrow_mut() = Some(json_of(&s));
-
-            let migrated = load_session_wrapped(&ks, &path).unwrap().unwrap();
-            assert_eq!(json_of(&migrated), json_of(&s));
-            // Old blob deleted; new scheme now owns the session.
-            assert!(ks.get_legacy().unwrap().is_none());
-            assert!(ks.get_key().unwrap().is_some());
-            assert!(read_session_blob(&path).unwrap().is_some());
-
-            // A second read comes straight from the new scheme (no legacy blob left).
-            let again = load_session_wrapped(&ks, &path).unwrap().unwrap();
-            assert_eq!(json_of(&again), json_of(&s));
-            let _ = std::fs::remove_file(&path);
         }
 
         #[test]

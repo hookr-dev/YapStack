@@ -75,8 +75,13 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sync/pull", get(sync::pull::pull))
         .route("/sync/completeness", get(sync::completeness::completeness))
+        // Phase-2 seam: SSE liveness optimization. Mounted but no current client caller —
+        // the desktop drain uses polling pull (spec-compliant). See SYNC_REMEDIATION.md §6b.
         .route("/sync/stream", get(sync::stream::stream))
         // --- audio E2E blobs (§9) ---
+        // Phase-2 seam: audio round-trip is NOT wired on the client yet (no audio transport
+        // calls). These routes are mounted but currently have zero client caller — see
+        // SYNC_REMEDIATION.md §6 (owner decision on audio scope).
         .route("/audio/presign", post(audio::presign))
         .route("/audio/:session_id", get(audio::get))
         // --- R2 snapshot bootstrap (blind opaque blob, §9-style) ---

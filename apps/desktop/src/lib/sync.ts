@@ -161,15 +161,12 @@ export interface LoginBeginResult {
 // ----- IPC boundary (implemented by the Rust `sync` feature) -----
 
 export const syncCommands = {
-  /** `GET /sync/info` against `serverUrl`; surfaces `billingUrl` when advertised. */
-  info: (serverUrl: string): Promise<SyncInfo> =>
-    invoke("sync_info", { serverUrl }),
-
   /** Typed relay probe (T025): reachability / TLS / not-a-relay are distinct classes and a
    *  version gap is advisory metadata on success. Normalizes the URL, enforces a 5s budget,
    *  and applies the 2xx-sentinel check (protocol_version + engine_version) so a bare proxy
    *  200 never reads as connected. Resolves with `RelayProbeOk`; REJECTS with a
-   *  `RelayProbeError` the caller discriminates on `kind`. Leaves `info` untouched. */
+   *  `RelayProbeError` the caller discriminates on `kind`. This is the only relay-metadata
+   *  call; `billingUrl` rides on `sync_status`. */
   probe: (serverUrl: string): Promise<RelayProbeOk> =>
     invoke("sync_probe", { serverUrl }),
 
@@ -209,18 +206,7 @@ export const syncCommands = {
   approveDevice: (fingerprint: string): Promise<SyncStatus> =>
     invoke("sync_approve_device", { fingerprint }),
 
-  /** `GET /devices`: the account's device index (pending + active), fingerprinted for
-   *  out-of-band comparison (§7.5). Membership truth is the client-verified signed
-   *  roster; this is the relay's advisory view used to surface pending approvals. */
-  deviceList: (): Promise<DeviceRosterEntry[]> => invoke("sync_device_list"),
-
   signOut: (): Promise<void> => invoke("sync_sign_out"),
-
-  /** Vault-wrap a plaintext secret (AI apiKey) under the vault key before it can
-   *  reach any syncable surface (§4, deliverable E). Returns the base64
-   *  committing envelope; the plaintext never leaves this call. */
-  wrapSecret: (plaintext: string): Promise<string> =>
-    invoke("sync_wrap_secret", { plaintext }),
 };
 
 // ----- Pure display / parsing helpers (unit-tested, no Tauri) -----
