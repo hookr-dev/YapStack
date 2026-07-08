@@ -208,6 +208,7 @@ export function RelayCard({
             <ProbeResult
               conn={relayConn}
               canSave={!signedIn}
+              savedUrl={savedUrl}
               onSaveAnyway={onSaveAnyway}
             />
           </>
@@ -260,19 +261,28 @@ function ConnectionBadge({ conn }: { conn: RelayConnState }) {
 function ProbeResult({
   conn,
   canSave,
+  savedUrl,
   onSaveAnyway,
 }: {
   conn: RelayConnState;
   canSave: boolean;
+  /** Persisted `syncConfig.serverUrl`; used to confirm the probed URL was saved. */
+  savedUrl: string;
   onSaveAnyway: () => void;
 }) {
   if (conn.kind === "ok") {
+    // A signed-out successful probe auto-persists the normalized URL into syncConfig
+    // (store test-and-save, §0.1). Surface that explicitly — the owner reported seeing
+    // no "save" for the relay connection — by appending "· saved" once the persisted
+    // value matches the probed URL.
+    const persisted = conn.normalizedUrl === savedUrl;
     return (
       <div className="space-y-1">
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
           Connected — engine v{conn.engineVersion} · protocol v
           {conn.protocolVersion} · {conn.latencyMs} ms
+          {persisted && " · saved"}
         </p>
         {conn.versionAdvisory && (
           <p className="text-[11px] text-amber-600 dark:text-amber-400">

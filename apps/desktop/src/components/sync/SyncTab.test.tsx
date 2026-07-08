@@ -138,6 +138,43 @@ describe("SyncTab", () => {
     expect(screen.getByText("42 ms", { exact: false })).toBeInTheDocument();
   });
 
+  it("shows an explicit 'saved' cue once the probed URL is persisted", () => {
+    // A signed-out successful probe auto-persists the normalized URL into syncConfig, so
+    // savedUrl === normalizedUrl → the muted line must read "· saved" (owner asked for an
+    // explicit save cue for the relay connection).
+    setup({
+      serverUrl: "https://relay.example.com",
+      relayConn: {
+        kind: "ok",
+        engineVersion: "0.16.3",
+        protocolVersion: 1,
+        latencyMs: 7,
+        normalizedUrl: "https://relay.example.com",
+        versionAdvisory: null,
+      },
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("saved", { exact: false })).toBeInTheDocument();
+  });
+
+  it("omits the 'saved' cue when the probed URL was not persisted", () => {
+    // normalizedUrl differs from the persisted serverUrl (e.g. a probe of a different URL
+    // that has not been saved) → no "saved" suffix.
+    setup({
+      serverUrl: "https://sync.yapstack.app",
+      relayConn: {
+        kind: "ok",
+        engineVersion: "0.16.3",
+        protocolVersion: 1,
+        latencyMs: 7,
+        normalizedUrl: "https://relay.example.com",
+        versionAdvisory: null,
+      },
+    });
+    render(<SyncTab />);
+    expect(screen.queryByText("saved", { exact: false })).not.toBeInTheDocument();
+  });
+
   it("renders the verbatim raw error + Save anyway on probe failure", () => {
     setup({
       relayConn: {

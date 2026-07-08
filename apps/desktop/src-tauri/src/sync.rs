@@ -60,7 +60,20 @@ use yapstack_sync::{
 };
 
 const KEYCHAIN_SERVICE: &str = "dev.yapstack.app.sync";
+/// LEGACY session account (T019/T020): once held the FULL session JSON (access + refresh
+/// tokens + vault key) as one keychain BLOB. That blob exceeds the Windows Credential Manager
+/// limit (`CRED_MAX_CREDENTIAL_BLOB_SIZE` = 5120 bytes = 2560 UTF-16 chars), which fails
+/// sign-in on Windows release builds. It is NO LONGER written (T029): the session now lives in
+/// a key-wrapped file (see `KEYCHAIN_ACCOUNT_SESSION_KEY` + `session_enc_path`). This name is
+/// kept ONLY as the migration source (an existing macOS install signed in the old way) and as
+/// a best-effort delete target once the new scheme takes over.
 const KEYCHAIN_ACCOUNT: &str = "session-v1";
+/// Session wrapping-key account (T029). Holds ONLY a base64-encoded random 32-byte
+/// XChaCha20-Poly1305 key (~44 chars — far under every platform's credential limit). The
+/// session JSON itself is encrypted under this key and written to `session_enc_path()`; the
+/// keychain never again stores the oversized session BLOB. Same service as the session/identity
+/// entries; distinct account so sign-out clears the key + file without touching `identity-v1`.
+const KEYCHAIN_ACCOUNT_SESSION_KEY: &str = "session-key-v1";
 /// A DISTINCT keychain account (same service) holding ONLY this install's persistent
 /// device identity (§7.1): `client_id` + the Ed25519 signing seed. Deliberately separate
 /// from the session entry so sign-out — which deletes the session entry — never destroys
@@ -77,6 +90,11 @@ const SETTING_DOMAIN: &[u8] = b"yapstack.setting.v1";
 const WRAP_VAULT_PW_DOMAIN: &[u8] = b"yapstack.wrap.vault.pw.v1";
 /// AAD domain for the recovery-wrapped vault key (CRYPTO_SPEC §4.2/§6.2).
 const WRAP_VAULT_REC_DOMAIN: &[u8] = b"yapstack.wrap.vault.rec.v1";
+/// AAD domain binding the at-rest session file envelope (T029). Distinct from every key-wrap /
+/// changeset / setting domain so a session ciphertext can never be confused with another
+/// surface (CRYPTO_SPEC §5 domain separation). Bound as the second AAD field after the
+/// authenticated version byte.
+const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v1";
 /// How often the drain cycles when idle. SSE wakeups (T008) can shorten this
 /// later; a fixed poll is correct and simplest for v1.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -192,6 +210,22 @@ fn dev_store_path() -> PathBuf {
         .join("sync-dev-creds.json")
 }
 
+/// Directory for the key-wrapped session file (T029), set from the app config dir at boot.
+/// Available in BOTH debug and release: the encrypted session file (`sync-session.enc`) is
+/// the same on every platform — only the wrapping KEY's home differs (keychain in release,
+/// dev file in debug, via `store_get/set`).
+static SESSION_STORE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Path to the encrypted at-rest session file (T029). Falls back to the temp dir before
+/// `init_credential_store` runs, mirroring `dev_store_path`.
+fn session_enc_path() -> PathBuf {
+    SESSION_STORE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("sync-session.enc")
+}
+
 #[cfg(debug_assertions)]
 fn dev_read_map() -> Result<std::collections::BTreeMap<String, String>, String> {
     match std::fs::read_to_string(dev_store_path()) {
@@ -263,6 +297,216 @@ fn store_delete(account: &str) -> Result<(), String> {
 
 // ----- Backing-store (de)serialisation of the two logical entries -----
 
+// ----- Key-wrapped session store (T029: Windows credential-blob overflow fix) -----
+//
+// The OS keychain caps credential blobs on Windows (`CRED_MAX_CREDENTIAL_BLOB_SIZE` = 2560
+// UTF-16 chars); the full session JSON (tokens + vault key + roster metadata) blows past it,
+// failing sign-in. macOS Keychain has no such cap, so this only ever surfaced on Windows —
+// but the fix is UNIFORM across platforms (no Windows special-case): the keychain now holds
+// ONLY a random 32-byte wrapping key (base64, ~44 chars); the session JSON is sealed under
+// that key (XChaCha20-Poly1305, matching `yapstack-sync::crypto` conventions — version byte
+// first, random 192-bit nonce, AAD = LP(version, domain)) and written to `sync-session.enc`.
+// `identity-v1` is UNCHANGED (small, and its survives-sign-out semantics from T019 must hold).
+
+/// Seal the session JSON under the wrapping key. Standard envelope
+/// (`0x01 || nonce24 || ct||tag`) via `yapstack-crypto::aead::seal_standard`, AAD =
+/// `LP(version, SESSION_STORE_DOMAIN)` — same construction the changeset/setting surfaces use.
+fn seal_session(wrap_key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let aad = yapstack_crypto::aead::lp(&[&[yapstack_crypto::VERSION], SESSION_STORE_DOMAIN]);
+    yapstack_crypto::aead::seal_standard(wrap_key, &nonce, plaintext, &aad)
+        .map_err(|e| e.to_string())
+}
+
+/// Open a sealed session file. Any failure (wrong key, tamper, truncation, version skew) is a
+/// clean `Err` the caller degrades to signed-out — never a panic.
+fn open_session(wrap_key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+    let aad = yapstack_crypto::aead::lp(&[&[yapstack_crypto::VERSION], SESSION_STORE_DOMAIN]);
+    yapstack_crypto::aead::open_standard(wrap_key, blob, &aad).map_err(|e| e.to_string())
+}
+
+fn decode_wrap_key(b64: &str) -> Result<[u8; 32], String> {
+    let bytes = B64
+        .decode(b64.as_bytes())
+        .map_err(|_| "corrupt session wrapping key".to_string())?;
+    bytes
+        .try_into()
+        .map_err(|_| "session wrapping key wrong length".to_string())
+}
+
+fn new_wrap_key() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    OsRng.fill_bytes(&mut k);
+    k
+}
+
+/// Mockable seam over the wrapping key + legacy session blob, so the wrap/unwrap/migrate/
+/// degrade logic is exercised in `cargo test` against an in-memory fake rather than the real
+/// keychain. The production impl (`KeychainSessionKeyStore`) routes to `store_get/set/delete`
+/// (keychain in release, dev file in debug).
+trait SessionKeyStore {
+    fn get_key(&self) -> Result<Option<String>, String>;
+    fn set_key(&self, b64: &str) -> Result<(), String>;
+    fn delete_key(&self) -> Result<(), String>;
+    /// The old-style full-session JSON blob (`session-v1`), read for one-shot migration.
+    fn get_legacy(&self) -> Result<Option<String>, String>;
+    fn delete_legacy(&self) -> Result<(), String>;
+}
+
+struct KeychainSessionKeyStore;
+impl SessionKeyStore for KeychainSessionKeyStore {
+    fn get_key(&self) -> Result<Option<String>, String> {
+        store_get(KEYCHAIN_ACCOUNT_SESSION_KEY)
+    }
+    fn set_key(&self, b64: &str) -> Result<(), String> {
+        store_set(KEYCHAIN_ACCOUNT_SESSION_KEY, b64)
+    }
+    fn delete_key(&self) -> Result<(), String> {
+        store_delete(KEYCHAIN_ACCOUNT_SESSION_KEY)
+    }
+    fn get_legacy(&self) -> Result<Option<String>, String> {
+        store_get(KEYCHAIN_ACCOUNT)
+    }
+    fn delete_legacy(&self) -> Result<(), String> {
+        store_delete(KEYCHAIN_ACCOUNT)
+    }
+}
+
+fn read_session_blob(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn write_session_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Write-then-rename so a crash mid-write never leaves a torn file that would decrypt-fail.
+    let tmp = path.with_extension("enc.tmp");
+    std::fs::write(&tmp, blob).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn remove_session_blob(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// One-shot transparent migration of an OLD-style `session-v1` full-JSON blob into the new
+/// key-wrapped file scheme. Preserves the owner's signed-in state across the upgrade (the
+/// Mac is signed in the old way right now) and deletes the old blob afterward. A legacy blob
+/// that does not parse as a session is left untouched and treated as signed-out.
+fn migrate_legacy_session(
+    ks: &impl SessionKeyStore,
+    enc_path: &Path,
+) -> Result<Option<Session>, String> {
+    let Some(legacy_json) = ks.get_legacy()? else {
+        return Ok(None);
+    };
+    let Ok(session) = serde_json::from_str::<Session>(&legacy_json) else {
+        return Ok(None);
+    };
+    store_session_wrapped(ks, enc_path, &session)?;
+    let _ = ks.delete_legacy();
+    Ok(Some(session))
+}
+
+/// Read the session: keychain key + encrypted file → decrypt → session. Missing file OR
+/// missing key OR decrypt failure → signed-out (clean degrade). Inconsistent components (a
+/// stray key without a file, or vice versa) are cleaned up best-effort, then a legacy blob is
+/// migrated if present.
+fn load_session_wrapped(
+    ks: &impl SessionKeyStore,
+    enc_path: &Path,
+) -> Result<Option<Session>, String> {
+    match (ks.get_key()?, read_session_blob(enc_path)?) {
+        (Some(key_b64), Some(blob)) => {
+            // Corrupt key or AEAD failure (wrong key / tamper / truncation) → signed-out. We do
+            // NOT delete here: a genuinely tampered file is unrecoverable and the next sign-in
+            // overwrites it, but a transient keychain read must never destroy a session file.
+            let Ok(key) = decode_wrap_key(&key_b64) else {
+                return Ok(None);
+            };
+            match open_session(&key, &blob) {
+                Ok(json) => match serde_json::from_slice::<Session>(&json) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(_) => Ok(None),
+                },
+                Err(_) => Ok(None),
+            }
+        }
+        // Stray wrapping key with no file: clean it up, then look for a legacy blob to migrate.
+        (Some(_), None) => {
+            let _ = ks.delete_key();
+            migrate_legacy_session(ks, enc_path)
+        }
+        // Orphan file with no key: it can never be decrypted — remove it, then try migration.
+        (None, Some(_)) => {
+            let _ = remove_session_blob(enc_path);
+            migrate_legacy_session(ks, enc_path)
+        }
+        (None, None) => migrate_legacy_session(ks, enc_path),
+    }
+}
+
+/// Persist the session under the wrapping scheme: load-or-create the 32-byte wrapping key
+/// (generated on first persist), seal the JSON, write the file, and best-effort drop any stale
+/// legacy blob now that the new scheme owns the session.
+fn store_session_wrapped(
+    ks: &impl SessionKeyStore,
+    enc_path: &Path,
+    s: &Session,
+) -> Result<(), String> {
+    let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    let key = match ks.get_key()? {
+        Some(key_b64) => match decode_wrap_key(&key_b64) {
+            Ok(k) => k,
+            // A corrupt existing key would strand the new ciphertext — replace it.
+            Err(_) => {
+                let k = new_wrap_key();
+                ks.set_key(&B64.encode(k))?;
+                k
+            }
+        },
+        None => {
+            let k = new_wrap_key();
+            ks.set_key(&B64.encode(k))?;
+            k
+        }
+    };
+    let blob = seal_session(&key, json.as_bytes())?;
+    write_session_blob(enc_path, &blob)?;
+    // Best-effort: the old oversized keychain blob is now superseded (also handles the rename
+    // from `session-v1` → `session-key-v1` on first run).
+    let _ = ks.delete_legacy();
+    Ok(())
+}
+
+/// Sign-out cleanup for the wrapped store: delete the file, the wrapping key, and any stale
+/// legacy blob. Best-effort (a keychain/file hiccup must never block sign-out). `identity-v1`
+/// is untouched here — its preservation is handled by the caller (`clear_session`, T019).
+fn clear_session_wrapped(ks: &impl SessionKeyStore, enc_path: &Path) -> Result<(), String> {
+    let _ = remove_session_blob(enc_path);
+    let _ = ks.delete_key();
+    let _ = ks.delete_legacy();
+    Ok(())
+}
+
+// DEBUG keeps the plaintext dev-file store UNCHANGED: the session is one JSON value under
+// `session-v1` in `sync-dev-creds.json`. There is no Windows credential-blob limit on a local
+// dev file, and the dev store is plaintext-by-design (developer's own machine, T020). The
+// key-wrapping scheme is exercised in debug via the unit tests' in-memory `SessionKeyStore`
+// fake, not the dev file, so the production RELEASE path is fully covered without perturbing
+// the dev store. RELEASE routes the session through the key-wrapped file (Windows-safe).
+
+#[cfg(debug_assertions)]
 fn load_session_from_store() -> Result<Option<Session>, String> {
     match store_get(KEYCHAIN_ACCOUNT)? {
         Some(json) => serde_json::from_str(&json)
@@ -272,9 +516,30 @@ fn load_session_from_store() -> Result<Option<Session>, String> {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn load_session_from_store() -> Result<Option<Session>, String> {
+    load_session_wrapped(&KeychainSessionKeyStore, &session_enc_path())
+}
+
+#[cfg(debug_assertions)]
 fn store_session_to_store(s: &Session) -> Result<(), String> {
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
     store_set(KEYCHAIN_ACCOUNT, &json)
+}
+
+#[cfg(not(debug_assertions))]
+fn store_session_to_store(s: &Session) -> Result<(), String> {
+    store_session_wrapped(&KeychainSessionKeyStore, &session_enc_path(), s)
+}
+
+#[cfg(debug_assertions)]
+fn clear_session_from_store() -> Result<(), String> {
+    store_delete(KEYCHAIN_ACCOUNT)
+}
+
+#[cfg(not(debug_assertions))]
+fn clear_session_from_store() -> Result<(), String> {
+    clear_session_wrapped(&KeychainSessionKeyStore, &session_enc_path())
 }
 
 fn load_identity_from_store() -> Result<Option<DeviceIdentity>, String> {
@@ -348,13 +613,11 @@ fn ensure_cache_loaded() {
 /// cache once, so the first `sync_status` poll never blocks on the store. In release the
 /// path arg is unused (the keychain needs no directory).
 pub fn init_credential_store(config_dir: &Path) {
+    // The key-wrapped session file (T029) lives here on every platform.
+    let _ = SESSION_STORE_DIR.set(config_dir.to_path_buf());
     #[cfg(debug_assertions)]
     {
         let _ = DEV_STORE_DIR.set(config_dir.to_path_buf());
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = config_dir;
     }
     ensure_cache_loaded();
 }
@@ -432,7 +695,7 @@ fn migrate_identity_from_session() {
 /// PENDING one (§7.5). The cache's session is cleared in lock-step so status → disconnected.
 fn clear_session() -> Result<(), String> {
     migrate_identity_from_session();
-    store_delete(KEYCHAIN_ACCOUNT)?;
+    clear_session_from_store()?;
     // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
     set_drain_health(DrainHealth::Ok);
@@ -1505,9 +1768,17 @@ fn parse_semver_core(v: &str) -> Option<(u64, u64, u64, bool)> {
 }
 
 /// True when `app_version` is strictly older than the relay's published
-/// `min_client_version` (→ "update this app"). Same-core pre-releases (e.g.
-/// `1.0.0-alpha` vs `1.0.0`) count the pre-release as older, per semver §11. Unparseable
-/// inputs → `false` (no advisory); we never manufacture an advisory from garbage.
+/// `min_client_version` (→ "update this app"). Unparseable inputs → `false` (no advisory);
+/// we never manufacture an advisory from garbage.
+///
+/// POLICY (T029 Bug B): compare RELEASE CORES ONLY — a pre-release of `X.Y.Z` SATISFIES a
+/// minimum of `X.Y.Z` and is NOT flagged. Rationale: the advisory exists solely to nag
+/// genuinely outdated clients, and the relay publishes a single release-shaped minimum — it
+/// cannot meaningfully express a prerelease floor (a server that wanted to bar
+/// `1.0.0-alpha.11` but allow `1.0.0-alpha.12` has no way to say so). Treating our own
+/// in-development `1.0.0-alpha.12` as "older than 1.0.0" produced a false "update YapStack"
+/// nag against the relay's own advertised `1.0.0` during Windows UAT; comparing cores only
+/// fixes that without ever hiding a real major/minor/patch gap.
 fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
     let (Some(a), Some(m)) = (
         parse_semver_core(app_version),
@@ -1515,12 +1786,8 @@ fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
     ) else {
         return false;
     };
-    let (acore, mcore) = ((a.0, a.1, a.2), (m.0, m.1, m.2));
-    if acore != mcore {
-        return acore < mcore;
-    }
-    // Same numeric core: a pre-release of the required release is older than the release.
-    a.3 && !m.3
+    // Release cores only; the parsed pre-release flag is deliberately ignored (see POLICY).
+    (a.0, a.1, a.2) < (m.0, m.1, m.2)
 }
 
 /// Build the version advisory when this client is behind the relay's minimum. Advisory
@@ -2617,6 +2884,186 @@ mod tests {
         .is_err());
     }
 
+    // ----- Key-wrapped session store (T029) -----
+    //
+    // Exercises the RELEASE session store's crypto/file/migration/degrade logic against an
+    // in-memory `SessionKeyStore` fake + a temp file (the "mockable keychain seam"), so the
+    // production path is verified in `cargo test` (a debug build) without a real keychain and
+    // without perturbing the dev-file store.
+    mod session_store {
+        use super::super::*;
+        use std::cell::RefCell;
+
+        /// In-memory stand-in for the keychain (release) / dev file (debug): holds the tiny
+        /// wrapping key and, optionally, a stale old-style `session-v1` blob for migration.
+        #[derive(Default)]
+        struct FakeKeyStore {
+            key: RefCell<Option<String>>,
+            legacy: RefCell<Option<String>>,
+        }
+        impl SessionKeyStore for FakeKeyStore {
+            fn get_key(&self) -> Result<Option<String>, String> {
+                Ok(self.key.borrow().clone())
+            }
+            fn set_key(&self, b64: &str) -> Result<(), String> {
+                *self.key.borrow_mut() = Some(b64.to_string());
+                Ok(())
+            }
+            fn delete_key(&self) -> Result<(), String> {
+                *self.key.borrow_mut() = None;
+                Ok(())
+            }
+            fn get_legacy(&self) -> Result<Option<String>, String> {
+                Ok(self.legacy.borrow().clone())
+            }
+            fn delete_legacy(&self) -> Result<(), String> {
+                *self.legacy.borrow_mut() = None;
+                Ok(())
+            }
+        }
+
+        fn temp_enc_path() -> PathBuf {
+            std::env::temp_dir().join(format!("yapstack-sess-test-{}.enc", Uuid::new_v4()))
+        }
+
+        /// A session with realistically LARGE token/key material — the exact payload that
+        /// overflowed the Windows keychain when stored inline.
+        fn sample_session() -> Session {
+            Session {
+                server_url: "https://relay.example.com".into(),
+                email: "owner@example.com".into(),
+                vault_key_b64: B64.encode([9u8; 32]),
+                epoch: 3,
+                tenant_id: Uuid::from_u128(77),
+                // Two ~800-char JWT-shaped tokens: comfortably over the 2560-UTF-16 cap.
+                bearer: "h.".to_string() + &"A".repeat(800) + ".sig",
+                refresh_token: Some("r.".to_string() + &"B".repeat(800) + ".sig"),
+                device_fingerprint: Some("AAAABBBBCCCCDDDD".into()),
+                sync_enabled: true,
+                client_id: Uuid::from_u128(1234),
+                device_sk_b64: B64.encode([7u8; 32]),
+                salt_enc_b64: Some(B64.encode([2u8; 16])),
+                roster_counter: 5,
+                roster_fingerprint: Some("EEEEFFFFGGGGHHHH".into()),
+            }
+        }
+
+        fn json_of(s: &Session) -> String {
+            serde_json::to_string(s).unwrap()
+        }
+
+        #[test]
+        fn wrap_unwrap_roundtrip_through_file() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let s = sample_session();
+            store_session_wrapped(&ks, &path, &s).unwrap();
+
+            // The on-disk bytes are ciphertext (version byte + nonce + AEAD ct), not plaintext.
+            let raw = std::fs::read(&path).unwrap();
+            assert_eq!(raw[0], yapstack_crypto::VERSION, "version byte first");
+            assert!(!raw.windows(5).any(|w| w == b"owner"), "no plaintext email");
+            assert!(!raw.windows(4).any(|w| w == b"relay"), "no plaintext URL");
+
+            let loaded = load_session_wrapped(&ks, &path).unwrap().unwrap();
+            assert_eq!(json_of(&loaded), json_of(&s));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn tampered_file_degrades_to_signed_out() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+
+            // Flip one ciphertext byte (past the version byte) → AEAD open must fail cleanly.
+            let mut raw = std::fs::read(&path).unwrap();
+            let last = raw.len() - 1;
+            raw[last] ^= 0x01;
+            std::fs::write(&path, &raw).unwrap();
+
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_none(),
+                "a tampered session file must degrade to signed-out, never a session"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn missing_file_degrades_and_cleans_stray_key() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+
+            assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
+            // The orphaned wrapping key is cleaned up so the next boot starts clean.
+            assert!(ks.get_key().unwrap().is_none());
+        }
+
+        #[test]
+        fn missing_key_degrades_and_cleans_orphan_file() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            ks.delete_key().unwrap();
+
+            assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
+            // The undecryptable orphan file is removed.
+            assert!(read_session_blob(&path).unwrap().is_none());
+        }
+
+        #[test]
+        fn legacy_blob_migrates_transparently_and_is_deleted() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let s = sample_session();
+            // Simulate an existing macOS install signed in the OLD way (full JSON in `session-v1`)
+            // with no new key/file yet — the owner's Mac must NOT get signed out.
+            *ks.legacy.borrow_mut() = Some(json_of(&s));
+
+            let migrated = load_session_wrapped(&ks, &path).unwrap().unwrap();
+            assert_eq!(json_of(&migrated), json_of(&s));
+            // Old blob deleted; new scheme now owns the session.
+            assert!(ks.get_legacy().unwrap().is_none());
+            assert!(ks.get_key().unwrap().is_some());
+            assert!(read_session_blob(&path).unwrap().is_some());
+
+            // A second read comes straight from the new scheme (no legacy blob left).
+            let again = load_session_wrapped(&ks, &path).unwrap().unwrap();
+            assert_eq!(json_of(&again), json_of(&s));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn keychain_payload_stays_tiny_and_identity_has_headroom() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+
+            // What the keychain now holds for the session is ONLY the base64 wrapping key.
+            let key_val = ks.get_key().unwrap().expect("wrapping key persisted");
+            assert!(
+                key_val.chars().count() < 200,
+                "keychain session payload must be < 200 chars (was {})",
+                key_val.chars().count()
+            );
+
+            // `identity-v1` is unchanged and must keep comfortable headroom under the Windows
+            // 2560-UTF-16 credential cap.
+            let identity = DeviceIdentity {
+                client_id: Uuid::from_u128(1234),
+                device_sk_b64: B64.encode([7u8; 32]),
+            };
+            let id_len = serde_json::to_string(&identity).unwrap().chars().count();
+            assert!(
+                id_len < 2560,
+                "identity-v1 must stay under the Windows cap (was {id_len})"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     // ----- Typed relay connection probe (T025) -----
     //
     // Live-server cases use a one-shot raw-HTTP responder over a loopback socket (no extra
@@ -2820,15 +3267,19 @@ mod tests {
 
         #[test]
         fn version_advisory_direction_and_edges() {
-            // Older core → advisory ("update this app").
+            // Older core → advisory ("update this app"). (T029: this genuine gap still nags.)
             assert!(compute_version_advisory("0.9.0", "1.0.0").is_some());
             // Equal or newer → no advisory (never "the server is behind").
             assert!(compute_version_advisory("1.0.0", "1.0.0").is_none());
             assert!(compute_version_advisory("1.2.0", "1.0.0").is_none());
-            // Same-core pre-release is older than the release (semver §11).
-            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_some());
-            // A release is NOT older than its own pre-release.
+            // T029 Bug B policy: a pre-release of the required release SATISFIES the minimum
+            // (compare release cores only). The owner's own `1.0.0-alpha.12` build must NOT
+            // nag itself against the relay's advertised `1.0.0`.
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_none());
+            // A release is NOT older than its own pre-release (cores equal → satisfied).
             assert!(compute_version_advisory("1.0.0", "1.0.0-alpha.1").is_none());
+            // A genuinely older core is still flagged even when it carries a pre-release tag.
+            assert!(compute_version_advisory("0.9.0-beta.1", "1.0.0").is_some());
             // Unparseable server value → no manufactured advisory.
             assert!(compute_version_advisory("1.0.0", "not-a-version").is_none());
         }
