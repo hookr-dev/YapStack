@@ -63,7 +63,7 @@ vi.mock("@/lib/db", () => {
   };
 });
 
-vi.mock("@tauri-apps/plugin-sql", () => ({
+vi.mock("@/lib/db-backend", () => ({
   default: { load: vi.fn() },
 }));
 

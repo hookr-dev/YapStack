@@ -1,6 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use tauri_plugin_sql::{Migration, MigrationKind};
+/// A single schema migration. Repo-owned (replaces `tauri_plugin_sql::Migration`
+/// after the Option A′ backend swap); applied by [`crate::db_service::run_migrations`],
+/// which preserves continuity with the plugin's `_sqlx_migrations` bookkeeping.
+/// All migrations are `Up`, so there is no `kind` discriminant.
+pub struct Migration {
+    pub version: i64,
+    pub description: &'static str,
+    pub sql: &'static str,
+}
 
 /// Row to insert into `session_audio_parts`. Mirrors the columns in the v15
 /// migration; constructed by both the live finalize path and reconciliation.
@@ -17,13 +25,13 @@ pub struct AudioPartRow {
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
 /// live in the frontend's `getDb()` so they run after migrations on fresh installs.
 pub fn ensure_runtime_schema(db_path: &Path) {
-    use rusqlite::Connection;
-
     if !db_path.exists() {
         return;
     }
 
-    let conn = match Connection::open(db_path) {
+    // Routed through the shared connection helper so it runs on a
+    // cr-sqlite-initialized connection under the `sync` feature (A3-ready).
+    let managed = match crate::db_service::open_managed(db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -33,8 +41,9 @@ pub fn ensure_runtime_schema(db_path: &Path) {
             return;
         }
     };
+    let conn = managed.conn();
 
-    if !table_exists(&conn, "segments") {
+    if !table_exists(conn, "segments") {
         return;
     }
 
@@ -49,7 +58,7 @@ pub fn ensure_runtime_schema(db_path: &Path) {
         [],
     );
 
-    close_orphaned_recordings(&conn);
+    close_orphaned_recordings(conn);
 }
 
 /// Records `dir` in `audio_save_locations`. Called at recording start with
@@ -60,10 +69,11 @@ pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
     if !db_path.exists() {
         return;
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return;
     };
-    if !table_exists(&conn, "audio_save_locations") {
+    let conn = managed.conn();
+    if !table_exists(conn, "audio_save_locations") {
         // Should already exist via ensure_runtime_schema; create if not.
         let _ = conn.execute(
             "CREATE TABLE IF NOT EXISTS audio_save_locations (\
@@ -166,7 +176,8 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
 /// crash that leaves a row already inserted is recoverable on retry.
 pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
     use rusqlite::params;
-    let conn = rusqlite::Connection::open(db_path)?;
+    let managed = crate::db_service::open_managed(db_path)?;
+    let conn = managed.conn();
     let id = format!(
         "{:016x}{:016x}",
         rand_u64_from_clock(),
@@ -215,10 +226,11 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     if !db_path.exists() {
         return out.into_iter().collect();
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return out.into_iter().collect();
     };
-    if !table_exists(&conn, "session_audio_parts") {
+    let conn = managed.conn();
+    if !table_exists(conn, "session_audio_parts") {
         return out.into_iter().collect();
     }
     if let Ok(mut stmt) = conn
@@ -239,7 +251,7 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     // a brand-new custom dir whose first run has not yet committed). It
     // closes the gap where reconciliation would otherwise never visit a
     // newly-chosen audioSaveLocation.
-    if table_exists(&conn, "audio_save_locations") {
+    if table_exists(conn, "audio_save_locations") {
         if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
                 for dir in rows.flatten() {
@@ -261,10 +273,11 @@ pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
     if !db_path.exists() {
         return;
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return;
     };
-    if !table_exists(&conn, "session_audio_parts") || !table_exists(&conn, "sessions") {
+    let conn = managed.conn();
+    if !table_exists(conn, "session_audio_parts") || !table_exists(conn, "sessions") {
         return;
     }
 
@@ -463,7 +476,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_segments_offset ON segments(session_id, audio_offset_seconds);
             CREATE INDEX idx_sessions_created ON sessions(created_at DESC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 2,
@@ -485,7 +497,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_sessions_folder ON sessions(folder_id);
             CREATE INDEX idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 3,
@@ -496,7 +507,6 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE segments ADD COLUMN deleted_at TEXT;
             ALTER TABLE segments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 4,
@@ -521,7 +531,6 @@ pub fn migrations() -> Vec<Migration> {
 
             ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'transcription';
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 5,
@@ -530,7 +539,6 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN wav_file_path TEXT;
             ALTER TABLE sessions ADD COLUMN wav_duration_seconds REAL;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 6,
@@ -549,7 +557,6 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_shares_folder ON shares(folder_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 7,
@@ -566,7 +573,6 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id, created_at ASC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 8,
@@ -589,7 +595,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 9,
@@ -613,7 +618,6 @@ pub fn migrations() -> Vec<Migration> {
             INSERT INTO session_folders (session_id, folder_id)
             SELECT id, folder_id FROM sessions WHERE folder_id IS NOT NULL;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 10,
@@ -636,7 +640,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_dictation_history_created ON dictation_history(created_at DESC);
             CREATE INDEX idx_dictation_history_slot ON dictation_history(slot_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 11,
@@ -663,7 +666,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_session_tags_tag ON session_tags(tag_id);
             CREATE INDEX idx_session_tags_session ON session_tags(session_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 12,
@@ -777,7 +779,6 @@ pub fn migrations() -> Vec<Migration> {
                     VALUES (new.id, new.output_text, new.input_text);
             END;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 13,
@@ -785,7 +786,6 @@ pub fn migrations() -> Vec<Migration> {
             sql: r#"
             ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 14,
@@ -823,7 +823,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_chat_messages_send
                 ON chat_messages(context_key, send_id, sequence);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 15,
@@ -879,7 +878,6 @@ pub fn migrations() -> Vec<Migration> {
             FROM sessions
             WHERE wav_file_path IS NOT NULL;
         "#,
-            kind: MigrationKind::Up,
         },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
@@ -956,17 +954,6 @@ mod tests {
         // v11 should create tags and session_tags
         assert!(m[10].sql.contains("CREATE TABLE tags"));
         assert!(m[10].sql.contains("CREATE TABLE session_tags"));
-    }
-
-    #[test]
-    fn test_all_migrations_are_up() {
-        for m in migrations() {
-            assert!(
-                matches!(m.kind, MigrationKind::Up),
-                "migration v{} should be an Up migration",
-                m.version
-            );
-        }
     }
 
     #[test]

@@ -21,8 +21,10 @@ tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-# Used by `db::ensure_runtime_schema` to perform a single direct ALTER TABLE
-# at startup (out-of-band of tauri-plugin-sql's migration list).
+# Backs the repo-owned `db_service` command pool (Option A′ stage 2) that
+# replaced tauri-plugin-sql, plus `db`'s ad-hoc startup writers. `bundled`
+# pins the SQLite build. Same 0.32 that yapstack-sync uses, so the
+# `rusqlite::Connection` type unifies across the `sync` feature boundary.
 rusqlite = { version = "0.32", features = ["bundled"] }
 hound = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
@@ -30,12 +32,11 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+specta = { version = "=2.0.0-rc.22", features = ["derive", "serde_json"] }
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 tokio = { workspace = true }
 futures-util = { workspace = true }
-tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-global-shortcut = "2"

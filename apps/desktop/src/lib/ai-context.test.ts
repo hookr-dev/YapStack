@@ -27,7 +27,7 @@ vi.mock("@/lib/db", () => ({
   listTags: vi.fn().mockResolvedValue([]),
   listFolders: vi.fn().mockResolvedValue([]),
 }));
-vi.mock("@tauri-apps/plugin-sql", () => ({
+vi.mock("@/lib/db-backend", () => ({
   default: { load: vi.fn() },
 }));
 

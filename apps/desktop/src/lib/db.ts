@@ -1,4 +1,4 @@
-import Database from "@tauri-apps/plugin-sql";
+import Database, { type DbConnection } from "./db-backend";
 import { stripHtml } from "./utils";
 
 // --- Types ---
@@ -167,9 +167,9 @@ export interface DbChatMessage {
 
 // --- Singleton ---
 
-let dbInstance: Database | null = null;
+let dbInstance: DbConnection | null = null;
 
-async function getDb(): Promise<Database> {
+async function getDb(): Promise<DbConnection> {
   if (!dbInstance) {
     dbInstance = await Database.load("sqlite:yapstack.db");
     await ensureRuntimeSchema(dbInstance);
@@ -185,7 +185,7 @@ async function getDb(): Promise<Database> {
  * `IF NOT EXISTS` or are wrapped with `.catch()` so the duplicate-column /
  * duplicate-table error on subsequent runs is a silent no-op.
  */
-async function ensureRuntimeSchema(db: Database): Promise<void> {
+async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
   // Single-column patches (column-add only).
   await db
     .execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER")

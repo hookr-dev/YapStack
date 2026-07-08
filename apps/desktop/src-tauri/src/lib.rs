@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod db_service;
 mod device_broker;
 mod logging;
 mod system_volume;
@@ -325,6 +326,8 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
+            db_service::db_execute,
+            db_service::db_select,
         ]);
     #[cfg(feature = "sync")]
     let specta_builder =
@@ -375,6 +378,8 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
+            db_service::db_execute,
+            db_service::db_select,
             sync::sync_probe,
             sync::sync_status,
             sync::sync_signup,
@@ -447,12 +452,12 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_http::init())
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:yapstack.db", db::migrations())
-                .build(),
-        );
+        .plugin(tauri_plugin_http::init());
+    // NOTE: tauri-plugin-sql was removed (Option A′ stage 2). The app's live
+    // `yapstack.db` is now served by the repo-owned `db_service` command backend
+    // (see `db_service::db_execute` / `db_select`), which owns a cr-sqlite-capable
+    // connection pool and runs the migration list in-repo. The service and its
+    // startup migrations are created in `setup`, before `backend_ready` is set.
 
     // Only init Aptabase when the key was provided at compile time (prod builds)
     if let Some(key) = option_env!("APTABASE_KEY") {
@@ -649,6 +654,18 @@ pub fn run() {
             // "state not managed". (The frontend additionally gates on
             // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
+
+            // Repo-owned DB command backend (Option A′ stage 2). Opening the
+            // service runs the in-repo migration list on its writer connection
+            // BEFORE any `db_execute`/`db_select` command can be served, and
+            // before `backend_ready` unblocks the frontend. Migration continuity
+            // with the removed tauri-plugin-sql is preserved via the existing
+            // `_sqlx_migrations` bookkeeping (see `db_service::run_migrations`).
+            let db_service = Arc::new(
+                db_service::DbService::open(&db_path)
+                    .expect("failed to open repo-owned DB service"),
+            );
+            app.manage(db_service as db_service::DbServiceState);
 
             // YapStack Sync runtime (deliverable A): manage the drain handle and,
             // if the keychain holds an enabled session, start the encrypted

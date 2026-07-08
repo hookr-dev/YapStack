@@ -475,6 +475,29 @@ async logFrontend(level: FrontendLogLevel, module: string | null, message: strin
 }
 },
 /**
+ * `db.execute(sql, params)` — write path. Rejects on SQL error so the
+ * frontend's `.catch()` on idempotent runtime patches keeps working.
+ */
+async dbExecute(query: string, values: JsonValue[]) : Promise<Result<DbExecuteResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("db_execute", { query, values }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * `db.select(sql, params)` — read path. Returns rows as JSON objects.
+ */
+async dbSelect(query: string, values: JsonValue[]) : Promise<Result<(Partial<{ [key in string]: JsonValue }>)[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("db_select", { query, values }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Typed relay connection probe (T025). Returns a TYPED result the UI branches on:
  * `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a version gap is
  * advisory metadata on SUCCESS — never a failure. 5s request budget; the app version is
@@ -617,6 +640,10 @@ export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; sy
  * Auto-generated TypeScript types via specta.
  */
 export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
+/**
+ * Result of a `db_execute`, matching tauri-plugin-sql's `QueryResult` shape.
+ */
+export type DbExecuteResult = { rowsAffected: number; lastInsertId: number }
 export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**
@@ -634,6 +661,7 @@ export type EngineKindDto = "Whisper" | "Parakeet"
  */
 export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
+export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Routing identity of a live-transcription runtime. `Session` is the
  * long-running recording flow that writes session audio parts; `Dictation`

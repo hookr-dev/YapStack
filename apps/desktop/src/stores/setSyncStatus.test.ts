@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => tauriEventMock());
 vi.mock("@tauri-apps/api/window", () => tauriWindowMock());
 vi.mock("@tauri-apps/api/dpi", () => tauriDpiMock());
 vi.mock("@tauri-apps/api/webviewWindow", () => tauriWebviewWindowMock());
-vi.mock("@tauri-apps/plugin-sql", () => tauriSqlMock());
+vi.mock("@/lib/db-backend", () => tauriSqlMock());
 vi.mock("@/lib/tauri", () => tauriCommandsMock());
 vi.mock("sonner", () => ({
   toast: { info: vi.fn(), error: vi.fn(), warning: vi.fn(), success: vi.fn() },
