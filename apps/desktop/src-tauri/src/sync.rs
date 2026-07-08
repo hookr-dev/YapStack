@@ -61,6 +61,13 @@ use yapstack_sync::{
 
 const KEYCHAIN_SERVICE: &str = "dev.yapstack.app.sync";
 const KEYCHAIN_ACCOUNT: &str = "session-v1";
+/// A DISTINCT keychain account (same service) holding ONLY this install's persistent
+/// device identity (§7.1): `client_id` + the Ed25519 signing seed. Deliberately separate
+/// from the session entry so sign-out — which deletes the session entry — never destroys
+/// the identity. If the two shared one entry, sign-out→sign-in on the SAME machine would
+/// lose the id, mint a fresh one, and re-enrol as a phantom PENDING device (§7.5). This
+/// entry survives sign-out; only the session entry is cleared.
+const KEYCHAIN_ACCOUNT_IDENTITY: &str = "identity-v1";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 /// AAD domain for a vault-wrapped device setting secret (AI apiKey). Distinct
 /// from the changeset / audio / share domains so a wrapped setting can never be
@@ -126,8 +133,75 @@ impl Session {
     }
 }
 
+/// This install's persistent device identity (§7.1), held in its OWN keychain entry so it
+/// SURVIVES sign-out. `client_id` is the stable §7.1 UUIDv4; `device_sk_b64` is the private
+/// Ed25519 signing seed — kept in the keychain, NEVER transmitted (only the public key is
+/// listed in the roster, §7.5). The session entry may still carry a convenience copy, but
+/// THIS entry is the single source of truth for identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceIdentity {
+    client_id: Uuid,
+    /// base64 of this device's 32-byte Ed25519 signing seed (§7.1).
+    device_sk_b64: String,
+}
+
+impl DeviceIdentity {
+    fn seed(&self) -> Result<[u8; 32], String> {
+        let bytes = B64
+            .decode(self.device_sk_b64.as_bytes())
+            .map_err(|_| "corrupt device_sk in keychain".to_string())?;
+        bytes
+            .try_into()
+            .map_err(|_| "device_sk wrong length".to_string())
+    }
+}
+
 fn keychain_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+}
+
+fn identity_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_IDENTITY).map_err(|e| e.to_string())
+}
+
+fn load_identity() -> Result<Option<DeviceIdentity>, String> {
+    match identity_entry()?.get_password() {
+        Ok(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        // No identity entry yet = fresh install (or pre-upgrade session-only install).
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn store_identity(id: &DeviceIdentity) -> Result<(), String> {
+    let json = serde_json::to_string(id).map_err(|e| e.to_string())?;
+    identity_entry()?
+        .set_password(&json)
+        .map_err(|e| e.to_string())
+}
+
+/// Best-effort migration: if the identity entry is absent but the session entry still
+/// carries this install's identity (a pre-upgrade session created before the identity
+/// entry existed), promote it into the identity entry so it survives the session being
+/// cleared. Errors are swallowed — a keychain hiccup here must never block sign-out, and
+/// we only ever WRITE the identity entry when it is currently absent, so we cannot clobber
+/// an authoritative identity.
+fn migrate_identity_from_session() {
+    match load_identity() {
+        Ok(Some(_)) => return, // identity already authoritative — nothing to migrate.
+        Ok(None) => {}
+        Err(_) => return, // keychain unreadable — don't risk a partial write.
+    }
+    if let Ok(Some(s)) = load_session() {
+        if !s.device_sk_b64.is_empty() {
+            let _ = store_identity(&DeviceIdentity {
+                client_id: s.client_id,
+                device_sk_b64: s.device_sk_b64,
+            });
+        }
+    }
 }
 
 fn load_session() -> Result<Option<Session>, String> {
@@ -148,7 +222,12 @@ fn store_session(s: &Session) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Sign-out: delete ONLY the session entry. The persistent device identity (§7.1) is
+/// preserved — first migrated out of the session entry if the identity entry does not yet
+/// hold it — so a subsequent sign-in on the SAME install presents the SAME `client_id` and
+/// is recognised as the existing device, NOT re-enrolled as a phantom PENDING one (§7.5).
 fn clear_session() -> Result<(), String> {
+    migrate_identity_from_session();
     match keychain_entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -350,6 +429,7 @@ pub fn start_drain_if_enabled(live_db: &Path, runtime: &SyncRuntimeState) {
         vault_key,
         session.epoch,
         session.tenant_id,
+        session.client_id,
     ) {
         Ok(handle) => {
             if let Ok(mut g) = runtime.lock() {
@@ -373,6 +453,10 @@ fn spawn_drain(
     vault_key: [u8; 32],
     epoch: u32,
     tenant_id: Uuid,
+    // This install's persistent §7.1 client_id (from the identity keychain entry, via the
+    // session). Passed in — rather than minted per-DB by `state::client_id` — so the device
+    // that AUTHORS changesets is the SAME device listed in the signed roster (§7.5).
+    client_id: Uuid,
 ) -> Result<DrainHandle, String> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = shutdown.clone();
@@ -404,13 +488,6 @@ fn spawn_drain(
                 tracing::error!("sync drain: outbox table: {e}");
                 return;
             }
-            let client_id = match state::client_id(conn) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!("sync drain: client_id: {e}");
-                    return;
-                }
-            };
             let transport = HttpTransport::new(server_url, bearer);
             let cipher = ChangesetCipher::new(
                 vault_key,
@@ -668,26 +745,51 @@ async fn http_get_devices(session: &Session) -> Result<DevicesResponse, String> 
     .await
 }
 
-/// Reuse this install's device identity if the keychain already holds one for this
-/// account, else mint a fresh `client_id` + Ed25519 seed (§7.1). A brand-new install
-/// therefore enrolls as a PENDING device on login (§7.5); a re-login on the same device
-/// keeps its identity and stays active.
-fn load_or_create_device_identity(server_url: &str, email: &str) -> ([u8; 32], Uuid) {
-    if let Ok(Some(s)) = load_session() {
-        if s.server_url == server_url
-            && s.email.eq_ignore_ascii_case(email)
-            && !s.device_sk_b64.is_empty()
-        {
-            if let Ok(seed) = B64.decode(s.device_sk_b64.as_bytes()) {
-                if let Ok(arr) = <[u8; 32]>::try_from(seed.as_slice()) {
-                    return (arr, s.client_id);
-                }
+/// The SINGLE SOURCE OF TRUTH for this install's device identity (§7.1) — used by signup,
+/// login, recovery, the roster, and the drain. Returns `(ed25519_seed, client_id)`.
+///
+/// Resolution order:
+///  1. the persistent IDENTITY keychain entry, if present (survives sign-out);
+///  2. MIGRATION — an existing session entry's identity (a pre-upgrade install whose id
+///     lived only in the session), promoted into and persisted as the identity entry;
+///  3. a freshly minted `client_id` + Ed25519 seed, PERSISTED to the identity entry before
+///     returning so it is stable from now on.
+///
+/// Because the identity survives sign-out, a re-login on the SAME install presents the SAME
+/// `client_id` and is recognised as the existing device — NOT re-enrolled as PENDING. A
+/// genuinely NEW install has neither entry, so it mints a fresh id and DOES enrol as a
+/// PENDING device (§7.5) — the approval flow for a new machine (e.g. a Windows join) is
+/// unaffected.
+fn load_or_create_device_identity() -> Result<([u8; 32], Uuid), String> {
+    // 1. Authoritative identity entry.
+    if let Some(id) = load_identity()? {
+        if let Ok(seed) = id.seed() {
+            return Ok((seed, id.client_id));
+        }
+        // Corrupt identity entry — fall through and re-mint below.
+    }
+    // 2. Migrate a pre-upgrade session-only identity into the identity entry.
+    if let Some(s) = load_session()? {
+        if !s.device_sk_b64.is_empty() {
+            let id = DeviceIdentity {
+                client_id: s.client_id,
+                device_sk_b64: s.device_sk_b64,
+            };
+            if let Ok(seed) = id.seed() {
+                store_identity(&id)?;
+                return Ok((seed, id.client_id));
             }
         }
     }
+    // 3. Fresh install: mint + persist so the id is stable across sign-out from now on.
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    (seed, Uuid::new_v4())
+    let id = DeviceIdentity {
+        client_id: Uuid::new_v4(),
+        device_sk_b64: B64.encode(seed),
+    };
+    store_identity(&id)?;
+    Ok((seed, id.client_id))
 }
 
 /// Build the UI status DTO for a signed-in session, fetching the live device index
@@ -803,6 +905,7 @@ pub async fn sync_enable(
         vault_key,
         session.epoch,
         session.tenant_id,
+        session.client_id,
     )?;
     {
         let mut guard = runtime
@@ -888,10 +991,10 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
     let wrapped_pw = wrap_vault_key(&master_key, &vault_key, WRAP_VAULT_PW_DOMAIN)?;
     let wrapped_rec = wrap_vault_key(&recovery_key, &vault_key, WRAP_VAULT_REC_DOMAIN)?;
 
-    // §7.1 device identity + §7.5 first-device self-enrolled roster (counter 0, epoch 0).
-    let client_id = Uuid::new_v4();
-    let mut dev_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut dev_seed);
+    // §7.1 device identity (persistent, survives sign-out) + §7.5 first-device self-enrolled
+    // roster (counter 0, epoch 0). Sourcing from the identity entry means a re-login on this
+    // same install later presents the SAME client_id and is recognised, not re-enrolled.
+    let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
     let dev_pub_b64 = B64.encode(dev_pub);
     let label = device_label();
@@ -1030,7 +1133,7 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
         .try_into()
         .map_err(|_| "master_key length".to_string())?;
 
-    let (dev_seed, client_id) = load_or_create_device_identity(&pending.server_url, &pending.email);
+    let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
 
     let cached_counter = load_session()?
@@ -1130,7 +1233,7 @@ pub async fn sync_recover(
         .map_err(|_| "wrapped_vault_key_recovery: invalid base64".to_string())?;
     let vault_key = unwrap_vault_key(&recovery_key, &wrapped_rec, WRAP_VAULT_REC_DOMAIN)?;
 
-    let (dev_seed, client_id) = load_or_create_device_identity(&server_url, &email);
+    let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
     let cached_counter = load_session()?
         .filter(|s| s.server_url == server_url && s.email.eq_ignore_ascii_case(&email))
@@ -1474,6 +1577,7 @@ fn start_and_store_drain(
         vault_key,
         session.epoch,
         session.tenant_id,
+        session.client_id,
     )?;
     let mut guard = runtime
         .lock()
@@ -1554,6 +1658,89 @@ mod tests {
         )
         .unwrap();
         assert!(!active2);
+    }
+
+    #[test]
+    fn device_identity_seed_roundtrips_to_stable_key() {
+        // The persisted identity blob must decode back to the exact seed, and that seed must
+        // drive a deterministic Ed25519 identity — the invariant that makes a re-login on the
+        // same install present the SAME device key (not a phantom one).
+        let seed = [11u8; 32];
+        let id = DeviceIdentity {
+            client_id: Uuid::from_u128(42),
+            device_sk_b64: B64.encode(seed),
+        };
+        assert_eq!(id.seed().unwrap(), seed);
+        let pub1 = SigningKey::from_bytes(&id.seed().unwrap())
+            .verifying_key()
+            .to_bytes();
+        let pub2 = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert_eq!(pub1, pub2);
+        // A corrupt blob is rejected rather than silently yielding a wrong key.
+        let bad = DeviceIdentity {
+            client_id: Uuid::nil(),
+            device_sk_b64: "not-base64!!".into(),
+        };
+        assert!(bad.seed().is_err());
+    }
+
+    /// End-to-end identity lifecycle against the REAL OS keychain: migration out of a
+    /// session-only install, survival across sign-out, and a stable id on re-login. Gated
+    /// `#[ignore]` because keychain access is unavailable/headless in CI; run explicitly with
+    /// `cargo test --features sync -- --ignored`. Non-destructive: it backs up and restores
+    /// whatever entries the machine already holds.
+    #[test]
+    #[ignore = "touches the real OS keychain (backs up + restores); run with --ignored"]
+    fn identity_survives_session_clear() {
+        let orig_session = load_session().ok().flatten();
+        let orig_identity = load_identity().ok().flatten();
+        let _ = keychain_entry().unwrap().delete_credential();
+        let _ = identity_entry().unwrap().delete_credential();
+
+        // A pre-upgrade install: identity lives ONLY in the session entry.
+        let seed = [7u8; 32];
+        let client_id = Uuid::from_u128(1234);
+        let session = Session {
+            server_url: "https://relay.test".into(),
+            email: "id-test@example.com".into(),
+            vault_key_b64: B64.encode([1u8; 32]),
+            epoch: 0,
+            tenant_id: Uuid::nil(),
+            bearer: "t".into(),
+            device_fingerprint: None,
+            sync_enabled: false,
+            client_id,
+            device_sk_b64: B64.encode(seed),
+            salt_enc_b64: None,
+            roster_counter: 0,
+            roster_fingerprint: None,
+        };
+        store_session(&session).unwrap();
+
+        // First resolve migrates the session identity into the identity entry.
+        let (got_seed, got_id) = load_or_create_device_identity().unwrap();
+        assert_eq!(got_id, client_id);
+        assert_eq!(got_seed, seed);
+        assert_eq!(load_identity().unwrap().unwrap().client_id, client_id);
+
+        // Sign out clears the session but MUST preserve the identity.
+        clear_session().unwrap();
+        assert!(load_session().unwrap().is_none());
+        assert_eq!(load_identity().unwrap().unwrap().client_id, client_id);
+
+        // Sign back in on the SAME install → SAME client_id (no phantom pending device).
+        let (_, relogin_id) = load_or_create_device_identity().unwrap();
+        assert_eq!(relogin_id, client_id);
+
+        // Restore the machine's original keychain state.
+        let _ = identity_entry().unwrap().delete_credential();
+        let _ = keychain_entry().unwrap().delete_credential();
+        if let Some(s) = orig_session {
+            let _ = store_session(&s);
+        }
+        if let Some(i) = orig_identity {
+            let _ = store_identity(&i);
+        }
     }
 
     #[test]
