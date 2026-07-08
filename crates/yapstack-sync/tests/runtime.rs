@@ -208,3 +208,46 @@ async fn two_devices_converge_through_relay() {
 fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_initial_capture_splits_into_multiple_bounded_outbox_entries() {
+    let db = CrsqlDb::open_in_memory().unwrap();
+    make_kv(&db);
+    let conn = db.conn();
+    let client = state::client_id(conn).unwrap();
+    let relay = MockRelay::new();
+    let c = cipher();
+    let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+    // ~1.3 MiB of local writes: enough to overrun the per-chunk plaintext budget several
+    // times, forcing capture to split into multiple bounded outbox entries (the fix for
+    // the 413 that a single all-history push triggered).
+    let big = "x".repeat(32 * 1024);
+    for i in 0..40 {
+        conn.execute(
+            "INSERT INTO kv(id,v) VALUES(?1,?2)",
+            rusqlite::params![format!("k{i}"), big.as_str()],
+        )
+        .unwrap();
+    }
+
+    let r = drain_once(conn, &c, &relay, client, sv, ev).await.unwrap();
+
+    let entries = count(conn, "SELECT count(*) FROM _yapstack_outbox");
+    let acked = count(conn, "SELECT count(*) FROM _yapstack_outbox WHERE acked=1");
+    assert!(
+        entries >= 2,
+        "capture must split a large history into multiple entries, got {entries}"
+    );
+    assert_eq!(acked, entries, "every captured entry is pushed and acked");
+    assert_eq!(r.pushed as i64, entries, "drain reports all entries pushed");
+
+    // The relay holds exactly the captured entries — all pushed within ONE drain cycle
+    // (batched back-to-back, not one batch per cycle).
+    let comp = relay.completeness().await.unwrap();
+    assert_eq!(comp.count, entries);
+
+    // Re-drain is a no-op: nothing new to capture or push (watermark advanced correctly).
+    let r2 = drain_once(conn, &c, &relay, client, sv, ev).await.unwrap();
+    assert_eq!(r2.pushed, 0);
+}
