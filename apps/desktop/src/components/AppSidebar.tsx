@@ -35,6 +35,7 @@ import { getBinding } from "@/lib/shortcuts";
 import { YapStackIcon } from "@/components/YapStackIcon";
 import { BackfillDropdown } from "@/components/BackfillDropdown";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { SyncStatusGlyph } from "@/components/SyncStatusGlyph";
 
 export function AppSidebar() {
   const navigateTo = useAppStore((s) => s.navigateTo);
@@ -229,14 +230,17 @@ export function AppSidebar() {
       {/* Footer */}
       <div className="border-t border-sidebar-border px-2 py-2">
         <UpdateBanner />
-        <button
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground transition-all duration-150"
-          onClick={() => navigateTo("settings")}
-          aria-label="Settings"
-        >
-          <Settings className="h-3.5 w-3.5 shrink-0" />
-          Settings
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            className="flex flex-1 min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground transition-all duration-150"
+            onClick={() => navigateTo("settings")}
+            aria-label="Settings"
+          >
+            <Settings className="h-3.5 w-3.5 shrink-0" />
+            Settings
+          </button>
+          <SyncStatusGlyph />
+        </div>
       </div>
 
       {/* New folder dialog */}

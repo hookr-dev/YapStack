@@ -531,11 +531,12 @@ interface AppState {
   /**
    * One-shot signal from anywhere in the app to land the user on a specific
    * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSection
-   * on mount, then cleared. Single-value rather than a queue — only the most
-   * recent intent matters. Cleared after consumption.
+   * on mount, then cleared. `"sync"` (from the ambient sidebar glyph) opens the
+   * Sync tab and is cleared by SettingsPanel itself. Single-value rather than a
+   * queue — only the most recent intent matters. Cleared after consumption.
    */
-  settingsRequest: "ai-add-connection" | null;
-  setSettingsRequest: (request: "ai-add-connection" | null) => void;
+  settingsRequest: "ai-add-connection" | "sync" | null;
+  setSettingsRequest: (request: "ai-add-connection" | "sync" | null) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
   /**
