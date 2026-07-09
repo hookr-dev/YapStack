@@ -856,6 +856,16 @@ fn ensure_cache_loaded() {
     }
     let session = load_session_from_store().ok().flatten();
     let identity = load_identity_from_store().ok().flatten();
+    // Boot session-load outcome. The per-arm degrade paths in `load_session_wrapped`
+    // only `warn!` on anomalies; a healthy load and the clean no-session case are
+    // otherwise silent, so a boot with no log line was ambiguous ("boot ran, no
+    // session" vs "boot code never ran"). This unconditional INFO line (no secrets —
+    // presence booleans only) guarantees every Windows build surfaces the outcome.
+    tracing::info!(
+        session_present = session.is_some(),
+        identity_present = identity.is_some(),
+        "sync boot: credential cache warm-up complete"
+    );
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     if !g.loaded {
         g.session = session;

@@ -216,7 +216,12 @@ import { isMac } from "@/lib/utils";
  * Returns empty string for modifier-only presses.
  */
 export function eventToBinding(e: KeyboardEvent): string {
-  const key = e.key.toLowerCase();
+  // Windows/WebView2 can dispatch keydown events with an undefined `key` (media/
+  // hardware keys, IME "Process" key, host-synthesized events). WKWebView on macOS
+  // always populates `key`, which is why this only crashed on Windows. An event with
+  // no key cannot correspond to any binding, so treat it like a modifier-only press.
+  const key = e.key?.toLowerCase();
+  if (!key) return "";
 
   // Ignore modifier-only keypresses
   if (["control", "meta", "shift", "alt"].includes(key)) return "";
@@ -277,14 +282,16 @@ const MODIFIER_CODES = new Set([
  * not ">".
  */
 export function eventToGlobalBinding(e: KeyboardEvent): string {
-  if (MODIFIER_CODES.has(e.code)) return "";
+  // Same Windows/WebView2 hazard as eventToBinding: `code` can be undefined for
+  // host-synthesized/media keys. An event with no physical code maps to no binding.
+  const code = e.code;
+  if (!code || MODIFIER_CODES.has(code)) return "";
 
   const parts: string[] = [];
   if (e.metaKey || e.ctrlKey) parts.push("CommandOrControl");
   if (e.shiftKey) parts.push("Shift");
   if (e.altKey) parts.push("Alt");
 
-  const code = e.code;
   if (code.startsWith("Key") && code.length === 4) {
     parts.push(code.charAt(3).toUpperCase());
   } else if (code.startsWith("Digit") && code.length === 6) {

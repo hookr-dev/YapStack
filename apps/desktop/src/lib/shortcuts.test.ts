@@ -128,6 +128,16 @@ describe("eventToBinding", () => {
       eventToBinding(makeEvent({ key: ".", ctrlKey: true })),
     ).toBe("mod+.");
   });
+
+  // Windows/WebView2 can dispatch keydown events with an undefined `key` (media/
+  // hardware keys, IME "Process" key). This crashed the window-level keydown handler
+  // with "Cannot read properties of undefined (reading 'toLowerCase')". A keyless
+  // event maps to no binding and must not throw.
+  it("returns empty string (no throw) when e.key is undefined (Windows/WebView2)", () => {
+    const evt = { ...makeEvent({}), key: undefined } as unknown as KeyboardEvent;
+    expect(() => eventToBinding(evt)).not.toThrow();
+    expect(eventToBinding(evt)).toBe("");
+  });
 });
 
 describe("eventToGlobalBinding", () => {
@@ -177,5 +187,12 @@ describe("eventToGlobalBinding", () => {
         makeEvent({ code: "Period", metaKey: true, shiftKey: true }),
       ),
     ).toBe("CommandOrControl+Shift+.");
+  });
+
+  // Same Windows/WebView2 hazard: an undefined `code` must not throw.
+  it("returns empty string (no throw) when e.code is undefined (Windows/WebView2)", () => {
+    const evt = { ...makeEvent({}), code: undefined } as unknown as KeyboardEvent;
+    expect(() => eventToGlobalBinding(evt)).not.toThrow();
+    expect(eventToGlobalBinding(evt)).toBe("");
   });
 });
