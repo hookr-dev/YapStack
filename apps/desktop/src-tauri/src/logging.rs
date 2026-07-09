@@ -421,6 +421,17 @@ fn log_memory_sample(reason: &'static str) {
 mod tests {
     use super::*;
 
+    /// Env var that switches [`panic_hook_subprocess_child`] into its "actually
+    /// panic" role; its value is the temp log dir the child dumps into. Unset
+    /// during a normal test run, so the child test is a no-op then.
+    const PANIC_HOOK_SMOKE_ENV: &str = "YAPSTACK_PANIC_HOOK_SMOKE_DIR";
+    /// Panic message the subprocess child raises; the parent asserts it lands in
+    /// the crash file.
+    const SUBPROC_PANIC_MESSAGE: &str = "subprocess boot crash — real panic path";
+    /// Ring-buffer line the subprocess child seeds; the parent asserts prior
+    /// history survives the crash alongside the panic header.
+    const SUBPROC_RING_LINE: &str = "boot-step-before-subprocess-crash";
+
     /// Panic-payload extraction handles the two shapes std panics actually
     /// produce (`&str` and `String`) plus the opaque fallback. This is the
     /// in-test-provable half of the panic-hook guarantee — the hook's *content*
@@ -474,9 +485,103 @@ mod tests {
         );
     }
 
+    /// End-to-end proof of the R7 durability guarantee against the REAL panic
+    /// path — not the by-construction hand-wave the sibling tests settle for.
+    ///
+    /// We re-exec THIS test binary as a child (`current_exe`) that installs the
+    /// production panic hook against a temp log dir, seeds the ring buffer, and
+    /// then genuinely `panic!`s. The parent asserts the child died abnormally
+    /// AND that the hook fsync'd the panic message + ring-buffer history into
+    /// `yapstack-panic.log` before the process was torn down — i.e. the crash
+    /// dump survives even when nothing unwinds.
+    ///
+    /// A subprocess is what makes this viable under the `--features sync` test
+    /// binary: it statically links the vendored cr-sqlite staticlib, whose
+    /// no_std `panic=abort` runtime shadows the unwinding runtime symbols
+    /// (`eh_personality` / `__rust_start_panic` — the same family the Windows
+    /// `/FORCE:MULTIPLE` link flag exists for). In that binary an in-process
+    /// `catch_unwind` of a real panic hits `failed to initiate panic, error 3`
+    /// and aborts the whole harness. Containing the abort inside a child process
+    /// lets us exercise the true `panic=abort` production path for real, in both
+    /// the default and the sync test binaries.
+    #[test]
+    fn panic_hook_writes_crash_dump_on_real_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = std::env::current_exe().expect("current test exe");
+        let status = std::process::Command::new(exe)
+            .args(["logging::tests::panic_hook_subprocess_child", "--exact"])
+            // Child noise (incl. the runtime's abort message) is expected; keep
+            // it out of a GREEN gate's output. The assertions carry the proof.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env(PANIC_HOOK_SMOKE_ENV, dir.path())
+            .status()
+            .expect("spawn child test process");
+
+        assert!(
+            !status.success(),
+            "child must die abnormally on the real panic (status: {status:?})"
+        );
+
+        let dumped = std::fs::read_to_string(dir.path().join(PANIC_LOG_FILENAME))
+            .expect("panic hook must have fsync'd the crash file before the process died");
+        assert!(
+            dumped.contains(SUBPROC_PANIC_MESSAGE),
+            "panic message must be in the crash file: {dumped}"
+        );
+        assert!(
+            dumped.contains(SUBPROC_RING_LINE),
+            "ring-buffer history must be in the crash file: {dumped}"
+        );
+    }
+
+    /// Subprocess entry point for [`panic_hook_writes_crash_dump_on_real_panic`]
+    /// — a test only in the libtest-harness sense, not a standalone assertion.
+    ///
+    /// During a normal `cargo test` run the env var is unset and this is a
+    /// no-op that passes. When the parent re-execs the test binary with
+    /// `PANIC_HOOK_SMOKE_ENV` pointing at a temp dir, this installs the REAL
+    /// production panic hook, seeds a recognizable ring-buffer line, and triggers
+    /// a REAL panic so the hook runs on the genuine `panic=abort` path.
+    #[test]
+    fn panic_hook_subprocess_child() {
+        let Ok(dir) = std::env::var(PANIC_HOOK_SMOKE_ENV) else {
+            return; // normal run: no-op.
+        };
+        let buffer = Arc::new(LogBuffer::new(500));
+        buffer.push(LogEntry {
+            ts_ms: 1,
+            level: LogLevel::Info,
+            target: "yapstack_desktop".to_string(),
+            message: SUBPROC_RING_LINE.to_string(),
+        });
+        install_panic_hook(buffer, PathBuf::from(dir));
+        // The genuine article: a real panic drives the installed hook, which
+        // must fsync the crash dump BEFORE the runtime tears the process down.
+        panic!("{SUBPROC_PANIC_MESSAGE}");
+    }
+
     /// The crash dump is panic-hook-safe: it must recover a POISONED ring-buffer
     /// mutex (poisoned by the very panic being handled) instead of re-panicking,
     /// which under `panic=abort` would abort with no diagnostic at all.
+    ///
+    /// This stays an in-process test gated to the unwinding (non-`sync`) build,
+    /// for two independent reasons, both rooted in `panic=abort`:
+    ///   1. Constructing a poisoned mutex REQUIRES an unwind (a `MutexGuard`
+    ///      only sets the poison flag in its `Drop`, which runs while
+    ///      `thread::panicking()`). Under `panic=abort` — including the
+    ///      `--features sync` test binary, whose vendored cr-sqlite staticlib
+    ///      shadows the unwinding runtime — `catch_unwind` and thread panics
+    ///      abort instead of unwinding, so a poisoned mutex cannot be produced
+    ///      at all.
+    ///   2. For the same reason the branch under test is unreachable in an abort
+    ///      build: with no guard drops during a panic, the mutex the panic hook
+    ///      re-locks is never poisoned.
+    /// So this property is both constructible and meaningful ONLY in an
+    /// unwinding build, which the default `cargo test -p yapstack-desktop` gate
+    /// provides; the real abort path is covered by
+    /// [`panic_hook_writes_crash_dump_on_real_panic`] above.
+    #[cfg(not(feature = "sync"))]
     #[test]
     fn crash_dump_tolerates_poisoned_buffer_mutex() {
         let dir = tempfile::tempdir().expect("temp dir");
