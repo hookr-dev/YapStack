@@ -56,3 +56,53 @@ describe("db-backend DB_SWAP_IN_PROGRESS retry (F6)", () => {
     expect(invokeMock).toHaveBeenCalledTimes(11);
   });
 });
+
+describe('db-backend "database is locked" retry (R6 item 1b)', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("retries transient write-lock contention with the drain, then resolves", async () => {
+    invokeMock
+      .mockRejectedValueOnce("database is locked")
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce([{ id: "s1" }]);
+
+    const conn = await dbBackend.load("sqlite:yapstack.db");
+    const pending = conn.select<Array<{ id: string }>>("SELECT id FROM sessions");
+
+    // Capped backoff windows: 60ms then 120ms before the third attempt lands.
+    await vi.advanceTimersByTimeAsync(60);
+    await vi.advanceTimersByTimeAsync(120);
+
+    await expect(pending).resolves.toEqual([{ id: "s1" }]);
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does NOT retry a genuine SQL error that merely mentions a table", async () => {
+    invokeMock.mockRejectedValueOnce("no such table: sessions");
+
+    const conn = await dbBackend.load("sqlite:yapstack.db");
+    await expect(conn.select("SELECT 1 FROM sessions")).rejects.toBe(
+      "no such table: sessions",
+    );
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after the lock retry cap and surfaces the lock error", async () => {
+    invokeMock.mockRejectedValue("database is locked");
+
+    const conn = await dbBackend.load("sqlite:yapstack.db");
+    const pending = conn.execute("UPDATE sessions SET title='x'");
+    const assertion = expect(pending).rejects.toContain("database is locked");
+
+    // Initial attempt + 8 retries; capped backoff tops out at 500ms, so drain the max.
+    await vi.advanceTimersByTimeAsync(500 * 9);
+    await assertion;
+    expect(invokeMock).toHaveBeenCalledTimes(9);
+  });
+});

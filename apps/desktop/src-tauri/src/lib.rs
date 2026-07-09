@@ -655,6 +655,20 @@ pub fn run() {
             // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
 
+            // R6 item 4(c): resolve the credential-store home (SESSION_STORE_DIR) and warm
+            // the credential cache FIRST — before `recover_interrupted_cutover` and
+            // `DbService::open`. `session_enc_path()` falls back to `std::env::temp_dir()`
+            // until SESSION_STORE_DIR is set, so ANY session read that raced ahead of the old
+            // init point (line ~692) resolved the sealed `sync-session.enc` to the temp dir at
+            // boot while sign-in wrote it under the config dir — a write/read PATH MISMATCH
+            // that reads as "signed out on every restart". Setting it here makes the boot-read
+            // and sign-in-write paths provably identical, and emits the once-per-boot session
+            // trace (which logs the RESOLVED path + backend outcome) at the earliest safe point.
+            #[cfg(feature = "sync")]
+            if let Ok(config_dir) = app.path().app_config_dir() {
+                sync::init_credential_store(&config_dir);
+            }
+
             // F1.2: recover any CRR cutover that was interrupted by a crash/kill
             // BEFORE opening the DB. `DbService::open` would otherwise CREATE an empty
             // `yapstack.db` over a mid-swap state (live renamed to backup, staging not
@@ -684,18 +698,19 @@ pub fn run() {
             // when signed out. Entirely behind the `sync` cargo feature.
             #[cfg(feature = "sync")]
             {
-                // T020: point the credential store at the app config dir (DEBUG file store;
-                // no-op for the release keychain) and warm the in-memory credential cache
-                // ONCE, so the polled `sync_status` never re-reads the keychain per call
-                // (which SPAMMED a macOS prompt every poll in unsigned dev builds).
-                if let Ok(config_dir) = app.path().app_config_dir() {
-                    sync::init_credential_store(&config_dir);
-                }
+                // Credential store home + cache warm-up already ran above (before the DB open),
+                // so `sync_status` never re-reads the keychain per call (T020) AND the sealed
+                // session path is deterministic before any read (R6 item 4c).
                 app.manage(sync::cred_cache_handle());
                 let sync_runtime: sync::SyncRuntimeState =
                     Arc::new(StdMutex::new(None));
                 app.manage(sync_runtime.clone());
-                sync::start_drain_if_enabled(&db_path, &sync_runtime, &db_service);
+                sync::start_drain_if_enabled(
+                    &app.handle().clone(),
+                    &db_path,
+                    &sync_runtime,
+                    &db_service,
+                );
             }
 
             let model_manager = ModelManager::new(app_data_dir.clone());

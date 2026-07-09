@@ -498,12 +498,26 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
                     });
                 }
             };
+            // Merge THIS changeset in its own transaction (merge_changeset BEGIN..COMMIT),
+            // then persist the watermark and yield BEFORE touching the next one. Item 1(a):
+            // each changeset is a bounded merge transaction whose write lock is RELEASED at
+            // its COMMIT, and the watermark only advances after that commit — so a concurrent
+            // db_service writer (the frontend) can win the lock between changesets instead of
+            // being starved for the whole page, and a crash mid-backlog resumes from exactly
+            // the last committed changeset (the R5 halt-at-first-crypto-failure invariant is
+            // unchanged: a decode failure above still pins the watermark at `last_good`).
             let (a, q) = merge_changeset(conn, &cs)?;
             report.applied += a;
             report.quarantined += q;
             last_good = pc.changeset_seq;
+            state::set_pull_watermark(conn, last_good)?;
+            // Cooperative yield point between batches. On the drain's single-thread runtime
+            // this hands the executor a scheduling point between write transactions rather
+            // than monopolising it across a long backlog page.
+            tokio::task::yield_now().await;
         }
-        // Whole page consumed cleanly — advance to the relay's reported next_seq.
+        // Whole page consumed cleanly — advance to the relay's reported next_seq (>= last_good;
+        // covers a trailing run of our own echoes with no merge to move the watermark).
         state::set_pull_watermark(conn, resp.next_seq)?;
         if !resp.has_more {
             break;
@@ -1169,5 +1183,77 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "changeset {k} merged");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_releases_write_lock_between_batches() {
+        // Item 1(a): a pulled backlog is merged one changeset per BEGIN..COMMIT batch, and the
+        // write lock MUST be released at each COMMIT so a concurrent writer (the frontend's
+        // db_service connection) can win the lock BETWEEN batches instead of being starved
+        // across the whole page. Modelled with a second, independent connection that writes
+        // between two `merge_changeset` calls; a SHORT busy_timeout makes it fail fast if the
+        // merge left a transaction open.
+        use crate::quarantine::merge_changeset;
+
+        // A source device authors TWO separate changesets (two db_versions).
+        let src = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&src);
+        src.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k1','v1')", [])
+            .unwrap();
+        let cs1 = crate::change::read_local_changes_since(src.conn(), 0).unwrap();
+        let v1 = crate::change::max_local_db_version(src.conn()).unwrap();
+        src.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k2','v2')", [])
+            .unwrap();
+        let cs2 = crate::change::read_local_changes_since(src.conn(), v1).unwrap();
+        assert!(!cs1.rows.is_empty() && !cs2.rows.is_empty());
+
+        // Target on-disk DB so a SECOND connection can contend for the file's write lock.
+        let dir = std::env::temp_dir().join(format!("yapstack-merge-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dst.db");
+        let dst = CrsqlDb::open(&path).unwrap();
+        dst.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        make_kv(&dst);
+
+        // The stand-in for db_service: an independent writer with SHORT patience.
+        let probe = Connection::open(&path).unwrap();
+        probe
+            .busy_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        probe
+            .execute_batch("CREATE TABLE probe_t(id INTEGER PRIMARY KEY, n INTEGER);")
+            .unwrap();
+
+        // Batch 1 → lock released at COMMIT → the probe can write BETWEEN batches.
+        merge_changeset(dst.conn(), &cs1).unwrap();
+        assert!(
+            dst.conn().is_autocommit(),
+            "write lock released after batch 1 (connection back in autocommit)"
+        );
+        probe
+            .execute("INSERT INTO probe_t(n) VALUES(1)", [])
+            .expect("probe must win the write lock between batches");
+
+        // Batch 2 → lock released again.
+        merge_changeset(dst.conn(), &cs2).unwrap();
+        assert!(
+            dst.conn().is_autocommit(),
+            "write lock released after batch 2"
+        );
+        probe
+            .execute("INSERT INTO probe_t(n) VALUES(2)", [])
+            .expect("probe must win the write lock after the final batch");
+
+        let n: i64 = probe
+            .query_row("SELECT count(*) FROM probe_t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both interleaved probe writes committed");
+        drop(probe);
+        drop(dst);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

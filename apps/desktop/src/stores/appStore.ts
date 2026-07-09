@@ -1,7 +1,13 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/tauri";
 import { commandErrorMessage } from "@/lib/command-error";
+
+/** Backend event fired by the sync drain after it merges peer changes (R6 item 2). */
+const SYNC_APPLIED_EVENT = "sync://applied";
+/** Collapse a burst of merge events into one coarse refresh (1.5s). */
+const SYNC_APPLIED_DEBOUNCE_MS = 1500;
 
 /**
  * Poll the builder-managed `backend_ready` flag until the Rust setup hook
@@ -519,6 +525,13 @@ interface AppState {
   autoSetup: () => Promise<void>;
   loadSessions: () => Promise<void>;
   loadFolders: () => Promise<void>;
+  /**
+   * Subscribe to the backend `sync://applied` event (R6 item 2): the sync drain merged
+   * peer changes into the DB but nothing told the UI, so pulled sessions/notes/folders
+   * only appeared after an app restart. On each event we debounce, then refresh the coarse
+   * views (sessions / folders / tags and their maps). Returns an unlisten function.
+   */
+  startSyncAppliedRefresh: () => Promise<() => void>;
   createAndStartSession: (backfillSeconds?: number, trigger?: string) => Promise<void>;
   resumeSession: (sessionId: string) => Promise<void>;
   stopActiveSession: () => Promise<void>;
@@ -1129,6 +1142,30 @@ function createAppStore() {
         } catch (e) {
           console.error("Failed to load sessions:", e);
         }
+      },
+
+      startSyncAppliedRefresh: async () => {
+        // Debounce so a long pulled backlog (many rapid `sync://applied` events) triggers a
+        // SINGLE coarse refresh instead of thrashing the UI. Coarse-only by design (v1): no
+        // fine-grained per-row invalidation — reload the whole session/folder/tag views.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const coarseRefresh = () => {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = undefined;
+            const s = get();
+            void s.loadSessions();
+            void s.loadFolders();
+            void s.loadSessionFolders();
+            void s.loadTags();
+            void s.loadSessionTags();
+          }, SYNC_APPLIED_DEBOUNCE_MS);
+        };
+        const unlisten = await listen(SYNC_APPLIED_EVENT, coarseRefresh);
+        return () => {
+          if (timer) clearTimeout(timer);
+          unlisten();
+        };
       },
 
       loadFolders: async () => {
@@ -3175,3 +3212,12 @@ function getOrCreateAppStore(): HmrStore {
 }
 
 export const useAppStore = getOrCreateAppStore();
+
+// Auto-subscribe to backend `sync://applied` events at module load so pulled peer changes
+// refresh the UI without an app restart (R6 item 2). Guarded to a real Tauri window so unit
+// tests (jsdom, no `__TAURI_INTERNALS__`) don't register a live listener; those exercise
+// `startSyncAppliedRefresh` directly with a mocked event API. Best-effort: a failure here
+// must never break app boot.
+if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+  void useAppStore.getState().startSyncAppliedRefresh();
+}

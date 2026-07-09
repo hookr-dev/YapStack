@@ -35,14 +35,40 @@ const SWAP_SENTINEL = "DB_SWAP_IN_PROGRESS";
 const SWAP_RETRY_DELAY_MS = 250;
 const SWAP_MAX_RETRIES = 10;
 
+/**
+ * Transient SQLite write-lock contention. Post-cutover (Option A′) the sync drain's
+ * CrsqlDb writer and db_service's writer share one WAL file, so while the drain is
+ * merging a large pulled backlog a frontend `db_select`/`db_execute` can lose the race
+ * for the write lock past the Rust `busy_timeout` and surface `SQLITE_BUSY` as
+ * "database is locked". The drain now commits one changeset per batch and yields the
+ * lock between batches, so the next attempt almost always wins — we retry with a bounded
+ * capped backoff and only surface the lock error if it stays stuck (R6 item 1b).
+ */
+const LOCK_MAX_RETRIES = 8;
+const LOCK_RETRY_BASE_MS = 60;
+const LOCK_RETRY_MAX_MS = 500;
+
+function errMessage(err: unknown): string {
+  return typeof err === "string"
+    ? err
+    : err instanceof Error
+      ? err.message
+      : String(err ?? "");
+}
+
 function isSwapInProgress(err: unknown): boolean {
-  const msg =
-    typeof err === "string"
-      ? err
-      : err instanceof Error
-        ? err.message
-        : String(err ?? "");
-  return msg.includes(SWAP_SENTINEL);
+  return errMessage(err).includes(SWAP_SENTINEL);
+}
+
+/**
+ * A transient SQLite busy/locked error (not a schema/constraint failure). Matches the
+ * two verbatim SQLite strings — "database is locked" (SQLITE_BUSY) and "database table
+ * is locked" (SQLITE_LOCKED) — case-insensitively, so only genuine contention is retried
+ * while real SQL errors still reject immediately.
+ */
+function isDatabaseLocked(err: unknown): boolean {
+  const msg = errMessage(err).toLowerCase();
+  return msg.includes("database is locked") || msg.includes("database table is locked");
 }
 
 function sleep(ms: number): Promise<void> {
@@ -50,27 +76,43 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Invoke a DB command, transparently retrying while the backend reports the cutover
- * swap window (F6). Any other error rejects immediately; after `SWAP_MAX_RETRIES`
- * the last swap error is surfaced so a genuinely stuck swap still fails loudly.
+ * Invoke a DB command, transparently retrying two distinct transient conditions:
+ *   1. the cutover swap window (F6) — the backend reports `DB_SWAP_IN_PROGRESS`;
+ *   2. write-lock contention with the sync drain (R6) — "database is locked".
+ * Any OTHER error (SQL/constraint/schema) rejects immediately. After the respective
+ * retry budget the last transient error is surfaced so a genuinely stuck DB still fails
+ * loudly rather than hanging forever.
  */
 async function invokeWithSwapRetry<T>(
   command: string,
   args: Record<string, unknown>,
 ): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= SWAP_MAX_RETRIES; attempt++) {
+  let swapAttempts = 0;
+  let lockAttempts = 0;
+  for (;;) {
     try {
       return await invoke<T>(command, args);
     } catch (err) {
-      lastError = err;
-      if (!isSwapInProgress(err) || attempt === SWAP_MAX_RETRIES) {
-        throw err;
+      if (isSwapInProgress(err)) {
+        if (swapAttempts >= SWAP_MAX_RETRIES) throw err;
+        swapAttempts++;
+        await sleep(SWAP_RETRY_DELAY_MS);
+        continue;
       }
-      await sleep(SWAP_RETRY_DELAY_MS);
+      if (isDatabaseLocked(err)) {
+        if (lockAttempts >= LOCK_MAX_RETRIES) throw err;
+        // Capped exponential backoff: 60, 120, 240, 480, 500, 500, ...
+        const delay = Math.min(
+          LOCK_RETRY_BASE_MS * 2 ** lockAttempts,
+          LOCK_RETRY_MAX_MS,
+        );
+        lockAttempts++;
+        await sleep(delay);
+        continue;
+      }
+      throw err;
     }
   }
-  throw lastError;
 }
 
 const connection: DbConnection = {

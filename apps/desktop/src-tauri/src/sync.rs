@@ -45,7 +45,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -54,7 +54,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
 use yapstack_common::auth::{
@@ -236,14 +236,30 @@ fn dev_store_path() -> PathBuf {
 /// dev file in debug, via `store_get/set`).
 static SESSION_STORE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The at-rest sealed-session filename, joined onto the resolved store directory.
+const SESSION_ENC_FILENAME: &str = "sync-session.enc";
+
+/// Pure resolver for the encrypted at-rest session file path (T029), factored out of
+/// [`session_enc_path`] so the determinism invariant is unit-testable without touching the
+/// process-global `SESSION_STORE_DIR`.
+///
+/// R6 item 4(c): `store_dir = Some(config_dir)` once `init_credential_store` has run, and
+/// `None` before it — in which case it falls back to `std::env::temp_dir()`. The
+/// path-mismatch bug is precisely `resolve_session_enc_path(None)` (a boot read that raced
+/// ahead of init → temp dir) NOT equalling `resolve_session_enc_path(Some(config_dir))` (the
+/// sign-in write → config dir). With init hoisted before every session touch (lib.rs), both
+/// the boot read and the sign-in write resolve through `Some(config_dir)` and are identical.
+fn resolve_session_enc_path(store_dir: Option<&Path>) -> PathBuf {
+    store_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(SESSION_ENC_FILENAME)
+}
+
 /// Path to the encrypted at-rest session file (T029). Falls back to the temp dir before
 /// `init_credential_store` runs, mirroring `dev_store_path`.
 fn session_enc_path() -> PathBuf {
-    SESSION_STORE_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("sync-session.enc")
+    resolve_session_enc_path(SESSION_STORE_DIR.get().map(PathBuf::as_path))
 }
 
 #[cfg(debug_assertions)]
@@ -406,8 +422,13 @@ mod win_creds {
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_NOT_FOUND {
+                // R6 item 4(b): "not found" is the exact tell of a credential that did NOT
+                // survive the restart (the CRED_PERSIST_LOCAL_MACHINE persistence question).
+                // Name only — never the value.
+                tracing::info!(entry = %account, "win_creds: read (not found)");
                 return Ok(None);
             }
+            tracing::warn!(entry = %account, "win_creds: read failed (win32 error {err})");
             return Err(format!("CredReadW failed (win32 error {err})"));
         }
         // SAFETY: CredReadW returned success → p_cred is a valid, non-null allocation.
@@ -423,6 +444,12 @@ mod win_creds {
         };
         // SAFETY: p_cred was allocated by CredReadW and has not been freed yet.
         unsafe { CredFree(p_cred as *const core::ffi::c_void) };
+        // Byte-length of the credential BLOB only — never the wrapping key itself.
+        tracing::info!(
+            entry = %account,
+            blob_bytes = blob_len,
+            "win_creds: read (found)"
+        );
         Ok(Some(value))
     }
 
@@ -452,8 +479,17 @@ mod win_creds {
         let ok = unsafe { CredWriteW(&mut cred as *const CREDENTIALW, 0) };
         if ok == 0 {
             let err = unsafe { GetLastError() };
+            tracing::warn!(entry = %account, "win_creds: write failed (win32 error {err})");
             return Err(format!("CredWriteW failed (win32 error {err})"));
         }
+        // R6 item 4(b): entry name + BLOB byte-length only (never the value). Confirms the
+        // write landed with CRED_PERSIST_LOCAL_MACHINE so a next-boot "not found" read
+        // pinpoints a persistence failure rather than a never-written entry.
+        tracing::info!(
+            entry = %account,
+            blob_bytes = blob.len(),
+            "win_creds: write (LOCAL_MACHINE)"
+        );
         Ok(())
     }
 
@@ -465,10 +501,13 @@ mod win_creds {
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_NOT_FOUND {
+                tracing::info!(entry = %account, "win_creds: delete (already absent)");
                 return Ok(());
             }
+            tracing::warn!(entry = %account, "win_creds: delete failed (win32 error {err})");
             return Err(format!("CredDeleteW failed (win32 error {err})"));
         }
+        tracing::info!(entry = %account, "win_creds: delete (removed)");
         Ok(())
     }
 }
@@ -588,14 +627,42 @@ impl SessionKeyStore for KeychainSessionKeyStore {
 }
 
 fn read_session_blob(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    // R6 item 4(b): make the sealed-session read outcome visible on disk — path + result +
+    // ciphertext byte-length only (no plaintext, no key). A Windows boot can no longer be
+    // silent about whether the file was even found, and the logged path is the direct check
+    // for the write/read path-mismatch hypothesis (4c).
     match std::fs::read(path) {
-        Ok(b) => Ok(Some(b)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
+        Ok(b) => {
+            tracing::info!(
+                sealed_path = %path.display(),
+                bytes = b.len(),
+                "sync: sealed session file read (found)"
+            );
+            Ok(Some(b))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                sealed_path = %path.display(),
+                "sync: sealed session file read (not found)"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            tracing::warn!(
+                sealed_path = %path.display(),
+                "sync: sealed session file read failed: {e}"
+            );
+            Err(e.to_string())
+        }
     }
 }
 
 fn write_session_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
+    tracing::info!(
+        sealed_path = %path.display(),
+        bytes = blob.len(),
+        "sync: sealed session file write"
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -844,34 +911,80 @@ pub fn cred_cache_handle() -> SyncCredCache {
     cred_cache().clone()
 }
 
+/// Static label of the credential BACKEND compiled into this build — the home of the
+/// session wrapping key + identity entry. Diagnostics only; no secrets. (The sealed session
+/// FILE path is logged separately via `session_enc_path()`.)
+fn cred_store_backend() -> &'static str {
+    #[cfg(debug_assertions)]
+    {
+        "dev-file"
+    }
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    {
+        "win_creds(CRED_PERSIST_LOCAL_MACHINE)"
+    }
+    #[cfg(all(not(debug_assertions), not(target_os = "windows")))]
+    {
+        "keyring"
+    }
+}
+
+/// Emit the boot session-load outcome EXACTLY ONCE per process, on the first session access.
+///
+/// R6 item 4(a): the previous trace lived inline in `ensure_cache_loaded`, PAST its
+/// `if loaded { return }` early-exit. The `loaded` flag is also flipped silently by the
+/// write helpers (`store_session` / `store_identity` / `clear_session`), so if the cache was
+/// warmed by a write — or the boot read raced anything — the trace was skipped and the boot
+/// outcome was never surfaced (the Round-5 Windows silence). This helper is gated by its own
+/// `Once`, INDEPENDENT of the cache flag, so the first session touch of the boot always logs
+/// the outcome once — including the RESOLVED sealed-session path and the backend, which is
+/// the smoking-gun diagnostic for the write/read path-mismatch hypothesis (4c). No secrets:
+/// presence booleans + a filesystem path + a static backend label only.
+fn log_session_boot_trace() {
+    static BOOT_TRACE: Once = Once::new();
+    BOOT_TRACE.call_once(|| {
+        let (session_present, identity_present) = {
+            let g = cred_cache().read().unwrap_or_else(|e| e.into_inner());
+            (g.session.is_some(), g.identity.is_some())
+        };
+        tracing::info!(
+            session_present,
+            identity_present,
+            store_backend = cred_store_backend(),
+            sealed_path = %session_enc_path().display(),
+            store_dir_resolved = SESSION_STORE_DIR.get().is_some(),
+            "sync boot: credential cache warm-up complete"
+        );
+    });
+}
+
 /// Populate the cache from the backing store ONCE. Subsequent calls are a cheap flag check
-/// and never touch the store (hence never the keychain). Safe to call from any thread.
+/// and never touch the store (hence never the keychain). Safe to call from any thread. The
+/// first call of the boot (whichever path reaches it) emits the once-per-boot session trace.
 fn ensure_cache_loaded() {
     if cred_cache()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .loaded
     {
+        // Cache already warm (e.g. a sign-in write beat the boot read). Still guarantee the
+        // once-per-boot trace fires — it is idempotent and reads the current cache state.
+        log_session_boot_trace();
         return;
     }
     let session = load_session_from_store().ok().flatten();
     let identity = load_identity_from_store().ok().flatten();
-    // Boot session-load outcome. The per-arm degrade paths in `load_session_wrapped`
-    // only `warn!` on anomalies; a healthy load and the clean no-session case are
-    // otherwise silent, so a boot with no log line was ambiguous ("boot ran, no
-    // session" vs "boot code never ran"). This unconditional INFO line (no secrets —
-    // presence booleans only) guarantees every Windows build surfaces the outcome.
-    tracing::info!(
-        session_present = session.is_some(),
-        identity_present = identity.is_some(),
-        "sync boot: credential cache warm-up complete"
-    );
-    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
-    if !g.loaded {
-        g.session = session;
-        g.identity = identity;
-        g.loaded = true;
+    {
+        let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+        if !g.loaded {
+            g.session = session;
+            g.identity = identity;
+            g.loaded = true;
+        }
     }
+    // Log AFTER the cache is populated (and the write lock released) so the trace reflects the
+    // resolved state, exactly once per boot.
+    log_session_boot_trace();
 }
 
 /// Boot hook (lib.rs setup): point the DEBUG file store at the app config dir and warm the
@@ -2197,12 +2310,44 @@ fn expire_session_terminally() -> bool {
     set_drain_health(DrainHealth::AuthExpired)
 }
 
+/// Tauri event emitted to the frontend after a drain cycle that MERGED pulled peer
+/// changes (`applied > 0`). Item 2 (R6): the drain applies remote writes to the live DB
+/// but nothing told the frontend, so pulled sessions/notes/folders only appeared after an
+/// app restart. The store listens for this and refreshes the coarse queries (debounced).
+pub const SYNC_APPLIED_EVENT: &str = "sync://applied";
+
+/// Payload for [`SYNC_APPLIED_EVENT`]. Counts only — no row content, table names are the
+/// coarse hint the frontend already refreshes wholesale (no fine-grained invalidation v1).
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct SyncAppliedEvent {
+    /// Rows merged from peers this cycle (the trigger; always > 0 when emitted).
+    applied: usize,
+    /// Rows deferred to quarantine this cycle (unknown-column schema gap).
+    quarantined: usize,
+    /// Quarantined rows replayed this cycle once their column existed.
+    replayed: usize,
+}
+
+/// The [`SYNC_APPLIED_EVENT`] payload for a drain cycle, or `None` when nothing peer-visible
+/// was merged. Extracted from the drain loop so the "emit iff `applied > 0`" decision is
+/// unit-testable without a running Tauri app (item 2). A purely quarantine/replay cycle
+/// changes no currently-visible rows, so it does NOT trigger a refresh.
+fn applied_event_for(report: &outbox::DrainReport) -> Option<SyncAppliedEvent> {
+    (report.applied > 0).then_some(SyncAppliedEvent {
+        applied: report.applied,
+        quarantined: report.quarantined,
+        replayed: report.replayed,
+    })
+}
+
 /// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds an
 /// enabled session, ensure the live DB is CRR-prepared (running the one-time A3
 /// cutover if this device was enabled under the old copy architecture — the owner's
 /// Mac migrates itself on next restart with no re-click) and start the drain on the
 /// LIVE CRR DB. No-op when signed out or sync not yet enabled.
 pub fn start_drain_if_enabled(
+    app: &tauri::AppHandle,
     live_db: &Path,
     runtime: &SyncRuntimeState,
     db_service: &crate::db_service::DbServiceState,
@@ -2235,6 +2380,7 @@ pub fn start_drain_if_enabled(
         discard_legacy_sync_copy(live_db);
     }
     match spawn_drain(
+        app.clone(),
         live_db.to_path_buf(),
         session.server_url,
         session.bearer,
@@ -2258,7 +2404,11 @@ pub fn start_drain_if_enabled(
 /// that applied or replayed changes we run `cascade_gc` + `enforce_uniqueness`
 /// (the drain itself only replays quarantine; the merge-time invariants are the
 /// desktop's responsibility per the T010 handoff).
+// The drain is parameterised by the full session tuple plus the AppHandle it emits
+// `sync://applied` on; grouping these into a struct would not aid clarity here.
+#[allow(clippy::too_many_arguments)]
 fn spawn_drain(
+    app: tauri::AppHandle,
     sync_db: PathBuf,
     server_url: String,
     bearer: String,
@@ -2470,6 +2620,30 @@ fn spawn_drain(
                     }
                     if let Err(e) = uniqueness::enforce_uniqueness(conn) {
                         tracing::warn!("sync drain: enforce_uniqueness: {e}");
+                    }
+                }
+
+                // Item 3 (R6): pull-side observability. The push transitions log above; before
+                // this the PULL/apply half was a black box (Round-5 Windows logs had ZERO pull
+                // lines across hours of syncing). Log per cycle ONLY when a merge actually landed
+                // — never per idle cycle, counts only, no row content or secrets.
+                if report.applied > 0 || report.quarantined > 0 || report.replayed > 0 {
+                    tracing::info!(
+                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed)",
+                        report.applied,
+                        report.quarantined,
+                        report.replayed
+                    );
+                }
+
+                // Item 2 (R6): tell the frontend a merge landed so it can refresh the affected
+                // views WITHOUT an app restart. Only when peer rows were actually applied
+                // (`applied > 0`); a purely-quarantine/replay cycle changes no visible rows.
+                // Best-effort emit — a missing webview (not yet mounted) must never wedge the
+                // drain, exactly like `device_broker`'s `devices-changed`.
+                if let Some(ev) = applied_event_for(&report) {
+                    if let Err(e) = app.emit(SYNC_APPLIED_EVENT, ev) {
+                        tracing::warn!("sync drain: emit {SYNC_APPLIED_EVENT} failed: {e}");
                     }
                 }
 
@@ -3202,6 +3376,7 @@ pub async fn sync_enable(
     // Deliverable A: start the drain on its dedicated thread — now on the LIVE CRR DB.
     let vault_key = session.vault_key()?;
     let handle = spawn_drain(
+        app.clone(),
         db_path.clone(),
         session.server_url.clone(),
         session.bearer.clone(),
@@ -3736,7 +3911,7 @@ pub async fn sync_seed(
         state::set_push_watermark(db.conn(), max_dbv).map_err(|e| e.to_string())?;
     }
 
-    start_and_store_drain(&session, &runtime, &sync_db)?;
+    start_and_store_drain(&app, &session, &runtime, &sync_db)?;
     session.sync_enabled = true;
     store_session(&session)?;
     Ok(build_status_dto(&session).await)
@@ -3809,7 +3984,7 @@ pub async fn sync_join(
     mark_prepared(base.conn()).map_err(|e| e.to_string())?;
     drop(base);
 
-    start_and_store_drain(&session, &runtime, &sync_db)?;
+    start_and_store_drain(&app, &session, &runtime, &sync_db)?;
     session.sync_enabled = true;
     store_session(&session)?;
 
@@ -3833,12 +4008,14 @@ pub async fn sync_join(
 
 /// Spawn the drain on its dedicated thread and store the handle (shared by seed + join).
 fn start_and_store_drain(
+    app: &tauri::AppHandle,
     session: &Session,
     runtime: &State<'_, SyncRuntimeState>,
     sync_db: &Path,
 ) -> Result<(), String> {
     let vault_key = session.vault_key()?;
     let handle = spawn_drain(
+        app.clone(),
         sync_db.to_path_buf(),
         session.server_url.clone(),
         session.bearer.clone(),
@@ -3860,6 +4037,45 @@ fn start_and_store_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_event_emitted_only_when_peer_rows_merged() {
+        // Item 2 (R6): the drain fires `sync://applied` iff `applied > 0`. A clean/idle cycle
+        // and a pure quarantine/replay cycle (no currently-visible rows changed) do NOT.
+        let idle = outbox::DrainReport::default();
+        assert!(
+            applied_event_for(&idle).is_none(),
+            "idle cycle emits nothing"
+        );
+
+        let quarantine_only = outbox::DrainReport {
+            applied: 0,
+            quarantined: 3,
+            replayed: 2,
+            ..Default::default()
+        };
+        assert!(
+            applied_event_for(&quarantine_only).is_none(),
+            "a quarantine/replay-only cycle changes no visible rows → no refresh"
+        );
+
+        let merged = outbox::DrainReport {
+            applied: 5,
+            quarantined: 1,
+            replayed: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            applied_event_for(&merged),
+            Some(SyncAppliedEvent {
+                applied: 5,
+                quarantined: 1,
+                replayed: 2,
+            }),
+            "a merge of peer rows carries the counts to the frontend"
+        );
+        assert_eq!(SYNC_APPLIED_EVENT, "sync://applied");
+    }
 
     #[test]
     fn fail_surface_threshold_gates_a_single_blip_but_surfaces_a_run() {
@@ -4619,6 +4835,43 @@ mod tests {
             let loaded = load_session_wrapped(&ks, &path).unwrap().unwrap();
             assert_eq!(json_of(&loaded), json_of(&s));
             let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn sealed_path_is_identical_at_boot_read_and_signin_write() {
+            // R6 item 4(c): the sealed-session path MUST be the same at the boot READ and the
+            // sign-in WRITE. Both go through `resolve_session_enc_path(Some(config_dir))` with
+            // the SAME resolved store dir, so they are byte-identical.
+            let config_dir = std::env::temp_dir().join(format!("yapstack-cfg-{}", Uuid::new_v4()));
+            let boot_read = resolve_session_enc_path(Some(&config_dir));
+            let signin_write = resolve_session_enc_path(Some(&config_dir));
+            assert_eq!(
+                boot_read, signin_write,
+                "boot read and sign-in write resolve to the SAME sealed file"
+            );
+            assert_eq!(
+                boot_read,
+                config_dir.join(SESSION_ENC_FILENAME),
+                "resolves under the config dir, deterministically"
+            );
+        }
+
+        #[test]
+        fn pre_init_fallback_path_diverges_from_config_path() {
+            // The bug this guards against: a session touch BEFORE `init_credential_store` sets
+            // SESSION_STORE_DIR resolves via the `None` → temp-dir fallback, which does NOT
+            // equal the post-init config-dir path — so a boot read that raced ahead of init
+            // would look in the temp dir while sign-in wrote under the config dir. lib.rs now
+            // hoists init before every session touch; this asserts the divergence the reorder
+            // eliminates (config_dir is deliberately not the temp dir).
+            let config_dir = std::env::temp_dir().join(format!("yapstack-cfg-{}", Uuid::new_v4()));
+            let pre_init = resolve_session_enc_path(None);
+            let post_init = resolve_session_enc_path(Some(&config_dir));
+            assert_ne!(
+                pre_init, post_init,
+                "pre-init temp fallback must NOT collide with the config-dir path (the mismatch)"
+            );
+            assert_eq!(pre_init, std::env::temp_dir().join(SESSION_ENC_FILENAME));
         }
 
         #[test]
