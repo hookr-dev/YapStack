@@ -65,6 +65,65 @@ fn crr_migration_roundtrip_synthetic() {
     );
 }
 
+/// R8 fresh-install regression: the full db_service migration chain produces a
+/// 13-column `segments` (speaker_id is a frontend runtime patch, not a migration).
+/// The hardcoded rebuild assumed 14 columns and crashed cutover with
+/// `segments__crr_rebuild has 14 columns but 13 values were supplied`. The derived
+/// rebuild must follow the live 13-column shape and still round-trip + CRRify.
+#[test]
+fn crr_migration_roundtrip_fresh_chain_13col_segments() {
+    let db = CrsqlDb::open_in_memory().unwrap();
+    let conn = db.conn();
+    support::create_original_schema(conn);
+    // Drop speaker_id to reproduce the pristine migration-chain shape (13 columns).
+    conn.execute_batch("ALTER TABLE segments DROP COLUMN speaker_id;")
+        .unwrap();
+    let ncols: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('segments')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ncols, 13,
+        "precondition: fresh-chain segments has 13 columns"
+    );
+    support::populate(conn);
+
+    let pre: Vec<(&str, (i64, u64))> = SYNC_TABLES
+        .iter()
+        .map(|t| (*t, support::fingerprint(conn, t)))
+        .collect();
+
+    schema::crr_migrate(conn).expect("crr_migrate must adapt to the 13-column live shape");
+
+    for (t, (pn, ph)) in &pre {
+        let (n, h) = support::fingerprint(conn, t);
+        assert_eq!(n, *pn, "{t}: row count drifted {pn}->{n}");
+        assert_eq!(h, *ph, "{t}: content fingerprint drifted");
+        assert!(
+            schema::is_crr(conn, t).unwrap(),
+            "{t}: not converted to a CRR"
+        );
+    }
+    // A post-migration write to the 13-column CRR captures to crsql_changes.
+    conn.execute(
+        "INSERT INTO segments(id,session_id,source,text,audio_offset_seconds,chunk_duration_seconds) \
+         VALUES ('post','s0','mic','after',9,1)",
+        [],
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM crsql_changes WHERE \"table\"='segments' AND pk IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(n > 0, "post-cutover write must capture to crsql_changes");
+}
+
 /// R3 against a COPY of the REAL populated DB. Opt-in: set `YAPSTACK_SPIKE_DB` to a
 /// `.backup` copy path (NEVER the live DB — T001 copy procedure). Ignored by default.
 #[test]

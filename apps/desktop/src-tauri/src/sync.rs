@@ -4322,6 +4322,138 @@ mod tests {
         (dir, path, std::sync::Arc::new(svc))
     }
 
+    /// Build a live DB through the REAL db_service migration runner (all migrations,
+    /// fresh) and seed a couple of rows — WITHOUT the frontend's out-of-band
+    /// speaker_id ALTER. `add_speaker_id` mimics a long-lived dev DB whose frontend
+    /// already patched segments.speaker_id in (the Mac-shaped 14-column divergence).
+    fn migration_chain_fixture(
+        add_speaker_id: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::db_service::DbServiceState,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yapstack.db");
+        let svc = crate::db_service::DbService::open(&path).expect("open service");
+        if add_speaker_id {
+            svc.execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER", &[])
+                .unwrap();
+        }
+        svc.execute(
+            "INSERT INTO sessions (id, title, source) VALUES ('s1','First','Mic')",
+            &[],
+        )
+        .unwrap();
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+             VALUES ('g1','s1','Mic','hello searchable world',0,1)",
+            &[],
+        )
+        .unwrap();
+        (dir, path, std::sync::Arc::new(svc))
+    }
+
+    /// R8 regression: a FRESH-install live DB built purely by the migration chain has a
+    /// 13-column `segments` (speaker_id is a frontend runtime patch, not a migration).
+    /// The hardcoded rebuild expected 14 columns and crashed cutover with
+    /// `segments__crr_rebuild has 14 columns but 13 values were supplied`. The derived
+    /// rebuild must follow the live 13-column shape. This test — built through the REAL
+    /// db_service runner, not a hand-written fixture — is the one that would have caught
+    /// today's bug.
+    #[test]
+    fn cutover_fresh_migration_chain_no_speaker_id_succeeds() {
+        let (_dir, path, svc) = migration_chain_fixture(false);
+        // Precondition: the migration chain leaves segments at 13 columns, no speaker_id.
+        let cols = svc
+            .select("SELECT name FROM pragma_table_info('segments')", &[])
+            .unwrap();
+        assert_eq!(cols.len(), 13, "fresh migration chain: 13-column segments");
+        assert!(
+            !cols
+                .iter()
+                .any(|r| r["name"] == serde_json::json!("speaker_id")),
+            "fresh migration chain must NOT carry speaker_id"
+        );
+
+        assert!(!live_is_crr_prepared(&path));
+        let pre = synced_table_row_counts(&path).unwrap();
+
+        perform_cutover(&path, &svc).expect("fresh-chain cutover must succeed");
+
+        assert!(live_is_crr_prepared(&path), "live DB is now CRR");
+        assert!(backup_db_path(&path).exists(), "pre-sync backup kept");
+        assert_eq!(
+            synced_table_row_counts(&path).unwrap(),
+            pre,
+            "row counts preserved"
+        );
+
+        // A post-cutover write to the reopened CRR pool captures to crsql_changes.
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+             VALUES ('g2','s1','Mic','after cutover',1,1)",
+            &[],
+        )
+        .unwrap();
+        let db = CrsqlDb::open(&path).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\"='segments'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            n > 0,
+            "post-cutover write must be captured by crsql_changes"
+        );
+    }
+
+    /// R8 Mac-shaped divergence: a dev DB whose schema DIFFERS from the fresh chain by
+    /// the runtime-patched 14th column (segments.speaker_id) must ALSO cut over cleanly.
+    /// Dynamic derivation makes this automatic — the same code path adapts to 14 columns.
+    #[test]
+    fn cutover_dev_db_with_speaker_id_succeeds() {
+        let (_dir, path, svc) = migration_chain_fixture(true);
+        let cols = svc
+            .select("SELECT name FROM pragma_table_info('segments')", &[])
+            .unwrap();
+        assert_eq!(cols.len(), 14, "dev DB: 14-column segments");
+        assert_eq!(cols[13]["name"], serde_json::json!("speaker_id"));
+
+        let pre = synced_table_row_counts(&path).unwrap();
+        perform_cutover(&path, &svc).expect("dev-DB (14-col) cutover must succeed");
+        assert!(live_is_crr_prepared(&path));
+        assert_eq!(
+            synced_table_row_counts(&path).unwrap(),
+            pre,
+            "row counts preserved"
+        );
+
+        // speaker_id survives the rebuild and a write to it captures cleanly.
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, speaker_id) \
+             VALUES ('g2','s1','Mic','after cutover',1,1,7)",
+            &[],
+        )
+        .unwrap();
+        let db = CrsqlDb::open(&path).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\"='segments'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            n > 0,
+            "post-cutover write must be captured by crsql_changes"
+        );
+    }
+
     #[test]
     fn cutover_full_sequence_preserves_data_fts_and_prepares_crr() {
         let (_dir, path, svc) = cutover_fixture();

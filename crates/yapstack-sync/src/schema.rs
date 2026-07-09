@@ -35,137 +35,167 @@ pub const SYNC_TABLES: &[&str] = &[
     "shares",
 ];
 
-/// CRR-compatible column definition body for each sync table, matching the live
-/// column order (incl. the db.ts out-of-band columns `segments.speaker_id` and the
-/// `chat_messages` columns, which the live DB already carries). Ported from the
-/// T003 spike, which round-tripped the real 41 MB DB with identical fingerprints.
-pub fn rebuild_body(table: &str) -> Result<&'static str, SyncError> {
-    Ok(match table {
-        "sessions" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             title TEXT NOT NULL DEFAULT '', \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             source TEXT NOT NULL DEFAULT 'Mixed', \
-             status TEXT NOT NULL DEFAULT 'recording', \
-             duration_seconds REAL, \
-             total_segments INTEGER NOT NULL DEFAULT 0, \
-             folder_id TEXT, \
-             is_pinned INTEGER NOT NULL DEFAULT 0, \
-             pinned_at TEXT, \
-             session_type TEXT NOT NULL DEFAULT 'transcription', \
-             wav_file_path TEXT, \
-             wav_duration_seconds REAL, \
-             sort_order INTEGER NOT NULL DEFAULT 0"
+/// One column's metadata as reported by `PRAGMA table_info`, in declared (`cid`)
+/// order. This is the authoritative, drift-proof shape of the LIVE table.
+struct ColInfo {
+    name: String,
+    ty: String,
+    notnull: bool,
+    dflt: Option<String>,
+    /// 0 = not part of the PK; 1..N = position within the PRIMARY KEY.
+    pk: i64,
+}
+
+/// Read the live column metadata for `table` in declared order.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ColInfo>, SyncError> {
+    let mut stmt = conn.prepare(
+        "SELECT name, type, \"notnull\", dflt_value, pk \
+         FROM pragma_table_info(?1) ORDER BY cid",
+    )?;
+    let cols: Result<Vec<ColInfo>, _> = stmt
+        .query_map([table], |r| {
+            Ok(ColInfo {
+                name: r.get(0)?,
+                ty: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                notnull: r.get::<_, i64>(2)? != 0,
+                dflt: r.get::<_, Option<String>>(3)?,
+                pk: r.get(4)?,
+            })
+        })?
+        .collect();
+    Ok(cols?)
+}
+
+/// True if a declared column type has TEXT storage affinity (TEXT/CHAR/CLOB).
+/// The sync architecture assumes UUID **TEXT** primary keys.
+fn type_is_text(ty: &str) -> bool {
+    let u = ty.to_ascii_uppercase();
+    u.contains("TEXT") || u.contains("CHAR") || u.contains("CLOB")
+}
+
+/// A non-null, type-valid synthetic default for a NOT-NULL column the live schema
+/// left without one — required so `is_table_compatible` accepts the CRR and so a
+/// merge that inserts a partial row does not violate NOT NULL.
+fn synthetic_default(ty: &str) -> &'static str {
+    let u = ty.to_ascii_uppercase();
+    if u.contains("INT")
+        || u.contains("REAL")
+        || u.contains("FLOA")
+        || u.contains("DOUB")
+        || u.contains("NUM")
+        || u.contains("DEC")
+    {
+        "0"
+    } else {
+        "''"
+    }
+}
+
+/// Re-emit a live default so it is valid inside a fresh `CREATE TABLE`. `PRAGMA
+/// table_info` strips the parentheses SQLite requires around an *expression* default
+/// (e.g. `datetime('now')`), so a non-literal is re-wrapped in `(...)`; literals
+/// (numbers, quoted strings, NULL, CURRENT_* keywords, already-parenthesized exprs)
+/// pass through verbatim.
+fn emit_default(dflt: &str) -> String {
+    let t = dflt.trim();
+    if t.is_empty() {
+        return "''".to_string();
+    }
+    let u = t.to_ascii_uppercase();
+    let literal = t.starts_with('(')
+        || t.starts_with('\'')
+        || t.starts_with('"')
+        || u == "NULL"
+        || u == "TRUE"
+        || u == "FALSE"
+        || u == "CURRENT_TIME"
+        || u == "CURRENT_DATE"
+        || u == "CURRENT_TIMESTAMP"
+        || t.parse::<f64>().is_ok();
+    if literal {
+        t.to_string()
+    } else {
+        format!("({t})")
+    }
+}
+
+/// Derive the CRR-compatible rebuild body for `table` from its LIVE shape, rather
+/// than a hardcoded column list. This is the fresh-install cutover fix (R8): a DB
+/// built by the full A2 migration runner legitimately differs — by the runtime-patched
+/// `segments.speaker_id` column — from a long-lived dev DB that already carries it, so
+/// a hardcoded shape races the migration history and `INSERT ... SELECT *` mismatches
+/// the column count. Deriving from `PRAGMA table_info` follows the live schema exactly.
+///
+/// Transformations applied (the invariants the rebuild exists to enforce, per the
+/// module doc): the single-column TEXT PK becomes `NOT NULL PRIMARY KEY`; a composite
+/// PK is re-declared as a trailing `PRIMARY KEY (...)` clause with its members forced
+/// NOT NULL; every NOT-NULL non-PK column WITHOUT a default gains a type-appropriate
+/// synthetic default. FK constraints, non-PK UNIQUE indexes and CHECK constraints are
+/// deliberately NOT reconstructed — cascade/uniqueness move to the app layer (see
+/// `cascade`/`uniqueness`), and a surviving CHECK would be a merge hazard (a peer's
+/// merged value that violated it would fail to apply and desync). Column names and
+/// order are copied verbatim, so the existing `INSERT ... SELECT *` round-trips.
+///
+/// CRYPTO/architecture invariant: sync assumes a UUID TEXT primary key. Every PK column
+/// is asserted to have TEXT affinity; a table whose PK is anything else fails loudly.
+pub fn derive_rebuild_body(conn: &Connection, table: &str) -> Result<String, SyncError> {
+    let cols = table_columns(conn, table)?;
+    if cols.is_empty() {
+        return Err(SyncError::UnknownTable(table.to_string()));
+    }
+    let mut pk_cols: Vec<&ColInfo> = cols.iter().filter(|c| c.pk > 0).collect();
+    pk_cols.sort_by_key(|c| c.pk);
+    if pk_cols.is_empty() {
+        return Err(SyncError::Migration(format!(
+            "sync table `{table}` has no PRIMARY KEY; sync requires a UUID TEXT PK"
+        )));
+    }
+    for c in &pk_cols {
+        if !type_is_text(&c.ty) {
+            return Err(SyncError::Migration(format!(
+                "sync table `{table}` PK column `{}` has type `{}`, not TEXT; the sync \
+                 architecture (and per-row crypto AAD) assumes a UUID TEXT primary key",
+                c.name, c.ty
+            )));
         }
-        "segments" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             session_id TEXT NOT NULL DEFAULT '', \
-             source TEXT NOT NULL DEFAULT '', \
-             text TEXT NOT NULL DEFAULT '', \
-             audio_offset_seconds REAL NOT NULL DEFAULT 0, \
-             chunk_duration_seconds REAL NOT NULL DEFAULT 0, \
-             confidence REAL NOT NULL DEFAULT 1.0, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             chunk_index INTEGER NOT NULL DEFAULT 0, \
-             original_text TEXT, \
-             edited_at TEXT, \
-             deleted_at TEXT, \
-             hidden INTEGER NOT NULL DEFAULT 0, \
-             speaker_id INTEGER"
+    }
+    let single_pk = pk_cols.len() == 1;
+
+    let mut defs: Vec<String> = Vec::with_capacity(cols.len() + 1);
+    for c in &cols {
+        let ty = c.ty.trim();
+        let mut d = if ty.is_empty() {
+            format!("\"{}\"", c.name)
+        } else {
+            format!("\"{}\" {ty}", c.name)
+        };
+        if c.pk > 0 {
+            // PK columns are always NOT NULL; a single TEXT PK is declared inline.
+            d.push_str(" NOT NULL");
+            if single_pk {
+                d.push_str(" PRIMARY KEY");
+            }
+        } else if c.notnull {
+            d.push_str(" NOT NULL DEFAULT ");
+            match &c.dflt {
+                Some(v) => d.push_str(&emit_default(v)),
+                None => d.push_str(synthetic_default(&c.ty)),
+            }
+        } else if let Some(v) = &c.dflt {
+            d.push_str(" DEFAULT ");
+            d.push_str(&emit_default(v));
         }
-        "notes" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             session_id TEXT NOT NULL DEFAULT '', \
-             content TEXT NOT NULL DEFAULT '', \
-             updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
-        }
-        "note_versions" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             note_id TEXT NOT NULL DEFAULT '', \
-             content TEXT NOT NULL DEFAULT '', \
-             created_at TEXT NOT NULL DEFAULT (datetime('now'))"
-        }
-        "folders" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             name TEXT NOT NULL DEFAULT '', \
-             parent_id TEXT, \
-             sort_order INTEGER NOT NULL DEFAULT 0, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             icon TEXT, \
-             color TEXT, \
-             description TEXT"
-        }
-        "session_folders" => {
-            "session_id TEXT NOT NULL, \
-             folder_id TEXT NOT NULL, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             PRIMARY KEY (session_id, folder_id)"
-        }
-        "chat_messages" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             context_key TEXT NOT NULL DEFAULT '', \
-             session_id TEXT, \
-             role TEXT NOT NULL DEFAULT '', \
-             content TEXT NOT NULL DEFAULT '', \
-             action TEXT, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             tool_calls TEXT, \
-             send_id TEXT, \
-             sequence INTEGER, \
-             tool_call_id TEXT, \
-             observation TEXT, \
-             status TEXT"
-        }
-        "dictation_history" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             slot_id TEXT NOT NULL DEFAULT '', \
-             slot_name TEXT NOT NULL DEFAULT '', \
-             input_text TEXT NOT NULL DEFAULT '', \
-             output_text TEXT NOT NULL DEFAULT '', \
-             ai_enabled INTEGER NOT NULL DEFAULT 0, \
-             ai_prompt TEXT, \
-             output_action TEXT NOT NULL DEFAULT '', \
-             wav_file_path TEXT, \
-             wav_duration_seconds REAL, \
-             session_id TEXT, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now'))"
-        }
-        "tags" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             name TEXT NOT NULL DEFAULT '', \
-             color TEXT, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now'))"
-        }
-        "session_tags" => {
-            "session_id TEXT NOT NULL, \
-             tag_id TEXT NOT NULL, \
-             source TEXT NOT NULL DEFAULT 'manual', \
-             confidence REAL, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             PRIMARY KEY (session_id, tag_id)"
-        }
-        "session_audio_parts" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             session_id TEXT NOT NULL DEFAULT '', \
-             part_index INTEGER NOT NULL DEFAULT 0, \
-             file_path TEXT NOT NULL DEFAULT '', \
-             format TEXT NOT NULL DEFAULT 'wav' CHECK (format IN ('wav','mp3')), \
-             duration_seconds REAL NOT NULL DEFAULT 0, \
-             sample_rate INTEGER NOT NULL DEFAULT 0, \
-             created_at TEXT NOT NULL DEFAULT (datetime('now'))"
-        }
-        "shares" => {
-            "id TEXT NOT NULL PRIMARY KEY, \
-             folder_id TEXT NOT NULL DEFAULT '', \
-             shared_with_email TEXT, \
-             permission TEXT NOT NULL DEFAULT 'viewer', \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             expires_at TEXT"
-        }
-        other => return Err(SyncError::UnknownTable(other.to_string())),
-    })
+        defs.push(d);
+    }
+    if !single_pk {
+        let names = pk_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("PRIMARY KEY ({names})"));
+    }
+    Ok(defs.join(", "))
 }
 
 /// True if `table` currently exists in the schema.
@@ -211,7 +241,10 @@ pub fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncEr
 
     conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tmp = format!("{table}__crr_rebuild");
-    let body = rebuild_body(table)?;
+    // Derive the rebuild shape from the LIVE table (not a hardcoded list) so the
+    // column count/order always matches `SELECT *`, regardless of migration drift
+    // such as the runtime-patched `segments.speaker_id` (R8 fresh-install fix).
+    let body = derive_rebuild_body(conn, table)?;
     conn.execute_batch("BEGIN;")?;
     let build = || -> Result<(), SyncError> {
         conn.execute_batch(&format!("CREATE TABLE \"{tmp}\" ({body});"))?;
@@ -306,4 +339,160 @@ pub fn apply_out_of_band_alters(conn: &Connection) -> Result<(), SyncError> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Column names of `table` in declared order.
+    fn col_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .unwrap();
+        stmt.query_map([table], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    /// Build the derived body, materialize it as a real table, and return that
+    /// table's column names — proving the derived DDL is valid SQL and preserves the
+    /// live column set/order.
+    fn derived_cols(conn: &Connection, src: &str) -> Vec<String> {
+        let body = derive_rebuild_body(conn, src).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE _derived ({body});"))
+            .unwrap();
+        // INSERT ... SELECT * must line up column-for-column with the source.
+        conn.execute_batch(&format!("INSERT INTO _derived SELECT * FROM \"{src}\";"))
+            .unwrap();
+        let out = col_names(conn, "_derived");
+        conn.execute_batch("DROP TABLE _derived;").unwrap();
+        out
+    }
+
+    // The exact 13-column `segments` the full db_service migration chain produces
+    // (v1 base + v3 editing columns) — NO speaker_id, which is a frontend runtime
+    // patch, not a migration. This is the fresh-install shape that crashed cutover.
+    const SEGMENTS_13: &str = "CREATE TABLE segments (\
+        id TEXT PRIMARY KEY, \
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, \
+        source TEXT NOT NULL, \
+        text TEXT NOT NULL, \
+        audio_offset_seconds REAL NOT NULL, \
+        chunk_duration_seconds REAL NOT NULL, \
+        confidence REAL NOT NULL DEFAULT 1.0, \
+        created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+        chunk_index INTEGER NOT NULL DEFAULT 0, \
+        original_text TEXT, \
+        edited_at TEXT, \
+        deleted_at TEXT, \
+        hidden INTEGER NOT NULL DEFAULT 0);";
+
+    #[test]
+    fn derive_segments_fresh_chain_13_columns_no_speaker_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(SEGMENTS_13).unwrap();
+        conn.execute(
+            "INSERT INTO segments(id,session_id,source,text,audio_offset_seconds,chunk_duration_seconds) \
+             VALUES ('g1','s1','mic','hi',0,1)",
+            [],
+        )
+        .unwrap();
+        let cols = derived_cols(&conn, "segments");
+        assert_eq!(cols.len(), 13, "fresh-chain segments derives 13 columns");
+        assert!(!cols.iter().any(|c| c == "speaker_id"));
+        assert_eq!(cols[0], "id");
+        // Single TEXT PK is rebuilt NOT NULL PRIMARY KEY.
+        let body = derive_rebuild_body(&conn, "segments").unwrap();
+        assert!(body.contains("\"id\" TEXT NOT NULL PRIMARY KEY"));
+        // NOT-NULL-no-default columns get synthetic defaults; expression default kept.
+        assert!(body.contains("\"session_id\" TEXT NOT NULL DEFAULT ''"));
+        assert!(body.contains("\"audio_offset_seconds\" REAL NOT NULL DEFAULT 0"));
+        assert!(body.contains("\"created_at\" TEXT NOT NULL DEFAULT (datetime('now'))"));
+        assert!(body.contains("\"confidence\" REAL NOT NULL DEFAULT 1.0"));
+    }
+
+    #[test]
+    fn derive_segments_dev_db_14_columns_with_speaker_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(SEGMENTS_13).unwrap();
+        // The Mac-shaped divergence: frontend getDb() patched in speaker_id.
+        conn.execute_batch("ALTER TABLE segments ADD COLUMN speaker_id INTEGER;")
+            .unwrap();
+        let cols = derived_cols(&conn, "segments");
+        assert_eq!(cols.len(), 14, "dev-DB segments derives 14 columns");
+        assert_eq!(cols.last().unwrap(), "speaker_id");
+    }
+
+    #[test]
+    fn derive_composite_pk_emits_trailing_primary_key_clause() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_folders (\
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, \
+             folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE, \
+             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+             PRIMARY KEY (session_id, folder_id));",
+        )
+        .unwrap();
+        let body = derive_rebuild_body(&conn, "session_folders").unwrap();
+        assert!(body.contains("PRIMARY KEY (\"session_id\", \"folder_id\")"));
+        // Composite-PK members are NOT NULL but carry no synthetic default.
+        assert!(body.contains("\"session_id\" TEXT NOT NULL,"));
+        assert!(!body.contains("\"session_id\" TEXT NOT NULL DEFAULT"));
+        // The materialized table still round-trips SELECT *.
+        let cols = derived_cols(&conn, "session_folders");
+        assert_eq!(cols, vec!["session_id", "folder_id", "created_at"]);
+    }
+
+    #[test]
+    fn derive_drops_non_pk_unique_and_check_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_audio_parts (\
+             id TEXT PRIMARY KEY, \
+             session_id TEXT NOT NULL, \
+             part_index INTEGER NOT NULL, \
+             file_path TEXT NOT NULL, \
+             format TEXT NOT NULL CHECK (format IN ('wav','mp3')), \
+             duration_seconds REAL NOT NULL, \
+             sample_rate INTEGER NOT NULL, \
+             created_at TEXT NOT NULL, \
+             UNIQUE (session_id, part_index));",
+        )
+        .unwrap();
+        let body = derive_rebuild_body(&conn, "session_audio_parts").unwrap();
+        // CHECK and UNIQUE are stripped (merge hazards; enforced app-side instead).
+        assert!(!body.to_uppercase().contains("CHECK"));
+        assert!(!body.to_uppercase().contains("UNIQUE"));
+        // format keeps a valid NOT NULL synthetic default.
+        assert!(body.contains("\"format\" TEXT NOT NULL DEFAULT ''"));
+    }
+
+    #[test]
+    fn derive_rejects_non_text_primary_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE bad (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        let err = derive_rebuild_body(&conn, "bad").unwrap_err();
+        match err {
+            SyncError::Migration(m) => {
+                assert!(m.contains("not TEXT"), "loud PK-type failure: {m}");
+            }
+            other => panic!("expected Migration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_rejects_missing_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        match derive_rebuild_body(&conn, "nope").unwrap_err() {
+            SyncError::UnknownTable(t) => assert_eq!(t, "nope"),
+            other => panic!("expected UnknownTable, got {other:?}"),
+        }
+    }
 }
