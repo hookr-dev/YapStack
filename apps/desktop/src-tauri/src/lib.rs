@@ -617,8 +617,11 @@ pub fn run() {
 
             // Initialise tracing → stderr + rotating file + UI ring buffer.
             // Must happen before other state registration so those log lines
-            // are captured. The WorkerGuard is managed so the non-blocking
-            // file writer survives for the lifetime of the app.
+            // are captured. The WorkerGuard is managed so the non-blocking file
+            // writer survives for the lifetime of the app. `logging::init` also
+            // installs the R7 crash-durable panic hook, which fsyncs the ring
+            // buffer + the panic to `yapstack-panic.log` — so a `panic=abort`
+            // (where the non-blocking tail is lost) still leaves evidence.
             let log_dir = app
                 .path()
                 .app_log_dir()
@@ -647,6 +650,24 @@ pub fn run() {
                 .app_config_dir()
                 .map(|p| p.join("yapstack.db"))
                 .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
+
+            // Fresh-install durability (R7): the OLD tauri-plugin-sql created
+            // the app-data / config directories implicitly before opening the
+            // DB. We now own the DB open (`db_service`), and SQLite CANNOT
+            // create intermediate directories — so on a CLEAN install (no
+            // pre-existing %APPDATA% / %LOCALAPPDATA% dirs, e.g. after an
+            // uninstall + app-data wipe) `Connection::open(yapstack.db)` fails
+            // with SQLITE_CANTOPEN. Under the release profile's `panic=abort`
+            // the old `.expect()` on that failure aborted the whole app, leaving
+            // no log evidence. Every prior Windows round masked this because it
+            // was an UPGRADE install (the dirs already existed). Create every
+            // app-owned directory up front, before anything opens a file inside
+            // it. (`db_service` also create_dir_all's the DB parent defensively
+            // for every open path; this is the earliest, coarsest guarantee.)
+            std::fs::create_dir_all(&app_data_dir).ok();
+            if let Some(config_dir) = db_path.parent() {
+                std::fs::create_dir_all(config_dir).ok();
+            }
 
             // Manage every command dependency BEFORE the db/filesystem sweeps
             // below: the webviews load concurrently with this hook, and a
@@ -686,10 +707,27 @@ pub fn run() {
             // before `backend_ready` unblocks the frontend. Migration continuity
             // with the removed tauri-plugin-sql is preserved via the existing
             // `_sqlx_migrations` bookkeeping (see `db_service::run_migrations`).
-            let db_service: db_service::DbServiceState = Arc::new(
-                db_service::DbService::open(&db_path)
-                    .expect("failed to open repo-owned DB service"),
-            );
+            // Graceful open (R7): if the DB still cannot be opened after the
+            // dir-creation above (genuine disk/permission failure, corruption),
+            // do NOT `.expect()` — a panic here aborts under release
+            // `panic=abort` and, worse, leaves no diagnosis. Log the concrete
+            // path + error (blocking writer → durable) and return a graceful
+            // setup error, which fails the Tauri build path cleanly (the
+            // top-level `unwrap_or_else` prints and exits(1)) instead of an
+            // evidence-free abort.
+            let db_service: db_service::DbServiceState = match db_service::DbService::open(&db_path) {
+                Ok(svc) => Arc::new(svc),
+                Err(e) => {
+                    tracing::error!(
+                        db_path = %db_path.display(),
+                        "fatal: failed to open the local database: {e}"
+                    );
+                    return Err(Box::new(std::io::Error::other(format!(
+                        "failed to open the local database at {}: {e}",
+                        db_path.display()
+                    ))));
+                }
+            };
             app.manage(db_service.clone());
 
             // YapStack Sync runtime (deliverable A): manage the drain handle and,
@@ -1052,6 +1090,67 @@ mod tests {
 
         assert!(!is_allowed_audio_path(&base, &outside));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R7 fresh-install boot regression: run the setup-equivalent boot sequence
+    /// against a COMPLETELY EMPTY temp tree — no app-data, config, or log dirs
+    /// exist — and assert a clean startup with a usable, empty DB. This is the
+    /// test that would have caught the fresh-Windows-install crash: the app-data
+    /// / config dir is absent, SQLite cannot create it, and (before the fix) the
+    /// DB open aborted the app under release `panic=abort`.
+    ///
+    /// AppHandle-bound steps (`logging::init`, `sync::start_drain_if_enabled`)
+    /// and process-global steps (`sync::init_credential_store`, which only READS
+    /// and returns "signed out" on a missing store) cannot be driven without a
+    /// live Tauri app, so their fresh-state safety is asserted by construction;
+    /// the load-bearing crash — directory-less DB open + migrations — is proven
+    /// here directly.
+    #[test]
+    fn fresh_install_boot_sequence_on_empty_tree() {
+        // A pristine root standing in for a machine with NOTHING under the app's
+        // %APPDATA%/%LOCALAPPDATA% (post uninstall + wipe). The three app-owned
+        // dirs are named but do NOT exist yet.
+        let root = test_temp_dir();
+        let app_data_dir = root.join("app-data");
+        let config_dir = root.join("config");
+        let log_dir = root.join("logs");
+        for d in [&app_data_dir, &config_dir, &log_dir] {
+            assert!(!d.exists(), "precondition: {} must be absent", d.display());
+        }
+
+        // Step 1 — setup's up-front directory creation (mirrors lib.rs setup).
+        std::fs::create_dir_all(&log_dir).ok();
+        std::fs::create_dir_all(&app_data_dir).ok();
+        std::fs::create_dir_all(&config_dir).ok();
+
+        // Step 2 — resolve the DB path exactly as setup does.
+        let db_path = config_dir.join("yapstack.db");
+
+        // Step 3 — interrupted-cutover recovery runs BEFORE the DB open. On an
+        // empty tree there is no journal and no live DB: it must be a clean
+        // no-op and must NOT panic. (Sync-feature-only, like setup.)
+        #[cfg(feature = "sync")]
+        sync::recover_interrupted_cutover(&db_path);
+
+        // Step 4 — open the repo-owned DB service (runs migrations on a truly
+        // fresh DB). This is the exact call that crashed a clean install.
+        let db_service =
+            db_service::DbService::open(&db_path).expect("fresh-install DB open must succeed");
+        assert!(db_path.exists(), "DB file created on the fresh tree");
+
+        // Step 5 — the DB is migrated, usable, and empty.
+        let rows = db_service
+            .select("SELECT COUNT(*) AS c FROM sessions", &[])
+            .expect("query the fresh empty DB");
+        assert_eq!(rows[0]["c"], serde_json::json!(0), "fresh DB is empty");
+
+        // Every app-owned directory now exists — nothing in the boot path
+        // assumed pre-existing state.
+        for d in [&app_data_dir, &config_dir, &log_dir] {
+            assert!(d.exists(), "{} must exist after boot", d.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

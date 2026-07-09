@@ -77,6 +77,22 @@ impl ManagedConn {
     /// Open `path`, initialize cr-sqlite (sync feature only), and apply the
     /// shared pragmas.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        // Fresh-install durability (R7): SQLite CANNOT create intermediate
+        // directories — `sqlite3_open` only creates the DB FILE, never its
+        // parent. The removed tauri-plugin-sql created the app-data/config dir
+        // implicitly; we now own every open, so on a CLEAN install (no
+        // pre-existing %APPDATA%/%LOCALAPPDATA% dirs) `Connection::open` would
+        // fail with SQLITE_CANTOPEN merely because the directory is absent —
+        // which previously aborted the whole app under release `panic=abort`.
+        // Create the parent up front (idempotent, cheap) so every open path —
+        // `DbService::open` AND every `open_managed` caller — is safe on a
+        // fresh tree. lib.rs setup also creates these dirs; this is the
+        // belt-and-suspenders guarantee at the point of first use.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         #[cfg(feature = "sync")]
         {
             // CrsqlDb::open already applies busy_timeout + inits cr-sqlite +
@@ -724,6 +740,36 @@ mod tests {
         let (dir, path) = temp_db();
         let svc = DbService::open(&path).expect("open service");
         (dir, svc)
+    }
+
+    /// R7 fresh-install crash regression: opening the DB at a path whose parent
+    /// directory does NOT exist must succeed (create the dir + a usable empty,
+    /// migrated DB) rather than fail with SQLITE_CANTOPEN. This is the exact
+    /// condition a clean Windows install hit: `%APPDATA%\<id>\yapstack.db` with
+    /// `%APPDATA%\<id>` absent. Before the fix, `Connection::open` errored and
+    /// the `.expect()` in setup panic-aborted the app.
+    #[test]
+    fn open_creates_missing_parent_dirs_fresh_install() {
+        let root = tempfile::tempdir().unwrap();
+        // A path two levels deep under a directory tree that does not exist yet.
+        let db_path = root
+            .path()
+            .join("does-not-exist")
+            .join("config")
+            .join("yapstack.db");
+        assert!(
+            !db_path.parent().unwrap().exists(),
+            "precondition: parent absent"
+        );
+
+        let svc = DbService::open(&db_path).expect("open must create the parent dir and succeed");
+        assert!(db_path.exists(), "the DB file must have been created");
+
+        // The DB is fully migrated and usable: the core table exists and is empty.
+        let rows = svc
+            .select("SELECT COUNT(*) AS c FROM sessions", &[])
+            .expect("query a fresh, migrated, empty DB");
+        assert_eq!(rows[0]["c"], serde_json::json!(0));
     }
 
     #[test]
