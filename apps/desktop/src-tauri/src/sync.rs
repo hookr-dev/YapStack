@@ -239,26 +239,65 @@ static SESSION_STORE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The at-rest sealed-session filename, joined onto the resolved store directory.
 const SESSION_ENC_FILENAME: &str = "sync-session.enc";
 
+// ----- Deletion-reason vocabulary (R10 fix 5) -----
+//
+// Every credential / sealed-file removal (or replacement) carries an explicit REASON that is
+// logged at the delete site. After R10 fix 1 (non-destructive reads) the ONLY two reasons a
+// production build may ever remove or replace either session component are an explicit user
+// sign-out and a successful overwrite by a fresh sign-in — nothing on a read/boot path may
+// delete. These are the exhaustive production inventory; any third reason appearing in a log
+// is a regression.
+
+/// Reason: the user explicitly signed out (`clear_session_wrapped`). Removes BOTH the sealed
+/// file and the wrapping-key entry.
+const DELETE_REASON_SIGN_OUT: &str = "user_sign_out";
+
+/// Reason: a fresh sign-in overwrote an existing wrapped session (`store_session_wrapped`) —
+/// the sealed file is replaced via atomic rename and the wrapping-key entry via `set_key`.
+const DELETE_REASON_OVERWRITE: &str = "overwrite";
+
 /// Pure resolver for the encrypted at-rest session file path (T029), factored out of
 /// [`session_enc_path`] so the determinism invariant is unit-testable without touching the
 /// process-global `SESSION_STORE_DIR`.
 ///
 /// R6 item 4(c): `store_dir = Some(config_dir)` once `init_credential_store` has run, and
-/// `None` before it — in which case it falls back to `std::env::temp_dir()`. The
-/// path-mismatch bug is precisely `resolve_session_enc_path(None)` (a boot read that raced
-/// ahead of init → temp dir) NOT equalling `resolve_session_enc_path(Some(config_dir))` (the
-/// sign-in write → config dir). With init hoisted before every session touch (lib.rs), both
-/// the boot read and the sign-in write resolve through `Some(config_dir)` and are identical.
-fn resolve_session_enc_path(store_dir: Option<&Path>) -> PathBuf {
-    store_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(SESSION_ENC_FILENAME)
+/// `None` before it. The path-mismatch bug is precisely `resolve_session_enc_path(None)` (a
+/// boot read that raced ahead of init) NOT equalling `resolve_session_enc_path(Some(config_dir))`
+/// (the sign-in write → config dir). With init hoisted before every session touch (lib.rs),
+/// both the boot read and the sign-in write resolve through `Some(config_dir)` and are
+/// identical.
+///
+/// R10 fix 2: an unresolved store dir is NO LONGER a silent `%TEMP%` fallback in RELEASE — it
+/// is an ERROR. Writing the real session to `%TEMP%` (a) escapes the durable, ACL-scoped config
+/// dir and (b) hides the init race instead of surfacing it. The pure seam below takes
+/// `allow_temp_fallback` explicitly so a test can exercise BOTH the release (no-fallback →
+/// error) and the debug (fallback retained for dev ergonomics) behaviour under one build.
+fn resolve_session_enc_path_seam(
+    store_dir: Option<&Path>,
+    allow_temp_fallback: bool,
+) -> Result<PathBuf, String> {
+    match store_dir {
+        Some(dir) => Ok(dir.join(SESSION_ENC_FILENAME)),
+        None if allow_temp_fallback => Ok(std::env::temp_dir().join(SESSION_ENC_FILENAME)),
+        None => Err(
+            "session store dir unresolved (init_credential_store has not run); refusing the \
+             %TEMP% fallback"
+                .to_string(),
+        ),
+    }
 }
 
-/// Path to the encrypted at-rest session file (T029). Falls back to the temp dir before
-/// `init_credential_store` runs, mirroring `dev_store_path`.
-fn session_enc_path() -> PathBuf {
+/// Resolve the sealed session path. DEBUG/dev keeps the temp fallback (dev ergonomics + unit
+/// tests); RELEASE forbids it — an unresolved `SESSION_STORE_DIR` is an error the caller
+/// surfaces (read degrades with a clear log; write hard-fails so sign-in visibly fails rather
+/// than writing the session to `%TEMP%`).
+fn resolve_session_enc_path(store_dir: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_session_enc_path_seam(store_dir, cfg!(debug_assertions))
+}
+
+/// Path to the encrypted at-rest session file (T029). In RELEASE this errors before
+/// `init_credential_store` has set `SESSION_STORE_DIR` (no `%TEMP%` fallback, R10 fix 2).
+fn session_enc_path() -> Result<PathBuf, String> {
     resolve_session_enc_path(SESSION_STORE_DIR.get().map(PathBuf::as_path))
 }
 
@@ -329,14 +368,16 @@ fn store_set(account: &str, value: &str) -> Result<(), String> {
 }
 
 #[cfg(debug_assertions)]
-fn store_delete(account: &str) -> Result<(), String> {
+fn store_delete(account: &str, reason: &str) -> Result<(), String> {
+    tracing::info!(entry = %account, reason, "sync: credential delete (dev-file)");
     let mut map = dev_read_map()?;
     map.remove(account);
     dev_write_map(&map)
 }
 
 #[cfg(all(not(debug_assertions), not(target_os = "windows")))]
-fn store_delete(account: &str) -> Result<(), String> {
+fn store_delete(account: &str, reason: &str) -> Result<(), String> {
+    tracing::info!(entry = %account, reason, "sync: credential delete (keyring)");
     match keyring::Entry::new(KEYCHAIN_SERVICE, account)
         .map_err(|e| e.to_string())?
         .delete_credential()
@@ -347,8 +388,8 @@ fn store_delete(account: &str) -> Result<(), String> {
 }
 
 #[cfg(all(not(debug_assertions), target_os = "windows"))]
-fn store_delete(account: &str) -> Result<(), String> {
-    win_creds::delete(account)
+fn store_delete(account: &str, reason: &str) -> Result<(), String> {
+    win_creds::delete(account, reason)
 }
 
 // ----- Windows credential shim (R5) — wire-format helpers + FFI backend -----
@@ -494,20 +535,23 @@ mod win_creds {
     }
 
     /// Delete one entry. `ERROR_NOT_FOUND` is a no-op success (parity with keyring's `NoEntry`).
-    pub(super) fn delete(account: &str) -> Result<(), String> {
+    /// `reason` (R10 fix 5) names WHY the credential is being removed — logged at the delete
+    /// site so an audit of the credential lifecycle can confirm the only production reasons are
+    /// `user_sign_out` and `overwrite`. Never logs the value.
+    pub(super) fn delete(account: &str, reason: &str) -> Result<(), String> {
         let target = to_wstr(&cred_target_name(account, KEYCHAIN_SERVICE));
         // SAFETY: `target` is a valid NUL-terminated wide string.
         let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_NOT_FOUND {
-                tracing::info!(entry = %account, "win_creds: delete (already absent)");
+                tracing::info!(entry = %account, reason, "win_creds: delete (already absent)");
                 return Ok(());
             }
-            tracing::warn!(entry = %account, "win_creds: delete failed (win32 error {err})");
+            tracing::warn!(entry = %account, reason, "win_creds: delete failed (win32 error {err})");
             return Err(format!("CredDeleteW failed (win32 error {err})"));
         }
-        tracing::info!(entry = %account, "win_creds: delete (removed)");
+        tracing::info!(entry = %account, reason, "win_creds: delete (removed)");
         Ok(())
     }
 }
@@ -610,7 +654,9 @@ fn new_wrap_key() -> [u8; 32] {
 trait SessionKeyStore {
     fn get_key(&self) -> Result<Option<String>, String>;
     fn set_key(&self, b64: &str) -> Result<(), String>;
-    fn delete_key(&self) -> Result<(), String>;
+    /// Delete the wrapping-key entry. `reason` (R10 fix 5) names WHY — only ever
+    /// `user_sign_out` or `overwrite` in production; logged at the backend delete site.
+    fn delete_key(&self, reason: &str) -> Result<(), String>;
 }
 
 struct KeychainSessionKeyStore;
@@ -621,8 +667,8 @@ impl SessionKeyStore for KeychainSessionKeyStore {
     fn set_key(&self, b64: &str) -> Result<(), String> {
         store_set(KEYCHAIN_ACCOUNT_SESSION_KEY, b64)
     }
-    fn delete_key(&self) -> Result<(), String> {
-        store_delete(KEYCHAIN_ACCOUNT_SESSION_KEY)
+    fn delete_key(&self, reason: &str) -> Result<(), String> {
+        store_delete(KEYCHAIN_ACCOUNT_SESSION_KEY, reason)
     }
 }
 
@@ -675,10 +721,21 @@ fn write_session_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
     // the pre-rename file is broader than 0600. Windows inherits the user-scoped AppData ACL,
     // so this is a unix-only no-op elsewhere.
     set_owner_only(&tmp)?;
+    // R10 fix 4 — A3.1 journal discipline: fsync the temp file so its BYTES are durable on
+    // disk BEFORE the rename publishes it. Without this, a crash/power-loss after the rename
+    // could leave a zero-length or torn file that decrypt-fails, degrading a signed-in user to
+    // signed-out on the next boot (the exact durability hole behind the session-loss reports).
+    fsync_file(&tmp).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     // rename preserves the mode; re-assert on the final path in case it pre-existed with a
     // broader mode (e.g. an older build wrote it before this hardening landed).
-    set_owner_only(path)
+    set_owner_only(path)?;
+    // fsync the parent directory so the rename itself (the directory entry) is durable — a
+    // crash after this point can never lose the newly-published session file.
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Restrict a file to `0600` (owner read/write only) on unix. No-op on other platforms —
@@ -695,7 +752,10 @@ fn set_owner_only(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_session_blob(path: &Path) -> Result<(), String> {
+fn remove_session_blob(path: &Path, reason: &str) -> Result<(), String> {
+    // R10 fix 5: name WHY the sealed file is being removed. After fix 1 the only production
+    // caller is sign-out (`user_sign_out`); no read/boot path removes the file. No secrets.
+    tracing::info!(sealed_path = %path.display(), reason, "sync: sealed session file remove");
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -716,16 +776,16 @@ fn load_session_wrapped(
             let (key, expected_epoch) = match decode_wrap_entry(&entry_str) {
                 Ok(v) => v,
                 // decode-fail arm: the wrapping-key ENTRY exists but is unparseable (e.g. a
-                // stale round-2 bare-base64 value from a pre-`WrapKeyEntry` build). Leaving it
-                // in place wedges the store — every boot re-reads the same undecodable entry and
-                // degrades, but the file can never be opened. DELETE the entry so a fresh
-                // sign-in can mint a clean one. The file is left alone (a new sign-in overwrites
-                // it under the new key). No secret is logged.
+                // stale round-2 bare-base64 value from a pre-`WrapKeyEntry` build). R10 fix 1:
+                // do NOT delete on a read/boot path. A transient store returning a stale/garbled
+                // value is indistinguishable from a truly corrupt entry here, and deleting would
+                // destroy a recoverable component. PRESERVE it and degrade signed-out; the next
+                // successful sign-in overwrites the entry (`store_session_wrapped`, the ONLY
+                // non-sign-out replacement). No secret is logged.
                 Err(_) => {
                     tracing::warn!(
-                        "sync boot: session wrapping-key entry undecodable (decode-fail) — deleting stale entry, degrading signed-out"
+                        "sync boot: session wrapping-key entry present but undecodable (decode-fail) — PRESERVING entry + file (no deletion on a read path), degrading signed-out; a fresh sign-in overwrites it"
                     );
-                    let _ = ks.delete_key();
                     return Ok(None);
                 }
             };
@@ -760,13 +820,16 @@ fn load_session_wrapped(
                 }
             }
         }
-        // file-missing arm: a wrapping key with no file. The key alone is useless; clean it up
-        // (steady-state hygiene), then signed-out. Log the arm.
+        // file-missing arm: a wrapping key with no file. R10 fix 1: do NOT delete the key. A
+        // transiently-missing file (an unsynced/rolled-back write, a path hiccup, AV quarantine)
+        // presents identically to a truly orphaned key, and deleting the key would escalate a
+        // recoverable transient into permanent session destruction. PRESERVE the key and degrade
+        // signed-out; if the file returns next boot the session recovers, and a fresh sign-in
+        // overwrites the key harmlessly otherwise. Log exactly what was found/missing.
         (Some(_), None) => {
             tracing::warn!(
-                "sync boot: wrapping key present but session file missing (file-missing) — clearing stray key, degrading signed-out"
+                "sync boot: wrapping-key entry present but session file MISSING (file-missing) — PRESERVING key (possible transient/unsynced file), degrading signed-out; no deletion on a read path"
             );
-            let _ = ks.delete_key();
             Ok(None)
         }
         // entry-missing arm: a session file with NO wrapping-key entry. Previously we DELETED
@@ -797,9 +860,20 @@ fn store_session_wrapped(
     // corrupt existing entry would strand the new ciphertext, so we replace it.) The RECORDED
     // epoch is always overwritten below with THIS session's epoch.
     let key = match ks.get_key()? {
-        Some(entry_str) => decode_wrap_entry(&entry_str)
-            .map(|(k, _prev_epoch)| k)
-            .unwrap_or_else(|_| new_wrap_key()),
+        Some(entry_str) => {
+            // R10 fix 5: a fresh sign-in over an existing wrapped session REPLACES both
+            // components (the sealed file via atomic rename below, the wrapping-key entry via
+            // `set_key`). This is the ONLY non-sign-out path allowed to remove/replace either
+            // component; name the reason so a credential-lifecycle audit sees exactly the two
+            // production reasons (`user_sign_out` + `overwrite`). No secret is logged.
+            tracing::info!(
+                reason = DELETE_REASON_OVERWRITE,
+                "sync: overwriting existing wrapped session (fresh sign-in)"
+            );
+            decode_wrap_entry(&entry_str)
+                .map(|(k, _prev_epoch)| k)
+                .unwrap_or_else(|_| new_wrap_key())
+        }
         None => new_wrap_key(),
     };
     // Seal + write the file FIRST, then commit the wrapping-key entry (key + this session's
@@ -816,8 +890,8 @@ fn store_session_wrapped(
 /// (a keychain/file hiccup must never block sign-out). `identity-v1` is untouched here — its
 /// preservation is handled by the caller (`clear_session`, T019).
 fn clear_session_wrapped(ks: &impl SessionKeyStore, enc_path: &Path) -> Result<(), String> {
-    let _ = remove_session_blob(enc_path);
-    let _ = ks.delete_key();
+    let _ = remove_session_blob(enc_path, DELETE_REASON_SIGN_OUT);
+    let _ = ks.delete_key(DELETE_REASON_SIGN_OUT);
     Ok(())
 }
 
@@ -840,7 +914,11 @@ fn load_session_from_store() -> Result<Option<Session>, String> {
 
 #[cfg(not(debug_assertions))]
 fn load_session_from_store() -> Result<Option<Session>, String> {
-    load_session_wrapped(&KeychainSessionKeyStore, &session_enc_path())
+    // R10 fix 2: an unresolved store path is a READ FAILURE surfaced as `Err` (never a
+    // %TEMP% fallback) — `ensure_cache_loaded` then leaves the cache UNLOADED so a later
+    // access retries, rather than caching a bogus signed-out for the process lifetime.
+    let path = session_enc_path()?;
+    load_session_wrapped(&KeychainSessionKeyStore, &path)
 }
 
 #[cfg(debug_assertions)]
@@ -851,17 +929,21 @@ fn store_session_to_store(s: &Session) -> Result<(), String> {
 
 #[cfg(not(debug_assertions))]
 fn store_session_to_store(s: &Session) -> Result<(), String> {
-    store_session_wrapped(&KeychainSessionKeyStore, &session_enc_path(), s)
+    // R10 fix 2: if the store path is unresolved, sign-in FAILS LOUDLY here (the `?`) rather
+    // than sealing the real session into %TEMP%.
+    let path = session_enc_path()?;
+    store_session_wrapped(&KeychainSessionKeyStore, &path, s)
 }
 
 #[cfg(debug_assertions)]
 fn clear_session_from_store() -> Result<(), String> {
-    store_delete(KEYCHAIN_ACCOUNT)
+    store_delete(KEYCHAIN_ACCOUNT, DELETE_REASON_SIGN_OUT)
 }
 
 #[cfg(not(debug_assertions))]
 fn clear_session_from_store() -> Result<(), String> {
-    clear_session_wrapped(&KeychainSessionKeyStore, &session_enc_path())
+    let path = session_enc_path()?;
+    clear_session_wrapped(&KeychainSessionKeyStore, &path)
 }
 
 fn load_identity_from_store() -> Result<Option<DeviceIdentity>, String> {
@@ -940,18 +1022,33 @@ fn cred_store_backend() -> &'static str {
 /// the outcome once — including the RESOLVED sealed-session path and the backend, which is
 /// the smoking-gun diagnostic for the write/read path-mismatch hypothesis (4c). No secrets:
 /// presence booleans + a filesystem path + a static backend label only.
-fn log_session_boot_trace() {
+fn log_session_boot_trace(read_error: bool) {
     static BOOT_TRACE: Once = Once::new();
     BOOT_TRACE.call_once(|| {
-        let (session_present, identity_present) = {
+        let (session_some, identity_present) = {
             let g = cred_cache().read().unwrap_or_else(|e| e.into_inner());
             (g.session.is_some(), g.identity.is_some())
+        };
+        // R10 fix 3: a boot READ error is reported DISTINCTLY from a genuine signed-out — an
+        // Err (transient store failure) is "error", NOT "false". "false" means the store was
+        // read cleanly and no session exists; "error" means the read failed and the cache was
+        // left unloaded for a later retry. Conflating them is the swallow this fix removes.
+        let session_present: &str = if read_error {
+            "error"
+        } else if session_some {
+            "true"
+        } else {
+            "false"
+        };
+        let sealed = match session_enc_path() {
+            Ok(p) => p.display().to_string(),
+            Err(e) => format!("<unresolved: {e}>"),
         };
         tracing::info!(
             session_present,
             identity_present,
             store_backend = cred_store_backend(),
-            sealed_path = %session_enc_path().display(),
+            sealed_path = %sealed,
             store_dir_resolved = SESSION_STORE_DIR.get().is_some(),
             "sync boot: credential cache warm-up complete"
         );
@@ -969,22 +1066,61 @@ fn ensure_cache_loaded() {
     {
         // Cache already warm (e.g. a sign-in write beat the boot read). Still guarantee the
         // once-per-boot trace fires — it is idempotent and reads the current cache state.
-        log_session_boot_trace();
+        log_session_boot_trace(false);
         return;
     }
-    let session = load_session_from_store().ok().flatten();
-    let identity = load_identity_from_store().ok().flatten();
+    // R10 fix 3: distinguish a genuine signed-out (`Ok(None)` → cache it) from a store READ
+    // FAILURE (`Err` → do NOT mark loaded, so a later poll-driven access retries). Previously
+    // `.ok().flatten()` collapsed both into a cached signed-out for the whole process lifetime,
+    // so one transient read wedged the session as signed-out until the next launch (stopping
+    // the drain — the incomplete-pull driver).
+    let (session, identity, loaded_ok) =
+        resolve_cache_from_reads(load_session_from_store(), load_identity_from_store());
     {
         let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
         if !g.loaded {
             g.session = session;
             g.identity = identity;
-            g.loaded = true;
+            // Only mark the cache loaded when BOTH reads succeeded. On a read error we leave
+            // `loaded = false`; the next access (polled ~5s, no hot loop) retries. This is
+            // deliberately bounded — accesses are poll-driven, so there is no retry storm.
+            g.loaded = loaded_ok;
         }
     }
     // Log AFTER the cache is populated (and the write lock released) so the trace reflects the
-    // resolved state, exactly once per boot.
-    log_session_boot_trace();
+    // resolved state, exactly once per boot — reporting a read error distinctly.
+    log_session_boot_trace(!loaded_ok);
+}
+
+/// Decide the cache state from the two backing-store reads (R10 fix 3). A clean `Ok(None)` is
+/// a genuine signed-out and IS cached; an `Err` is a transient read failure that must NOT mark
+/// the cache loaded (so a later access retries). Returns `(session, identity, loaded_ok)` where
+/// `loaded_ok` is false iff either read failed. Pure + logging-only, so the swallow-vs-retry
+/// decision is unit-testable without the real keychain.
+fn resolve_cache_from_reads(
+    session_read: Result<Option<Session>, String>,
+    identity_read: Result<Option<DeviceIdentity>, String>,
+) -> (Option<Session>, Option<DeviceIdentity>, bool) {
+    let read_failed = session_read.is_err() || identity_read.is_err();
+    let session = match session_read {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "sync boot: session store read FAILED ({e}) — leaving cache unloaded so a later access retries (NOT caching signed-out)"
+            );
+            None
+        }
+    };
+    let identity = match identity_read {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(
+                "sync boot: identity store read FAILED ({e}) — leaving cache unloaded so a later access retries"
+            );
+            None
+        }
+    };
+    (session, identity, !read_failed)
 }
 
 /// Boot hook (lib.rs setup): point the DEBUG file store at the app config dir and warm the
@@ -4812,8 +4948,8 @@ mod tests {
     fn identity_survives_session_clear() {
         let orig_session = load_session_from_store().ok().flatten();
         let orig_identity = load_identity_from_store().ok().flatten();
-        let _ = store_delete(KEYCHAIN_ACCOUNT);
-        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY);
+        let _ = store_delete(KEYCHAIN_ACCOUNT, "test_reset");
+        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY, "test_reset");
         reset_cache_for_test();
 
         // A pre-upgrade install: identity lives ONLY in the session entry.
@@ -4856,8 +4992,8 @@ mod tests {
         assert_eq!(relogin_id, client_id);
 
         // Restore the machine's original credential-store state.
-        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY);
-        let _ = store_delete(KEYCHAIN_ACCOUNT);
+        let _ = store_delete(KEYCHAIN_ACCOUNT_IDENTITY, "test_reset");
+        let _ = store_delete(KEYCHAIN_ACCOUNT, "test_reset");
         reset_cache_for_test();
         if let Some(s) = orig_session {
             let _ = store_session(&s);
@@ -4915,7 +5051,7 @@ mod tests {
                 *self.key.borrow_mut() = Some(b64.to_string());
                 Ok(())
             }
-            fn delete_key(&self) -> Result<(), String> {
+            fn delete_key(&self, _reason: &str) -> Result<(), String> {
                 *self.key.borrow_mut() = None;
                 Ok(())
             }
@@ -4975,8 +5111,8 @@ mod tests {
             // sign-in WRITE. Both go through `resolve_session_enc_path(Some(config_dir))` with
             // the SAME resolved store dir, so they are byte-identical.
             let config_dir = std::env::temp_dir().join(format!("yapstack-cfg-{}", Uuid::new_v4()));
-            let boot_read = resolve_session_enc_path(Some(&config_dir));
-            let signin_write = resolve_session_enc_path(Some(&config_dir));
+            let boot_read = resolve_session_enc_path(Some(&config_dir)).unwrap();
+            let signin_write = resolve_session_enc_path(Some(&config_dir)).unwrap();
             assert_eq!(
                 boot_read, signin_write,
                 "boot read and sign-in write resolve to the SAME sealed file"
@@ -4997,8 +5133,11 @@ mod tests {
             // hoists init before every session touch; this asserts the divergence the reorder
             // eliminates (config_dir is deliberately not the temp dir).
             let config_dir = std::env::temp_dir().join(format!("yapstack-cfg-{}", Uuid::new_v4()));
-            let pre_init = resolve_session_enc_path(None);
-            let post_init = resolve_session_enc_path(Some(&config_dir));
+            // In a debug (test) build the temp fallback is retained (dev ergonomics), so a
+            // `None` store dir resolves under the temp dir. R10 fix 2 removes this fallback in
+            // RELEASE; the release-error behaviour is asserted via the seam below.
+            let pre_init = resolve_session_enc_path(None).unwrap();
+            let post_init = resolve_session_enc_path(Some(&config_dir)).unwrap();
             assert_ne!(
                 pre_init, post_init,
                 "pre-init temp fallback must NOT collide with the config-dir path (the mismatch)"
@@ -5026,15 +5165,23 @@ mod tests {
         }
 
         #[test]
-        fn missing_file_degrades_and_cleans_stray_key() {
+        fn missing_file_degrades_and_preserves_stray_key() {
+            // R10 fix 1: a wrapping key with NO session file degrades signed-out but PRESERVES
+            // the key. A transiently-missing file (unsynced/rolled-back write, path hiccup, AV
+            // quarantine) is indistinguishable from a truly orphaned key here, and deleting the
+            // key would escalate a recoverable transient into permanent session destruction.
+            // Only sign-out / overwrite may delete — never a read/boot path.
             let ks = FakeKeyStore::default();
             let path = temp_enc_path();
             store_session_wrapped(&ks, &path, &sample_session()).unwrap();
             std::fs::remove_file(&path).unwrap();
 
             assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
-            // The orphaned wrapping key is cleaned up so the next boot starts clean.
-            assert!(ks.get_key().unwrap().is_none());
+            // The wrapping key is PRESERVED (previously this arm deleted it).
+            assert!(
+                ks.get_key().unwrap().is_some(),
+                "the wrapping key must be preserved across a transiently-missing file"
+            );
         }
 
         #[test]
@@ -5049,7 +5196,7 @@ mod tests {
             store_session_wrapped(&ks, &path, &sample_session()).unwrap();
             // Snapshot the entry so we can restore it (modelling a keychain miss that resolves).
             let saved_key = ks.get_key().unwrap().unwrap();
-            ks.delete_key().unwrap();
+            ks.delete_key("test_reset").unwrap();
 
             assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
             // The file must SURVIVE the key-miss degrade.
@@ -5101,11 +5248,13 @@ mod tests {
         }
 
         #[test]
-        fn undecodable_wrap_entry_is_deleted_and_degrades() {
-            // R5 hygiene: a wrapping-key ENTRY that no longer parses (e.g. a stale round-2
-            // bare-base64 value from a pre-`WrapKeyEntry` build) must be DELETED so the store
-            // cannot wedge on the same undecodable entry every boot. The load degrades
-            // signed-out; a fresh sign-in then mints a clean entry.
+        fn undecodable_wrap_entry_degrades_and_preserves() {
+            // R10 fix 1 (reverses the old R5 cleanup): a wrapping-key ENTRY that no longer
+            // parses degrades signed-out but is PRESERVED — no deletion on a read/boot path. A
+            // transient store returning a stale/garbled value is indistinguishable from a truly
+            // corrupt entry here, and deleting would destroy a recoverable component. A fresh
+            // sign-in overwrites it (the ONLY non-sign-out replacement), un-wedging the store
+            // without ever deleting on a read.
             let ks = FakeKeyStore::default();
             let path = temp_enc_path();
             store_session_wrapped(&ks, &path, &sample_session()).unwrap();
@@ -5118,8 +5267,14 @@ mod tests {
 
             assert!(load_session_wrapped(&ks, &path).unwrap().is_none());
             assert!(
-                ks.get_key().unwrap().is_none(),
-                "the stale, undecodable wrapping-key entry must be deleted"
+                ks.get_key().unwrap().is_some(),
+                "the undecodable wrapping-key entry must be PRESERVED (no delete on a read path)"
+            );
+            // A fresh sign-in overwrites the stale entry and the session opens again.
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_some(),
+                "a fresh sign-in overwrites the stale entry and recovers the session"
             );
             let _ = std::fs::remove_file(&path);
         }
@@ -5251,6 +5406,119 @@ mod tests {
                 "a v1-AAD blob must fail cleanly under the v2 epoch-bound AAD"
             );
             let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn release_resolution_without_store_dir_is_error_not_temp() {
+            // R10 fix 2: model the RELEASE build via the seam (allow_temp_fallback = false). An
+            // unresolved store dir must be an Err — NEVER a silent %TEMP% path — so a sign-in
+            // WRITE fails loudly and a boot READ degrades with a clear log instead of sealing the
+            // real session under a temp dir.
+            let err = resolve_session_enc_path_seam(None, false);
+            assert!(
+                err.is_err(),
+                "release resolution with no store dir must ERROR, not fall back to %TEMP%"
+            );
+            // With a store dir it resolves deterministically under it, in BOTH modes.
+            let dir = std::env::temp_dir().join(format!("yapstack-r10-{}", Uuid::new_v4()));
+            assert_eq!(
+                resolve_session_enc_path_seam(Some(&dir), false).unwrap(),
+                dir.join(SESSION_ENC_FILENAME)
+            );
+            assert_eq!(
+                resolve_session_enc_path_seam(Some(&dir), true).unwrap(),
+                dir.join(SESSION_ENC_FILENAME)
+            );
+            // The DEBUG seam retains the temp fallback (dev ergonomics + unit tests).
+            assert_eq!(
+                resolve_session_enc_path_seam(None, true).unwrap(),
+                std::env::temp_dir().join(SESSION_ENC_FILENAME)
+            );
+        }
+
+        #[test]
+        fn boot_read_error_leaves_cache_unloaded_for_retry() {
+            // R10 fix 3: a transient store READ error (Err) must NOT be cached as signed-out —
+            // `resolve_cache_from_reads` returns loaded=false so a later poll-driven access
+            // retries. A clean Ok(None) IS a genuine signed-out and marks the cache loaded.
+            let (s, i, loaded) = resolve_cache_from_reads(Err("boom".into()), Ok(None));
+            assert!(s.is_none() && i.is_none());
+            assert!(
+                !loaded,
+                "a read Err must leave the cache UNLOADED (retry), not cache signed-out"
+            );
+
+            // A clean signed-out marks the cache loaded (no needless retry).
+            let (_, _, loaded_clean) = resolve_cache_from_reads(Ok(None), Ok(None));
+            assert!(
+                loaded_clean,
+                "a clean Ok(None) is a genuine signed-out → cache it"
+            );
+
+            // A subsequent SUCCESSFUL read populates the cache.
+            let (s3, _, loaded3) = resolve_cache_from_reads(Ok(Some(sample_session())), Ok(None));
+            assert!(
+                s3.is_some() && loaded3,
+                "a later successful read populates the cache"
+            );
+
+            // An identity-read error alone also blocks marking loaded.
+            let (_, _, loaded4) = resolve_cache_from_reads(Ok(None), Err("id-boom".into()));
+            assert!(
+                !loaded4,
+                "an identity read Err also leaves the cache unloaded"
+            );
+        }
+
+        #[test]
+        fn session_write_is_durable_tmp_gone_final_present_roundtrips() {
+            // R10 fix 4: the write is tmp → fsync file → rename → fsync parent dir (fsync by
+            // construction via the shared helpers). Behaviourally: the temp file is gone (renamed
+            // away, never left torn), the final file is present, and the content round-trips.
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let s = sample_session();
+            store_session_wrapped(&ks, &path, &s).unwrap();
+
+            let tmp = path.with_extension("enc.tmp");
+            assert!(
+                !tmp.exists(),
+                "the atomic-write temp file must be renamed away, never left behind"
+            );
+            assert!(
+                path.exists(),
+                "the final sealed file must be present after the write"
+            );
+            let loaded = load_session_wrapped(&ks, &path).unwrap().unwrap();
+            assert_eq!(json_of(&loaded), json_of(&s), "content must round-trip");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn sign_out_removes_both_components_and_reason_inventory_is_exact() {
+            // R10 fix 5: sign-out (`clear_session_wrapped`) removes BOTH the sealed file and the
+            // wrapping-key entry, carrying the `user_sign_out` reason. After fix 1 the ONLY two
+            // production deletion/replacement reasons are sign-out and overwrite — assert that
+            // exact inventory here.
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            store_session_wrapped(&ks, &path, &sample_session()).unwrap();
+            assert!(ks.get_key().unwrap().is_some());
+            assert!(path.exists());
+
+            clear_session_wrapped(&ks, &path).unwrap();
+            assert!(
+                ks.get_key().unwrap().is_none(),
+                "sign-out must clear the wrapping-key entry"
+            );
+            assert!(
+                !path.exists(),
+                "sign-out must remove the sealed session file"
+            );
+
+            // The exhaustive production reason inventory.
+            assert_eq!(DELETE_REASON_SIGN_OUT, "user_sign_out");
+            assert_eq!(DELETE_REASON_OVERWRITE, "overwrite");
         }
     }
 

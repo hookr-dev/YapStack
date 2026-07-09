@@ -686,8 +686,19 @@ pub fn run() {
             // and sign-in-write paths provably identical, and emits the once-per-boot session
             // trace (which logs the RESOLVED path + backend outcome) at the earliest safe point.
             #[cfg(feature = "sync")]
-            if let Ok(config_dir) = app.path().app_config_dir() {
-                sync::init_credential_store(&config_dir);
+            match app.path().app_config_dir() {
+                Ok(config_dir) => sync::init_credential_store(&config_dir),
+                // R10 fix 2: NEVER silently skip credential-store init. Leaving SESSION_STORE_DIR
+                // unset makes release session resolution hard-ERROR (no %TEMP% fallback) rather
+                // than sealing the real session under a temp dir — but that must be LOUD so the
+                // root cause (app_config_dir unresolved) is visible instead of a silent
+                // signed-out-forever. Fail-safe: the store stays uninitialized (the error path),
+                // it is NOT redirected to a temp fallback.
+                Err(e) => {
+                    tracing::error!(
+                        "sync: app_config_dir() failed ({e}); credential store left UNINITIALIZED — session reads will degrade and sign-in will fail loudly rather than write to %TEMP%"
+                    );
+                }
             }
 
             // F1.2: recover any CRR cutover that was interrupted by a crash/kill
