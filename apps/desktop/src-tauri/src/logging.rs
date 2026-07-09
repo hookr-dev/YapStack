@@ -577,6 +577,7 @@ mod tests {
     ///   2. For the same reason the branch under test is unreachable in an abort
     ///      build: with no guard drops during a panic, the mutex the panic hook
     ///      re-locks is never poisoned.
+    ///
     /// So this property is both constructible and meaningful ONLY in an
     /// unwinding build, which the default `cargo test -p yapstack-desktop` gate
     /// provides; the real abort path is covered by
