@@ -75,6 +75,17 @@ fn main() {
         "cargo:rerun-if-changed={}",
         bundle_static.join("src/lib.rs").display()
     );
+    // Watch the vendored Rust bundle sources so YapStack vendor patches (see
+    // vendor/cr-sqlite/YAPSTACK_PATCHES.md) actually trigger a rebuild of the
+    // static archive. Without these, edits to the CRR engine / capi shim were
+    // silently ignored and a stale `libcrsql_bundle_static.a` would be relinked.
+    for dir in [
+        vendor_core.join("rs/core/src"),
+        vendor_core.join("rs/sqlite-rs-embedded/sqlite3_capi/src"),
+        vendor_core.join("rs/sqlite-rs-embedded/sqlite_nostd/src"),
+    ] {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
 
     // --- 1. Build the vendored Rust static bundle with the pinned nightly. ---
     let cr_target = out_dir.join("crbuild");

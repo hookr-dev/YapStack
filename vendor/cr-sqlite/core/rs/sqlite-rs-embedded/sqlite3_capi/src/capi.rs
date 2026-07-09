@@ -544,9 +544,15 @@ pub fn user_data(ctx: *mut context) -> *mut c_void {
 }
 
 pub fn value_text<'a>(arg1: *mut value) -> &'a str {
+    // YAPSTACK VENDOR PATCH (upstream cr-sqlite @ vendored sha in YAPSTACK_PATCHES.md):
+    // The SQLite C API requires sqlite3_value_text() to be called BEFORE
+    // sqlite3_value_bytes() for TEXT values. sqlite3_value_bytes() reports the
+    // byte length that results from the text conversion, so reading it first can
+    // return a stale/incorrect length and build a slice that over- or under-runs
+    // the actual string. Fetch the text pointer first, then measure it.
     unsafe {
-        let len = value_bytes(arg1);
         let bytes = invoke_sqlite!(value_text, arg1);
+        let len = value_bytes(arg1);
         let slice = core::slice::from_raw_parts(bytes as *const u8, len as usize);
         core::str::from_utf8_unchecked(slice)
     }
@@ -561,9 +567,12 @@ pub fn value_bytes(arg1: *mut value) -> c_int {
 }
 
 pub fn value_blob<'a>(value: *mut value) -> &'a [u8] {
+    // YAPSTACK VENDOR PATCH: same API-ordering hazard as value_text above.
+    // sqlite3_value_blob() must be called before sqlite3_value_bytes() so the
+    // reported length matches the returned buffer after any type conversion.
     unsafe {
-        let n = value_bytes(value);
         let b = invoke_sqlite!(value_blob, value);
+        let n = value_bytes(value);
         core::slice::from_raw_parts(b.cast::<u8>(), n as usize)
     }
 }

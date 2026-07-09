@@ -50,6 +50,7 @@ use core::ffi::c_char;
 use core::mem;
 use core::ptr::null_mut;
 extern crate alloc;
+use alloc::ffi::CString;
 use alter::crsql_compact_post_alter;
 use automigrate::*;
 use backfill::*;
@@ -560,6 +561,20 @@ unsafe extern "C" fn x_crsql_as_crr(
         ("main", args[0].text())
     };
 
+    // YAPSTACK VENDOR PATCH (see vendor/cr-sqlite/YAPSTACK_PATCHES.md):
+    // crsql_create_crr() consumes these pointers via CStr::from_ptr, which reads
+    // until a NUL byte. `&str::as_ptr()` (from value_text) is NOT NUL-terminated,
+    // so C read adjacent heap — layout-dependent behavior that surfaced as a
+    // spurious SQLITE_NOMEM from crsql_as_crr(). Copy into owned, NUL-terminated
+    // buffers before crossing the FFI boundary.
+    let (schema_c, table_c) = match (CString::new(schema_name), CString::new(table_name)) {
+        (Ok(s), Ok(t)) => (s, t),
+        _ => {
+            ctx.result_error("crsql_as_crr: schema or table name contains an interior NUL byte");
+            return;
+        }
+    };
+
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
@@ -569,8 +584,8 @@ unsafe extern "C" fn x_crsql_as_crr(
     }
     let rc = crsql_create_crr(
         db,
-        schema_name.as_ptr() as *const c_char,
-        table_name.as_ptr() as *const c_char,
+        schema_c.as_ptr(),
+        table_c.as_ptr(),
         0,
         0,
         &mut err_msg as *mut _,
@@ -656,12 +671,24 @@ unsafe extern "C" fn x_crsql_commit_alter(
         ("main", args[0].text())
     };
 
+    // YAPSTACK VENDOR PATCH (see vendor/cr-sqlite/YAPSTACK_PATCHES.md):
+    // Both crsql_compact_post_alter() and crsql_create_crr() re-derive these
+    // names via CStr::from_ptr, which requires NUL termination. `&str::as_ptr()`
+    // is not NUL-terminated; copy into owned buffers before the FFI call.
+    let (schema_c, table_c) = match (CString::new(schema_name), CString::new(table_name)) {
+        (Ok(s), Ok(t)) => (s, t),
+        _ => {
+            ctx.result_error("crsql_commit_alter: schema or table name contains an interior NUL byte");
+            return;
+        }
+    };
+
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let mut err_msg = null_mut();
     let db = ctx.db_handle();
     let rc = crsql_compact_post_alter(
         db,
-        table_name.as_ptr() as *const c_char,
+        table_c.as_ptr(),
         ext_data,
         &mut err_msg as *mut _,
     );
@@ -669,8 +696,8 @@ unsafe extern "C" fn x_crsql_commit_alter(
     let rc = if rc == ResultCode::OK as c_int {
         crsql_create_crr(
             db,
-            schema_name.as_ptr() as *const c_char,
-            table_name.as_ptr() as *const c_char,
+            schema_c.as_ptr(),
+            table_c.as_ptr(),
             1,
             0,
             &mut err_msg as *mut _,
