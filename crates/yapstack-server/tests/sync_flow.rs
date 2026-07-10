@@ -163,6 +163,44 @@ async fn push_assigns_dense_seqs_and_is_idempotent() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn push_rejects_seq_regression_but_allows_identical_retry() {
+    // G3 — the idempotency branch must distinguish a benign retry from a counter REGRESSION.
+    // Same (client_id, client_seq) with IDENTICAL ciphertext is a retry (dedup ack, 200). The
+    // SAME pair with DIFFERENT ciphertext can only be a client whose counter regressed (a DB
+    // restore) re-minting a reused seq over new content — silently deduplicating it would
+    // swallow that write (the confirmed bug), so it must fail loudly with a 409.
+    let app = build_router(setup(false).await);
+    let (tok, _t) = signup(&app).await;
+    let dev = Uuid::new_v4();
+
+    let first = json!({ "changes": [change(dev, 1, b"original-content")] });
+    let resp = post(&app, "/sync/push", Some(&tok), first.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["acks"][0]["deduplicated"], false);
+
+    // Benign idempotent retry: same pair, IDENTICAL ciphertext → dedup ack, 200.
+    let resp = post(&app, "/sync/push", Some(&tok), first).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["acks"][0]["deduplicated"], true);
+
+    // Counter regression: same pair, DIFFERENT ciphertext → 409, never a silent dedup.
+    let regressed = json!({ "changes": [change(dev, 1, b"different-after-restore")] });
+    let resp = post(&app, "/sync/push", Some(&tok), regressed).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a reused seq carrying different content must 409, not silently deduplicate"
+    );
+
+    // The rejection did not consume a seq or store anything new: the relay still holds exactly
+    // the one original changeset.
+    let v = body_json(get(&app, "/sync/completeness", &tok).await).await;
+    assert_eq!(v["max_changeset_seq"], 1);
+    assert_eq!(v["count"], 1);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn concurrent_pushes_are_gap_free_and_monotonic() {
     let app = build_router(setup(false).await);
     let (tok, _tenant) = signup(&app).await;

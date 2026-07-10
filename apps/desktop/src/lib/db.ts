@@ -1,4 +1,5 @@
 import Database, { type DbConnection } from "./db-backend";
+import { log } from "./logger";
 import { stripHtml } from "./utils";
 
 // --- Types ---
@@ -178,6 +179,67 @@ async function getDb(): Promise<DbConnection> {
 }
 
 /**
+ * True if `table` is cr-sqlite CRR-tracked, detected by the presence of its clock
+ * shadow table `<table>__crsql_clock` (the same signal the Rust side uses,
+ * `schema::is_crr`). If the probe itself fails we return `false` so the caller falls
+ * back to the plain non-CRR ALTER path rather than skipping a needed column.
+ */
+async function isCrrTracked(db: DbConnection, table: string): Promise<boolean> {
+  try {
+    const rows = await db.select<{ n: number }[]>(
+      "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name = $1",
+      [`${table}__crsql_clock`],
+    );
+    return (rows[0]?.n ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Apply one runtime `ALTER TABLE <table> ADD COLUMN` — but ONLY on a non-CRR
+ * (pre-sync) DB. On a sync-enabled (cr-sqlite CRR) DB the Rust boot self-heal owns
+ * schema evolution: it adds the column through the crsql alter dance so the column
+ * is CRR-tracked. A bare ALTER here would RACE that self-heal, and — since we cannot
+ * rely on cr-sqlite rejecting a bare `ADD COLUMN` on a CRR table (unverified) — an
+ * accepted bare ALTER would land an UN-CRR-tracked column that `apply_out_of_band_alters`
+ * then skips, resurrecting the indefinite-quarantine bug. So we GATE: when `table` is
+ * CRR-tracked we skip the bare ALTER entirely and let the Rust path own it (logged at
+ * debug/info, not error — this is the correct, expected branch on a synced DB).
+ *
+ * On a non-CRR DB the bare ALTER is correct and expected to no-op once the column
+ * exists ("duplicate column name" is the silent idempotent case). Every OTHER rejection
+ * there is logged loudly (devtools `console.error` + the backend `log.error` seam)
+ * instead of vanishing.
+ */
+async function addColumnIfMissing(
+  db: DbConnection,
+  table: string,
+  sql: string,
+): Promise<void> {
+  if (await isCrrTracked(db, table)) {
+    log.info(
+      `ensureRuntimeSchema: ${table} is CRR-tracked; deferring ADD COLUMN to the Rust boot self-heal (skipping bare ALTER): ${sql}`,
+      "db",
+    );
+    return;
+  }
+  try {
+    await db.execute(sql);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/duplicate column name/i.test(message)) {
+      return; // expected idempotent no-op: the column already exists on a non-CRR DB
+    }
+    console.error(`ensureRuntimeSchema: runtime ALTER failed: ${sql}: ${message}`);
+    log.error(
+      `runtime ALTER rejected (column not applied — incoming sync changes for it may quarantine until the Rust boot self-heal runs): ${sql}: ${message}`,
+      "db",
+    );
+  }
+}
+
+/**
  * Idempotent runtime schema patches. tauri-plugin-sql can skip a migration
  * on a dev DB whose `_sqlx_migrations` history was written under a prior
  * version-numbering scheme (see CLAUDE.md). Re-applying these on every load
@@ -186,29 +248,25 @@ async function getDb(): Promise<DbConnection> {
  * duplicate-table error on subsequent runs is a silent no-op.
  */
 async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
-  // Single-column patches (column-add only).
-  await db
-    .execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER")
-    .catch(() => {});
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT")
-    .catch(() => {});
+  // Single-column patches (column-add only). These bare ALTERs are correct on a
+  // pre-sync (non-CRR) DB and are expected to no-op once the column exists. On a
+  // sync-enabled (cr-sqlite CRR) DB, however, `addColumnIfMissing` skips the bare
+  // ALTER entirely: schema evolution there is owned by the Rust boot self-heal
+  // (apply_out_of_band_alters via the crsql alter dance), which CRR-tracks the new
+  // column. Issuing a bare ALTER on a CRR table would race that self-heal and risk an
+  // un-CRR-tracked column that quarantines incoming changes forever.
+  await addColumnIfMissing(db, "segments", "ALTER TABLE segments ADD COLUMN speaker_id INTEGER");
+  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT");
   // v14: per-LLM-response shape for tool replay.
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN send_id TEXT")
-    .catch(() => {});
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN sequence INTEGER")
-    .catch(() => {});
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT")
-    .catch(() => {});
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN observation TEXT")
-    .catch(() => {});
-  await db
-    .execute("ALTER TABLE chat_messages ADD COLUMN status TEXT")
-    .catch(() => {});
+  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN send_id TEXT");
+  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN sequence INTEGER");
+  await addColumnIfMissing(
+    db,
+    "chat_messages",
+    "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT",
+  );
+  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN observation TEXT");
+  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN status TEXT");
   // Backfill legacy rows so they have a self-consistent send group.
   await db
     .execute("UPDATE chat_messages SET send_id = id WHERE send_id IS NULL")

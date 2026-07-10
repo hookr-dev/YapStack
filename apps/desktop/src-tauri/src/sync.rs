@@ -1563,6 +1563,11 @@ fn prepare_library_for_sync(live_db: &Path) -> Result<PathBuf, String> {
     let db = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
     let conn = db.conn();
     schema::crr_migrate(conn).map_err(|e| format!("crr_migrate: {e}"))?;
+    // Same out-of-band ALTER pass as the live in-place cutover: ensure the seed
+    // snapshot produced from this copy carries the runtime-patched columns as
+    // CRR-tracked (not absent), so a peer joining via snapshot never quarantines
+    // speaker_id / chat_messages column changes. Idempotent (schema.rs:329,332).
+    schema::apply_out_of_band_alters(conn).map_err(|e| format!("apply_out_of_band_alters: {e}"))?;
     cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
     uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
     mark_prepared(conn).map_err(|e| e.to_string())?;
@@ -2120,6 +2125,17 @@ fn cutover_with_fault(
         let db = CrsqlDb::open(&staging).map_err(|e| e.to_string())?;
         let conn = db.conn();
         schema::crr_migrate(conn).map_err(|e| format!("crr_migrate: {e}"))?;
+        // (Bug fix) crr_migrate CRRifies whatever column shape the live copy currently
+        // has — on a fresh device that is the base-migration shape (13-col segments,
+        // 6-col chat_messages) because the frontend's runtime ALTERs (db.ts) had not
+        // yet added speaker_id / the chat_messages columns before cutover ran. Apply the
+        // codified out-of-band ALTERs through the crsql alter dance NOW, while the table
+        // is CRR but before it becomes live, so those columns are CRR-tracked instead of
+        // being added later by a bare (and swallowed) frontend ALTER that desyncs the
+        // clock and quarantines every incoming change for them forever. Idempotent: a
+        // long-lived DB that already carries the columns is skipped (schema.rs:329,332).
+        schema::apply_out_of_band_alters(conn)
+            .map_err(|e| format!("apply_out_of_band_alters: {e}"))?;
         cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
         uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
         mark_prepared(conn).map_err(|e| e.to_string())?;
@@ -2792,6 +2808,21 @@ fn spawn_drain(
             if let Err(e) = outbox::ensure_outbox_table(conn) {
                 tracing::error!("sync drain: outbox table: {e}");
                 return;
+            }
+            // F2 boot-time self-heal: this connection has the crsql extension loaded and
+            // the live DB is CRR-prepared by the time any drain starts (start_drain_if_enabled
+            // guarantees cutover ran; enable/re-login likewise). A DB that was CRR-prepared by
+            // a build PRIOR to the cutover fix above — or that gains new OUT_OF_BAND_ALTERS
+            // entries in a future update — is missing those CRR-tracked columns, so every
+            // incoming change for them quarantines (is_unknown_column) and never replays. Apply
+            // the codified alters here once, on the drain's own connection, BEFORE the loop:
+            // idempotent (skips columns that already exist), and the very next replay_pending
+            // cycle then recovers all previously quarantined changes automatically. No separate
+            // replay trigger is needed.
+            if let Err(e) = schema::apply_out_of_band_alters(conn) {
+                // Non-fatal: a failure here leaves the pre-existing (quarantining) behaviour
+                // rather than aborting the drain. Log loudly so it is not silent.
+                tracing::error!("sync drain: out-of-band alter self-heal failed: {e}");
             }
             let cipher = ChangesetCipher::new(
                 vault_key,
@@ -4746,6 +4777,19 @@ mod tests {
         assert!(
             n > 0,
             "post-cutover write must be captured by crsql_changes"
+        );
+
+        // F1: cutover now runs the out-of-band ALTER pass, so a fresh 13-col device
+        // gains a CRR-tracked `speaker_id` instead of leaving it absent — the missing
+        // column is exactly what quarantined every incoming speaker_id change forever in
+        // the two-device UAT. It must exist AND still be part of a CRR table.
+        assert!(
+            schema::column_exists(db.conn(), "segments", "speaker_id").unwrap(),
+            "cutover must add the out-of-band speaker_id column"
+        );
+        assert!(
+            schema::is_crr(db.conn(), "segments").unwrap(),
+            "segments must remain CRR after the wrapped out-of-band alter"
         );
     }
 

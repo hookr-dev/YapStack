@@ -273,6 +273,48 @@ fn r7_quarantine_replay_across_schema_gap() {
     );
 }
 
+/// (Finding 3 pin) cr-sqlite's ACTUAL behavior for a BARE `ALTER TABLE ... ADD COLUMN` on a
+/// CRR table — the assumption the frontend gate must not rely on. On the pinned cr-sqlite
+/// version a bare `ADD COLUMN` is ACCEPTED, NOT rejected: the column lands on the base table
+/// OUTSIDE the `crsql_begin_alter`/`crsql_commit_alter` dance. That is precisely why the db.ts
+/// gate (`addColumnIfMissing` skips CRR tables) is required: it CANNOT depend on cr-sqlite
+/// refusing the statement. Two facts make either possible cr-sqlite behavior safe once the gate
+/// is in place:
+///   1. If cr-sqlite REJECTED the bare ALTER, the frontend simply no-ops and the Rust boot
+///      self-heal adds the column via `crsql_alter`.
+///   2. If cr-sqlite ACCEPTS it (as here), the frontend gate means the frontend never issues it
+///      on a CRR DB — so the un-dance'd column is never created by the frontend. Crucially,
+///      `apply_out_of_band_alters` SKIPS any column that already `column_exists`, so had the
+///      frontend bare-ALTERed it first, the Rust dance would be skipped and the column could be
+///      left improperly clock-tracked. The gate closes exactly that race.
+#[test]
+fn bare_alter_add_column_on_crr_table_is_accepted_not_rejected() {
+    let db = CrsqlDb::open_in_memory().unwrap();
+    let conn = db.conn();
+    conn.execute_batch(
+        "CREATE TABLE doc(id TEXT NOT NULL PRIMARY KEY, a TEXT NOT NULL DEFAULT '');",
+    )
+    .unwrap();
+    conn.query_row("SELECT crsql_as_crr('doc')", [], |_| Ok(()))
+        .unwrap();
+    assert!(schema::is_crr(conn, "doc").unwrap(), "doc is CRR-tracked");
+
+    // The load-bearing fact: cr-sqlite does NOT reject a bare ADD COLUMN on a CRR table.
+    let result = conn.execute("ALTER TABLE doc ADD COLUMN b TEXT", []);
+    assert!(
+        result.is_ok(),
+        "PINNED cr-sqlite ACCEPTS a bare ADD COLUMN on a CRR table (got {result:?}); the db.ts \
+         gate must therefore proactively skip CRR tables rather than rely on a rejection"
+    );
+    assert!(
+        schema::column_exists(conn, "doc", "b").unwrap(),
+        "the bare ALTER did land the column on the base table (outside the crsql_alter dance)"
+    );
+    // And `apply_out_of_band_alters` would now SKIP `b` (it already exists), never running the
+    // proper crsql_alter dance for it — the quarantine-bug resurrection the frontend gate averts.
+    apply_out_of_band_alters(conn).unwrap();
+}
+
 /// R7: the named db.ts out-of-band ALTERs are applied through begin/commit_alter,
 /// preserving existing rows and their clocks.
 #[test]
@@ -302,4 +344,80 @@ fn r7_out_of_band_alters_are_wrapped() {
     assert!(count(conn, "SELECT count(*) FROM crsql_changes") >= clocks_before);
     // Idempotent second application.
     apply_out_of_band_alters(conn).unwrap();
+}
+
+/// (Bug fix) End-to-end proof of the two-device UAT failure and its fix. A fresh
+/// device CRRifies `segments` at the BASE shape (no `speaker_id`, because the
+/// frontend's runtime ALTER had not run before cutover). WITHOUT the out-of-band
+/// alter pass it quarantines every incoming `speaker_id` change forever
+/// (`is_unknown_column`, the 26k-quarantined-changes symptom); WITH it — as the
+/// fixed cutover / boot self-heal now runs — the column is CRR-tracked and the
+/// identical incoming change APPLIES directly, converging with no data loss.
+#[test]
+fn out_of_band_alters_let_fresh_device_apply_speaker_id_without_quarantine() {
+    // Device A already carries a CRR-tracked speaker_id and writes it.
+    let a = CrsqlDb::open_in_memory().unwrap();
+    a.conn()
+        .execute_batch(
+            "CREATE TABLE segments(id TEXT NOT NULL PRIMARY KEY, \
+             session_id TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', \
+             speaker_id INTEGER);",
+        )
+        .unwrap();
+    a.conn()
+        .query_row("SELECT crsql_as_crr('segments')", [], |_| Ok(()))
+        .unwrap();
+    a.conn()
+        .execute(
+            "INSERT INTO segments(id,session_id,text,speaker_id) VALUES('g1','s','hi',7)",
+            [],
+        )
+        .unwrap();
+    let cs = read_local_changes_since(a.conn(), 0).unwrap();
+
+    // A fresh device B at the BASE (no-speaker_id) shape, CRRified.
+    let fresh_base = || {
+        let b = CrsqlDb::open_in_memory().unwrap();
+        b.conn()
+            .execute_batch(
+                "CREATE TABLE segments(id TEXT NOT NULL PRIMARY KEY, \
+                 session_id TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '');",
+            )
+            .unwrap();
+        b.conn()
+            .query_row("SELECT crsql_as_crr('segments')", [], |_| Ok(()))
+            .unwrap();
+        b
+    };
+
+    // Control (pre-fix): no out-of-band alters → the speaker_id change quarantines.
+    let raw = fresh_base();
+    let (_applied, quarantined) = merge_changeset(raw.conn(), &cs).unwrap();
+    assert!(
+        quarantined >= 1,
+        "without the alter the speaker_id change must quarantine, got {quarantined}"
+    );
+    assert!(!schema::column_exists(raw.conn(), "segments", "speaker_id").unwrap());
+
+    // Fixed path: run apply_out_of_band_alters first (as cutover / boot self-heal now
+    // does), then the SAME changeset applies with zero quarantine.
+    let healed = fresh_base();
+    apply_out_of_band_alters(healed.conn()).unwrap();
+    assert!(schema::column_exists(healed.conn(), "segments", "speaker_id").unwrap());
+    let (applied, quarantined) = merge_changeset(healed.conn(), &cs).unwrap();
+    assert!(applied >= 1, "the changeset must apply, got {applied}");
+    assert_eq!(
+        quarantined, 0,
+        "with speaker_id CRR-tracked, nothing quarantines"
+    );
+    assert_eq!(pending_count(healed.conn()).unwrap(), 0);
+
+    // Converged: B carries A's speaker_id with no data loss.
+    let sid: Option<i64> = healed
+        .conn()
+        .query_row("SELECT speaker_id FROM segments WHERE id='g1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sid, Some(7));
 }

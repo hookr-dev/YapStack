@@ -90,12 +90,15 @@ pub async fn push(
             .fetch_one(&mut *tx)
             .await?;
 
-    // (3) Idempotency: which (client_id, client_seq) pairs already exist? Race-free
-    // under the lock. One query via parallel arrays.
+    // (3) Idempotency: which (client_id, client_seq) pairs already exist, and with what
+    // stored ciphertext? Race-free under the lock. One query via parallel arrays. We fetch
+    // the stored ciphertext too so the dedup branch can tell a benign retry (identical bytes)
+    // from a counter REGRESSION (a DB restore re-mints a reused seq with DIFFERENT content —
+    // G3): the latter must be rejected loudly, never silently deduplicated.
     let client_ids: Vec<Uuid> = req.changes.iter().map(|c| c.client_id).collect();
     let client_seqs: Vec<i64> = req.changes.iter().map(|c| c.client_seq).collect();
-    let existing_rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "SELECT client_id, client_seq, changeset_seq FROM changesets \
+    let existing_rows: Vec<(Uuid, i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT client_id, client_seq, changeset_seq, ciphertext FROM changesets \
          WHERE workspace_id = $1 \
            AND (client_id, client_seq) IN \
                (SELECT * FROM unnest($2::uuid[], $3::bigint[]))",
@@ -105,9 +108,9 @@ pub async fn push(
     .bind(&client_seqs)
     .fetch_all(&mut *tx)
     .await?;
-    let mut existing: HashMap<(Uuid, i64), i64> = existing_rows
+    let mut existing: HashMap<(Uuid, i64), (i64, Vec<u8>)> = existing_rows
         .into_iter()
-        .map(|(cid, cseq, seq)| ((cid, cseq), seq))
+        .map(|(cid, cseq, seq, ct)| ((cid, cseq), (seq, ct)))
         .collect();
 
     // (5-prep) Walk the batch in order, assigning seqs to genuinely-new pairs. Also
@@ -117,11 +120,25 @@ pub async fn push(
     let mut added_bytes: u64 = 0;
     for (c, bytes) in req.changes.iter().zip(decoded) {
         let key = (c.client_id, c.client_seq);
-        if let Some(&seq) = existing.get(&key) {
+        if let Some((seq, stored_ct)) = existing.get(&key) {
+            // G3 — the pair already exists. IDENTICAL ciphertext is a benign idempotent retry
+            // (dedup ack, unchanged behavior). DIFFERENT ciphertext can NEVER be a retry: the
+            // same (client_id, client_seq) is carrying new content, which only happens when a
+            // client's counter REGRESSED (a DB restore) and re-minted a reused seq over fresh
+            // data. Silently deduplicating it would swallow that write (the confirmed bug), so
+            // reject the whole batch with a 409 and let the client fail loudly and reseed.
+            // Never log or echo ciphertext.
+            if stored_ct.as_slice() != bytes.as_slice() {
+                return Err(AppError::Conflict(format!(
+                    "client_seq regression: (client_id, client_seq)=({}, {}) already stored \
+                     with different content; the client counter regressed and must reseed",
+                    c.client_id, c.client_seq
+                )));
+            }
             acks.push(PushAck {
                 client_id: c.client_id,
                 client_seq: c.client_seq,
-                changeset_seq: seq,
+                changeset_seq: *seq,
                 deduplicated: true,
             });
             continue;
@@ -133,11 +150,11 @@ pub async fn push(
             seq,
             c.client_id,
             c.client_seq,
-            bytes,
+            bytes.clone(),
             c.schema_version,
             c.engine_version,
         ));
-        existing.insert(key, seq); // catch intra-batch repeats
+        existing.insert(key, (seq, bytes)); // catch intra-batch repeats (with content)
         acks.push(PushAck {
             client_id: c.client_id,
             client_seq: c.client_seq,

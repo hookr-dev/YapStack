@@ -363,14 +363,74 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
             }
         }
 
-        let resp = transport.push(PushRequest { changes }).await?;
-        for ack in &resp.acks {
+        let resp = match transport.push(PushRequest { changes }).await {
+            Ok(r) => r,
+            // G3 — the relay returned 409 Conflict: our counter regressed and re-minted a seq
+            // the relay already holds under DIFFERENT ciphertext. Recover in-band (reseed past
+            // the tail, reset the watermark, drop the colliding entries) and return NON-FATALLY
+            // so the next cycle re-walks and re-pushes under fresh seqs — instead of collapsing
+            // into a permanent Failing loop (the wedge this closes). If completeness is ALSO
+            // unreachable, `recover_from_conflict` propagates that error as push_error.
+            Err(e) if crate::transport::is_conflict(&e) => {
+                recover_from_conflict(conn, client_id, transport).await?;
+                return Ok(total_acked);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Apply the genuinely-new acks (deduplicated=false) unconditionally: these entries
+        // were freshly stored under their pushed seq.
+        let mut applied = 0usize;
+        for ack in resp.acks.iter().filter(|a| !a.deduplicated) {
             conn.execute(
                 "UPDATE _yapstack_outbox SET acked=1, changeset_seq=?1 WHERE client_seq=?2",
                 rusqlite::params![ack.changeset_seq, ack.client_seq],
             )?;
+            applied += 1;
         }
-        total_acked += resp.acks.len();
+
+        // G2 — deduplicated-ack backstop (for a relay that does NOT implement G3). A
+        // `deduplicated=true` ack means the relay already holds this `(client_id, client_seq)`.
+        // Against a G3 relay a real regression surfaces as a 409 (different ciphertext under the
+        // reused pair, handled above), so here a dedup is normally the benign retry-after-lost-
+        // ack (we pushed this exact entry before, its ack was lost, the relay holds OUR
+        // ciphertext). Against a NO-G3 relay a dedup is AMBIGUOUS — it could instead be a counter
+        // REGRESSION (a DB restore reused the seq over DIFFERENT content, the silent-loss bug the
+        // old code hid by acking unconditionally). We disambiguate best-effort by asking the
+        // relay for our tail (G1 reconcile): a regressed local counter is behind the relay tail.
+        // This is heuristic, not exact — a regressed re-mint landing EXACTLY at the tail reads as
+        // "no regression" and is acked, but that false-negative is benign (the relay's stored
+        // copy of that pair is the same-or-newer converged data). Only a detected regression
+        // reseeds. G1's per-spawn reconcile-before-push is the primary guard; this only catches
+        // a residual regression that slipped a stale completeness view.
+        let dedup_count = resp.acks.iter().filter(|a| a.deduplicated).count();
+        if dedup_count > 0 {
+            if reconcile_seq_counter(conn, client_id, transport).await? {
+                // Regression confirmed: reconcile advanced the counter, reset the push
+                // watermark, and DROPPED these unacked colliding entries — they re-mint under
+                // fresh, non-colliding seqs on the next cycle's full re-walk. We do NOT ack
+                // them (acking was the bug). Stop this drain's push here.
+                tracing::error!(
+                    target: "yapstack::sync",
+                    deduplicated_entries = dedup_count,
+                    "relay deduplicated a first-time push under a regressed client_seq counter; \
+                     entries left UNACKED and re-queued for re-mint (silent data loss averted)"
+                );
+                total_acked += applied;
+                break;
+            }
+            // No regression: a benign retry — the relay already holds OUR ciphertext under this
+            // seq. Ack these entries as the idempotency contract intends.
+            for ack in resp.acks.iter().filter(|a| a.deduplicated) {
+                conn.execute(
+                    "UPDATE _yapstack_outbox SET acked=1, changeset_seq=?1 WHERE client_seq=?2",
+                    rusqlite::params![ack.changeset_seq, ack.client_seq],
+                )?;
+                applied += 1;
+            }
+        }
+
+        total_acked += applied;
 
         // Defensive: a server that acks nothing must not spin the loop forever.
         if resp.acks.is_empty() {
@@ -433,6 +493,117 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
     Ok(report)
 }
 
+/// G1 — reconcile this device's `client_seq` counter against the relay's record of our OWN
+/// tail, repairing a counter REGRESSION (a DB restore that reset the counter to a value the
+/// relay has already moved past — the confirmed silent-loss bug).
+///
+/// Fetches `GET /sync/completeness`, finds our `client_id`'s `max_client_seq`, and compares
+/// it to the local last-assigned counter. If the relay holds a HIGHER seq, the counter
+/// regressed and we:
+/// - advance the counter to the server max, so the next mint is `server_max + 1` — past
+///   every pair the relay already holds, so we stop re-minting the colliding pairs the relay
+///   silently dedups;
+/// - reset the push watermark to 0 so the next capture RE-WALKS the full change stream,
+///   recovering edits whose watermark advanced but whose pushes were swallowed (this makes a
+///   regressed device re-push its full history ONCE — idempotent: cr-sqlite merge converges,
+///   and the re-encrypted entries carry NEW seqs so they are genuinely-new pairs, not dedups);
+/// - DROP the unacked outbox entries, which carry the regressed colliding seqs; the re-walk
+///   re-mints them under fresh seqs.
+///
+/// Logs a WARN naming the old counter and the server max (never key/token/ciphertext). Returns
+/// `true` when a regression was repaired, `false` when the counter was already consistent. On
+/// either success it records the per-spawn reconciled marker so steady-state drains this spawn
+/// skip the round-trip (the marker is connection-scoped, so the next spawn reconciles again).
+async fn reconcile_seq_counter<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    client_id: uuid::Uuid,
+    transport: &T,
+) -> Result<bool, SyncError> {
+    state::ensure_meta_table(conn)?;
+    ensure_outbox_table(conn)?;
+    let resp = transport.completeness().await?;
+    let server_max = resp
+        .per_client
+        .iter()
+        .find(|t| t.client_id == client_id)
+        .map(|t| t.max_client_seq)
+        .unwrap_or(0);
+    let local = state::client_seq(conn)?;
+    if server_max <= local {
+        // The counter is at or ahead of the relay tail — no regression. Record that we have
+        // reconciled this spawn so future drains skip the completeness round-trip.
+        state::mark_seq_reconciled(conn)?;
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        target: "yapstack::sync",
+        old_client_seq = local,
+        server_max_client_seq = server_max,
+        "client_seq counter regressed below the relay tail (DB restore?): advancing counter to \
+         the server tail, resetting the push watermark to re-walk the full change stream, and \
+         dropping unacked outbox entries for re-mint under fresh seqs"
+    );
+    reseed_counter_to_tail(conn, server_max)?;
+    state::mark_seq_reconciled(conn)?;
+    Ok(true)
+}
+
+/// Reseed the local `client_seq` counter to `target` (the relay tail), reset the push
+/// watermark so the next capture RE-WALKS the full change stream, and DROP the unacked outbox
+/// entries whose seqs may collide — all in ONE IMMEDIATE transaction so the reseed, watermark
+/// reset, and purge are atomic with respect to a concurrent capture writer (same discipline as
+/// `enqueue_local`). Shared by the G1 regression repair and the G3 conflict recovery. Never
+/// rewinds: callers only ever pass a `target >= local`.
+fn reseed_counter_to_tail(conn: &Connection, target: i64) -> Result<(), SyncError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    state::set_client_seq(&tx, target)?;
+    state::set_push_watermark(&tx, 0)?;
+    tx.execute("DELETE FROM _yapstack_outbox WHERE acked=0", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// G3 — recover from a relay `409 Conflict`. The relay rejected a push whose
+/// `(client_id, client_seq)` it already holds under DIFFERENT ciphertext: this device's
+/// counter regressed (a DB restore) and re-minted a seq the relay already passed. Clear the
+/// per-spawn reconciled marker, fetch the relay tail, then reseed the counter to at least that
+/// tail — the 409 is proof of a collision AT the current seq, so we must mint strictly PAST it
+/// (hence `server_max.max(local)`, never a rewind), reset the watermark, and drop the unacked
+/// colliding entries. The next cycle re-walks and re-pushes under fresh, non-colliding seqs;
+/// because the reseed advances past the tail, the same conflict CANNOT recur (no hot loop). If
+/// completeness is unreachable, the error propagates as `push_error` (surfaced, never silent).
+async fn recover_from_conflict<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    client_id: uuid::Uuid,
+    transport: &T,
+) -> Result<(), SyncError> {
+    state::ensure_meta_table(conn)?;
+    ensure_outbox_table(conn)?;
+    state::clear_seq_reconciled(conn)?;
+    let resp = transport.completeness().await?;
+    let server_max = resp
+        .per_client
+        .iter()
+        .find(|t| t.client_id == client_id)
+        .map(|t| t.max_client_seq)
+        .unwrap_or(0);
+    let local = state::client_seq(conn)?;
+    let target = server_max.max(local);
+    tracing::warn!(
+        target: "yapstack::sync",
+        old_client_seq = local,
+        server_max_client_seq = server_max,
+        "relay rejected a colliding push (409 conflict): reseeding the counter past the relay \
+         tail, resetting the push watermark to re-walk, and dropping unacked entries for re-mint \
+         under fresh seqs (silent data loss averted)"
+    );
+    reseed_counter_to_tail(conn, target)?;
+    // We have now reconciled this spawn against the relay tail.
+    state::mark_seq_reconciled(conn)?;
+    Ok(())
+}
+
 /// Capture this device's local writes, then push the outbox. The push half of one
 /// [`drain_once`] cycle; its error is captured into `DrainReport::push_error` so it cannot
 /// abort the pull. Preserves the capture-before-push ordering and the [`SyncError::Oversized`]
@@ -445,6 +616,19 @@ async fn push_direction<T: SyncTransport + ?Sized>(
     schema_version: i32,
     engine_version: i32,
 ) -> Result<usize, SyncError> {
+    // G1 — before minting or pushing anything, reconcile the counter against the relay tail so
+    // a regressed counter (DB restore) never emits colliding pairs. Runs exactly ONCE PER DRAIN
+    // SPAWN: the reconciled marker is connection-scoped (a TEMP marker, see
+    // `state::seq_reconciled`), so a fresh spawn (app launch / enable / re-login) re-checks and
+    // every file-level restore self-heals — while steady-state cycles this spawn skip the
+    // completeness round-trip. Pushes are GATED until one successful reconcile: if completeness
+    // is unreachable we do NOT capture-or-push new entries under a possibly-regressed counter
+    // (that is the collision window), we leave the marker unset, and we surface the error as
+    // push_error so the drain retries reconcile next cycle. The pull half still runs (F1), so
+    // the drain never wedges. A 401 propagates so the drain's token-refresh path still fires.
+    if !state::seq_reconciled(conn)? {
+        reconcile_seq_counter(conn, client_id, transport).await?;
+    }
     enqueue_local(conn, cipher, client_id, schema_version, engine_version)?;
     push_outbox(conn, client_id, transport).await
 }
@@ -1255,5 +1439,512 @@ mod tests {
         drop(probe);
         drop(dst);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- G1/G2: client_seq counter-regression recovery (silent-loss bug) -----
+
+    /// Decrypt every changeset the `relay` holds for `client_id` and report whether any of
+    /// them carries a `kv` row whose text value equals `needle` — i.e. proof the content
+    /// actually reached the relay (not a silent loss).
+    async fn relay_holds_kv_value(
+        relay: &MockRelay,
+        cipher: &ChangesetCipher,
+        client_id: Uuid,
+        needle: &str,
+    ) -> bool {
+        let pull = relay.pull(0, 100_000).await.unwrap();
+        for pc in &pull.changes {
+            if pc.client_id != client_id {
+                continue;
+            }
+            let Ok(blob) = B64.decode(pc.ciphertext.as_bytes()) else {
+                continue;
+            };
+            let Ok(pt) = cipher.decrypt(pc.client_id, pc.client_seq, &blob) else {
+                continue;
+            };
+            let Ok(cs) = Changeset::decode(&pt) else {
+                continue;
+            };
+            if cs
+                .rows
+                .iter()
+                .any(|r| matches!(&r.val, Value::Text(s) if s == needle))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Model a DB restore to a pre-sync backup for the IN-MEMORY tests: everything the local DB
+    /// held rolls back — the `client_seq` counter, the watermarks, AND the outbox (all mutually
+    /// consistent with each other in the backup) — while `client_id` PERSISTS (it comes from the
+    /// credential store, not the DB, and survives the restore). Crucially there is NO persisted
+    /// reconciled flag to restore any more (that was the bug): the marker is connection-scoped,
+    /// so a real restore-then-launch opens a FRESH connection with no marker. These in-memory
+    /// tests reuse one connection, so we drop the temp marker here to faithfully model that
+    /// fresh-connection spawn. The relay is untouched, so it still holds the old
+    /// `(client_id, client_seq)` pairs the restarted counter will collide with — the confirmed
+    /// silent-loss setup. (The on-disk `restore_carrying_stale_counter_still_reaches_relay`
+    /// proves the same via an actual connection reopen with meta left intact.)
+    fn simulate_db_restore(conn: &Connection) {
+        conn.execute(
+            "DELETE FROM _yapstack_sync_meta WHERE key <> 'client_id'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM _yapstack_outbox", []).unwrap();
+        // Model the fresh drain connection a real restore-then-launch opens: the connection-
+        // scoped reconciled marker is absent, so G1 reconcile re-runs this spawn.
+        conn.execute("DROP TABLE IF EXISTS _yapstack_sync_session", [])
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn counter_regression_reseeds_and_recovers_without_silent_loss() {
+        // The two-device silent-loss bug, reproduced end to end and fixed by G1. A device
+        // pushes edits to the relay, then its DB is restored to a pre-CRR backup: the
+        // client_seq counter restarts while the relay still holds the old pairs. A fresh edit
+        // made AFTER the restore must still reach the relay — the bug swallowed it. G1 detects
+        // the regression from the relay tail, reseeds the counter past it, and re-walks the
+        // full change stream so the edit lands under a fresh, non-colliding seq.
+        let dev = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&dev);
+        let cid = state::client_id(dev.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // Original run: three edits pushed to the relay under this device's seqs 1..3.
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            dev.conn()
+                .execute(
+                    "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                    rusqlite::params![k, v],
+                )
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+        }
+        let comp = relay.completeness().await.unwrap();
+        let tail = comp
+            .per_client
+            .iter()
+            .find(|t| t.client_id == cid)
+            .map(|t| t.max_client_seq)
+            .unwrap_or(0);
+        assert_eq!(tail, 3, "relay holds our seqs 1..3");
+        let rows_before = comp.count;
+
+        // Restore wipes the counter + reconciled flag; the relay is untouched.
+        simulate_db_restore(dev.conn());
+        assert_eq!(
+            state::client_seq(dev.conn()).unwrap(),
+            0,
+            "counter restarted"
+        );
+        assert!(
+            !state::seq_reconciled(dev.conn()).unwrap(),
+            "reconciled flag lost with the DB restore"
+        );
+
+        // A new edit made AFTER the restore — the write the bug silently dropped.
+        dev.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k4','post-restore')", [])
+            .unwrap();
+
+        let report = drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.push_error.is_none(),
+            "push is clean after the reseed: {:?}",
+            report.push_error
+        );
+
+        // The counter was reseeded past the relay tail, and the reconciled flag is set so
+        // steady-state drains skip the completeness round-trip.
+        assert!(
+            state::client_seq(dev.conn()).unwrap() >= 3,
+            "counter advanced to at least the server tail"
+        );
+        assert!(state::seq_reconciled(dev.conn()).unwrap());
+
+        // No silent loss: the relay grew (the full re-walk landed under NEW pairs) and the
+        // post-restore edit is decryptable on the relay under one of our fresh seqs.
+        assert!(
+            relay.completeness().await.unwrap().count > rows_before,
+            "the re-walk pushed fresh changesets under new seqs"
+        );
+        assert!(
+            relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore").await,
+            "the post-restore edit reached the relay (no silent loss)"
+        );
+    }
+
+    /// A relay that fails `completeness` a fixed number of times (then delegates), so a test
+    /// can drive G1 to DEFER (completeness unreachable at drain start) yet let G2's later
+    /// reconcile succeed. Every other call delegates to the inner [`MockRelay`].
+    struct CompletenessFlaky {
+        inner: Arc<MockRelay>,
+        fail_remaining: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl SyncTransport for CompletenessFlaky {
+        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
+            self.inner.push(r).await
+        }
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            self.inner.pull(since, limit).await
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            use std::sync::atomic::Ordering;
+            if self
+                .fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(SyncError::Network("completeness down (test)".into()));
+            }
+            self.inner.completeness().await
+        }
+        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
+            self.inner.put_snapshot(m, c).await
+        }
+        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+            self.inner.get_snapshot().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_reconcile_gates_push_no_silent_loss() {
+        // F1 gating: when G1 cannot reconcile at drain start (completeness unreachable), the
+        // push is GATED — we do NOT capture-or-push new entries under a possibly-regressed
+        // counter (the collision window). The failure rides on push_error (surfaced), nothing
+        // is pushed, and the post-restore edit stays queued locally. The NEXT cycle (relay
+        // healthy) reconciles, reseeds, re-walks, and the edit lands — no silent loss.
+        let dev = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&dev);
+        let cid = state::client_id(dev.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // Original run establishes relay seqs 1..2 for this device.
+        for (k, v) in [("k1", "v1"), ("k2", "v2")] {
+            dev.conn()
+                .execute(
+                    "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                    rusqlite::params![k, v],
+                )
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+        }
+        simulate_db_restore(dev.conn());
+        dev.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k3','post-restore-gate')", [])
+            .unwrap();
+
+        // Cycle 1: completeness is down, so reconcile fails and the push is gated.
+        let flaky = CompletenessFlaky {
+            inner: relay.clone(),
+            fail_remaining: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let report = drain_once(dev.conn(), &cipher, &flaky, cid, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.push_error.is_some(),
+            "reconcile failure surfaces as push_error (never silent)"
+        );
+        assert_eq!(
+            report.pushed, 0,
+            "nothing pushed while reconcile is deferred"
+        );
+        // The counter was NOT reseeded (reconcile never succeeded) and the edit stayed local.
+        assert!(
+            !relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore-gate").await,
+            "the gated push did not land — it is queued locally, not lost"
+        );
+
+        // Cycle 2: relay healthy → reconcile reseeds past the tail, re-walk re-mints, edit lands.
+        let report2 = drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+            .await
+            .unwrap();
+        assert!(report2.push_error.is_none());
+        assert!(
+            state::client_seq(dev.conn()).unwrap() >= 2,
+            "counter reseeded to at least the relay tail once reconcile succeeded"
+        );
+        assert!(
+            relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore-gate").await,
+            "after reseed + re-mint the post-restore edit reaches the relay (no silent loss)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedup_regression_backstop_reseeds_via_push_outbox() {
+        // The no-G3-relay backstop inside push_outbox, exercised DIRECTLY (push_direction's G1
+        // gate normally prevents an unreconciled push, so we call push_outbox on a deliberately
+        // regressed counter to pin the backstop). MockRelay dedups silently (models a relay
+        // WITHOUT G3): a regressed counter that re-mints a seq the relay already holds under
+        // different content gets a `deduplicated=true` ack. The backstop asks the relay for our
+        // tail, sees the local counter is BEHIND it, and reseeds instead of silently acking the
+        // lost edit.
+        let dev = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&dev);
+        let cid = state::client_id(dev.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // Establish relay seqs 1..3 for this device, then clear the (acked) outbox.
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            dev.conn()
+                .execute(
+                    "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                    rusqlite::params![k, v],
+                )
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+        }
+        dev.conn()
+            .execute("DELETE FROM _yapstack_outbox", [])
+            .unwrap();
+
+        // Regress the counter to 0 while leaving the push watermark past k1..k3, so the next
+        // capture mints seq 1 for ONLY the new edit — colliding with the relay's seq 1 under
+        // different content. local (=1) is strictly behind the relay tail (=3): a real
+        // regression the backstop must detect.
+        state::set_client_seq(dev.conn(), 0).unwrap();
+        dev.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k4','post-restore-dedup')", [])
+            .unwrap();
+        let assigned = enqueue_local(dev.conn(), &cipher, cid, sv, ev).unwrap();
+        assert_eq!(assigned, vec![1], "the new edit minted the colliding seq 1");
+
+        // Push directly: the relay dedups seq 1; the backstop reconciles, detects the
+        // regression (server_max 3 > local 1), reseeds past the tail, and drops the entry.
+        let acked = push_outbox(dev.conn(), cid, relay.as_ref()).await.unwrap();
+        assert_eq!(acked, 0, "the suspect dedup was NOT acked");
+        assert!(
+            state::client_seq(dev.conn()).unwrap() >= 3,
+            "counter reseeded to at least the relay tail"
+        );
+        let unacked: i64 = dev
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM _yapstack_outbox WHERE acked=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unacked, 0, "the colliding entry was dropped for re-mint");
+        assert!(
+            !relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore-dedup").await,
+            "the refused push did not silently land"
+        );
+
+        // Recovery: re-walk (watermark was reset to 0) re-mints under fresh seqs; the edit lands.
+        enqueue_local(dev.conn(), &cipher, cid, sv, ev).unwrap();
+        push_outbox(dev.conn(), cid, relay.as_ref()).await.unwrap();
+        assert!(
+            relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore-dedup").await,
+            "after reseed + re-mint the edit reaches the relay (no silent loss)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_carrying_stale_counter_still_reaches_relay() {
+        // F4(a) — the real file-restore model the persisted-flag design failed. A restore
+        // rewrites the DB FILE from a backup that carries a STALE (lower) client_seq counter
+        // with EVERYTHING ELSE INTACT — no meta deletion, no manual flag clearing — while the
+        // relay tail is ahead. The old design persisted a "reconciled" flag IN the DB, so the
+        // backup restored flag=1 alongside the stale counter and the drain SKIPPED reconcile
+        // exactly when it was needed → the post-restore edit was silently lost. With the
+        // connection-scoped marker, reopening the connection after the restore (a fresh spawn)
+        // starts with the marker absent, so reconcile runs, reseeds past the tail, and the edit
+        // lands. This test proves it via an ACTUAL file copy + connection reopen.
+        let dir = std::env::temp_dir().join(format!("yapstack-restore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db");
+        let backup = dir.join("backup.db");
+
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // A device with two synced edits; capture a BACKUP at this point (counter=2, relay 1..2,
+        // meta + outbox all mutually consistent with the backup).
+        let cid;
+        {
+            let dev = CrsqlDb::open(&live).unwrap();
+            dev.conn()
+                .execute_batch("PRAGMA journal_mode=WAL;")
+                .unwrap();
+            make_kv(&dev);
+            cid = state::client_id(dev.conn()).unwrap();
+            for (k, v) in [("k1", "v1"), ("k2", "v2")] {
+                dev.conn()
+                    .execute(
+                        "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                        rusqlite::params![k, v],
+                    )
+                    .unwrap();
+                drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(state::client_seq(dev.conn()).unwrap(), 2);
+            assert!(state::seq_reconciled(dev.conn()).unwrap());
+            // Checkpoint WAL into the main file so a plain file copy is a faithful backup.
+            dev.conn()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            std::fs::copy(&live, &backup).unwrap();
+
+            // Move the relay tail ahead of the backup: a third edit synced AFTER the backup.
+            dev.conn()
+                .execute("INSERT INTO kv(id,v) VALUES('k3','v3')", [])
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+            assert_eq!(state::client_seq(dev.conn()).unwrap(), 3);
+        }
+        let tail_before = relay.completeness().await.unwrap().count;
+        assert_eq!(tail_before, 3, "relay holds our seqs 1..3");
+
+        // RESTORE: overwrite the live DB with the backup file (counter=2, meta intact, NO flag
+        // wiped) and REOPEN — the fresh connection a real restore-then-launch opens.
+        std::fs::copy(&backup, &live).unwrap();
+        let dev = CrsqlDb::open(&live).unwrap();
+        dev.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(
+            state::client_seq(dev.conn()).unwrap(),
+            2,
+            "restored DB carries the STALE counter"
+        );
+        assert!(
+            !state::seq_reconciled(dev.conn()).unwrap(),
+            "the connection-scoped marker cannot be restored from a file — fresh spawn re-checks"
+        );
+
+        // A post-restore edit — the write the persisted-flag design swallowed.
+        dev.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k4','post-restore')", [])
+            .unwrap();
+        let report = drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.push_error.is_none(),
+            "push clean after the per-spawn reseed: {:?}",
+            report.push_error
+        );
+        assert!(
+            state::client_seq(dev.conn()).unwrap() >= 3,
+            "reconcile reseeded the counter past the relay tail"
+        );
+        assert!(
+            relay.completeness().await.unwrap().count > tail_before,
+            "the re-walk pushed fresh changesets under new seqs"
+        );
+        assert!(
+            relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore").await,
+            "the post-restore edit reached the relay (no silent loss)"
+        );
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_outbox_recovers_from_relay_409_conflict() {
+        // F4(c) — the client-side G3 recovery, always-on (no live Postgres). A raw HTTP server
+        // returns 409 Conflict for the push (the relay rejecting a colliding pair carrying
+        // different content) and then serves a completeness JSON naming our tail. push_outbox
+        // must classify the 409 as a conflict, reseed past the tail, drop the colliding entry,
+        // and return NON-FATALLY (Ok) — never wedge in a permanent Failing loop.
+        use crate::transport::HttpTransport;
+        use std::io::{Read, Write};
+
+        let cid = Uuid::from_u128(0xC0FFEE);
+        // Seed a single unacked outbox entry (opaque bytes) whose client_seq (1) the relay will
+        // report as already held at the tail — the collision.
+        let conn = seed_outbox(&[vec![7u8; 32]]);
+
+        let completeness_json = format!(
+            "{{\"max_changeset_seq\":1,\"count\":1,\"contiguous\":true,\
+             \"per_client\":[{{\"client_id\":\"{cid}\",\"max_client_seq\":1}}]}}"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // Response 1: POST /sync/push → 409. Response 2: GET /sync/completeness → JSON.
+            let bodies = [
+                ("409 Conflict".to_string(), String::new()),
+                ("200 OK".to_string(), completeness_json),
+            ];
+            for (status_line, body) in bodies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let transport = HttpTransport::new(format!("http://{addr}"), "access-token");
+        // The local counter starts at 0 (seed_outbox does not set it), so the reseed target is
+        // the relay tail (1). The call must NOT error (non-fatal recovery).
+        let acked = push_outbox(&conn, cid, &transport).await.unwrap();
+        assert_eq!(acked, 0, "the colliding batch was not acked");
+        assert!(
+            state::client_seq(&conn).unwrap() >= 1,
+            "counter reseeded to at least the relay tail"
+        );
+        let unacked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM _yapstack_outbox WHERE acked=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unacked, 0, "the colliding entry was dropped for re-mint");
+        assert!(
+            state::seq_reconciled(&conn).unwrap(),
+            "the conflict recovery marks the counter reconciled this spawn"
+        );
+        server.join().unwrap();
     }
 }

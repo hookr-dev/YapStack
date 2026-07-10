@@ -94,6 +94,18 @@ fn map_send_error(e: reqwest::Error) -> SyncError {
     }
 }
 
+/// True if `err` is the relay's HTTP 409 Conflict — the G3 signal that the relay already
+/// holds this `(client_id, client_seq)` under DIFFERENT ciphertext, so this client's counter
+/// regressed (a DB restore) and re-minted a seq the relay already passed. A 409 is not
+/// intercepted by [`classify_status`] (which isolates only 401), so it flows through
+/// `error_for_status` into [`SyncError::Http`], whose `reqwest::Error` carries the status.
+/// The drain matches on it to trigger the reseed-and-recover path instead of treating it as a
+/// permanent generic failure that wedges sync (the bug this closes). Kept a pure predicate
+/// over the surfaced error so it is unit-testable without a live server.
+pub(crate) fn is_conflict(err: &SyncError) -> bool {
+    matches!(err, SyncError::Http(e) if e.status() == Some(StatusCode::CONFLICT))
+}
+
 /// Map a relay response to a distinct-401 result before decoding: a 401 is the
 /// refreshable auth-expiry path, everything else keeps the existing
 /// `error_for_status` behaviour.
@@ -455,6 +467,52 @@ mod tests {
         t.set_bearer("rotated-token");
         assert_eq!(t.bearer(), "rotated-token");
 
+        server.join().unwrap();
+    }
+
+    /// End-to-end proof over a real socket that a relay `409 Conflict` (the G3
+    /// counter-regression rejection) is classified by [`is_conflict`] as a conflict —
+    /// distinct from a benign `500` — so the drain runs the reseed-and-recover path
+    /// instead of wedging in a permanent Failing loop. A 200 is NOT a conflict. Serves the
+    /// two canned statuses over a tiny raw HTTP responder (no live Postgres, no extra deps).
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_classifies_409_as_conflict() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for status_line in ["409 Conflict", "500 Internal Server Error"] {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        let e409 = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            is_conflict(&e409),
+            "409 must classify as a conflict, got {e409:?}"
+        );
+        let e500 = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            !is_conflict(&e500),
+            "500 must NOT classify as a conflict, got {e500:?}"
+        );
         server.join().unwrap();
     }
 
