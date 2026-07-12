@@ -90,36 +90,65 @@ pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
     );
 }
 
-/// At startup the app cannot have a real in-flight recording session, so any
-/// row left at status='recording' is from a prior crash or force-quit. Empty
-/// ones (no segments, no audio parts) are deleted; the rest are marked
-/// completed with duration recomputed from their parts (or, as a final
-/// fallback, from their segments' max offset).
-fn close_orphaned_recordings(conn: &rusqlite::Connection) {
-    // Newly-installed databases may not yet have the parts table; gate on
-    // its presence so this sweep is forward- and backward-compatible.
-    let has_parts_table = table_exists(conn, "session_audio_parts");
+/// Flat liveness threshold (LIVE_SESSION_STATE.md D5 / resolved Q2). A
+/// `status='recording'` row is "stale" — treated as a crashed session rather than a
+/// live one — once its heartbeat (the max `segments.created_at`, falling back to the
+/// session's own `created_at` at zero segments) is older than this. Named constant per
+/// Q2 ("flat 3 minutes, a named constant; revisit only if UAT shows flapping").
+const RECORDING_STALE_THRESHOLD_MINUTES: i64 = 3;
 
-    let deleted = if has_parts_table {
-        conn.execute(
-            "DELETE FROM sessions \
-             WHERE status = 'recording' \
-               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
-               AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)",
-            [],
-        )
-    } else {
-        conn.execute(
-            "DELETE FROM sessions \
-             WHERE status = 'recording' \
-               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)",
-            [],
-        )
+/// True once the live DB has EVER been CRR-prepared, i.e. cr-sqlite converted the
+/// `sessions` table and left its clock shadow table (`sessions__crsql_clock`) behind.
+///
+/// This mirrors `yapstack_sync::schema::is_crr(conn, "sessions")`
+/// (crates/yapstack-sync/src/schema.rs:212) but is evaluated here as a plain
+/// `sqlite_master` probe so the boot sweep can decide on a bare rusqlite connection —
+/// no crsql extension is needed for a table-existence check — and so it behaves
+/// identically in `sync` and `no-sync` builds (a `no-sync` DB never grows this table, so
+/// it reads false). It is deliberately NOT `device_fingerprint IS NULL`: a credential
+/// clear / fresh keychain over a *retained* CRR DB has a NULL fingerprint yet still holds
+/// foreign synced rows, and a fingerprint predicate would let the interim finalize a
+/// peer's stale-at-receiver live row and LWW-propagate `'completed'` back after
+/// re-enrollment. The DB-level check cannot be fooled that way
+/// (LIVE_SESSION_STATE.md "Sweep rules — interim").
+fn db_was_crr_prepared(conn: &rusqlite::Connection) -> bool {
+    table_exists(conn, "sessions__crsql_clock")
+}
+
+/// Interim ownership gate for the boot sweep (LIVE_SESSION_STATE.md slice 1: D1,
+/// "Sweep rules — interim", sequencing step 1).
+///
+/// There is no `recording_device_id` column yet, so per-row ownership cannot be
+/// evaluated; the gate is therefore at the whole-DB level via [`db_was_crr_prepared`]:
+///
+/// - On a DB that has EVER been CRR-prepared, a `status='recording'` row may be another
+///   device's genuinely-live session delivered by sync. This sweep runs on the CRR
+///   connection (`open_managed`, [`ensure_runtime_schema`] above), so any write here
+///   LWW-propagates; finalizing such a row would write `status='completed'` onto the
+///   recorder mid-recording (the P0 corruption path) and breach owner-only finalization
+///   (D6). So on a CRR-prepared DB the sweep DELETES NOTHING and FINALIZES NOTHING;
+///   genuine local-crash cleanup defers to the ownership-gated final rule (sequencing
+///   step 3). This holds regardless of any identity / fingerprint state, because the
+///   predicate reads the DB shape, not the fingerprint.
+/// - On a never-CRR-prepared DB (a pure pre-sync single-device DB that cannot contain
+///   another device's rows) the interim finalizes stale `'recording'` rows to
+///   `'completed'`. Per the interim rule it NEVER deletes — column-gated delete
+///   eligibility returns with the final rule (step 3). "stale" is the [`RECORDING_STALE_THRESHOLD_MINUTES`]
+///   heartbeat gate (D5).
+fn close_orphaned_recordings(conn: &rusqlite::Connection) {
+    if db_was_crr_prepared(conn) {
+        tracing::info!(
+            "close_orphaned_recordings: CRR-prepared DB — interim ownership gate active; \
+             deleted 0, completed 0 (local-crash cleanup defers to the ownership-gated final sweep)"
+        );
+        return;
     }
-    .unwrap_or_else(|e| {
-        tracing::warn!("close_orphaned_recordings: delete failed: {e}");
-        0
-    });
+
+    // Never-CRR-prepared: single-device crash cleanup. The interim NEVER deletes; it
+    // finalizes only stale rows. Newly-installed databases may not yet have the parts
+    // table, so gate the duration source on its presence.
+    let has_parts_table = table_exists(conn, "session_audio_parts");
+    let stale_modifier = format!("-{RECORDING_STALE_THRESHOLD_MINUTES} minutes");
 
     let completed = if has_parts_table {
         conn.execute(
@@ -133,8 +162,12 @@ fn close_orphaned_recordings(conn: &rusqlite::Connection) {
                     duration_seconds \
                 ), \
                 updated_at = datetime('now') \
-             WHERE status = 'recording'",
-            [],
+             WHERE status = 'recording' \
+               AND datetime(COALESCE( \
+                     (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
+                     created_at \
+                   )) <= datetime('now', ?1)",
+            rusqlite::params![stale_modifier],
         )
     } else {
         conn.execute(
@@ -147,20 +180,23 @@ fn close_orphaned_recordings(conn: &rusqlite::Connection) {
                     duration_seconds \
                 ), \
                 updated_at = datetime('now') \
-             WHERE status = 'recording'",
-            [],
+             WHERE status = 'recording' \
+               AND datetime(COALESCE( \
+                     (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
+                     created_at \
+                   )) <= datetime('now', ?1)",
+            rusqlite::params![stale_modifier],
         )
     }
     .unwrap_or_else(|e| {
-        tracing::warn!("close_orphaned_recordings: update failed: {e}");
+        tracing::warn!("close_orphaned_recordings: finalize failed: {e}");
         0
     });
 
-    if deleted > 0 || completed > 0 {
-        tracing::info!(
-            "close_orphaned_recordings: deleted {deleted} empty, completed {completed} stale"
-        );
-    }
+    tracing::info!(
+        "close_orphaned_recordings: never-CRR-prepared DB — deleted 0, completed {completed} stale \
+         (interim never deletes)"
+    );
 }
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
@@ -1224,6 +1260,180 @@ mod tests {
                 .unwrap_or_else(|e| panic!("query against {fts_table} failed: {e}"));
             assert_eq!(count, 0, "{fts_table} should be empty after migration");
         }
+    }
+
+    // --- Boot-sweep interim ownership gate (LIVE_SESSION_STATE.md slice 1) ---------
+
+    /// Migrated in-memory DB (never CRR-prepared).
+    fn migrated_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        conn
+    }
+
+    /// Simulate a DB that has been CRR-prepared by planting the `sessions` clock
+    /// shadow table cr-sqlite leaves behind — no real crsql extension needed, matching
+    /// the DB-level `is_crr(conn, "sessions")` probe the sweep uses.
+    fn mark_crr_prepared(conn: &rusqlite::Connection) {
+        conn.execute_batch("CREATE TABLE sessions__crsql_clock (x INTEGER);")
+            .unwrap();
+    }
+
+    /// Insert a `status='recording'` session whose `created_at` is the given SQL
+    /// expression (e.g. `datetime('now')` or `datetime('now', '-1 hour')`).
+    fn insert_recording(conn: &rusqlite::Connection, id: &str, created_at_sql: &str) {
+        conn.execute(
+            &format!(
+                "INSERT INTO sessions (id, title, source, status, created_at, updated_at) \
+                 VALUES ('{id}', 't', 'MicOnly', 'recording', {created_at_sql}, {created_at_sql})"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    fn insert_segment(
+        conn: &rusqlite::Connection,
+        seg_id: &str,
+        session_id: &str,
+        created_at_sql: &str,
+    ) {
+        conn.execute(
+            &format!(
+                "INSERT INTO segments \
+                    (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, created_at) \
+                 VALUES ('{seg_id}', '{session_id}', 'mic', 'hi', 0.0, 1.0, {created_at_sql})"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    fn session_status(conn: &rusqlite::Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn session_exists(conn: &rusqlite::Connection, id: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n == 1
+    }
+
+    #[test]
+    fn db_was_crr_prepared_detects_clock_shadow_table() {
+        let conn = migrated_conn();
+        assert!(
+            !db_was_crr_prepared(&conn),
+            "a freshly-migrated DB has never been CRR-prepared"
+        );
+        mark_crr_prepared(&conn);
+        assert!(
+            db_was_crr_prepared(&conn),
+            "presence of sessions__crsql_clock means the DB was CRR-prepared"
+        );
+    }
+
+    #[test]
+    fn interim_never_crr_finalizes_stale_and_never_deletes() {
+        let conn = migrated_conn();
+        // Stale (crash) rows: heartbeat well past the 3-min threshold.
+        insert_recording(&conn, "stale-empty", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "stale-full", "datetime('now', '-1 hour')");
+        insert_segment(
+            &conn,
+            "seg-full",
+            "stale-full",
+            "datetime('now', '-1 hour')",
+        );
+
+        close_orphaned_recordings(&conn);
+
+        // Stale non-empty → finalized (today's crash-cleanup behavior, gated stale).
+        assert_eq!(session_status(&conn, "stale-full"), "completed");
+        // Stale empty → finalized, NOT deleted (interim never deletes).
+        assert_eq!(session_status(&conn, "stale-empty"), "completed");
+        assert!(
+            session_exists(&conn, "stale-empty"),
+            "interim must never DELETE, even an empty stale row"
+        );
+    }
+
+    #[test]
+    fn interim_never_crr_leaves_fresh_recording_untouched() {
+        let conn = migrated_conn();
+        // Fresh rows (heartbeat < 3 min): must not be finalized — could be a genuine
+        // in-flight recording (or, during rollout, a live NULL-owner peer).
+        insert_recording(&conn, "fresh-empty", "datetime('now')");
+        insert_recording(&conn, "fresh-full", "datetime('now')");
+        insert_segment(&conn, "seg-fresh", "fresh-full", "datetime('now')");
+
+        close_orphaned_recordings(&conn);
+
+        assert_eq!(session_status(&conn, "fresh-empty"), "recording");
+        assert_eq!(session_status(&conn, "fresh-full"), "recording");
+    }
+
+    #[test]
+    fn interim_crr_prepared_touches_nothing() {
+        let conn = migrated_conn();
+        mark_crr_prepared(&conn);
+        // Every shape of recording row — empty/full, stale/fresh — must be left alone,
+        // because on a synced DB any of them may be another device's live session.
+        insert_recording(&conn, "crr-stale-empty", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "crr-stale-full", "datetime('now', '-1 hour')");
+        insert_segment(
+            &conn,
+            "seg-crr",
+            "crr-stale-full",
+            "datetime('now', '-1 hour')",
+        );
+        insert_recording(&conn, "crr-fresh-empty", "datetime('now')");
+
+        close_orphaned_recordings(&conn);
+
+        for id in ["crr-stale-empty", "crr-stale-full", "crr-fresh-empty"] {
+            assert_eq!(
+                session_status(&conn, id),
+                "recording",
+                "{id} must stay 'recording' on a CRR-prepared DB (no finalize)"
+            );
+            assert!(session_exists(&conn, id), "{id} must not be deleted");
+        }
+    }
+
+    #[test]
+    fn interim_crr_prepared_untouched_regardless_of_identity_state() {
+        // Credential-clear edge (spec: Sweep rules interim + Verification matrix): a
+        // CRR-prepared DB with a stale synced row must NOT be finalized even when the
+        // device has no fingerprint (fresh keychain awaiting re-enrollment). The sweep
+        // reads no fingerprint at all — the gate is the DB-level `is_crr` predicate — so
+        // this holds by construction; the test documents that no cross-device finalize
+        // can occur in the interim window on any DB that has ever synced.
+        let conn = migrated_conn();
+        mark_crr_prepared(&conn);
+        insert_recording(&conn, "peer-live", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "seg-peer", "peer-live", "datetime('now', '-1 hour')");
+
+        close_orphaned_recordings(&conn);
+
+        assert_eq!(
+            session_status(&conn, "peer-live"),
+            "recording",
+            "a peer's stale-at-receiver row must never be finalized in the interim"
+        );
     }
 
     #[test]
