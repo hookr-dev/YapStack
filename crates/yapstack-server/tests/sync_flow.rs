@@ -416,6 +416,280 @@ async fn audio_presign_dedups_on_ciphertext_hash() {
     assert!(v["upload_url"].is_null());
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn cross_tenant_reads_are_denied_at_the_api() {
+    // §15 row 5 (Gap 3 / audit R5) — NEGATIVE cross-tenant isolation at the API surface, not
+    // just in-schema. Two independent signups mint two workspaces; neither JWT can read the
+    // other's changesets through /sync/pull or /sync/completeness, and — because the tenant is
+    // taken ONLY from the validated JWT (never request-shaped) — a push authenticated as B can
+    // only ever land in B's workspace, so A's served data never contains B's blob (and vice
+    // versa). This proves RLS DENIES cross-tenant reads at the API, the blind-relay tenancy
+    // guarantee.
+    let app = build_router(setup(false).await);
+    let (tok_a, tenant_a) = signup(&app).await;
+    let (tok_b, tenant_b) = signup(&app).await;
+    assert_ne!(
+        tenant_a, tenant_b,
+        "separate emails → separate workspaces (distinct tenants)"
+    );
+
+    // A pushes two distinctive blobs into A's workspace.
+    let dev_a = Uuid::new_v4();
+    let a_blob1 = b"A-SECRET-BLOB-alpha".to_vec();
+    let a_blob2 = b"A-SECRET-BLOB-bravo".to_vec();
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok_a),
+        json!({ "changes": [change(dev_a, 1, &a_blob1), change(dev_a, 2, &a_blob2)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A sees its own two changesets.
+    let va = body_json(get(&app, "/sync/completeness", &tok_a).await).await;
+    assert_eq!(va["count"], 2);
+    assert_eq!(va["max_changeset_seq"], 2);
+
+    // THE LOAD-BEARING NEGATIVE ASSERTION: B's JWT reads ZERO of A's blobs.
+    let vb_pull = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_b).await).await;
+    assert_eq!(
+        vb_pull["changes"].as_array().unwrap().len(),
+        0,
+        "tenant B must not read tenant A's changesets (RLS denies cross-tenant reads at the API)"
+    );
+    let vb = body_json(get(&app, "/sync/completeness", &tok_b).await).await;
+    assert_eq!(
+        vb["count"], 0,
+        "B's completeness reveals none of A's changesets"
+    );
+    assert_eq!(vb["max_changeset_seq"], 0);
+    assert!(
+        vb["per_client"].as_array().unwrap().is_empty(),
+        "B sees none of A's per-client tails"
+    );
+
+    // B pushes its own blob (authenticated as B → lands in B's workspace; there is no
+    // request field that could target A — the tenant comes from the JWT alone).
+    let dev_b = Uuid::new_v4();
+    let b_blob = b"B-SECRET-BLOB-charlie".to_vec();
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok_b),
+        json!({ "changes": [change(dev_b, 1, &b_blob)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // B's seq starts at 1 in ITS OWN workspace — a per-tenant sequence, not a shared global
+    // counter (further evidence the workspaces are isolated).
+    let vb2 = body_json(get(&app, "/sync/completeness", &tok_b).await).await;
+    assert_eq!(vb2["count"], 1);
+    assert_eq!(vb2["max_changeset_seq"], 1);
+
+    // AND THE MIRROR: A reads ZERO of B's blobs after B pushed.
+    let va_pull = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_a).await).await;
+    let a_changes = va_pull["changes"].as_array().unwrap();
+    assert_eq!(
+        a_changes.len(),
+        2,
+        "A still sees only its own two changesets"
+    );
+    for ch in a_changes {
+        let raw = B64.decode(ch["ciphertext"].as_str().unwrap()).unwrap();
+        assert_ne!(raw, b_blob, "A must never receive B's ciphertext");
+    }
+    let va2 = body_json(get(&app, "/sync/completeness", &tok_a).await).await;
+    assert_eq!(va2["count"], 2, "B's push did not leak into A's workspace");
+
+    // B's own pull returns EXACTLY its one blob and none of A's — the isolation is total.
+    let vb_pull2 = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_b).await).await;
+    let b_changes = vb_pull2["changes"].as_array().unwrap();
+    assert_eq!(b_changes.len(), 1, "B sees only its own one changeset");
+    let b_ct = B64
+        .decode(b_changes[0]["ciphertext"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(b_ct, b_blob);
+    for ch in b_changes {
+        let raw = B64.decode(ch["ciphertext"].as_str().unwrap()).unwrap();
+        assert_ne!(raw, a_blob1, "A's blob must never reach B");
+        assert_ne!(raw, a_blob2, "A's blob must never reach B");
+    }
+}
+
+/// Build a REAL client-side-encrypted changeset blob whose PLAINTEXT payload contains
+/// `sentinel`, mirroring the production two-envelope structure (a committing-wrapped random
+/// data key `||` a standard-sealed payload, per CRYPTO_SPEC §4/§5 and `ChangesetCipher`). The
+/// relay stores only these opaque bytes; the sentinel exists solely in the pre-encryption
+/// plaintext and MUST therefore never appear anywhere in the server's stored bytes.
+fn encrypt_canary_changeset(
+    vault_key: &[u8; 32],
+    tenant: Uuid,
+    client_id: Uuid,
+    client_seq: i64,
+    sentinel: &str,
+) -> Vec<u8> {
+    use rand::RngCore;
+    use yapstack_crypto::aead::{lp, seal_committing, seal_standard};
+    use yapstack_crypto::{DOMAIN_CHANGESET, VERSION};
+
+    let mut rng = rand::thread_rng();
+    let mut data_key = [0u8; 32];
+    let mut n_wrap = [0u8; 24];
+    let mut n_ct = [0u8; 24];
+    rng.fill_bytes(&mut data_key);
+    rng.fill_bytes(&mut n_wrap);
+    rng.fill_bytes(&mut n_ct);
+
+    // Wrap the per-changeset data key under the vault key (committing envelope, §4.2).
+    let wrap_aad = lp(&[&[VERSION], b"yapstack.wrap.data.v1", &0u32.to_be_bytes()]);
+    let wrapped = seal_committing(vault_key, &n_wrap, &data_key, &wrap_aad).unwrap();
+
+    // Seal the sentinel-bearing payload under the data key (standard envelope, §5.2 AAD).
+    let cs_aad = lp(&[
+        &[VERSION],
+        DOMAIN_CHANGESET,
+        tenant.as_bytes(),
+        client_id.as_bytes(),
+        &(client_seq as u64).to_be_bytes(),
+        &22u32.to_be_bytes(),
+        &16003u32.to_be_bytes(),
+    ]);
+    let plaintext = format!("changeset payload :: {sentinel} :: end").into_bytes();
+    let sealed = seal_standard(&data_key, &n_ct, &plaintext, &cs_aad).unwrap();
+
+    let mut blob = wrapped;
+    blob.extend_from_slice(&sealed);
+    // Sanity: the distinctive sentinel is in the plaintext but NOT in the ciphertext we push.
+    assert!(
+        !blob
+            .windows(sentinel.len())
+            .any(|w| w == sentinel.as_bytes()),
+        "encryption must not leave the sentinel in the pushed ciphertext"
+    );
+    blob
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn plaintext_sentinel_never_appears_in_stored_server_bytes() {
+    // §15 row 3 (Gap 4 / audit R3) — AUTOMATED no-plaintext regression gate, replacing the
+    // manual sweep. Push a changeset whose PLAINTEXT carries a distinctive random canary, then
+    // scan EVERY user-table column of the relay DB (bytea rendered via both encode(...,'escape')
+    // and encode(...,'hex'); everything else cast ::text) for the canary. The relay is a blind
+    // store: it must contain ZERO occurrences. This test FAILS if anyone ever stores plaintext
+    // server-side.
+    //
+    // Log half: capturing the server's tracing output inside this in-process oneshot-router
+    // harness is not feasible (tracing writes to a process-global subscriber, not a per-test
+    // sink). The log path stays covered by the standing tracing review (no content/URL/token
+    // is ever logged — verified in T009/T012/T012c). The DB half — the durable, most dangerous
+    // surface — is what this gate asserts automatically, honestly.
+    let state = setup(false).await;
+    let pool = state.pool.clone();
+    let app = build_router(state);
+    let (tok, tenant) = signup(&app).await;
+
+    let sentinel = format!("YAPSTACK_PLAINTEXT_CANARY_{}", Uuid::new_v4().simple());
+    let vault_key = [0x33u8; 32]; // matches the wrapped_vault_key fixture shape; value irrelevant to the relay
+    let dev = Uuid::new_v4();
+    let blob = encrypt_canary_changeset(&vault_key, tenant, dev, 1, &sentinel);
+
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok),
+        json!({ "changes": [change(dev, 1, &blob)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "canary changeset accepted");
+
+    // Scan under the tenant's RLS context so we can actually SEE the stored row (FORCE RLS
+    // otherwise hides it). The canary is THIS tenant's plaintext, so its only possible
+    // resting places are this tenant's rows (visible here) or a non-RLS table (visible
+    // regardless) — this context is complete for the canary.
+    let mut tx = yapstack_server::db::begin_tenant_tx(&pool, tenant)
+        .await
+        .unwrap();
+
+    // POSITIVE CONTROL: the scan actually reaches the stored ciphertext bytes. If this fails
+    // the sweep would be vacuous, so we assert it explicitly.
+    let blob_hex = hex::encode(&blob);
+    let seen: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM changesets WHERE position($1 in encode(ciphertext,'hex')) > 0",
+    )
+    .bind(&blob_hex)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        seen, 1,
+        "positive control: the pushed ciphertext must be visible to the scan (non-vacuous)"
+    );
+
+    // Enumerate every column of every base table in the public schema.
+    let cols: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.table_name, c.column_name, c.data_type \
+         FROM information_schema.columns c \
+         JOIN information_schema.tables t \
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+         WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' \
+         ORDER BY c.table_name, c.ordinal_position",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        cols.len() > 10,
+        "sanity: the sweep enumerated the relay's columns ({} found)",
+        cols.len()
+    );
+
+    let sentinel_hex = hex::encode(sentinel.as_bytes());
+    let mut hits: Vec<String> = Vec::new();
+    for (table, col, dtype) in &cols {
+        // Defensive: identifiers come from our own schema, but never interpolate a name that
+        // could break quoting.
+        if table.contains('"') || col.contains('"') {
+            continue;
+        }
+        let n: i64 = if dtype == "bytea" {
+            // Search the raw byte rendering (escape) for the ASCII canary AND the hex
+            // rendering for its hex form — catches plaintext however a bug might store it.
+            let sql = format!(
+                "SELECT count(*) FROM public.\"{table}\" \
+                 WHERE position($1 in encode(\"{col}\",'escape')) > 0 \
+                    OR position($2 in encode(\"{col}\",'hex')) > 0"
+            );
+            sqlx::query_scalar(&sql)
+                .bind(&sentinel)
+                .bind(&sentinel_hex)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        } else {
+            let sql = format!(
+                "SELECT count(*) FROM public.\"{table}\" WHERE position($1 in \"{col}\"::text) > 0"
+            );
+            sqlx::query_scalar(&sql)
+                .bind(&sentinel)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        };
+        if n > 0 {
+            hits.push(format!("{table}.{col} ({dtype}) = {n} row(s)"));
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "PLAINTEXT LEAK: the canary '{sentinel}' was found server-side in {hits:?} — the relay \
+         must never store plaintext"
+    );
+}
+
 // ----------------------------------------------------------------- admin helpers
 
 fn sign_admin(method: &str, path: &str, body: &str, nonce: &str) -> (i64, [u8; 64]) {
