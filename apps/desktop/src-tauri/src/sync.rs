@@ -1358,6 +1358,25 @@ fn store_session(s: &Session) -> Result<(), String> {
     Ok(())
 }
 
+/// This device's fingerprint (§7.5.5) as presented in `SyncStatusDto.device_fingerprint`
+/// (the `session.device_fingerprint` field the status DTO clones, `build_status_dto`),
+/// the public base32 hash of the roster identity — **NOT** any key/token material.
+///
+/// Served from the warmed in-memory credential cache via [`load_session`] (T020), so it is
+/// cheap and non-blocking at boot: once `init_credential_store` warms the cache, a read
+/// never hits the keychain. Returns `None` when sync was never configured (no session),
+/// when the session is unreadable, or when a legacy session predates fingerprint
+/// attribution — i.e. exactly the ownership-ambiguous case where the boot orphan sweep
+/// must NOT guess (LIVE_SESSION_STATE.md "Sweep rules"). Because the session entry is
+/// deleted on sign-out, a credential-clear over a retained CRR DB also yields `None`,
+/// keeping that case foreign-safe rather than mis-attributing peer rows to a stale self.
+pub fn current_device_fingerprint() -> Option<String> {
+    load_session()
+        .ok()
+        .flatten()
+        .and_then(|s| s.device_fingerprint)
+}
+
 /// Device identity, served from the cache (loaded from the store on first use).
 fn load_identity() -> Result<Option<DeviceIdentity>, String> {
     ensure_cache_loaded();

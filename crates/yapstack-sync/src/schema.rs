@@ -313,6 +313,11 @@ pub fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, 
 /// the base schema version migrates without clock desync.
 pub const OUT_OF_BAND_ALTERS: &[(&str, &str, &str)] = &[
     ("segments", "speaker_id", "speaker_id INTEGER"),
+    (
+        "sessions",
+        "recording_device_id",
+        "recording_device_id TEXT",
+    ),
     ("chat_messages", "tool_calls", "tool_calls TEXT"),
     ("chat_messages", "send_id", "send_id TEXT"),
     ("chat_messages", "sequence", "sequence INTEGER"),

@@ -92,6 +92,7 @@ import {
   addSessionTag as dbAddSessionTag,
   removeSessionTag as dbRemoveSessionTag,
   getTagByName,
+  isRecordingStale,
 } from "@/lib/db";
 import type { DbDictationHistory, DbTag } from "@/lib/db";
 import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNode } from "@/lib/folder-tree";
@@ -427,6 +428,18 @@ interface AppState {
   // Note refresh (for cross-component refresh signaling)
   noteRefreshCounter: number;
 
+  /**
+   * Store-visible edit-in-progress signal (LIVE_SESSION_STATE.md D4 normative).
+   * The segment editor is uncontrolled (contentEditable holds in-flight text in the
+   * DOM), so the sync-applied live refresh must consult a store signal to avoid
+   * clobbering an open edit. Currently set for the duration of an in-flight
+   * `editSegmentText` save; the D4 refresh skips reloading the open session's
+   * segments while it is non-null. Slice 4 / a follow-up can additionally set it on
+   * `EditableSegment` focus/blur to cover the whole open-edit window.
+   */
+  editingSegmentId: string | null;
+  setEditingSegmentId: (id: string | null) => void;
+
   // Audio playback
   playbackTime: number;
   isPlaying: boolean;
@@ -615,6 +628,10 @@ interface AppState {
   showHiddenSegments: boolean;
   setShowHiddenSegments: (show: boolean) => void;
   refreshViewSessionSegments: () => Promise<void>;
+  /** D4 live refresh: reload the open non-active session's row + segments on a
+   *  sync-applied batch, skipping while an edit is in progress and never bumping
+   *  noteRefreshCounter (LIVE_SESSION_STATE.md Gap 2). */
+  refreshOpenViewSession: () => Promise<void>;
 
   // Segment multi-selection (ephemeral; not persisted). Reset on session change.
   selectedSegmentIds: Set<string>;
@@ -818,6 +835,8 @@ function createAppStore() {
       backfillBoundarySeconds: null,
       sessionStopping: false,
       noteRefreshCounter: 0,
+      editingSegmentId: null,
+      setEditingSegmentId: (id: string | null) => set({ editingSegmentId: id }),
       playbackTime: 0,
       isPlaying: false,
       tags: [],
@@ -1159,6 +1178,10 @@ function createAppStore() {
             void s.loadSessionFolders();
             void s.loadTags();
             void s.loadSessionTags();
+            // D4 (Gap 2): live-refresh the OPEN non-active session's row + segments so a
+            // remote-live follow-along fills as segments merge (no manual reopen). The
+            // local active session reads from activeSessionSegments and is skipped.
+            void s.refreshOpenViewSession();
           }, SYNC_APPLIED_DEBOUNCE_MS);
         };
         const unlisten = await listen(SYNC_APPLIED_EVENT, coarseRefresh);
@@ -1270,7 +1293,13 @@ function createAppStore() {
 
         const sessionId = crypto.randomUUID();
 
-        await dbCreateSession(sessionId, settings.captureSource);
+        // Attribute the recording to THIS device (LIVE_SESSION_STATE D2); null when
+        // sync is not configured → single-device semantics unchanged.
+        await dbCreateSession(
+          sessionId,
+          settings.captureSource,
+          get().syncStatus?.deviceFingerprint ?? null,
+        );
 
         const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
         const vocabHints = buildVocabularyHints(freshFolders, freshTags);
@@ -1377,6 +1406,28 @@ function createAppStore() {
           toast.error("Could not load session.");
           return;
         }
+        // Defense-in-depth against the resume race (LIVE_SESSION_STATE resume-race
+        // transition). The `status !== 'completed'` refusal below is the operative
+        // guard and is strictly stronger — once a foreign device's `recording` write
+        // has synced, that check already refuses. This belt-and-suspenders adds
+        // nothing to the race window but yields a TRUTHFUL "live on <label>" message
+        // instead of the generic refusal when a fresh foreign owner holds the session.
+        const myFingerprint = get().syncStatus?.deviceFingerprint ?? null;
+        const owner = session.recording_device_id;
+        if (session.status === "recording" && owner && owner !== myFingerprint) {
+          const freshCheckSegments = await getSessionSegments(sessionId).catch(
+            () => [],
+          );
+          if (!isRecordingStale(session, freshCheckSegments)) {
+            const label =
+              get().syncStatus?.roster.find((r) => r.fingerprint === owner)
+                ?.label ?? "another device";
+            toast.error(`This session is live on ${label}.`);
+            return;
+          }
+          // A stale foreign owner falls through to the generic refusal below (v1 does
+          // not take over a session recorded elsewhere — see Non-goals).
+        }
         if (session.status !== "completed") {
           toast.error("This session is not in a state that can be resumed.");
           return;
@@ -1442,9 +1493,12 @@ function createAppStore() {
 
         // Status flip happens *after* the backend has accepted the start, so a
         // rejected resume leaves the session as `completed`.
-        await dbMarkSessionRecording(sessionId).catch((e) =>
-          console.error("Failed to flip session to recording:", e),
-        );
+        // Re-attribute to THIS device — a resumed session re-owns to whoever resumed
+        // it (LIVE_SESSION_STATE D2). Null when sync is not configured.
+        await dbMarkSessionRecording(
+          sessionId,
+          get().syncStatus?.deviceFingerprint ?? null,
+        ).catch((e) => console.error("Failed to flip session to recording:", e));
 
         // Sidebar's `isRecording` keys off `activeSessionId`, so we don't
         // need to reload the sessions list — the badge updates from
@@ -2527,12 +2581,19 @@ function createAppStore() {
 
       // Segment editing
       editSegmentText: async (segmentId: string, newText: string) => {
+        // Mark the edit in progress so a concurrent D4 sync-applied refresh does not
+        // clobber this in-flight write (LIVE_SESSION_STATE.md D4 normative).
+        set({ editingSegmentId: segmentId });
         try {
           await dbUpdateSegmentText(segmentId, newText);
           await get().refreshViewSessionSegments();
         } catch (e) {
           console.error("Failed to edit segment:", e);
           toast.error("Failed to edit segment");
+        } finally {
+          if (get().editingSegmentId === segmentId) {
+            set({ editingSegmentId: null });
+          }
         }
       },
 
@@ -2672,6 +2733,40 @@ function createAppStore() {
           }
         } catch (e) {
           console.error("Failed to refresh segments:", e);
+        }
+      },
+
+      // D4 live refresh (LIVE_SESSION_STATE.md Gap 2). Reload the OPEN session's row +
+      // segments when it is not the local active one, so a remote-live follow-along
+      // fills as segments merge. Normative constraints:
+      //   - Skip while an edit is in progress (editingSegmentId) so the reload cannot
+      //     clobber an open/in-flight edit or drop an editSegmentText write.
+      //   - Never bump noteRefreshCounter (that would re-run NoteEditor's content-reload
+      //     effect and could discard an open note edit); this reloads transcript state
+      //     only, leaving the note editor untouched.
+      refreshOpenViewSession: async () => {
+        const { selectedSessionId, activeSessionId, editingSegmentId } = get();
+        if (!selectedSessionId || selectedSessionId === activeSessionId) return;
+        if (editingSegmentId) return;
+        try {
+          const [row, segs] = await Promise.all([
+            getSession(selectedSessionId),
+            getSessionSegments(selectedSessionId),
+          ]);
+          // Re-check nothing changed during the await (session switched, or an edit
+          // opened) before committing the reload.
+          const now = get();
+          if (
+            now.selectedSessionId !== selectedSessionId ||
+            now.selectedSessionId === now.activeSessionId ||
+            now.editingSegmentId
+          ) {
+            return;
+          }
+          if (!row) return;
+          set({ viewSession: row, viewSessionSegments: segs });
+        } catch (e) {
+          console.error("Failed to live-refresh open session:", e);
         }
       },
 

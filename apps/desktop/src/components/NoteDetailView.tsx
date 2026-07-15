@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from "react";
+import { ArrowLeft } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
 import { SessionHeader } from "@/components/SessionHeader";
 import { ChatView } from "@/components/ChatView";
@@ -11,7 +12,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { canResumeSession, getSession } from "@/lib/db";
+import { canResumeSession, getSession, type DbSession } from "@/lib/db";
 import type { AudioPart } from "@/components/AudioPlayer";
 import {
   createSessionSources,
@@ -27,6 +28,31 @@ import { AutoTagSuggestions } from "@/components/AutoTagSuggestions";
 /** Build a URL for the custom audio-stream:// protocol registered in Rust. */
 function audioStreamUrl(filePath: string): string {
   return convertFileSrc(filePath, "audio-stream");
+}
+
+/**
+ * Remote-live selection predicate (LIVE_SESSION_STATE.md D3): a `recording` session
+ * owned by ANOTHER device — read-only follow-along. Pure so the branch selection is
+ * unit-testable without mounting the view. NULL `myFingerprint` (sync off / pre-
+ * enrollment) makes this always false, preserving single-device behavior. For this
+ * slice any non-mine truthy-owner `recording` row qualifies; slice 4 splits fresh
+ * ("Live") vs stale ("Interrupted") via `isRecordingStale`.
+ */
+export function isRemoteLiveSession(
+  session: Pick<DbSession, "status" | "recording_device_id">,
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+): boolean {
+  const owner = session.recording_device_id;
+  return (
+    !isActiveSession &&
+    session.status === "recording" &&
+    !!owner &&
+    // D7: with no fingerprint (sync off / pre-enrollment) every D3 comparison is
+    // false → single-device behavior, never a remote-live branch.
+    !!myFingerprint &&
+    owner !== myFingerprint
+  );
 }
 
 export function NoteDetailView() {
@@ -53,8 +79,11 @@ export function NoteDetailView() {
   const resumeSession = useAppStore((s) => s.resumeSession);
   const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
   const sessionStopping = useAppStore((s) => s.sessionStopping);
+  const syncStatus = useAppStore((s) => s.syncStatus);
+  const navigateTo = useAppStore((s) => s.navigateTo);
 
   const isActiveSession = selectedSessionId === activeSessionId;
+  const myFingerprint = syncStatus?.deviceFingerprint ?? null;
 
   const {
     suggestions,
@@ -276,6 +305,59 @@ export function NoteDetailView() {
             </div>
           </ResizablePanel>
         </ResizablePanelGroup>
+      </div>
+    );
+  }
+
+  // Remote-live follow-along (D3): a `recording` session owned by ANOTHER device.
+  // Read-only — every write affordance (record/resume/edit/delete, the notes editor,
+  // the chat bar) is withheld; the transcript streams in as D4 refreshes fire. For
+  // this slice any non-mine 'recording' row renders here (slice 4 will split fresh vs
+  // stale into "Live"/"Interrupted"); the liveness helper (isRecordingStale) already
+  // exists for slice 4 to consume.
+  const owner = session.recording_device_id;
+  const isRemoteLive = isRemoteLiveSession(session, isActiveSession, myFingerprint);
+
+  if (isRemoteLive) {
+    const label =
+      syncStatus?.roster.find((r) => r.fingerprint === owner)?.label ??
+      "another device";
+    return (
+      <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
+        <div className="flex items-center justify-between border-b px-4 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <button
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted"
+              onClick={() => navigateTo("note-list")}
+              aria-label="Back to notes"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <span className="truncate text-sm font-medium">
+              {session.title || "Untitled"}
+            </span>
+          </div>
+          <div
+            className="flex shrink-0 items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400"
+            aria-live="polite"
+          >
+            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>Live on {label}</span>
+          </div>
+        </div>
+        {segments.length > 0 ? (
+          <ChatView
+            sessionId={selectedSessionId ?? undefined}
+            segments={segments}
+            initialScrollToBottom
+          />
+        ) : (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">
+              Waiting for {label} to start speaking…
+            </p>
+          </div>
+        )}
       </div>
     );
   }

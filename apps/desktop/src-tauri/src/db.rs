@@ -24,7 +24,11 @@ pub struct AudioPartRow {
 /// Pre-migration runtime patches. Currently only sweeps stale `recording`
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
 /// live in the frontend's `getDb()` so they run after migrations on fresh installs.
-pub fn ensure_runtime_schema(db_path: &Path) {
+/// `me` = this device's `device_fingerprint` (LIVE_SESSION_STATE.md D7), threaded from the
+/// boot call site via `sync::current_device_fingerprint()`. `None` when sync is
+/// unconfigured, the identity is unloadable, or the build has no `sync` feature. It flows
+/// straight into [`close_orphaned_recordings`], which owner-scopes the sweep.
+pub fn ensure_runtime_schema(db_path: &Path, me: Option<&str>) {
     if !db_path.exists() {
         return;
     }
@@ -58,7 +62,7 @@ pub fn ensure_runtime_schema(db_path: &Path) {
         [],
     );
 
-    close_orphaned_recordings(conn);
+    close_orphaned_recordings(conn, me);
 }
 
 /// Records `dir` in `audio_save_locations`. Called at recording start with
@@ -115,87 +119,150 @@ fn db_was_crr_prepared(conn: &rusqlite::Connection) -> bool {
     table_exists(conn, "sessions__crsql_clock")
 }
 
-/// Interim ownership gate for the boot sweep (LIVE_SESSION_STATE.md slice 1: D1,
-/// "Sweep rules — interim", sequencing step 1).
+/// Production boot-sweep entry (LIVE_SESSION_STATE.md D1-final, "Sweep rules — final",
+/// sequencing step 3). Called from [`ensure_runtime_schema`] on the CRR (`open_managed`)
+/// connection.
 ///
-/// There is no `recording_device_id` column yet, so per-row ownership cannot be
-/// evaluated; the gate is therefore at the whole-DB level via [`db_was_crr_prepared`]:
+/// `me` = this device's `device_fingerprint` (`sync::current_device_fingerprint()`),
+/// threaded in from the boot call site now the sweep is owner-aware. It separates an OWN
+/// crashed row (finalize) from a FOREIGN live row (never touch, D6):
 ///
-/// - On a DB that has EVER been CRR-prepared, a `status='recording'` row may be another
-///   device's genuinely-live session delivered by sync. This sweep runs on the CRR
-///   connection (`open_managed`, [`ensure_runtime_schema`] above), so any write here
-///   LWW-propagates; finalizing such a row would write `status='completed'` onto the
-///   recorder mid-recording (the P0 corruption path) and breach owner-only finalization
-///   (D6). So on a CRR-prepared DB the sweep DELETES NOTHING and FINALIZES NOTHING;
-///   genuine local-crash cleanup defers to the ownership-gated final rule (sequencing
-///   step 3). This holds regardless of any identity / fingerprint state, because the
-///   predicate reads the DB shape, not the fingerprint.
-/// - On a never-CRR-prepared DB (a pure pre-sync single-device DB that cannot contain
-///   another device's rows) the interim finalizes stale `'recording'` rows to
-///   `'completed'`. Per the interim rule it NEVER deletes — column-gated delete
-///   eligibility returns with the final rule (step 3). "stale" is the [`RECORDING_STALE_THRESHOLD_MINUTES`]
-///   heartbeat gate (D5).
-fn close_orphaned_recordings(conn: &rusqlite::Connection) {
-    if db_was_crr_prepared(conn) {
-        tracing::info!(
-            "close_orphaned_recordings: CRR-prepared DB — interim ownership gate active; \
-             deleted 0, completed 0 (local-crash cleanup defers to the ownership-gated final sweep)"
-        );
-        return;
+/// - **`me = Some(fp)`** — sync is configured and the identity loaded. Run the full
+///   owner-scoped final rule ([`sweep_orphaned_recordings`] with `Some(fp)`) regardless of
+///   CRR state: foreign rows are never touched, own crashed rows finalize, own/sync-off
+///   empties delete per the delete rule, and NULL-owner rows finalize only when stale. This
+///   is the real P0-close path — on a CRR-prepared DB it now performs the deferred
+///   own-crash finalization safely because the ownership predicate protects every foreign
+///   row.
+/// - **`me = None` on a never-CRR-prepared DB** — a pure pre-sync / `no-sync` single-device
+///   DB that *cannot* hold another device's rows. `me` is genuinely NULL (sync-off), so run
+///   the full final rule with `me = None`: today's delete-empties + stale-finalize
+///   semantics, exactly per spec for a NULL column on a sync-off device.
+/// - **`me = None` on a CRR-prepared DB** — a synced DB with no loadable identity (sync
+///   never configured over a synced DB, or a credential clear / fresh keychain over a
+///   retained CRR DB). Ownership is ambiguous: a `status='recording'` row may be a peer's
+///   genuinely-live session, and this sweep runs on the CRR connection so any write
+///   LWW-propagates. Never guess — TOUCH NOTHING (foreign-safe; own-crash finalization
+///   waits until an identity is loadable). This matches the slice-1 interim behavior for
+///   synced DBs and keeps P0 fully closed in the ambiguous case.
+///
+/// The full owner-scoped rule itself is [`sweep_orphaned_recordings`], exercised across
+/// the complete spec matrix by the unit tests with synthetic `me` values.
+fn close_orphaned_recordings(conn: &rusqlite::Connection, me: Option<&str>) {
+    match me {
+        // Sync configured + identity loaded: the real owner-scoped final rule. Safe on a
+        // CRR-prepared DB — the ownership predicate never touches a foreign row.
+        Some(_) => sweep_orphaned_recordings(conn, me),
+        None if db_was_crr_prepared(conn) => {
+            // Synced DB, no loadable fingerprint → ambiguous ownership. Never guess.
+            tracing::info!(
+                "close_orphaned_recordings: CRR-prepared DB with no loadable device \
+                 fingerprint (sync unconfigured or identity unloadable); touching nothing \
+                 (foreign-safe, own-crash finalize deferred). deleted 0, completed 0"
+            );
+        }
+        // Never CRR-prepared: `me` is genuinely NULL (single-device / sync-off semantics).
+        None => sweep_orphaned_recordings(conn, None),
     }
+}
 
-    // Never-CRR-prepared: single-device crash cleanup. The interim NEVER deletes; it
-    // finalizes only stale rows. Newly-installed databases may not yet have the parts
-    // table, so gate the duration source on its presence.
+/// Owner-scoped final boot sweep (LIVE_SESSION_STATE.md "Sweep rules — final").
+///
+/// `me` = this device's `device_fingerprint`, NULL when sync is unconfigured.
+/// `foreign` = `recording_device_id IS NOT NULL AND recording_device_id != me`.
+/// `empty` = no `segments` AND no `session_audio_parts` rows.
+/// `stale` = heartbeat (`max(segments.created_at)`, fallback `session.created_at`) older
+/// than [`RECORDING_STALE_THRESHOLD_MINUTES`] (D5).
+///
+/// - **Foreign rows are NEVER touched** (D6: a non-owner has no finalization authority).
+/// - **DELETE** non-foreign, delete-eligible empties:
+///   `status='recording' AND empty AND (owner IS NULL OR owner = me) AND (me IS NULL OR owner = me)`.
+///   Sync-off (`me IS NULL`) → today's delete-empties (only the DB's own NULL-owner rows;
+///   a foreign owner still fails the not-foreign predicate). Sync-on → only `owner = me`.
+///   A NULL-owner row on a sync-ON device is never delete-eligible — it may be a peer's
+///   legacy row whose DELETE would sync back.
+/// - **FINALIZE** the remaining non-foreign rows not deleted above; the NULL-owner branch
+///   additionally requires `stale` (a fresh NULL-owner row can be a not-yet-updated live
+///   peer during rollout). Owned rows are always crashes at the owner's own boot, so they
+///   finalize regardless of staleness.
+///
+/// The ownership predicate `(recording_device_id IS NULL OR recording_device_id = ?1)`
+/// matches own + NULL rows and excludes foreign in BOTH the `me`-set and `me`-NULL cases
+/// (`owner = NULL` is SQL-unknown → falsy), so foreign rows are protected even sync-off.
+fn sweep_orphaned_recordings(conn: &rusqlite::Connection, me: Option<&str>) {
+    // A brand-new DB whose parts table hasn't landed yet: `empty`/duration key off
+    // segments alone.
     let has_parts_table = table_exists(conn, "session_audio_parts");
     let stale_modifier = format!("-{RECORDING_STALE_THRESHOLD_MINUTES} minutes");
 
-    let completed = if has_parts_table {
-        conn.execute(
-            "UPDATE sessions SET \
-                status = 'completed', \
-                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
-                duration_seconds = COALESCE( \
-                    (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
-                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
-                     FROM segments WHERE session_id = sessions.id), \
-                    duration_seconds \
-                ), \
-                updated_at = datetime('now') \
-             WHERE status = 'recording' \
-               AND datetime(COALESCE( \
-                     (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
-                     created_at \
-                   )) <= datetime('now', ?1)",
-            rusqlite::params![stale_modifier],
-        )
+    let empty_clause = if has_parts_table {
+        "NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
+         AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)"
     } else {
-        conn.execute(
-            "UPDATE sessions SET \
-                status = 'completed', \
-                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
-                duration_seconds = COALESCE( \
-                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
-                     FROM segments WHERE session_id = sessions.id), \
-                    duration_seconds \
-                ), \
-                updated_at = datetime('now') \
-             WHERE status = 'recording' \
-               AND datetime(COALESCE( \
-                     (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
-                     created_at \
-                   )) <= datetime('now', ?1)",
-            rusqlite::params![stale_modifier],
-        )
-    }
-    .unwrap_or_else(|e| {
-        tracing::warn!("close_orphaned_recordings: finalize failed: {e}");
-        0
-    });
+        "NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)"
+    };
+    // ?1 = me (may be NULL). Reused across both predicates. The NULL-safe `IS`
+    // operator is deliberate: with plain `=`, `recording_device_id = ?1` yields SQL
+    // NULL (not FALSE) whenever the column is NULL, and `FALSE OR NULL = NULL` /
+    // `TRUE AND NULL = NULL` would silently drop a NULL-owner row from the WHERE.
+    // `IS` compares NULL as a value, so every branch resolves to a definite bool.
+    let not_foreign = "(recording_device_id IS NULL OR recording_device_id IS ?1)";
+    let delete_eligible = "(?1 IS NULL OR recording_device_id IS ?1)";
+    // ?2 = the '-N minutes' modifier.
+    let stale_clause = "datetime(COALESCE( \
+            (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
+            created_at \
+        )) <= datetime('now', ?2)";
+
+    let delete_sql = format!(
+        "DELETE FROM sessions \
+         WHERE status = 'recording' \
+           AND ({empty_clause}) \
+           AND {not_foreign} \
+           AND {delete_eligible}"
+    );
+    let deleted = conn
+        .execute(&delete_sql, rusqlite::params![me])
+        .unwrap_or_else(|e| {
+            tracing::warn!("sweep_orphaned_recordings: delete failed: {e}");
+            0
+        });
+
+    let duration_expr = if has_parts_table {
+        "COALESCE( \
+            (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
+            (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+             FROM segments WHERE session_id = sessions.id), \
+            duration_seconds \
+        )"
+    } else {
+        "COALESCE( \
+            (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+             FROM segments WHERE session_id = sessions.id), \
+            duration_seconds \
+        )"
+    };
+    let update_sql = format!(
+        "UPDATE sessions SET \
+            status = 'completed', \
+            total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
+            duration_seconds = {duration_expr}, \
+            updated_at = datetime('now') \
+         WHERE status = 'recording' \
+           AND {not_foreign} \
+           AND NOT (({empty_clause}) AND {delete_eligible}) \
+           AND ((?1 IS NOT NULL AND recording_device_id IS ?1) OR ({stale_clause}))"
+    );
+    let completed = conn
+        .execute(&update_sql, rusqlite::params![me, stale_modifier])
+        .unwrap_or_else(|e| {
+            tracing::warn!("sweep_orphaned_recordings: finalize failed: {e}");
+            0
+        });
 
     tracing::info!(
-        "close_orphaned_recordings: never-CRR-prepared DB — deleted 0, completed {completed} stale \
-         (interim never deletes)"
+        sync_off = me.is_none(),
+        "sweep_orphaned_recordings: deleted {deleted}, completed {completed}"
     );
 }
 
@@ -915,6 +982,20 @@ pub fn migrations() -> Vec<Migration> {
             WHERE wav_file_path IS NOT NULL;
         "#,
         },
+        Migration {
+            version: 16,
+            description: "sessions.recording_device_id attribution column (LIVE_SESSION_STATE D2)",
+            // The recorder's `device_fingerprint`; NULL = legacy/pre-attribution OR
+            // sync-not-configured. ONE `ALTER TABLE sessions …` statement so
+            // `db_service::run_migrations` auto-wraps it through `crsql_alter`
+            // (crsql_begin_alter/commit_alter, backfilling col_version=1) on a
+            // CRR-prepared DB, and applies it plainly on a fresh / no-sync DB. A
+            // device that CRRified at the base schema version picks the column up via
+            // OUT_OF_BAND_ALTERS (yapstack-sync schema.rs) at cutover / boot self-heal.
+            sql: r#"
+            ALTER TABLE sessions ADD COLUMN recording_device_id TEXT;
+        "#,
+        },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
         // local dev DBs picked up a "ghost" v11 entry from another branch
@@ -936,7 +1017,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=15).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=16).collect::<Vec<_>>());
     }
 
     #[test]
@@ -996,8 +1077,8 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            15,
-            "v1-v15; segments.speaker_id is patched at runtime by the frontend's getDb()"
+            16,
+            "v1-v16; segments.speaker_id is patched at runtime by the frontend's getDb()"
         );
     }
 
@@ -1012,6 +1093,37 @@ mod tests {
         assert!(v15
             .sql
             .contains("INSERT OR IGNORE INTO session_audio_parts"));
+    }
+
+    #[test]
+    fn test_migration_v16_adds_recording_device_id_column() {
+        let m = migrations();
+        let v16 = &m[15];
+        assert_eq!(v16.version, 16);
+        // Single ALTER on the `sessions` sync table so run_migrations auto-wraps it
+        // through crsql_alter on a CRR DB.
+        assert!(v16.sql.contains("ALTER TABLE sessions"));
+        assert!(v16.sql.contains("recording_device_id"));
+        // Apply the whole chain and confirm the column materializes and defaults NULL.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('s16', 't', 'MicOnly', 'recording')",
+            [],
+        )
+        .unwrap();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT recording_device_id FROM sessions WHERE id = 's16'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None, "new column defaults NULL (pre-attribution)");
     }
 
     #[test]
@@ -1282,15 +1394,28 @@ mod tests {
             .unwrap();
     }
 
-    /// Insert a `status='recording'` session whose `created_at` is the given SQL
-    /// expression (e.g. `datetime('now')` or `datetime('now', '-1 hour')`).
+    /// Insert a `status='recording'` session with a NULL `recording_device_id` whose
+    /// `created_at` is the given SQL expression (e.g. `datetime('now')` or
+    /// `datetime('now', '-1 hour')`).
     fn insert_recording(conn: &rusqlite::Connection, id: &str, created_at_sql: &str) {
+        insert_recording_owned(conn, id, created_at_sql, None);
+    }
+
+    /// Insert a `status='recording'` session stamped with `owner` (`None` → NULL
+    /// `recording_device_id`), used to drive the owner-scoped sweep matrix.
+    fn insert_recording_owned(
+        conn: &rusqlite::Connection,
+        id: &str,
+        created_at_sql: &str,
+        owner: Option<&str>,
+    ) {
         conn.execute(
             &format!(
-                "INSERT INTO sessions (id, title, source, status, created_at, updated_at) \
-                 VALUES ('{id}', 't', 'MicOnly', 'recording', {created_at_sql}, {created_at_sql})"
+                "INSERT INTO sessions \
+                    (id, title, source, status, created_at, updated_at, recording_device_id) \
+                 VALUES ('{id}', 't', 'MicOnly', 'recording', {created_at_sql}, {created_at_sql}, ?1)"
             ),
-            [],
+            rusqlite::params![owner],
         )
         .unwrap();
     }
@@ -1346,93 +1471,257 @@ mod tests {
         );
     }
 
+    // --- Owner-scoped FINAL sweep rule matrix (LIVE_SESSION_STATE.md "Sweep rules —
+    // final"): {owned, foreign, NULL} × {empty, has-segments} × {fresh, stale} ×
+    // {sync-on, sync-off}. `me` = "A".
+
+    const ME: &str = "AAAABBBBCCCCDDDD";
+    const PEER: &str = "EEEEFFFFGGGGHHHH";
+
     #[test]
-    fn interim_never_crr_finalizes_stale_and_never_deletes() {
+    fn final_foreign_rows_are_never_touched_sync_on() {
+        // The P0 fix (D6): a peer's synced row — in EVERY shape — must never be
+        // deleted or finalized, so no 'completed'/DELETE LWW-propagates onto the
+        // recorder. Includes the stale-at-receiver-but-live-at-source case.
         let conn = migrated_conn();
-        // Stale (crash) rows: heartbeat well past the 3-min threshold.
-        insert_recording(&conn, "stale-empty", "datetime('now', '-1 hour')");
-        insert_recording(&conn, "stale-full", "datetime('now', '-1 hour')");
-        insert_segment(
+        insert_recording_owned(&conn, "f-empty-fresh", "datetime('now')", Some(PEER));
+        insert_recording_owned(
             &conn,
-            "seg-full",
-            "stale-full",
+            "f-empty-stale",
             "datetime('now', '-1 hour')",
+            Some(PEER),
         );
-
-        close_orphaned_recordings(&conn);
-
-        // Stale non-empty → finalized (today's crash-cleanup behavior, gated stale).
-        assert_eq!(session_status(&conn, "stale-full"), "completed");
-        // Stale empty → finalized, NOT deleted (interim never deletes).
-        assert_eq!(session_status(&conn, "stale-empty"), "completed");
-        assert!(
-            session_exists(&conn, "stale-empty"),
-            "interim must never DELETE, even an empty stale row"
-        );
-    }
-
-    #[test]
-    fn interim_never_crr_leaves_fresh_recording_untouched() {
-        let conn = migrated_conn();
-        // Fresh rows (heartbeat < 3 min): must not be finalized — could be a genuine
-        // in-flight recording (or, during rollout, a live NULL-owner peer).
-        insert_recording(&conn, "fresh-empty", "datetime('now')");
-        insert_recording(&conn, "fresh-full", "datetime('now')");
-        insert_segment(&conn, "seg-fresh", "fresh-full", "datetime('now')");
-
-        close_orphaned_recordings(&conn);
-
-        assert_eq!(session_status(&conn, "fresh-empty"), "recording");
-        assert_eq!(session_status(&conn, "fresh-full"), "recording");
-    }
-
-    #[test]
-    fn interim_crr_prepared_touches_nothing() {
-        let conn = migrated_conn();
-        mark_crr_prepared(&conn);
-        // Every shape of recording row — empty/full, stale/fresh — must be left alone,
-        // because on a synced DB any of them may be another device's live session.
-        insert_recording(&conn, "crr-stale-empty", "datetime('now', '-1 hour')");
-        insert_recording(&conn, "crr-stale-full", "datetime('now', '-1 hour')");
-        insert_segment(
+        insert_recording_owned(&conn, "f-full-fresh", "datetime('now')", Some(PEER));
+        insert_segment(&conn, "sf1", "f-full-fresh", "datetime('now')");
+        insert_recording_owned(
             &conn,
-            "seg-crr",
-            "crr-stale-full",
+            "f-full-stale",
             "datetime('now', '-1 hour')",
+            Some(PEER),
         );
-        insert_recording(&conn, "crr-fresh-empty", "datetime('now')");
+        insert_segment(&conn, "sf2", "f-full-stale", "datetime('now', '-1 hour')");
 
-        close_orphaned_recordings(&conn);
+        sweep_orphaned_recordings(&conn, Some(ME));
 
-        for id in ["crr-stale-empty", "crr-stale-full", "crr-fresh-empty"] {
+        for id in [
+            "f-empty-fresh",
+            "f-empty-stale",
+            "f-full-fresh",
+            "f-full-stale",
+        ] {
+            assert!(
+                session_exists(&conn, id),
+                "{id}: foreign row must not be deleted"
+            );
             assert_eq!(
                 session_status(&conn, id),
                 "recording",
-                "{id} must stay 'recording' on a CRR-prepared DB (no finalize)"
+                "{id}: foreign row must not be finalized"
             );
-            assert!(session_exists(&conn, id), "{id} must not be deleted");
         }
     }
 
     #[test]
-    fn interim_crr_prepared_untouched_regardless_of_identity_state() {
-        // Credential-clear edge (spec: Sweep rules interim + Verification matrix): a
-        // CRR-prepared DB with a stale synced row must NOT be finalized even when the
-        // device has no fingerprint (fresh keychain awaiting re-enrollment). The sweep
-        // reads no fingerprint at all — the gate is the DB-level `is_crr` predicate — so
-        // this holds by construction; the test documents that no cross-device finalize
-        // can occur in the interim window on any DB that has ever synced.
+    fn final_foreign_rows_are_never_touched_even_sync_off() {
+        // A credential-clear over a retained CRR DB leaves `me = NULL` while foreign
+        // synced rows remain: the not-foreign predicate still excludes them (`owner =
+        // NULL` is SQL-unknown), so a stale-at-receiver peer row is never finalized —
+        // "including when B's fingerprint is NULL" (spec Verification matrix).
+        let conn = migrated_conn();
+        insert_recording_owned(&conn, "peer-live", "datetime('now', '-1 hour')", Some(PEER));
+        insert_segment(&conn, "sp", "peer-live", "datetime('now', '-1 hour')");
+
+        sweep_orphaned_recordings(&conn, None);
+
+        assert!(session_exists(&conn, "peer-live"));
+        assert_eq!(session_status(&conn, "peer-live"), "recording");
+    }
+
+    #[test]
+    fn final_owned_rows_finalize_regardless_of_stale_and_empties_delete() {
+        let conn = migrated_conn();
+        // Owned non-empty: finalize whether fresh (own crash at own boot) or stale.
+        insert_recording_owned(&conn, "own-full-fresh", "datetime('now')", Some(ME));
+        insert_segment(&conn, "of1", "own-full-fresh", "datetime('now')");
+        insert_recording_owned(
+            &conn,
+            "own-full-stale",
+            "datetime('now', '-1 hour')",
+            Some(ME),
+        );
+        insert_segment(&conn, "of2", "own-full-stale", "datetime('now', '-1 hour')");
+        // Owned empty: deleted (own empties, sync-on).
+        insert_recording_owned(&conn, "own-empty", "datetime('now')", Some(ME));
+
+        sweep_orphaned_recordings(&conn, Some(ME));
+
+        assert_eq!(session_status(&conn, "own-full-fresh"), "completed");
+        assert_eq!(session_status(&conn, "own-full-stale"), "completed");
+        assert!(
+            !session_exists(&conn, "own-empty"),
+            "an owned empty recording row is delete-eligible on a sync-on device"
+        );
+    }
+
+    #[test]
+    fn final_null_owner_sync_on_never_deleted_finalized_only_when_stale() {
+        let conn = migrated_conn();
+        // NULL-owner empties on a SYNC-ON device are NEVER deleted (could be a peer's
+        // legacy row whose DELETE would sync back) — but ARE finalized when stale.
+        insert_recording(&conn, "null-empty-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "null-empty-fresh", "datetime('now')");
+        // NULL-owner non-empty: finalize only when stale (fresh could be a rollout
+        // peer still recording with a NULL owner).
+        insert_recording(&conn, "null-full-stale", "datetime('now', '-1 hour')");
+        insert_segment(
+            &conn,
+            "nfs",
+            "null-full-stale",
+            "datetime('now', '-1 hour')",
+        );
+        insert_recording(&conn, "null-full-fresh", "datetime('now')");
+        insert_segment(&conn, "nff", "null-full-fresh", "datetime('now')");
+
+        sweep_orphaned_recordings(&conn, Some(ME));
+
+        assert!(
+            session_exists(&conn, "null-empty-stale"),
+            "NULL-owner row on sync-on must never be DELETEd"
+        );
+        assert!(session_exists(&conn, "null-empty-fresh"));
+        assert_eq!(session_status(&conn, "null-empty-stale"), "completed");
+        assert_eq!(session_status(&conn, "null-empty-fresh"), "recording");
+        assert_eq!(session_status(&conn, "null-full-stale"), "completed");
+        assert_eq!(
+            session_status(&conn, "null-full-fresh"),
+            "recording",
+            "a fresh NULL-owner row may be a not-yet-updated live peer"
+        );
+    }
+
+    #[test]
+    fn final_sync_off_deletes_empties_and_finalizes_stale() {
+        // me = NULL: today's single-device semantics — delete empties, finalize stale
+        // non-empties, leave fresh non-empties (a genuine in-flight recording).
+        let conn = migrated_conn();
+        insert_recording(&conn, "off-empty-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "off-empty-fresh", "datetime('now')");
+        insert_recording(&conn, "off-full-stale", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "ofs", "off-full-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "off-full-fresh", "datetime('now')");
+        insert_segment(&conn, "off", "off-full-fresh", "datetime('now')");
+
+        sweep_orphaned_recordings(&conn, None);
+
+        assert!(
+            !session_exists(&conn, "off-empty-stale"),
+            "sync-off empties delete"
+        );
+        assert!(
+            !session_exists(&conn, "off-empty-fresh"),
+            "sync-off empties delete"
+        );
+        assert_eq!(session_status(&conn, "off-full-stale"), "completed");
+        assert_eq!(session_status(&conn, "off-full-fresh"), "recording");
+    }
+
+    #[test]
+    fn close_orphaned_recordings_never_crr_runs_sync_off_rule() {
+        // Production entry on a never-CRR DB: me is genuinely NULL → full sync-off rule.
+        let conn = migrated_conn();
+        insert_recording(&conn, "e", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "s", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "sseg", "s", "datetime('now', '-1 hour')");
+
+        close_orphaned_recordings(&conn, None);
+
+        assert!(
+            !session_exists(&conn, "e"),
+            "sync-off empty deleted at boot"
+        );
+        assert_eq!(session_status(&conn, "s"), "completed");
+    }
+
+    #[test]
+    fn close_orphaned_recordings_crr_prepared_no_fingerprint_touches_nothing() {
+        // Production entry on a CRR-prepared DB with `me = None` (sync unconfigured /
+        // identity unloadable): ownership is ambiguous, so it must touch NOTHING
+        // (foreign-safe; own-crash finalize deferred). Every shape stays untouched.
         let conn = migrated_conn();
         mark_crr_prepared(&conn);
-        insert_recording(&conn, "peer-live", "datetime('now', '-1 hour')");
-        insert_segment(&conn, "seg-peer", "peer-live", "datetime('now', '-1 hour')");
+        insert_recording_owned(&conn, "own-stale", "datetime('now', '-1 hour')", Some(ME));
+        insert_segment(&conn, "os", "own-stale", "datetime('now', '-1 hour')");
+        insert_recording_owned(
+            &conn,
+            "peer-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_recording(&conn, "null-empty-stale", "datetime('now', '-1 hour')");
 
-        close_orphaned_recordings(&conn);
+        close_orphaned_recordings(&conn, None);
+
+        for id in ["own-stale", "peer-stale", "null-empty-stale"] {
+            assert!(session_exists(&conn, id), "{id} must not be deleted");
+            assert_eq!(
+                session_status(&conn, id),
+                "recording",
+                "{id} must stay 'recording' on a CRR-prepared DB with no fingerprint"
+            );
+        }
+    }
+
+    #[test]
+    fn close_orphaned_recordings_crr_prepared_with_fingerprint_runs_owner_scoped_rule() {
+        // Production entry on a CRR-prepared DB with `me = Some(fp)`: the real owner-scoped
+        // final rule now runs. Foreign rows stay untouched (D6); the device's OWN crashed
+        // row finalizes; an owned empty deletes; a NULL-owner row finalizes only when stale.
+        let conn = migrated_conn();
+        mark_crr_prepared(&conn);
+        // Own crashed non-empty → finalize.
+        insert_recording_owned(&conn, "own-stale", "datetime('now', '-1 hour')", Some(ME));
+        insert_segment(&conn, "os", "own-stale", "datetime('now', '-1 hour')");
+        // Own empty → delete (sync-on own empties are delete-eligible).
+        insert_recording_owned(&conn, "own-empty", "datetime('now')", Some(ME));
+        // Peer's live-at-source row → never touched.
+        insert_recording_owned(
+            &conn,
+            "peer-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_segment(&conn, "ps", "peer-stale", "datetime('now', '-1 hour')");
+        // NULL-owner stale → finalize; NULL-owner fresh → left (possible live rollout peer).
+        insert_recording(&conn, "null-stale", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "ns", "null-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "null-fresh", "datetime('now')");
+        insert_segment(&conn, "nf", "null-fresh", "datetime('now')");
+
+        close_orphaned_recordings(&conn, Some(ME));
 
         assert_eq!(
-            session_status(&conn, "peer-live"),
+            session_status(&conn, "own-stale"),
+            "completed",
+            "own crashed row must finalize"
+        );
+        assert!(
+            !session_exists(&conn, "own-empty"),
+            "own empty recording row must delete on a sync-on device"
+        );
+        assert!(
+            session_exists(&conn, "peer-stale"),
+            "foreign row must never be deleted"
+        );
+        assert_eq!(
+            session_status(&conn, "peer-stale"),
             "recording",
-            "a peer's stale-at-receiver row must never be finalized in the interim"
+            "foreign row must never be finalized (D6)"
+        );
+        assert_eq!(session_status(&conn, "null-stale"), "completed");
+        assert_eq!(
+            session_status(&conn, "null-fresh"),
+            "recording",
+            "a fresh NULL-owner row may be a not-yet-updated live peer"
         );
     }
 

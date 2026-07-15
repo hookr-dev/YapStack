@@ -21,6 +21,63 @@ export interface DbSession {
   pinned_at: string | null;
   session_type: SessionType;
   sort_order: number;
+  /**
+   * The `device_fingerprint` of the device recording this session (synced column,
+   * LIVE_SESSION_STATE.md D2). NULL = legacy/pre-attribution OR sync-not-configured.
+   * Written at record-start and resume; a completed session keeps its last recorder.
+   */
+  recording_device_id: string | null;
+}
+
+/**
+ * Flat liveness threshold in minutes (LIVE_SESSION_STATE.md D5 / resolved Q2).
+ * Mirrors the Rust `RECORDING_STALE_THRESHOLD_MINUTES` boot-sweep constant. A
+ * `status='recording'` row whose heartbeat is older than this is treated as a
+ * crashed/interrupted session rather than a live one.
+ */
+export const RECORDING_STALE_THRESHOLD_MINUTES = 3;
+
+/**
+ * Parse a SQLite `datetime('now')`-shaped timestamp (`YYYY-MM-DD HH:MM:SS`, UTC,
+ * no zone suffix) into epoch millis. Returns `NaN` for an unparseable value.
+ */
+function parseDbTimestampMs(ts: string): number {
+  // SQLite emits space-separated UTC with no zone; normalize to ISO-8601 Z.
+  return Date.parse(ts.replace(" ", "T") + "Z");
+}
+
+/**
+ * Heartbeat of a `recording` session (LIVE_SESSION_STATE.md D5): the max
+ * `segments.created_at`, falling back to `session.created_at` at zero segments.
+ * The segment stream IS the heartbeat — `insertSegment` touches only `segments`,
+ * so no extra sync write is needed (D8). Returns epoch millis.
+ */
+export function sessionHeartbeatMs(
+  session: Pick<DbSession, "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+): number {
+  let max = parseDbTimestampMs(session.created_at);
+  for (const seg of segments) {
+    const t = parseDbTimestampMs(seg.created_at);
+    if (!Number.isNaN(t) && (Number.isNaN(max) || t > max)) max = t;
+  }
+  return max;
+}
+
+/**
+ * Whether a `recording` session's heartbeat is older than the D5 threshold
+ * (stale ⇒ interrupted/crashed rather than live). `nowMs` is injectable for
+ * tests and clock-skew reasoning. Structured so slice 4 (staleness rendering +
+ * the "mark completed" escape hatch) can consume it directly.
+ */
+export function isRecordingStale(
+  session: Pick<DbSession, "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+  nowMs: number = Date.now(),
+): boolean {
+  const heartbeat = sessionHeartbeatMs(session, segments);
+  if (Number.isNaN(heartbeat)) return false;
+  return nowMs - heartbeat >= RECORDING_STALE_THRESHOLD_MINUTES * 60_000;
 }
 
 export type AudioPartFormat = "wav" | "mp3";
@@ -467,11 +524,14 @@ async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
 export async function createSession(
   id: string,
   source: string,
+  recordingDeviceId: string | null = null,
 ): Promise<void> {
   const db = await getDb();
+  // `recording_device_id` stamps the recorder's fingerprint (LIVE_SESSION_STATE D2);
+  // NULL when sync is not configured, degrading to today's single-device semantics.
   await db.execute(
-    "INSERT INTO sessions (id, source) VALUES ($1, $2)",
-    [id, source],
+    "INSERT INTO sessions (id, source, recording_device_id) VALUES ($1, $2, $3)",
+    [id, source, recordingDeviceId],
   );
 }
 
@@ -520,14 +580,20 @@ export async function completeSession(
  * backend accepts a resume so the sidebar/UI sees the live state. The
  * reverse transition runs through `completeSession` at the next stop.
  */
-export async function markSessionRecording(id: string): Promise<void> {
+export async function markSessionRecording(
+  id: string,
+  recordingDeviceId: string | null = null,
+): Promise<void> {
   const db = await getDb();
+  // Re-attribute the session to whoever resumed it (LIVE_SESSION_STATE D2): the
+  // resuming device stamps its own fingerprint. NULL when sync is not configured.
   await db.execute(
     `UPDATE sessions
      SET status = 'recording',
+         recording_device_id = $2,
          updated_at = datetime('now')
      WHERE id = $1`,
-    [id],
+    [id, recordingDeviceId],
   );
 }
 

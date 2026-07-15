@@ -777,12 +777,12 @@ mod tests {
         let (_dir, path) = temp_db();
         let conn = Connection::open(&path).unwrap();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, (1..=15).collect::<Vec<i64>>());
+        assert_eq!(applied, (1..=16).collect::<Vec<i64>>());
         // Bookkeeping recorded.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 15);
+        assert_eq!(count, 16);
         // Core tables exist.
         for t in ["sessions", "segments", "notes", "chat_messages", "tags"] {
             let exists: bool = conn
@@ -824,7 +824,7 @@ mod tests {
             );",
         )
         .unwrap();
-        for v in 1..=15i64 {
+        for v in 1..=16i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
                  VALUES (?, 'preexisting', 1, x'', 0)",

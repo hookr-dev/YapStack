@@ -421,3 +421,80 @@ fn out_of_band_alters_let_fresh_device_apply_speaker_id_without_quarantine() {
         .unwrap();
     assert_eq!(sid, Some(7));
 }
+
+/// LIVE_SESSION_STATE.md Schema & sync-evolution: `sessions.recording_device_id` is
+/// added the R11-proven way (OUT_OF_BAND_ALTERS). A device that CRRified `sessions` at
+/// the base schema version must pick the column up via `apply_out_of_band_alters` and
+/// then apply a peer's incoming `recording_device_id` change WITHOUT quarantining it —
+/// the value converges. Mirrors the speaker_id proof for the new attribution column.
+#[test]
+fn out_of_band_alter_lets_fresh_device_apply_recording_device_id_without_quarantine() {
+    // Device A already carries a CRR-tracked recording_device_id and writes it.
+    let a = CrsqlDb::open_in_memory().unwrap();
+    a.conn()
+        .execute_batch(
+            "CREATE TABLE sessions(id TEXT NOT NULL PRIMARY KEY, \
+             title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'recording', \
+             recording_device_id TEXT);",
+        )
+        .unwrap();
+    a.conn()
+        .query_row("SELECT crsql_as_crr('sessions')", [], |_| Ok(()))
+        .unwrap();
+    a.conn()
+        .execute(
+            "INSERT INTO sessions(id,title,status,recording_device_id) \
+             VALUES('sx','t','recording','AAAABBBBCCCCDDDD')",
+            [],
+        )
+        .unwrap();
+    let cs = read_local_changes_since(a.conn(), 0).unwrap();
+
+    // A fresh device B CRRified `sessions` at the BASE (no recording_device_id) shape.
+    let fresh_base = || {
+        let b = CrsqlDb::open_in_memory().unwrap();
+        b.conn()
+            .execute_batch(
+                "CREATE TABLE sessions(id TEXT NOT NULL PRIMARY KEY, \
+                 title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'recording');",
+            )
+            .unwrap();
+        b.conn()
+            .query_row("SELECT crsql_as_crr('sessions')", [], |_| Ok(()))
+            .unwrap();
+        b
+    };
+
+    // Control (pre-heal): the recording_device_id change quarantines as an unknown column.
+    let raw = fresh_base();
+    let (_applied, quarantined) = merge_changeset(raw.conn(), &cs).unwrap();
+    assert!(
+        quarantined >= 1,
+        "without the out-of-band alter the recording_device_id change must quarantine, got \
+         {quarantined}"
+    );
+    assert!(!schema::column_exists(raw.conn(), "sessions", "recording_device_id").unwrap());
+
+    // Healed path: apply_out_of_band_alters adds the CRR-tracked column, then the SAME
+    // changeset applies with zero quarantine and the value converges.
+    let healed = fresh_base();
+    apply_out_of_band_alters(healed.conn()).unwrap();
+    assert!(schema::column_exists(healed.conn(), "sessions", "recording_device_id").unwrap());
+    let (applied, quarantined) = merge_changeset(healed.conn(), &cs).unwrap();
+    assert!(applied >= 1, "the changeset must apply, got {applied}");
+    assert_eq!(
+        quarantined, 0,
+        "with the column CRR-tracked, nothing quarantines"
+    );
+    assert_eq!(pending_count(healed.conn()).unwrap(), 0);
+
+    let owner: Option<String> = healed
+        .conn()
+        .query_row(
+            "SELECT recording_device_id FROM sessions WHERE id='sx'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner.as_deref(), Some("AAAABBBBCCCCDDDD"));
+}

@@ -780,7 +780,18 @@ pub fn run() {
             app.manage(Arc::new(commands::transcription::DictationOwnsMic::new())
                 as commands::transcription::DictationOwnsMicState);
 
-            db::ensure_runtime_schema(&db_path);
+            // LIVE_SESSION_STATE.md D1-final / D7: the boot orphan sweep is owner-scoped by
+            // this device's `device_fingerprint`. Sourced from the credential cache warmed by
+            // `init_credential_store` above (line ~690, which R6 hoisted to precede this
+            // sweep), so the read is cheap and non-blocking — a public hash only, never key
+            // material. `None` when sync is unconfigured / identity unloadable (sweep then
+            // touches nothing on a CRR-prepared DB — never guesses) or the `sync` feature is
+            // off (single-device semantics).
+            #[cfg(feature = "sync")]
+            let me = sync::current_device_fingerprint();
+            #[cfg(not(feature = "sync"))]
+            let me: Option<String> = None;
+            db::ensure_runtime_schema(&db_path, me.as_deref());
 
             // Seed the trusted-audio-dirs set from existing parts rows + the
             // default audio dir, then sweep those dirs for orphan files left
