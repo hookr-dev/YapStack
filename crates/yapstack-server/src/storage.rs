@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! S3/MinIO SigV4 **presigning** (architecture §9). This is pure local HMAC — the relay
 //! computes a signed URL and hands it to the client; it NEVER uploads, downloads,
-//! re-hashes, or otherwise touches the bytes (ZERO outbound calls). The client PUTs the
-//! ciphertext directly to object storage, which verifies the pinned content-length.
+//! re-hashes, or otherwise touches blob bytes. The client PUTs the ciphertext directly to
+//! object storage, which verifies the pinned content-length.
+//!
+//! The single exception is the **metadata-only HEAD** in [`object_exists`] (audio D8): it
+//! reads only object existence/metadata (never bytes, never plaintext), gating the
+//! `already_exists` vs. fresh-`upload_url` decision so a dead PUT can never be mistaken for
+//! a stored blob. This is the only outbound call the relay makes.
 //!
 //! Presigned URLs are BEARER CAPABILITIES: callers must never log them.
 
@@ -147,6 +152,38 @@ pub fn presign(
 
     let url = format!("{endpoint}{path}?{canonical_query}&X-Amz-Signature={signature}");
     PresignedUrl { url }
+}
+
+/// Metadata-only existence check against object storage (audio D8). Presigns a `HEAD` and
+/// issues it: `2xx` → present, `404` → absent. It reads ONLY existence/metadata — never
+/// blob bytes, never plaintext. A short connect/read timeout keeps a slow or unreachable
+/// backend from stalling a presign; the caller treats any error as "not confirmed present"
+/// and errs toward re-upload (never a phantom `done`).
+///
+/// # Errors
+/// Returns [`AppError::Unavailable`] if the HTTP client cannot be built, the request
+/// fails, or the backend returns an unexpected status (neither 2xx nor 404).
+pub async fn object_exists(cfg: &StorageConfig, key: &str) -> Result<bool, crate::error::AppError> {
+    use crate::error::AppError;
+    let signed = presign(cfg, "HEAD", key, None, chrono::Utc::now());
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::Unavailable(format!("storage client: {e}")))?;
+    let resp = client
+        .head(&signed.url)
+        .send()
+        .await
+        .map_err(|e| AppError::Unavailable(format!("storage HEAD failed: {e}")))?;
+    let code = resp.status().as_u16();
+    match code {
+        200..=299 => Ok(true),
+        404 => Ok(false),
+        other => Err(AppError::Unavailable(format!(
+            "storage HEAD returned unexpected status {other}"
+        ))),
+    }
 }
 
 #[cfg(test)]

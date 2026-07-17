@@ -30,6 +30,25 @@ pub fn ensure_meta_table(conn: &Connection) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Read an arbitrary meta value (ensures the table first). Public seam for sibling modules
+/// (e.g. the audio backfill-walk completion marker).
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, SyncError> {
+    ensure_meta_table(conn)?;
+    get_str(conn, key)
+}
+
+/// Write an arbitrary meta value (ensures the table first).
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), SyncError> {
+    ensure_meta_table(conn)?;
+    set_str(conn, key, value)
+}
+
 fn get_str(conn: &Connection, key: &str) -> Result<Option<String>, SyncError> {
     let v = conn
         .query_row(

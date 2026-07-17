@@ -369,29 +369,146 @@ async fn admin_nonce_replay_is_rejected() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
-async fn audio_presign_dedups_on_ciphertext_hash() {
-    // Storage configured so presign returns a URL. Point at a dummy MinIO.
+async fn audio_presign_d8_refcount_and_dead_put_never_false_done() {
+    // Audio round-trip D6/D8. Storage points at a REFUSED port (127.0.0.1:1) so the D8
+    // existence HEAD deterministically resolves to "object absent" — modelling a world
+    // where no PUT has landed yet. The invariants proven WITHOUT MinIO:
+    //   (1) a novel hash → a fresh upload_url (not already_exists);
+    //   (2) a distinct part with the SAME content, while the object is still absent →
+    //       still a fresh upload_url AND refcount ends at 2 (mapping-count invariant, D8);
+    //   (3) re-presigning the SAME part after a dead PUT → a FRESH upload_url (never a
+    //       false already_exists/`done`) and the refcount is NOT inflated (idempotent).
+    //   (4) the choke meters the new blob EXACTLY ONCE across all of the above.
     let base = setup(false).await;
-    // Re-load config WITH storage. Simplest: build a fresh state with a storage section.
     let url = std::env::var("DATABASE_URL").unwrap();
     let cfg = Config::from_toml_str(&format!(
         "database_url = \"{url}\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n\n\
-         [storage]\nendpoint = \"http://minio:9000\"\nregion = \"us-east-1\"\n\
+         [storage]\nendpoint = \"http://127.0.0.1:1\"\nregion = \"us-east-1\"\n\
          bucket = \"yap\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\n"
     ))
     .unwrap();
-    let app = build_router(AppState::new(base.pool.clone(), cfg));
-    let (tok, _t) = signup(&app).await;
+    let state = AppState::new(base.pool.clone(), cfg);
+    let pool = state.pool.clone();
+    let app = build_router(state);
+    let (tok, tenant) = signup(&app).await;
 
     let sha = "a".repeat(64);
-    let s1 = Uuid::new_v4();
-    let s2 = Uuid::new_v4();
+    let hash_bytes = hex::decode(&sha).unwrap();
+    let sess = Uuid::new_v4();
+    let part1 = Uuid::new_v4();
+    let part2 = Uuid::new_v4();
+    let size = 1024u64;
 
-    // First presign for a novel hash → a real upload URL, not a dedup.
+    let presign = |part: Uuid| {
+        let (app, tok, sha, sess) = (app.clone(), tok.clone(), sha.clone(), sess);
+        async move {
+            body_json(
+                post(
+                    &app,
+                    &format!(
+                        "/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"
+                    ),
+                    Some(&tok),
+                    json!({}),
+                )
+                .await,
+            )
+            .await
+        }
+    };
+
+    // (1) novel hash → fresh upload_url.
+    let v = presign(part1).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "novel blob is not already_exists"
+    );
+    assert!(v["upload_url"].is_string(), "novel blob gets an upload_url");
+
+    // (2) distinct part, same content, object still absent → upload_url + refcount 2.
+    let v = presign(part2).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "object is absent (dead/unmade PUT) → never a phantom already_exists"
+    );
+    assert!(v["upload_url"].is_string());
+    assert_eq!(
+        refcount(&pool, tenant, &hash_bytes).await,
+        2,
+        "two distinct-part mappings → refcount 2"
+    );
+
+    // (3) dead-PUT retry on the SAME part → fresh upload_url, refcount unchanged (no double count).
+    let v = presign(part1).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "a dead-PUT re-presign must return a fresh upload_url, not a false done"
+    );
+    assert!(v["upload_url"].is_string());
+    assert_eq!(
+        refcount(&pool, tenant, &hash_bytes).await,
+        2,
+        "a same-part idempotent retry must not inflate the refcount"
+    );
+
+    // (4) the choke metered the blob's declared size EXACTLY ONCE (first presign only).
+    assert_eq!(
+        storage_used(&pool, tenant).await,
+        size as i64,
+        "new blob metered once; D8 re-presigns and dedup mappings meter nothing"
+    );
+}
+
+/// MinIO-gated: `already_exists` is reported ONLY when the object is actually present.
+/// Requires a reachable object store — set `S3_ENDPOINT` (+ optional `S3_BUCKET`,
+/// `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`) to the deploy stack's MinIO. When unset
+/// the test is skipped (returns early) rather than failing.
+#[tokio::test]
+#[ignore = "requires a live Postgres AND a reachable MinIO (S3_ENDPOINT)"]
+async fn audio_presign_reports_already_exists_only_when_object_present() {
+    let Some((cfg_toml, endpoint, bucket, ak, sk, region)) = minio_env() else {
+        eprintln!("SKIP: S3_ENDPOINT unset — no reachable object store");
+        return;
+    };
+    let base = setup(false).await;
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let cfg = Config::from_toml_str(&format!(
+        "database_url = \"{url}\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n{cfg_toml}"
+    ))
+    .unwrap();
+    let app = build_router(AppState::new(base.pool.clone(), cfg));
+    let (tok, tenant) = signup(&app).await;
+
+    // A no-plaintext canary: the plaintext WAV carries a known marker; assert the stored
+    // OBJECT bytes never contain it (extends the DB no-plaintext grep to object storage).
+    let marker = b"YAPSTACK-CANARY-PLAINTEXT-MARKER";
+    let mut plaintext = b"RIFF....WAVE".to_vec();
+    plaintext.extend_from_slice(marker);
+    // Seal a real audio blob under a throwaway vault key so the ciphertext is genuine.
+    let vault = [0x24u8; 32];
+    let id = yapstack_crypto::audio_stream::AudioIdentity {
+        tenant_id: *tenant.as_bytes(),
+        session_id: [0x22; 16],
+        part_id: [0x33; 16],
+        epoch: 0,
+    };
+    let mut blob = Vec::new();
+    yapstack_crypto::audio_stream::seal_blob(&vault, &id, &plaintext[..], &mut blob).unwrap();
+    assert!(
+        !contains(&blob, marker),
+        "sealed blob must not contain the plaintext marker"
+    );
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&blob));
+
+    let sess = Uuid::new_v4();
+    let part = Uuid::new_v4();
+    let size = blob.len() as u64;
+
+    // First presign → upload_url (object absent).
     let v = body_json(
         post(
             &app,
-            &format!("/audio/presign?sha256={sha}&size=1024&session_id={s1}"),
+            &format!("/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"),
             Some(&tok),
             json!({}),
         )
@@ -399,21 +516,126 @@ async fn audio_presign_dedups_on_ciphertext_hash() {
     )
     .await;
     assert_eq!(v["already_exists"], false);
-    assert!(v["upload_url"].is_string());
+    let put_url = v["upload_url"].as_str().unwrap().to_string();
+    let object_key = v["object_key"].as_str().unwrap().to_string();
 
-    // Second session, SAME ciphertext hash → dedup hit, no upload URL.
+    // PUT the ciphertext directly to object storage (content-length pinned).
+    let client = reqwest::Client::new();
+    let put = client
+        .put(&put_url)
+        .header("content-length", size)
+        .body(blob.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        put.status().is_success(),
+        "direct PUT to MinIO failed: {}",
+        put.status()
+    );
+
+    // Re-presign the SAME part now that the object exists → already_exists, no upload_url.
     let v = body_json(
         post(
             &app,
-            &format!("/audio/presign?sha256={sha}&size=1024&session_id={s2}"),
+            &format!("/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"),
             Some(&tok),
             json!({}),
         )
         .await,
     )
     .await;
-    assert_eq!(v["already_exists"], true);
+    assert_eq!(v["already_exists"], true, "present object → already_exists");
     assert!(v["upload_url"].is_null());
+
+    // No-plaintext canary against the STORED object bytes.
+    let get_url = format!(
+        "{}/{}/{}",
+        endpoint.trim_end_matches('/'),
+        bucket,
+        object_key
+    );
+    let _ = (ak, sk, region); // creds are baked into the presign; the raw GET here is dev-only
+                              // Fetch via a fresh presigned GET through the relay (302 → storage) so creds are correct.
+    let resp = get(&app, &format!("/audio/part/{part}"), &tok).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let obj = client
+        .get(&loc)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(
+        !contains(&obj, marker),
+        "MinIO object bytes must not contain the plaintext marker (no-plaintext canary)"
+    );
+    assert_eq!(
+        &obj[..],
+        &blob[..],
+        "stored object is the exact ciphertext blob"
+    );
+    let _ = get_url;
+}
+
+/// Read the refcount for a hash as the tenant (RLS-scoped).
+async fn refcount(pool: &sqlx::PgPool, tenant: Uuid, hash: &[u8]) -> i64 {
+    let mut tx = yapstack_server::db::begin_tenant_tx(pool, tenant)
+        .await
+        .unwrap();
+    let (rc,): (i64,) = sqlx::query_as(
+        "SELECT refcount FROM audio_blobs WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
+    )
+    .bind(tenant)
+    .bind(hash)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    rc
+}
+
+/// Read the metered storage_bytes for the tenant.
+async fn storage_used(pool: &sqlx::PgPool, tenant: Uuid) -> i64 {
+    let mut tx = yapstack_server::db::begin_tenant_tx(pool, tenant)
+        .await
+        .unwrap();
+    let (used,): (i64,) =
+        sqlx::query_as("SELECT coalesce(storage_bytes, 0) FROM tenant_usage WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap()
+            .unwrap_or((0,));
+    tx.commit().await.unwrap();
+    used
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// MinIO connection from env, or `None` to skip. Returns a `[storage]` TOML block plus the
+/// individual fields for the raw canary GET.
+fn minio_env() -> Option<(String, String, String, String, String, String)> {
+    let endpoint = std::env::var("S3_ENDPOINT").ok()?;
+    let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "yapstack".into());
+    let ak = std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let sk = std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let toml = format!(
+        "\n[storage]\nendpoint = \"{endpoint}\"\nregion = \"{region}\"\n\
+         bucket = \"{bucket}\"\naccess_key_id = \"{ak}\"\nsecret_access_key = \"{sk}\"\n"
+    );
+    Some((toml, endpoint, bucket, ak, sk, region))
 }
 
 #[tokio::test]

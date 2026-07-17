@@ -38,6 +38,10 @@ hex = { workspace = true }
 futures-util = { workspace = true }
 ed25519-dalek = "2"
 zeroize = "1"
+# Audio D8: the single outbound call the relay makes — a metadata-only HEAD to object
+# storage to confirm a blob object exists before reporting `already_exists` (never bytes,
+# never plaintext). Same 0.12 rustls stack the desktop sync runtime uses.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use yapstack_common::sync::{
-    ClientTail, CompletenessResponse, PullResponse, PulledChange, PushAck, PushRequest,
-    PushResponse,
+    ClientTail, CompletenessResponse, PresignResponse, PullResponse, PulledChange, PushAck,
+    PushRequest, PushResponse,
 };
 
 use crate::snapshot::SnapshotMeta;
@@ -35,6 +35,49 @@ pub trait SyncTransport: Send + Sync {
     /// R2: fetch the latest encrypted snapshot for the tenant, or `None` if the seed
     /// has not published one yet (a join device then falls back to full changeset pull).
     async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError>;
+
+    /// Audio round-trip: presign a blob upload addressed by the `session_audio_parts` row
+    /// UUID (`part_id`, D6). The server's existence-checked response (D8) either reports
+    /// `already_exists` (object present — nothing to upload) or returns an `upload_url`.
+    /// `sha256` is the lowercase hex of the WHOLE encrypted `audio_blob`.
+    ///
+    /// Default: unsupported (test transports that never touch audio inherit this).
+    async fn presign_audio(
+        &self,
+        _sha256: &str,
+        _size: u64,
+        _part_id: &str,
+        _session_id: &str,
+    ) -> Result<PresignResponse, SyncError> {
+        Err(SyncError::Transport("audio presign not supported".into()))
+    }
+
+    /// PUT the encrypted temp file at `temp_path` to the presigned `upload_url` with a
+    /// STREAMING body (O(chunk) memory — never a buffered `vec`), content-length pinned.
+    ///
+    /// Default: unsupported.
+    async fn put_audio(
+        &self,
+        _upload_url: &str,
+        _temp_path: &std::path::Path,
+        _content_length: u64,
+    ) -> Result<(), SyncError> {
+        Err(SyncError::Transport("audio put not supported".into()))
+    }
+
+    /// Fetch the blob for `part_id`, streaming it to `dest_path`. `Ok(false)` when the blob
+    /// is not yet available on the relay (HTTP 404 — the row converged before its audio
+    /// uploaded); `Ok(true)` on a completed download. This is the fetch-path transport seam;
+    /// the on-demand UI trigger + decrypt-to-cache is a later slice.
+    ///
+    /// Default: unsupported.
+    async fn get_audio(
+        &self,
+        _part_id: &str,
+        _dest_path: &std::path::Path,
+    ) -> Result<bool, SyncError> {
+        Err(SyncError::Transport("audio get not supported".into()))
+    }
 }
 
 // ---- snapshot endpoint wire DTOs (client side) --------------------------------
@@ -262,6 +305,91 @@ impl SyncTransport for HttpTransport {
             bytes,
         )))
     }
+
+    async fn presign_audio(
+        &self,
+        sha256: &str,
+        size: u64,
+        part_id: &str,
+        session_id: &str,
+    ) -> Result<PresignResponse, SyncError> {
+        let r = check_auth(
+            self.client
+                .post(format!("{}/audio/presign", self.base_url))
+                .bearer_auth(self.bearer())
+                .query(&[
+                    ("sha256", sha256),
+                    ("size", &size.to_string()),
+                    ("part_id", part_id),
+                    ("session_id", session_id),
+                ])
+                .send()
+                .await
+                .map_err(map_send_error)?,
+        )?;
+        Ok(r.json().await?)
+    }
+
+    async fn put_audio(
+        &self,
+        upload_url: &str,
+        temp_path: &std::path::Path,
+        content_length: u64,
+    ) -> Result<(), SyncError> {
+        // STREAM the encrypted temp file — never `.body(vec)` (the snapshot path's mistake,
+        // transport.rs). `ReaderStream` yields ~8 KiB frames, so a 599 MB blob uploads with
+        // an O(frame) working set. Content-length is pinned to match the presigned policy.
+        let file = tokio::fs::File::open(temp_path)
+            .await
+            .map_err(|e| SyncError::Transport(format!("open audio temp: {e}")))?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        self.client
+            .put(upload_url)
+            .header("content-length", content_length)
+            .body(body)
+            .send()
+            .await
+            .map_err(map_send_error)?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn get_audio(
+        &self,
+        part_id: &str,
+        dest_path: &std::path::Path,
+    ) -> Result<bool, SyncError> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let resp = self
+            .client
+            .get(format!("{}/audio/part/{}", self.base_url, part_id))
+            .bearer_auth(self.bearer())
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        // Row present but blob not yet uploaded on the source device → not-yet-available.
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let resp = check_auth(resp)?; // 401 → refreshable; other non-2xx → error_for_status
+
+        let mut file = tokio::fs::File::create(dest_path)
+            .await
+            .map_err(|e| SyncError::Transport(format!("create audio cache file: {e}")))?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?; // reqwest::Error → SyncError::Http
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| SyncError::Transport(format!("write audio cache file: {e}")))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| SyncError::Transport(format!("flush audio cache file: {e}")))?;
+        Ok(true)
+    }
 }
 
 // --------------------------------------------------------------- mock relay
@@ -289,6 +417,12 @@ struct MockInner {
     // latest published snapshot (meta, opaque ciphertext) — faithfully opaque: the
     // mock never inspects the bytes, mirroring the blind relay.
     snapshot: Option<(SnapshotMeta, Vec<u8>)>,
+    // Audio: part_id → ciphertext sha; sha → stored object bytes (present objects only);
+    // sha → refcount (mapping-count invariant, D8). Faithfully models existence-checked
+    // presign: `already_exists` iff the OBJECT bytes are present, not just the mapping.
+    audio_mappings: HashMap<String, String>,
+    audio_present: HashMap<String, Vec<u8>>,
+    audio_refcount: HashMap<String, i64>,
 }
 
 impl MockRelay {
@@ -393,6 +527,98 @@ impl SyncTransport for MockRelay {
     async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
         let g = self.inner.lock().unwrap();
         Ok(g.snapshot.clone())
+    }
+
+    async fn presign_audio(
+        &self,
+        sha256: &str,
+        size: u64,
+        part_id: &str,
+        _session_id: &str,
+    ) -> Result<PresignResponse, SyncError> {
+        let mut g = self.inner.lock().unwrap();
+        // Mapping-count refcount (D8): a NEW mapping to a hash increments; a same-part
+        // repeat does not.
+        let same_part_same_hash = g.audio_mappings.get(part_id) == Some(&sha256.to_string());
+        if !same_part_same_hash {
+            g.audio_mappings
+                .insert(part_id.to_string(), sha256.to_string());
+            *g.audio_refcount.entry(sha256.to_string()).or_insert(0) += 1;
+        }
+        let present = g.audio_present.contains_key(sha256);
+        Ok(PresignResponse {
+            already_exists: present,
+            // The mock encodes the target hash in the URL so `put_audio` can store the bytes.
+            upload_url: if present {
+                None
+            } else {
+                Some(format!("mock://audio/put/{sha256}"))
+            },
+            object_key: format!("mock/{sha256}"),
+            content_length: size,
+        })
+    }
+
+    async fn put_audio(
+        &self,
+        upload_url: &str,
+        temp_path: &std::path::Path,
+        _content_length: u64,
+    ) -> Result<(), SyncError> {
+        let sha = upload_url
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| SyncError::Transport("mock put: bad url".into()))?
+            .to_string();
+        let bytes = std::fs::read(temp_path)
+            .map_err(|e| SyncError::Transport(format!("mock put read temp: {e}")))?;
+        self.inner.lock().unwrap().audio_present.insert(sha, bytes);
+        Ok(())
+    }
+
+    async fn get_audio(
+        &self,
+        part_id: &str,
+        dest_path: &std::path::Path,
+    ) -> Result<bool, SyncError> {
+        let bytes = {
+            let g = self.inner.lock().unwrap();
+            match g
+                .audio_mappings
+                .get(part_id)
+                .and_then(|h| g.audio_present.get(h))
+            {
+                Some(b) => b.clone(),
+                None => return Ok(false), // mapping unknown or object not yet uploaded
+            }
+        };
+        std::fs::write(dest_path, &bytes)
+            .map_err(|e| SyncError::Transport(format!("mock get write: {e}")))?;
+        Ok(true)
+    }
+}
+
+impl MockRelay {
+    /// Test helper: the current refcount the relay holds for a ciphertext hash.
+    #[must_use]
+    pub fn audio_refcount(&self, sha256: &str) -> i64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .audio_refcount
+            .get(sha256)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Test helper: whether the relay holds stored object bytes for a hash.
+    #[must_use]
+    pub fn audio_object_present(&self, sha256: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .audio_present
+            .contains_key(sha256)
     }
 }
 

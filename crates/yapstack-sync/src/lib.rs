@@ -16,6 +16,7 @@
 //! ceremony, starting the drain task) is T010b; two-populated-device bootstrap
 //! reconciliation is T011.
 
+pub mod audio;
 pub mod cascade;
 pub mod change;
 pub mod crsqlite;

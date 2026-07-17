@@ -11,6 +11,7 @@
 //! Rust KAT gate stands alone until then. See the crate `tests/kat.rs` header.
 
 pub mod aead;
+pub mod audio_stream;
 pub mod hkdf;
 pub mod kdf;
 pub mod sign;
@@ -24,7 +25,18 @@ pub const COMMIT_INFO: &[u8] = b"yapstack.commit.v1";
 
 // Per-surface AAD domain strings (§5.2).
 pub const DOMAIN_CHANGESET: &[u8] = b"yapstack.changeset.v1";
-pub const DOMAIN_AUDIO: &[u8] = b"yapstack.audio.v1";
+/// RETIRED, never shipped (CRYPTO_SPEC §5.2 amendment): the whole-blob audio domain.
+/// Zero blobs were ever sealed under it (the `audio_blobs`/`audio_objects` tables are
+/// empty in every deployment — the load-bearing invariant). Audio now uses the
+/// streaming construction below. Kept only so the retired constant is greppable.
+pub const DOMAIN_AUDIO_RETIRED: &[u8] = b"yapstack.audio.v1";
+/// Streaming-AEAD audio segment domain (§1.5). Not used as a per-segment AAD field
+/// directly (the clear header is the segment AAD); named here for the registry.
+pub const DOMAIN_AUDIO_STREAM: &[u8] = b"yapstack.audio.stream.v1";
+/// Wrap domain for the per-blob audio data key (§4.2 audio amendment). Bound into the
+/// committing wrap AAD together with the identity tuple `(tenant_id, session_id,
+/// part_id, epoch_u32)`.
+pub const DOMAIN_WRAP_AUDIO_STREAM: &[u8] = b"yapstack.wrap.audio.stream.v1";
 pub const DOMAIN_SHARE: &[u8] = b"yapstack.share.v1";
 
 /// Crypto failures. Every variant is a quarantine/deny path (§11.3) — callers must
@@ -41,6 +53,8 @@ pub enum CryptoError {
     Version(u8),
     #[error("malformed envelope (too short)")]
     Malformed,
+    #[error("i/o error during streaming crypto: {0}")]
+    Io(String),
     #[error("KDF parameters below floor or invalid")]
     KdfParams,
     #[error("KDF derivation failed")]

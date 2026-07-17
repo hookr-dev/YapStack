@@ -281,11 +281,7 @@ pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Re
     use rusqlite::params;
     let managed = crate::db_service::open_managed(db_path)?;
     let conn = managed.conn();
-    let id = format!(
-        "{:016x}{:016x}",
-        rand_u64_from_clock(),
-        rand_u64_from_clock()
-    );
+    let id = mint_part_id(conn)?;
     let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     conn.execute(
         "INSERT OR IGNORE INTO session_audio_parts (
@@ -306,13 +302,28 @@ pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Re
     Ok(())
 }
 
-fn rand_u64_from_clock() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-    n ^ (n.wrapping_mul(6364136223846793005).rotate_left(13))
+/// Mint a fresh `session_audio_parts.id` as a **CSPRNG UUIDv4** (audio round-trip D6).
+///
+/// Blobs are addressed cross-device by this row id (server `audio_objects` key + the
+/// crypto wrap AAD's `part_id`), so it MUST be collision-free across independent devices.
+/// The prior clock-derived id was NOT: two NTP-synced LAN devices minting at the same
+/// nanosecond could collide, and a cross-device PK collision under cr-sqlite would merge
+/// two distinct parts. Entropy comes from SQLite's OS-seeded `randomblob` (the same CSPRNG
+/// the v15 backfill already uses), formatted as a **32-hex simple-format** UUIDv4 (no
+/// dashes: version nibble = 4, variant nibble ∈ {8,9,a,b}) — the format the table already
+/// stores and the server's `/audio/part/{part_id}` route accepts.
+fn mint_part_id(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
+    let raw: String = conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+    debug_assert_eq!(raw.len(), 32, "randomblob(16) hex must be 32 chars");
+    let mut b = raw.into_bytes();
+    b[12] = b'4'; // RFC 4122 version 4
+                  // Variant nibble → 10xx (8..b): keep the low 2 random bits, force the top 2 to `10`.
+    let v = (b[16] as char).to_digit(16).unwrap_or(0) as u8;
+    let v = (v & 0x3) | 0x8;
+    b[16] = std::char::from_digit(u32::from(v), 16)
+        .map(|c| c as u8)
+        .unwrap_or(b'8');
+    Ok(String::from_utf8(b).unwrap_or_else(|_| "0".repeat(32)))
 }
 
 /// Returns canonicalized parent directories of every `session_audio_parts.file_path`,

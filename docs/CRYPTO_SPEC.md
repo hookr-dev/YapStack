@@ -145,6 +145,67 @@ to exactly one full context (A1 above).
 
 > `info` string is the ASCII bytes `yapstack.commit.v1` = `796170737461636b2e636f6d6d69742e7631`.
 
+### 1.5 Streaming AEAD envelope for audio — `yapstack.audio.stream.v1` (LOCKED)
+
+> **Amendment (audio round-trip tranche, Judge-gated crypto review).** This section is
+> **new, adversarially-reviewed crypto**. It defines the ONE audio blob format and
+> **retires** the never-shipped whole-blob audio domain `yapstack.audio.v1` (§5.2). The
+> retirement is safe *only* because **zero audio blobs exist in any deployment** (the
+> `audio_blobs` / `audio_objects` tables are empty — the load-bearing invariant): there is
+> no legacy ciphertext to migrate. This window closes the moment the first blob ships.
+
+Audio blobs are large (the production library's largest single WAV is 599 MB). The
+one-shot standard/committing envelopes (§1.3) take the whole plaintext as a single slice,
+so constant-memory whole-blob sealing is **impossible** with them. Audio therefore uses a
+**chunked STREAM** construction — **the maintained RustCrypto implementation
+(`chacha20poly1305::aead::stream`, `StreamBE32` over XChaCha20-Poly1305); NEVER
+hand-rolled.** It gives true **O(chunk) memory in both directions**, per-segment positional
+binding via the counter, and last-block truncation detection.
+
+**Blob layout (LOCKED):**
+
+```
+audio_blob = LP(wrapped_data_key)   # committing envelope §1.4/§4.2; wrap AAD binds identity (§4.2)
+           || header                # version(1)=0x01 || chunk_size(u32be) || nonce_prefix(19)
+           || seg_0 … seg_n         # STREAM segments; each = ct || tag(16); the last may be short
+
+stream plaintext = original_audio_bytes   # the caller may prepend a 1-byte codec tag; opaque here
+```
+
+The **ciphertext hash that is content-addressed and uploaded is the whole `audio_blob`**
+(from the leading `LP(wrapped_data_key)` through the last segment tag).
+
+**Construction (LOCKED):**
+
+- **Per-blob fresh random 32-byte data key** (§4), wrapped under `vault_key` with the
+  committing envelope (§4.2) and stored as the leading `LP(wrapped_data_key)`.
+- **Per-blob fresh random 19-byte `nonce_prefix`** (CSPRNG, §11.2). The per-segment nonce
+  is `nonce_prefix(19) || counter(u32be) || last_flag(1)` — the 5-byte `StreamBE32`
+  overhead — **assembled by the crate, never by us**. XChaCha's 24-byte nonce − 5 = 19.
+- **Chunking:** `chunk_size` = **1 MiB plaintext per segment** (v1 constant, recorded in the
+  header for agility). Each segment = `ct || tag(16)`; the last segment may be short. Memory
+  bound: O(`chunk_size`) both directions, independent of blob size.
+- **Last-segment discipline:** the final segment (even for an empty source — which yields
+  exactly one last segment) is sealed with `encrypt_last` (`last_flag` set) and opened with
+  `decrypt_last`. A **truncated** stream (dropped final segment) makes the previous
+  `last_flag=0` segment be opened as `last_flag=1` → nonce mismatch → authentication
+  failure. A **reordered / extended** stream shifts the counter → authentication failure.
+
+**Header authentication (LOCKED):** the clear `header` (`version || chunk_size ||
+nonce_prefix`) is passed as **AAD on every segment**, so header tamper (e.g. a `chunk_size`
+flip) fails the first `open`. The version byte is the **first authenticated header field**
+(C1 discipline, §5.2 / §11.1). A decryptor bounds `chunk_size` before allocating (a tampered
+header cannot force an unbounded buffer).
+
+**Identity binding at the wrap layer (LOCKED, D6):** identity is bound **only** on the
+committing data-key wrap (§4.2), never inside the segments — so a `part_id` change never
+requires re-encrypting content. A blob replayed under another tenant/session/part/epoch
+fails at **unwrap**, before any segment is touched. See §4.2 and §5.2.
+
+**Range access (documented, NOT v1):** the counter-addressable segments permit a future
+ranged decrypt from segment boundaries. It is **explicitly not wired in v1** — v1 fetches
+the whole blob before playing.
+
 ---
 
 ## 2. KDF — Argon2id, pinned client-side
@@ -351,11 +412,24 @@ wrapped_vault_key_recovery = committing_seal(K_root = recovery_key, pt = vault_k
                                              aad = LP("yapstack.wrap.vault.rec.v1"))
 wrapped_data_key           = committing_seal(K_root = vault_key,   pt = data_key,
                                              aad = LP("yapstack.wrap.data.v1", epoch_u32))
+wrapped_audio_data_key     = committing_seal(K_root = vault_key,   pt = audio_data_key,
+                                             aad = LP("yapstack.wrap.audio.stream.v1",
+                                                      tenant_id, session_id, part_id, epoch_u32))
 ```
 
 `epoch_u32` = the vault-key rotation epoch (§4.4), big-endian, so a data key wrapped
 under vault-key generation N cannot be silently reinterpreted under generation N+1.
 `LP(...)` is the canonical length-prefixed encoding of §5.
+
+> **Audio data-key wrap (LOCKED, amendment §1.5 / D6).** The per-audio-blob data key
+> (§1.5) is wrapped with a **distinct** wrap domain `yapstack.wrap.audio.stream.v1` that
+> **also binds the blob's identity tuple** `(tenant_id, session_id, part_id)` in addition
+> to `epoch_u32`. `part_id` (not `part_index`) is the `session_audio_parts` row UUID (D6):
+> the CRR rebuild strips `UNIQUE(session_id, part_index)`, so `part_index` can collide
+> cross-device, but a CSPRNG UUIDv4 row id cannot. A blob addressed to a different
+> tenant/session/part, or wrapped under a stale vault epoch, therefore **fails at unwrap
+> before any segment is decrypted**. As with every wrapped key, `version` is the first AAD
+> field (C1).
 
 ### 4.3 Password change (LOCKED)
 
@@ -425,8 +499,12 @@ downgraded. Wrapped-key AADs (§4.2) likewise gain `version` as their first fiel
 
 - **Changesets:**
   `AAD = LP(version, "yapstack.changeset.v1", tenant_id, client_id, client_seq, schema_version, engine_version)`
-- **Audio blobs:**
-  `AAD = LP(version, "yapstack.audio.v1", tenant_id, session_id)`
+- **Audio blobs (RETIRED — never shipped, amendment §1.5):**
+  `AAD = LP(version, "yapstack.audio.v1", tenant_id, session_id)`. This whole-blob domain
+  is **retired**: zero blobs were ever sealed under it (the empty-tables invariant). Audio
+  now uses the streaming construction (§1.5): the segment AAD is the **clear header**, and
+  identity is bound on the **data-key wrap** under `yapstack.wrap.audio.stream.v1` (§4.2),
+  which carries `(tenant_id, session_id, part_id, epoch_u32)`. There is **no dual format**.
 - **Shares:**
   `AAD = LP(version, "yapstack.share.v1", share_id)`
 - **Wrapped keys (§4.2):**
@@ -811,6 +889,9 @@ items are retryable (e.g. after a key-state change or vault-key rotation).
 | Tag length | 16 bytes |
 | Standard envelope | `0x01 \|\| nonce(24) \|\| ct \|\| tag(16)` |
 | Committing envelope | `0x01 \|\| commit(32) \|\| nonce(24) \|\| ct \|\| tag(16)` |
+| Audio stream envelope (§1.5) | `LP(wrapped_data_key) \|\| header(24) \|\| seg_0…seg_n`; `header = 0x01 \|\| chunk_size(u32be) \|\| nonce_prefix(19)`; `seg = ct \|\| tag(16)` |
+| Audio STREAM primitive | `StreamBE32` over XChaCha20-Poly1305; segment nonce `nonce_prefix(19) \|\| counter(u32be) \|\| last_flag(1)` |
+| Audio chunk size | 1 MiB plaintext/segment (v1 constant, in header) |
 | Argon2id (client) | m=65536 KiB, t=3, p=4, v=0x13, out=32 |
 | Argon2id floor (client) | ≥ m=65536, t=3, p=4, v=0x13, out=32 |
 | Argon2id (server verifier) | m=19456 KiB, t=2, p=1, v=0x13, out=32 |
@@ -825,7 +906,9 @@ items are retryable (e.g. after a key-state change or vault-key rotation).
 | `info` yapstack.recovery.v1 | `796170737461636b2e7265636f766572792e7631` |
 | `info` yapstack.devicelist.sign.v1 | `796170737461636b2e6465766963656c6973742e7369676e2e7631` |
 | Domain yapstack.changeset.v1 | `796170737461636b2e6368616e67657365742e7631` |
-| Domain yapstack.audio.v1 | `796170737461636b2e617564696f2e7631` |
+| Domain yapstack.audio.v1 (**RETIRED**, §1.5) | `796170737461636b2e617564696f2e7631` |
+| Domain yapstack.audio.stream.v1 | `796170737461636b2e617564696f2e73747265616d2e7631` |
+| Wrap domain yapstack.wrap.audio.stream.v1 | `796170737461636b2e777261702e617564696f2e73747265616d2e7631` |
 | Domain yapstack.share.v1 | `796170737461636b2e73686172652e7631` |
 
 ---
@@ -970,6 +1053,56 @@ recovery_auth_key[32..64]= 1e5ad1dbc106f5791bb28d514097f462fece2837b3b5a02b67083
 > ratification. `recovery_auth_key` (block 2 = `T(2)`) is the value the client sends to
 > `POST /auth/recover`; the server second-hashes it (§3.1) into `recovery_verifier`.
 
+### 13.8 Audio stream envelope (§1.5) — GENERATED
+
+> **Real, roundtrip-verified.** No audio KAT existed before this amendment (§13.4 is
+> changeset-domain and proves nothing about audio). These vectors were **generated** with
+> this crate's own `yapstack_crypto::audio_stream` primitives (the exact code production
+> uses) and asserted to reproduce + round-trip in
+> `crates/yapstack-crypto/tests/audio_stream.rs`. All inputs are fixed for determinism;
+> production data keys / nonce prefixes are random per §11. The JS/`@noble` parity vector
+> is a Phase-4 share-viewer deliverable (the viewer does not play audio in v1).
+
+**Segment vector** — 3 segments at `chunk_size = 8` (a short last segment):
+
+```
+data_key             = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+nonce_prefix (19)    = a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2
+chunk_size (u32be)   = 00000008
+plaintext (utf8)     = "the quick brown fox"   (19 bytes ⇒ segments 8 / 8 / 3)
+plaintext (hex)      = 74686520717569636b2062726f776e20666f78
+--- header (version || chunk_size || nonce_prefix), authenticated as AAD on every segment ---
+header (24)          = 0100000008a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2
+--- outputs (StreamBE32 / XChaCha20-Poly1305; each seg = ct || tag(16)) ---
+header||segments      = 0100000008a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2
+                        a60589414748d24e8126f11ca3b289b97fbacba45e5cd173   (seg0: 8ct+16tag)
+                        5522e597d0230d16d836467d7038fe914a0d60ef3870bcc0   (seg1: 8ct+16tag)
+                        2baff86b20d167fac830f13e3d0b35e3a294b0             (seg2: 3ct+16tag)
+open with same data_key → plaintext (verified); drop seg2 → open fails (truncation);
+swap seg0/seg1 → open fails (reorder)
+```
+
+**Data-key wrap vector** — committing envelope with the identity AAD (§4.2 / D6):
+
+```
+vault_key            = 404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+audio_data_key (pt)  = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+wrap_nonce (24)      = 101112131415161718191a1b1c1d1e1f2021222324252627
+identity tuple       = tenant_id=11..11(16) session_id=22..22(16) part_id=33..33(16) epoch=0
+aad = LP(version, "yapstack.wrap.audio.stream.v1", tenant_id, session_id, part_id, epoch_u32)
+--- output (committing: 0x01 || commit(32) || nonce(24) || ct(32) || tag(16) = 105 bytes) ---
+wrapped_data_key     = 0133a7b8159b0f524b992f78fa8b65acafd3d85af85906fb6dbf789422e7d6cfbb
+                        101112131415161718191a1b1c1d1e1f2021222324252627
+                        b503f59083f1b8c6f43a82633efc16750261aae28a25aac2e6888dd6c99b1475
+                        08f87190c05d4310c20760a359fd19fc
+unwrap under the same identity → audio_data_key (verified);
+unwrap under a different part_id OR a different epoch_u32 → fails (identity/anti-rollback)
+```
+
+> **Note:** the `commitment`/`nonce`/`k_aead` of the wrap depend only on `(vault_key,
+> wrap_nonce)`, so this vector's commitment (`33a7b8…cfbb`) matches §13.5's — only the
+> `ct||tag` differs (different plaintext key and audio wrap AAD).
+
 ---
 
 ## 14. Compliance checklist for implementers (both stacks)
@@ -978,7 +1111,8 @@ recovery_auth_key[32..64]= 1e5ad1dbc106f5791bb28d514097f462fece2837b3b5a02b67083
 - [ ] Argon2id params are compile-time constants; no server-supplied KDF params; floor check present.
 - [ ] Single Argon2 pass + HKDF split with the exact `info` strings in §12.
 - [ ] Server stores `Argon2id(auth_key, server_salt)`, never `auth_key`, never the password.
-- [ ] Committing envelope used for every wrapped key and every share; standard envelope for changesets/audio.
+- [ ] Committing envelope used for every wrapped key and every share; standard envelope for changesets.
+- [ ] Audio uses the §1.5 STREAM envelope ONLY (`yapstack.audio.stream.v1`); the whole-blob `yapstack.audio.v1` domain is retired/unused; the per-blob data key is wrapped under `yapstack.wrap.audio.stream.v1` binding `(tenant_id, session_id, part_id, epoch_u32)`; the clear header is the per-segment AAD; STREAM is the maintained crate (`aead::stream`), never hand-rolled.
 - [ ] AAD is `LP(...)` per §5 with the exact fields per surface; **`version` byte is the FIRST AAD field on every surface** (C1); `client_seq` (not server seq) bound.
 - [ ] §6 version/quarantine gates key off the **AAD-authenticated** `schema_version`/`engine_version`, never the server's plaintext metadata columns (C4).
 - [ ] Recovery code 160-bit CSPRNG, base32, forced capture; HKDF (no Argon2).
