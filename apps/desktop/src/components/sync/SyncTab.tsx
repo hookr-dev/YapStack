@@ -95,7 +95,8 @@ export function SyncTab() {
   // the transition INTO syncing (T024). Only runs while this tab is mounted.
   useEffect(() => {
     if (!signedIn) return;
-    const intervalMs = phase === "syncing" ? 1500 : 5000;
+    const active = phase === "syncing" || phase === "catching_up";
+    const intervalMs = active ? 1500 : 5000;
     const id = window.setInterval(() => {
       void refreshSyncStatus();
     }, intervalMs);
@@ -477,7 +478,7 @@ function SyncStatusLine({
     : 0;
 
   const icon =
-    display.state === "syncing" ? (
+    display.state === "syncing" || display.state === "catching-up" ? (
       <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
     ) : display.state === "error" ? (
       <AlertTriangle className="h-3.5 w-3.5 text-destructive" />

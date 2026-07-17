@@ -1692,6 +1692,7 @@ function createAppStore() {
               pendingBytes: prev?.pendingBytes ?? 0,
               ackedThisSession: prev?.ackedThisSession ?? 0,
               lastSuccess: prev?.lastSuccess ?? null,
+              pullBehind: prev?.pullBehind ?? 0,
             },
           });
         }

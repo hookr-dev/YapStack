@@ -92,6 +92,17 @@ pub struct DrainReport {
     pub push_error: Option<SyncError>,
     /// The pull direction's non-fatal error this cycle, if any. `None` on a clean pull.
     pub pull_error: Option<SyncError>,
+    /// This device's pull watermark (highest fully-merged commit-ordered `changeset_seq`) as
+    /// of the END of this cycle. Compared against [`Self::server_max`] to decide the honest
+    /// "up to date" vs. "catching up" state (R12) — an empty outbox alone is NOT up to date.
+    pub pull_watermark: i64,
+    /// The last-known tenant tip (`max_changeset_seq`) THIS cycle disclosed: from a push
+    /// response's `max_changeset_seq`, and — after a clean full pull — the tip we drained to
+    /// (which equals the final `pull_watermark`). `None` when no server response this cycle
+    /// revealed it (nothing to push AND the pull failed), so the caller keeps its previous
+    /// last-known tip rather than regressing it. `changeset_seq` is dense/monotonic, so this
+    /// is folded as a running max and never rewinds.
+    pub server_max: Option<i64>,
 }
 
 impl DrainReport {
@@ -107,6 +118,24 @@ impl DrainReport {
     /// for the caller to surface. `None` when both directions were clean.
     pub fn first_transport_error(&self) -> Option<&SyncError> {
         self.push_error.as_ref().or(self.pull_error.as_ref())
+    }
+
+    /// Changesets this device is still behind the last-known relay tip — `server_max -
+    /// pull_watermark`, clamped at 0. `None` when the tip is unknown this cycle (the caller
+    /// keeps its previous last-known value). The PULL side is honestly caught up ONLY when
+    /// this is `Some(0)`; any `Some(n > 0)` means a "catching up" state, never "up to date"
+    /// (R12). Counts CHANGESETS (commit-ordered seqs), not cells/changes.
+    pub fn pull_behind(&self) -> Option<i64> {
+        self.server_max.map(|m| (m - self.pull_watermark).max(0))
+    }
+}
+
+/// Fold a freshly-observed tenant tip into a report's running `server_max` max. A `None`
+/// observation leaves the field untouched; `changeset_seq` is dense/monotonic so this only
+/// ever advances (never rewinds a previously-known-higher tip).
+fn fold_server_max(report: &mut DrainReport, observed: Option<i64>) {
+    if let Some(v) = observed {
+        report.server_max = Some(report.server_max.map_or(v, |m| m.max(v)));
     }
 }
 
@@ -285,9 +314,14 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
     conn: &Connection,
     client_id: uuid::Uuid,
     transport: &T,
-) -> Result<usize, SyncError> {
+) -> Result<(usize, Option<i64>), SyncError> {
     ensure_outbox_table(conn)?;
     let mut total_acked = 0usize;
+    // R12: the tenant tip disclosed by the last push response this cycle. `None` when we
+    // never made a push request (empty outbox) — the caller then learns the tip from the
+    // pull instead. Every `PushResponse.max_changeset_seq` is the tenant's tip AFTER that
+    // push, so it is a fresh last-known tip for the honest up-to-date/catching-up decision.
+    let mut server_max: Option<i64> = None;
 
     loop {
         // Phase 1 — plan the next batch from cheap (seq, ciphertext length) metadata.
@@ -373,10 +407,13 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
             // unreachable, `recover_from_conflict` propagates that error as push_error.
             Err(e) if crate::transport::is_conflict(&e) => {
                 recover_from_conflict(conn, client_id, transport).await?;
-                return Ok(total_acked);
+                return Ok((total_acked, server_max));
             }
             Err(e) => return Err(e),
         };
+        // R12: record the tenant tip this push disclosed (monotonic, so keep the max).
+        server_max =
+            Some(server_max.map_or(resp.max_changeset_seq, |m| m.max(resp.max_changeset_seq)));
 
         // Apply the genuinely-new acks (deduplicated=false) unconditionally: these entries
         // were freshly stored under their pushed seq.
@@ -442,7 +479,7 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
         }
     }
 
-    Ok(total_acked)
+    Ok((total_acked, server_max))
 }
 
 /// One full drain cycle: enqueue local writes, push, pull+decrypt+merge, replay.
@@ -477,7 +514,10 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
     )
     .await
     {
-        Ok(pushed) => report.pushed = pushed,
+        Ok((pushed, srv_max)) => {
+            report.pushed = pushed;
+            fold_server_max(&mut report, srv_max);
+        }
         Err(e) => report.push_error = Some(e),
     }
 
@@ -485,6 +525,17 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
     // on `pull_error`; whatever it managed to apply before failing is retained (F1).
     if let Err(e) = pull_direction(conn, cipher, transport, client_id, &mut report).await {
         report.pull_error = Some(e);
+    }
+
+    // R12: record the pull watermark reached this cycle so the caller can decide the honest
+    // up-to-date vs. catching-up state. A CLEAN pull (no `pull_error`) drains to the relay
+    // tip, so the watermark it reached IS a fresh last-known tip (folded as a running max);
+    // a FAILED pull leaves the tip to whatever push disclosed (so the shortfall shows as a
+    // real "behind" count rather than being masked).
+    report.pull_watermark = state::pull_watermark(conn).unwrap_or(report.pull_watermark);
+    if report.pull_error.is_none() {
+        let wm = report.pull_watermark;
+        fold_server_max(&mut report, Some(wm));
     }
 
     // Replay quarantined rows now this cycle's merges have landed. A failure here is a LOCAL
@@ -615,7 +666,7 @@ async fn push_direction<T: SyncTransport + ?Sized>(
     client_id: uuid::Uuid,
     schema_version: i32,
     engine_version: i32,
-) -> Result<usize, SyncError> {
+) -> Result<(usize, Option<i64>), SyncError> {
     // G1 — before minting or pushing anything, reconcile the counter against the relay tail so
     // a regressed counter (DB restore) never emits colliding pairs. Runs exactly ONCE PER DRAIN
     // SPAWN: the reconciled marker is connection-scoped (a TEMP marker, see
@@ -867,8 +918,13 @@ mod tests {
         let blobs: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8; 700 * 1024]).collect();
         let conn = seed_outbox(&blobs);
         let t = LimitAssertingTransport::default();
-        let acked = push_outbox(&conn, Uuid::from_u128(1), &t).await.unwrap();
+        let (acked, server_max) = push_outbox(&conn, Uuid::from_u128(1), &t).await.unwrap();
         assert_eq!(acked, 6, "all entries acked in one drain");
+        assert_eq!(
+            server_max,
+            Some(6),
+            "push discloses the tenant tip after the batch"
+        );
         let reqs = t.requests.lock().unwrap();
         assert_eq!(reqs.len(), 6, "one large entry per request");
         assert!(reqs.iter().all(|(n, _, _)| *n == 1));
@@ -888,7 +944,7 @@ mod tests {
         let blobs: Vec<Vec<u8>> = (0..2500).map(|_| vec![0u8; 8]).collect();
         let conn = seed_outbox(&blobs);
         let t = LimitAssertingTransport::default();
-        let acked = push_outbox(&conn, Uuid::from_u128(2), &t).await.unwrap();
+        let (acked, _) = push_outbox(&conn, Uuid::from_u128(2), &t).await.unwrap();
         assert_eq!(acked, 2500);
         let reqs = t.requests.lock().unwrap();
         assert_eq!(reqs.len(), 3);
@@ -1184,6 +1240,80 @@ mod tests {
         );
         // B's change is durably on the relay.
         assert_eq!(relay.completeness().await.unwrap().count, 1);
+    }
+
+    // ----- R12: a fully-acked outbox is NOT "up to date" while the pull is behind -----
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_outbox_ack_is_not_up_to_date_while_pull_behind() {
+        // The R12 bug: "up to date" was declared whenever the OUTBOX drained, ignoring the
+        // PULL backlog. The report now exposes `pull_behind()` (server tip − pull watermark)
+        // so the caller can gate honestly: a cycle that fully acks the outbox while the pull
+        // has NOT reached the relay tip reports `pull_behind() > 0` (NOT up to date); only
+        // once the watermark reaches the tip does it read caught up (`Some(0)`).
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // A publishes three keys → the relay tip advances to 3.
+        for i in 0..3 {
+            a.conn()
+                .execute(&format!("INSERT INTO kv(id,v) VALUES('a{i}','v{i}')"), [])
+                .unwrap();
+            drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+                .await
+                .unwrap();
+        }
+        assert_eq!(relay.completeness().await.unwrap().max_changeset_seq, 3);
+
+        // B pushes ONE local write (fully acked) but its PULL fails this cycle: the outbox
+        // empties, yet B is still behind A's changesets. The push disclosed the tenant tip,
+        // so `pull_behind()` is a POSITIVE, honest shortfall — never "up to date".
+        b.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('b0','x')", [])
+            .unwrap();
+        let failing = PullFails(relay.clone());
+        let behind_report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
+            .await
+            .unwrap();
+        assert_eq!(behind_report.pushed, 1, "B's local write was fully acked");
+        assert!(
+            behind_report.pull_error.is_some(),
+            "the pull failed this cycle"
+        );
+        let behind = behind_report
+            .pull_behind()
+            .expect("push disclosed the tenant tip");
+        assert!(
+            behind > 0,
+            "an empty outbox with an un-caught-up pull is NOT up to date (behind={behind})"
+        );
+
+        // A clean drain: B pulls A's changesets and reaches the relay tip → caught up.
+        let caught_up = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            caught_up.first_transport_error().is_none(),
+            "the catch-up cycle was clean"
+        );
+        assert_eq!(
+            caught_up.pull_behind(),
+            Some(0),
+            "up to date ONLY once the watermark reached the relay tip"
+        );
+        // Sanity: B actually merged A's rows.
+        let av: String = b
+            .conn()
+            .query_row("SELECT v FROM kv WHERE id='a2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(av, "v2");
     }
 
     // ----- R5: honest crypto accounting — a crypto skip stops the pull, never lies -----
@@ -1737,7 +1867,7 @@ mod tests {
 
         // Push directly: the relay dedups seq 1; the backstop reconciles, detects the
         // regression (server_max 3 > local 1), reseeds past the tail, and drops the entry.
-        let acked = push_outbox(dev.conn(), cid, relay.as_ref()).await.unwrap();
+        let (acked, _) = push_outbox(dev.conn(), cid, relay.as_ref()).await.unwrap();
         assert_eq!(acked, 0, "the suspect dedup was NOT acked");
         assert!(
             state::client_seq(dev.conn()).unwrap() >= 3,
@@ -1927,7 +2057,7 @@ mod tests {
         let transport = HttpTransport::new(format!("http://{addr}"), "access-token");
         // The local counter starts at 0 (seed_outbox does not set it), so the reseed target is
         // the relay tail (1). The call must NOT error (non-fatal recovery).
-        let acked = push_outbox(&conn, cid, &transport).await.unwrap();
+        let (acked, _) = push_outbox(&conn, cid, &transport).await.unwrap();
         assert_eq!(acked, 0, "the colliding batch was not acked");
         assert!(
             state::client_seq(&conn).unwrap() >= 1,

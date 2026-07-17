@@ -1475,6 +1475,10 @@ pub struct SyncStatusDto {
     /// RFC3339 of the last time the outbox fully drained with the relay reachable;
     /// null before the first successful drain. The panel renders it relative to now.
     last_success: Option<String>,
+    /// R12: changesets this device is still behind the last-known relay tip on the PULL side
+    /// (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
+    /// device is honestly "up to date" only when this is 0 AND the outbox is empty.
+    pull_behind: u64,
 }
 
 // ----- Typed relay connection probe (T025) -----
@@ -2498,6 +2502,15 @@ struct DrainProgress {
     /// RFC3339 of the last cycle that completed with the outbox fully drained AND the
     /// relay reachable — the "last synced" time the panel shows relative to now.
     last_success: Option<String>,
+    /// R12: PULL-side backlog. True when this device's pull watermark is behind the
+    /// last-known relay tip — it is actively CATCHING UP and must NOT claim "up to date"
+    /// merely because the outbox is empty. Distinct from `syncing` (which is the PUSH
+    /// backlog). Set at cycle START (from the last-known tip) so a long catch-up pull shows
+    /// honestly WHILE it grinds, not only after it finishes.
+    catching_up: bool,
+    /// R12: changesets still to pull to reach the last-known relay tip (0 when caught up or
+    /// the tip is not yet known). Counts CHANGESETS (commit-ordered seqs), not cells.
+    pull_behind: u64,
 }
 
 fn drain_progress_cell() -> &'static RwLock<DrainProgress> {
@@ -2884,6 +2897,41 @@ fn spawn_drain(
                 }
             }
 
+            // R12: seed the last-known relay tip so a device that booted BEHIND on the PULL
+            // side shows an honest "catching up" state during the (possibly long) first drain
+            // instead of a stale "up to date". ONE cheap `GET /sync/completeness` at spawn;
+            // it is refreshed every cycle thereafter from the drain report (push tip /
+            // clean-pull watermark), so this is the only added round-trip. A device that has
+            // NEVER reached the relay must not read "up to date": a connectivity failure here
+            // lands the existing amber `Unreachable` health (which takes precedence over both
+            // catching-up and up-to-date), so the pre-first-sync window is honest.
+            let mut last_server_max: Option<i64> = match rt.block_on(transport.completeness()) {
+                Ok(c) => Some(c.max_changeset_seq),
+                Err(e) => {
+                    if e.is_network() {
+                        set_drain_health(DrainHealth::Unreachable(e.to_string()));
+                    }
+                    tracing::debug!("sync: initial relay tip unknown (completeness failed): {e}");
+                    None
+                }
+            };
+            // Behind = last-known tip − pull watermark, clamped at 0 (0 when caught up or the
+            // tip is unknown). This is the PULL backlog the up-to-date gate now honours.
+            let behind_now = |server_max: Option<i64>| -> u64 {
+                match (server_max, state::pull_watermark(conn)) {
+                    (Some(m), Ok(wm)) => (m - wm).max(0) as u64,
+                    _ => 0,
+                }
+            };
+            let initial_behind = behind_now(last_server_max);
+            // One-shot "catching up" transition log, mirroring `had_backlog` for the push side.
+            let mut announced_catch_up = initial_behind > 0;
+            if initial_behind > 0 {
+                tracing::info!(
+                    "sync: catching up — {initial_behind} changeset(s) behind the relay"
+                );
+            }
+
             // T024: measure the pre-existing backlog ONCE so a big initial sync announces
             // itself in the log and shows "syncing" in the UI immediately. `had_backlog`
             // gates the one-shot "up to date" transition log; `acked_session` is the
@@ -2904,6 +2952,8 @@ fn spawn_drain(
                         acked_this_session: 0,
                         syncing: p.entries > 0,
                         last_success: None,
+                        catching_up: p.entries == 0 && initial_behind > 0,
+                        pull_behind: initial_behind,
                     });
                     p.entries > 0
                 }
@@ -2919,6 +2969,27 @@ fn spawn_drain(
             let mut consecutive_errors: u32 = 0;
 
             while !stop.load(Ordering::SeqCst) {
+                // R12: BEFORE the (possibly long, multi-page) drain, publish the catching-up
+                // state if the last-known tip already says we are behind on the PULL. Without
+                // this, a big catch-up pull would leave the UI on the PRIOR state (e.g. a stale
+                // "up to date") for its whole grind — the exact display-honesty bug. Only
+                // touches progress when actually behind, so a caught-up device never strobes.
+                let start_behind = behind_now(last_server_max);
+                if start_behind > 0 {
+                    if !announced_catch_up {
+                        tracing::info!(
+                            "sync: catching up — {start_behind} changeset(s) behind the relay"
+                        );
+                        announced_catch_up = true;
+                    }
+                    let prev = drain_progress();
+                    set_drain_progress(DrainProgress {
+                        catching_up: prev.pending_entries == 0,
+                        pull_behind: start_behind,
+                        ..prev
+                    });
+                }
+
                 // A cycle now ALWAYS attempts BOTH push and pull (F1); a per-direction
                 // transport error rides on the report rather than aborting the cycle. Only a
                 // cycle-fatal LOCAL (sqlite/replay) fault returns `Err` — never crash the
@@ -3080,6 +3151,19 @@ fn spawn_drain(
                     }
                 }
 
+                // R12: fold the tip THIS cycle disclosed (push tip / clean-pull watermark) into
+                // the running last-known tip. `changeset_seq` is dense/monotonic so the tip
+                // only ever advances; a cycle that learned nothing (nothing to push AND the
+                // pull failed) leaves the previous tip intact rather than regressing it.
+                if let Some(m) = report.server_max {
+                    last_server_max = Some(last_server_max.map_or(m, |prev| prev.max(m)));
+                }
+                // Behind after this cycle: the last-known tip minus the watermark we reached.
+                // A CLEAN full pull drives this to 0; a failed/partial pull leaves the honest
+                // shortfall so we never claim "up to date" over an un-merged peer backlog.
+                let pull_behind = last_server_max
+                    .map_or(0i64, |m| (m - report.pull_watermark).max(0)) as u64;
+
                 // T024 progress: recompute the backlog from the outbox after this cycle's
                 // push, accumulate the session ack count, and log ONLY on real progress /
                 // transitions — never every idle 5s cycle.
@@ -3105,20 +3189,27 @@ fn spawn_drain(
                             );
                             had_backlog = true;
                         }
-                        // "Up to date" only counts when the outbox is empty AND no transport
-                        // error occurred this cycle (else we'd claim success mid-failure) AND no
-                        // pulled changeset failed to decrypt/decode this cycle (R5: a crypto skip
-                        // means a peer's write was NOT applied — claiming "up to date" then is the
-                        // lie this fixes). A crypto failure already rides on `pull_error`
-                        // (→ first_transport_error), so this is belt-and-suspenders, but it pins
-                        // the invariant explicitly against any future path that sets the count
-                        // without an error.
+                        // "Up to date" (R12) counts ONLY when ALL hold:
+                        //   1. the outbox is empty (`p.entries == 0`) — push fully acked;
+                        //   2. the PULL watermark has reached the last-known relay tip
+                        //      (`pull_behind == 0`) — the fix: an empty outbox is NOT up to
+                        //      date while a peer's changesets remain un-merged;
+                        //   3. no transport error AND no crypto skip this cycle (`clean`) —
+                        //      else we'd claim success mid-failure, or over a peer write we
+                        //      could not decrypt (R5). A crypto failure already rides on
+                        //      `pull_error`, so (3)'s crypto clause is belt-and-suspenders.
+                        // While (2) fails we publish a DISTINCT `catching_up` state carrying the
+                        // honest `pull_behind` count; connectivity/auth health (Unreachable /
+                        // Failing / AuthExpired) already takes precedence over both in
+                        // `build_status_dto` (unreachable/failing > catching-up > up-to-date).
                         let clean = report.first_transport_error().is_none()
                             && report.crypto_skipped == 0;
-                        let last_success = if p.entries == 0 && clean {
-                            if had_backlog {
+                        let caught_up = p.entries == 0 && pull_behind == 0 && clean;
+                        let last_success = if caught_up {
+                            if had_backlog || announced_catch_up {
                                 tracing::info!("sync: up to date");
                                 had_backlog = false;
+                                announced_catch_up = false;
                             }
                             Some(chrono::Utc::now().to_rfc3339())
                         } else {
@@ -3130,6 +3221,11 @@ fn spawn_drain(
                             acked_this_session: acked_session,
                             syncing: p.entries > 0,
                             last_success,
+                            // Catching-up is a PULL-side state; a pending PUSH backlog
+                            // (`syncing`) takes visual precedence, so only flag it when the
+                            // outbox is empty but the pull is still behind.
+                            catching_up: p.entries == 0 && pull_behind > 0,
+                            pull_behind,
                         });
                     }
                     Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
@@ -3462,8 +3558,16 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         // the connected phase; `deriveSyncDisplay` renders any set `last_error` as the
         // distinct "Sync error — needs attention" state, no DTO/contract change needed.
         DrainHealth::Failing(msg) => (connected_phase, Some(msg)),
+        // A PUSH backlog (outbox not yet drained) is the `syncing` phase, as before.
         DrainHealth::Ok if session.sync_enabled && progress.syncing => {
             ("syncing".to_string(), last_error)
+        }
+        // R12: the outbox is empty but the PULL is still behind the relay tip — a DISTINCT
+        // `catching_up` phase (never the green "up to date"). Ranks below the connectivity /
+        // auth states above and below `syncing`, giving the precedence
+        // unreachable/failing/auth > syncing > catching-up > up-to-date.
+        DrainHealth::Ok if session.sync_enabled && progress.catching_up => {
+            ("catching_up".to_string(), last_error)
         }
         DrainHealth::Ok => (connected_phase, last_error),
     };
@@ -3482,6 +3586,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         pending_bytes: progress.pending_bytes,
         acked_this_session: progress.acked_this_session,
         last_success: progress.last_success,
+        pull_behind: progress.pull_behind,
     }
 }
 
@@ -3726,6 +3831,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             pending_bytes: 0,
             acked_this_session: 0,
             last_success: None,
+            pull_behind: 0,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),

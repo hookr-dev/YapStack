@@ -8,6 +8,7 @@
 // unreachable, while `lastError` is set, or while anything is pending.
 
 import {
+  formatCatchingUp,
   formatLastSynced,
   formatSyncProgress,
   type RelayConnState,
@@ -26,11 +27,12 @@ export const SMALL_N = 3;
 /** Continuous-syncing window (ms) that also unlocks motion, independent of N. */
 export const SYNC_MOTION_MS = 2000;
 
-/** The seven mutually-exclusive display states (plan §3 table). */
+/** The mutually-exclusive display states (plan §3 table; `catching-up` added R12). */
 export type SyncDisplayState =
   | "off"
   | "caught-up"
   | "syncing"
+  | "catching-up"
   | "pending"
   | "auth-expired"
   | "unreachable"
@@ -85,8 +87,10 @@ function hostOf(url: string): string {
 
 /**
  * Derive the one display object every sync surface renders. Precedence (binding,
- * plan §1b): off → unreachable → auth-expired → error → syncing → pending →
- * caught-up. Connection failure short-circuits BEFORE any sync phase.
+ * plan §1b + R12): off → unreachable → auth-expired → error → syncing (push) →
+ * catching-up (pull behind) → pending → caught-up. Connection failure short-circuits
+ * BEFORE any sync phase, and "catching up" outranks "up to date" so a pull backlog can
+ * never masquerade as green.
  */
 export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   const { conn, status, signedIn, syncEnabled, syncingSince } = input;
@@ -108,6 +112,7 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   const phase = status?.phase ?? null;
   const pendingEntries = status?.pendingEntries ?? 0;
   const pendingBytes = status?.pendingBytes ?? 0;
+  const pullBehind = status?.pullBehind ?? 0;
   const lastError = status?.lastError ?? null;
   const lastSuccess = status?.lastSuccess ?? null;
   const hasError = lastError != null && lastError !== "";
@@ -176,7 +181,24 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
     };
   }
 
-  // 6. Idle with a backlog queued.
+  // 6. Outbox drained, but the PULL is still behind the relay tip (R12): a device is
+  //    actively catching up on peer changesets and must NOT show the green "Up to date".
+  //    Renders as an active-sync visual (same refresh glyph + motion as `syncing`) with
+  //    honest "(N to go)" copy. The backend sets phase=="catching_up"; we ALSO fall in
+  //    here on any pullBehind > 0 as a belt-and-suspenders guard so a phase/count mismatch
+  //    can never leak a false "up to date".
+  if (phase === "catching_up" || pullBehind > 0) {
+    return {
+      state: "catching-up",
+      label: formatCatchingUp(pullBehind),
+      tone: "active",
+      icon: "refresh",
+      motion: true,
+      tooltip: formatCatchingUp(pullBehind),
+    };
+  }
+
+  // 7. Idle with a PUSH backlog queued.
   if (pendingEntries > 0) {
     const noun = pendingEntries === 1 ? "change" : "changes";
     return {
@@ -189,8 +211,9 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
     };
   }
 
-  // 7. Fully drained, reachable, no error → up to date. (Strictly gated: we can
-  //    only reach here with pendingEntries == 0 AND !hasError.)
+  // 8. Fully drained, reachable, no error, AND caught up on the pull → up to date.
+  //    (Strictly gated: we can only reach here with pendingEntries == 0 AND !hasError
+  //    AND pullBehind == 0.)
   const rel = formatLastSynced(lastSuccess, now.getTime());
   return {
     state: "caught-up",

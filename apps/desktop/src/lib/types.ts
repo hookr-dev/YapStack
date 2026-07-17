@@ -906,7 +906,13 @@ ackedThisSession: number;
  * RFC3339 of the last time the outbox fully drained with the relay reachable;
  * null before the first successful drain. The panel renders it relative to now.
  */
-lastSuccess: string | null }
+lastSuccess: string | null;
+/**
+ * R12: changesets this device is still behind the last-known relay tip on the PULL side
+ * (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
+ * device is honestly "up to date" only when this is 0 AND the outbox is empty.
+ */
+pullBehind: number }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

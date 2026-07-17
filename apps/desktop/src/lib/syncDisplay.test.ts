@@ -24,6 +24,7 @@ function status(partial: Partial<SyncStatus> = {}): SyncStatus {
     pendingBytes: 0,
     ackedThisSession: 0,
     lastSuccess: null,
+    pullBehind: 0,
     ...partial,
   };
 }
@@ -200,6 +201,82 @@ describe("deriveSyncDisplay — syncing + motion gate", () => {
       syncingSince: NOW.getTime() - 500,
     });
     expect(d.motion).toBe(false);
+  });
+});
+
+describe("deriveSyncDisplay — catching up (R12, pull behind)", () => {
+  it("phase catching_up maps to the active syncing visual with (N to go) copy", () => {
+    const d = derive({
+      status: status({
+        phase: "catching_up",
+        pendingEntries: 0,
+        pullBehind: 1650,
+      }),
+    });
+    expect(d.state).toBe("catching-up");
+    expect(d.tone).toBe("active");
+    expect(d.icon).toBe("refresh");
+    expect(d.motion).toBe(true);
+    expect(d.label).toBe("Syncing — catching up (1650 changes to go)");
+    expect(d.tooltip).toBe("Syncing — catching up (1650 changes to go)");
+  });
+
+  it("singular copy for a single changeset behind", () => {
+    const d = derive({
+      status: status({ phase: "catching_up", pullBehind: 1 }),
+    });
+    expect(d.label).toBe("Syncing — catching up (1 change to go)");
+  });
+
+  it("a pull backlog is NOT 'up to date' even with an empty outbox and no error (the R12 bug)", () => {
+    // The exact regression: outbox drained (pendingEntries 0), no lastError — the OLD
+    // code showed the green "Up to date". A positive pullBehind must beat caught-up.
+    const d = derive({
+      status: status({
+        phase: "connected", // even if the phase lags, the count guards it
+        pendingEntries: 0,
+        lastError: null,
+        pullBehind: 42,
+      }),
+    });
+    expect(d.state).toBe("catching-up");
+    expect(d.label).toBe("Syncing — catching up (42 changes to go)");
+  });
+
+  it("connectivity health STILL outranks catching up (precedence preserved)", () => {
+    const d = derive({
+      conn: { kind: "unreachable", raw: "refused" },
+      status: status({ phase: "catching_up", pullBehind: 900 }),
+    });
+    expect(d.state).toBe("unreachable");
+  });
+
+  it("auth-expired outranks catching up", () => {
+    const d = derive({
+      status: status({ phase: "auth_expired", pullBehind: 900 }),
+    });
+    expect(d.state).toBe("auth-expired");
+  });
+
+  it("a set lastError (failing) outranks catching up", () => {
+    const d = derive({
+      status: status({ phase: "catching_up", pullBehind: 900, lastError: "boom" }),
+    });
+    expect(d.state).toBe("error");
+  });
+
+  it("a PUSH backlog (syncing) takes precedence over pull catch-up", () => {
+    const d = derive({
+      status: status({ phase: "syncing", pendingEntries: 5, pullBehind: 900 }),
+    });
+    expect(d.state).toBe("syncing");
+  });
+
+  it("caught-up ONLY once pullBehind reaches 0", () => {
+    const d = derive({
+      status: status({ phase: "connected", pendingEntries: 0, pullBehind: 0 }),
+    });
+    expect(d.state).toBe("caught-up");
   });
 });
 

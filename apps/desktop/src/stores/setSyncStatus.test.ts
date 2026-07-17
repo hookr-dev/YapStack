@@ -41,6 +41,7 @@ function disconnectedStatus(): SyncStatus {
     pendingBytes: 0,
     ackedThisSession: 0,
     lastSuccess: null,
+    pullBehind: 0,
   };
 }
 

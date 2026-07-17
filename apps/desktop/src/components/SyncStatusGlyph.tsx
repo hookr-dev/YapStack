@@ -167,8 +167,9 @@ function useAmbientSyncPoll(engaged: boolean): boolean {
     let capabilityChecked = false;
 
     const schedule = () => {
-      const syncing = useAppStore.getState().syncStatus?.phase === "syncing";
-      timer = setTimeout(tick, syncing ? 2000 : 5000);
+      const phase = useAppStore.getState().syncStatus?.phase;
+      const active = phase === "syncing" || phase === "catching_up";
+      timer = setTimeout(tick, active ? 2000 : 5000);
     };
 
     const tick = async () => {

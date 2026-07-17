@@ -49,6 +49,7 @@ function makeStatus(overrides: Partial<SyncStatus> = {}): SyncStatus {
     pendingBytes: 0,
     ackedThisSession: 0,
     lastSuccess: null,
+    pullBehind: 0,
     ...overrides,
   };
 }

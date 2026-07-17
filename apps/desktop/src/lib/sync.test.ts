@@ -8,6 +8,7 @@ import {
   isValidRecoveryCode,
   isValidServerUrl,
   formatSyncProgress,
+  formatCatchingUp,
   formatBytes,
   formatLastSynced,
 } from "./sync";
@@ -93,6 +94,19 @@ describe("formatSyncProgress", () => {
     expect(formatSyncProgress(137, 68 * 1024 * 1024)).toBe(
       "137 items remaining · 68.0 MB",
     );
+  });
+});
+
+describe("formatCatchingUp", () => {
+  it("phrases the pull backlog as changesets to go (plural)", () => {
+    expect(formatCatchingUp(1650)).toBe("Syncing — catching up (1650 changes to go)");
+  });
+  it("uses the singular noun for one changeset", () => {
+    expect(formatCatchingUp(1)).toBe("Syncing — catching up (1 change to go)");
+  });
+  it("falls back to plain phrasing for a non-positive count", () => {
+    expect(formatCatchingUp(0)).toBe("Syncing — catching up");
+    expect(formatCatchingUp(-5)).toBe("Syncing — catching up");
   });
 });
 

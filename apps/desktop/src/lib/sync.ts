@@ -94,6 +94,7 @@ export type SyncPhase =
   | "connected"
   | "preparing" // crr_migrate running: "preparing your library for sync"
   | "syncing" // a push is in flight — unacked entries remain in the outbox (T024)
+  | "catching_up" // outbox drained, but the PULL is still behind the relay tip (R12)
   | "auth_expired" // session expired; the drain stopped and needs a fresh sign-in (T023)
   | "unreachable" // drain hit a typed transport connectivity failure — relay unreachable (R3)
   | "error";
@@ -136,6 +137,10 @@ export interface SyncStatus {
   /** RFC3339 of the last fully-drained-and-reachable moment; null before the
    *  first successful drain. Rendered relative to now ("synced 2m ago"). */
   lastSuccess: string | null;
+  /** R12: changesets still to PULL to reach the last-known relay tip (0 when caught
+   *  up or the tip is unknown). Drives the "catching up (N to go)" copy. A device is
+   *  "up to date" only when this is 0 AND `pendingEntries` is 0. */
+  pullBehind: number;
 }
 
 export interface SignupRequest {
@@ -294,6 +299,18 @@ export function formatSyncProgress(
     return `${head} · ${formatBytes(pendingBytes)}`;
   }
   return head;
+}
+
+/**
+ * Copy for the PULL-side catch-up line (R12): the device has drained its own outbox
+ * but is still applying peer changesets. Counts CHANGESETS (commit-ordered batches),
+ * not individual cells — labelled "to go" so it never reads as an item/byte count. A
+ * non-positive/degenerate count falls back to the plain active-sync phrasing.
+ */
+export function formatCatchingUp(behind: number): string {
+  if (!Number.isFinite(behind) || behind <= 0) return "Syncing — catching up";
+  const noun = behind === 1 ? "change" : "changes";
+  return `Syncing — catching up (${behind} ${noun} to go)`;
 }
 
 /** Human byte size (MB/GB) for the sync backlog line. Base-1024, one decimal. */
