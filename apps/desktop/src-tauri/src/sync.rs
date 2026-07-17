@@ -110,6 +110,9 @@ const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v2";
 /// How often the drain cycles when idle. SSE wakeups (T008) can shorten this
 /// later; a fixed poll is correct and simplest for v1.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the INDEPENDENT audio-upload lane cycles once idle (S2). Longer than the
+/// changeset interval — audio is best-effort background work, not correctness-critical.
+const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_secs(8);
 
 /// How many CONSECUTIVE drain cycles must hit a (non-fatal) push/pull error before the
 /// panel flips to a distinct "Sync error" state (F2). A single blip — relay restart, laptop
@@ -1412,6 +1415,7 @@ fn clear_session() -> Result<(), String> {
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
     set_drain_health(DrainHealth::Ok);
     reset_drain_progress();
+    reset_audio_lane();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -1479,6 +1483,19 @@ pub struct SyncStatusDto {
     /// (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
     /// device is honestly "up to date" only when this is 0 AND the outbox is empty.
     pull_behind: u64,
+    /// S2 — audio upload lane (DISTINCT from changeset sync). Blobs (recordings) still to
+    /// seal+upload to the relay across both priorities (0 == every local recording is backed
+    /// up). Surfaced under the "audio-upload" label in the panel; never merged with the
+    /// changeset backlog.
+    audio_upload_outstanding: u64,
+    /// Of `audio_upload_outstanding`, the low-priority backfill of the existing library (D9).
+    audio_backfill_outstanding: u64,
+    /// Audio blobs the uploader marked `failed` (needs attention; app-start + manual retry).
+    audio_upload_failed: u64,
+    /// Cumulative recordings the relay confirms it holds for this device.
+    audio_uploaded_total: u64,
+    /// Whether the one-time idempotent backfill walk has completed on this device (D9).
+    audio_backfill_complete: bool,
 }
 
 // ----- Typed relay connection probe (T025) -----
@@ -2368,12 +2385,21 @@ fn rollback_to_backup(
 pub struct DrainHandle {
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// The independent audio-upload lane thread (S2). Bundled into the same handle so every
+    /// existing stop-site (sign-out, re-login re-spawn, enable) tears BOTH lanes down
+    /// together — no separate managed state to keep in lock-step.
+    audio_shutdown: Arc<AtomicBool>,
+    audio_join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DrainHandle {
     fn stop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.audio_shutdown.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        if let Some(join) = self.audio_join.take() {
             let _ = join.join();
         }
     }
@@ -2536,6 +2562,49 @@ fn set_drain_progress(next: DrainProgress) {
 /// the session is cleared so a subsequent poll never shows a stale backlog.
 fn reset_drain_progress() {
     set_drain_progress(DrainProgress::default());
+}
+
+// ----- Audio upload lane status (S2) -----
+//
+// The audio uploader runs on its OWN thread (independent of the changeset drain — a
+// 599 MB upload must never starve changeset sync). This process-global cell is the same
+// one-way channel pattern as `DrainProgress`/`DrainHealth`: the uploader publishes its
+// latest lane counts each cycle; `build_status_dto` reads them into the status DTO under
+// the DISTINCT "audio-upload" label (never merged with changeset health). Never carries
+// token material or a plaintext path.
+
+/// Point-in-time audio-upload lane snapshot surfaced to the Sync panel.
+#[derive(Debug, Default, Clone, Copy)]
+struct AudioLaneSnapshot {
+    /// Outstanding work across BOTH priorities (pending + sealing + uploading).
+    outstanding: u64,
+    /// Of `outstanding`, the low-priority backfill lane (the D9 historical library walk).
+    backfill_outstanding: u64,
+    /// Entries the uploader marked `failed` (needs attention; app-start + manual retry).
+    failed: u64,
+    /// Cumulative blobs the relay confirms it holds for this device (queue rows in `done`).
+    uploaded_total: u64,
+    /// Whether the idempotent backfill walk has completed on this device (D9).
+    backfill_complete: bool,
+}
+
+fn audio_lane_cell() -> &'static RwLock<AudioLaneSnapshot> {
+    static CELL: OnceLock<RwLock<AudioLaneSnapshot>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(AudioLaneSnapshot::default()))
+}
+
+fn audio_lane() -> AudioLaneSnapshot {
+    *audio_lane_cell().read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_audio_lane(next: AudioLaneSnapshot) {
+    *audio_lane_cell().write().unwrap_or_else(|e| e.into_inner()) = next;
+}
+
+/// Clear the audio-lane snapshot (uploader stopped / signed out) so a poll never shows a
+/// stale upload backlog.
+fn reset_audio_lane() {
+    set_audio_lane(AudioLaneSnapshot::default());
 }
 
 /// The `exp` (unix seconds) claim of a JWT, decoded WITHOUT verifying the signature.
@@ -2811,6 +2880,29 @@ fn spawn_drain(
     // progress slate (session ack count resets; no stale backlog shown, T024).
     set_drain_health(DrainHealth::Ok);
     reset_drain_progress();
+    reset_audio_lane();
+
+    // S2: spawn the INDEPENDENT audio-upload lane before the changeset drain consumes the
+    // session tuple. It opens its own connection to the same CRR live DB on its own thread
+    // (a 599 MB upload must never block the changeset drain), and shares the persisted
+    // bearer (reloaded when stale) rather than refreshing itself — two independent refreshers
+    // would race the reuse-detection family revocation (T009). Best-effort: an uploader
+    // spawn failure is logged and the changeset drain still starts.
+    let (audio_shutdown, audio_join) = match spawn_audio_uploader(
+        sync_db.clone(),
+        server_url.clone(),
+        bearer.clone(),
+        vault_key,
+        epoch,
+        tenant_id,
+    ) {
+        Ok((sd, jh)) => (sd, Some(jh)),
+        Err(e) => {
+            tracing::error!("sync: audio uploader spawn failed (upload lane disabled): {e}");
+            (Arc::new(AtomicBool::new(true)), None)
+        }
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = shutdown.clone();
 
@@ -3240,7 +3332,174 @@ fn spawn_drain(
     Ok(DrainHandle {
         shutdown,
         join: Some(join),
+        audio_shutdown,
+        audio_join,
     })
+}
+
+// ----- Audio upload lane (S2 — independent background uploader) -----
+
+/// Publish the current audio-lane counts to the status cell (read by `build_status_dto`).
+/// Reads are cheap sqlite `count(*)`s on the local, non-CRR queue table.
+fn publish_audio_lane(conn: &rusqlite::Connection) {
+    use yapstack_sync::audio;
+    let counts = match audio::lane_status(conn) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("audio uploader: lane_status: {e}");
+            return;
+        }
+    };
+    // The low-priority backfill lane's still-outstanding share (for the "backfilling library"
+    // copy). A direct query keeps the engine's `AudioLaneStatus` untouched.
+    let backfill_outstanding: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM _yapstack_audio_upload_queue \
+             WHERE priority = ?1 AND state IN ('pending','sealing','uploading')",
+            [audio::PRIORITY_BACKFILL],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0);
+    let backfill_complete = audio::backfill_walk_completed(conn).unwrap_or(false);
+    set_audio_lane(AudioLaneSnapshot {
+        outstanding: counts.outstanding(),
+        backfill_outstanding,
+        failed: counts.failed,
+        uploaded_total: counts.done,
+        backfill_complete,
+    });
+}
+
+/// Spawn the audio-upload lane on its own OS thread with a current-thread runtime (the
+/// `rusqlite::Connection` and the `!Send` `drain_one` future never leave it — same pattern
+/// as the changeset drain). At start it sweeps orphaned seal temps (A3), re-arms crashed +
+/// failed entries (D9 app-start retry), and runs the idempotent backfill walk (D9), then
+/// drains ONE blob at a time, NORMAL before LOW (the engine's ordering), publishing lane
+/// counts to the status cell. It NEVER refreshes the token itself — it reloads the bearer
+/// the changeset drain persisted when it is near expiry (two independent refreshers would
+/// race reuse-detection, T009).
+#[allow(clippy::too_many_arguments)]
+fn spawn_audio_uploader(
+    sync_db: PathBuf,
+    server_url: String,
+    bearer: String,
+    vault_key: [u8; 32],
+    epoch: u32,
+    tenant_id: Uuid,
+) -> Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>), String> {
+    use yapstack_sync::audio::{self, AudioSealContext, DrainStep};
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stop = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("yapstack-audio-uploader".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("audio uploader: runtime build failed: {e}");
+                    return;
+                }
+            };
+            // Own connection to the same CRR live DB (extension loaded on THIS connection).
+            let db = match CrsqlDb::open(&sync_db) {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!("audio uploader: cannot open CRR db: {e}");
+                    return;
+                }
+            };
+            let conn = db.conn();
+            if let Err(e) = audio::ensure_queue_table(conn) {
+                tracing::error!("audio uploader: queue table: {e}");
+                return;
+            }
+            // Seal temps live beside the live DB (THIS device's dir, D2) — never the source
+            // file's dir, never the source device's path.
+            let temp_dir = sync_db.with_file_name("audio-upload-tmp");
+            // A3: reclaim seal temps a crash left mid-seal (only files with OUR prefix).
+            match audio::sweep_orphan_temps(&temp_dir) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("audio uploader: swept {n} orphaned seal temp(s)")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("audio uploader: temp sweep: {e}"),
+            }
+            // App-start recovery (D9): re-arm crashed in-flight + retry failed entries.
+            if let Err(e) = audio::reset_in_flight(conn) {
+                tracing::warn!("audio uploader: reset_in_flight: {e}");
+            }
+            if let Err(e) = audio::retry_failed(conn) {
+                tracing::warn!("audio uploader: retry_failed: {e}");
+            }
+            // Backfill walk (owner: starts immediately, idempotent, on EVERY device that ever
+            // recorded — the server-completeness invariant). Enqueues every local part whose
+            // file exists on THIS device at LOW priority, behind new recordings.
+            match audio::backfill_walk(conn, |p| std::path::Path::new(p).exists()) {
+                Ok(r) => {
+                    if r.enqueued > 0 || r.missing_file > 0 {
+                        tracing::info!(
+                            "audio backfill: examined {} part(s), enqueued {}, {} missing here",
+                            r.examined,
+                            r.enqueued,
+                            r.missing_file
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("audio backfill walk failed: {e}"),
+            }
+            let ctx = AudioSealContext {
+                vault_key,
+                tenant_id: *tenant_id.as_bytes(),
+                epoch,
+            };
+            let transport = HttpTransport::new(server_url, bearer.clone());
+            let mut current_bearer = bearer;
+            publish_audio_lane(conn);
+
+            while !stop.load(Ordering::SeqCst) {
+                // Drain to Idle, ONE blob at a time (so a 599 MB upload never starves the UI
+                // poll or the changeset lane). Between blobs, reload the shared bearer only
+                // when it is near expiry — never refresh (rotate) it here.
+                loop {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if access_token_stale(&current_bearer, 60) {
+                        if let Ok(Some(s)) = load_session() {
+                            if s.bearer != current_bearer {
+                                current_bearer = s.bearer.clone();
+                                transport.set_bearer(&current_bearer);
+                            }
+                        }
+                    }
+                    match rt.block_on(audio::drain_one(conn, &transport, &ctx, &temp_dir)) {
+                        Ok(DrainStep::Idle) => break,
+                        Ok(DrainStep::Uploaded { .. }) | Ok(DrainStep::DroppedDeleted { .. }) => {
+                            publish_audio_lane(conn);
+                        }
+                        Ok(DrainStep::Failed { part_id, error }) => {
+                            tracing::warn!("audio upload failed for part {part_id}: {error}");
+                            publish_audio_lane(conn);
+                        }
+                        Err(e) => {
+                            // A sqlite/bookkeeping fault — back off and retry next cycle; never
+                            // crash the lane.
+                            tracing::warn!("audio uploader cycle error: {e}");
+                            break;
+                        }
+                    }
+                }
+                publish_audio_lane(conn);
+                std::thread::sleep(AUDIO_DRAIN_INTERVAL);
+            }
+            tracing::info!("audio uploader stopped");
+        })
+        .map_err(|e| e.to_string())?;
+    Ok((shutdown, join))
 }
 
 // ----- Auth-ceremony crypto + roster helpers (CRYPTO_SPEC §3/§4/§6/§7) -----
@@ -3508,6 +3767,8 @@ fn load_or_create_device_identity() -> Result<([u8; 32], Uuid), String> {
 /// (`GET /devices`) so pending-device approvals surface (§7.5). A relay error is
 /// surfaced in `last_error` (roster falls back to empty) rather than failing the call.
 async fn build_status_dto(session: &Session) -> SyncStatusDto {
+    // S2: the audio-upload lane's latest published counts (own one-way cell, like progress).
+    let audio = audio_lane();
     let mut roster = Vec::new();
     let mut last_error = None;
     match http_get_devices(session).await {
@@ -3587,6 +3848,11 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         acked_this_session: progress.acked_this_session,
         last_success: progress.last_success,
         pull_behind: progress.pull_behind,
+        audio_upload_outstanding: audio.outstanding,
+        audio_backfill_outstanding: audio.backfill_outstanding,
+        audio_upload_failed: audio.failed,
+        audio_uploaded_total: audio.uploaded_total,
+        audio_backfill_complete: audio.backfill_complete,
     }
 }
 
@@ -3832,6 +4098,11 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             acked_this_session: 0,
             last_success: None,
             pull_behind: 0,
+            audio_upload_outstanding: 0,
+            audio_backfill_outstanding: 0,
+            audio_upload_failed: 0,
+            audio_uploaded_total: 0,
+            audio_backfill_complete: false,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -3903,6 +4174,79 @@ pub fn sync_sign_out(runtime: State<'_, SyncRuntimeState>) -> Result<(), String>
         }
     }
     clear_session()
+}
+
+/// S2 producer seam: enqueue every finalized audio part of `session_id` onto the durable
+/// upload queue at NORMAL priority (jumps ahead of the LOW-priority backfill). Called
+/// FIRE-AND-FORGET from the frontend on session finalize — recording is never blocked by
+/// this, and the durable queue survives a restart. Idempotent (INSERT-OR-IGNORE by
+/// `part_id`), so a re-finalize or an overlap with the backfill walk never double-uploads.
+/// A no-op when sync is not enabled on this device (nothing drains the queue yet; the
+/// backfill walk will re-enqueue on next enable). Opens a lightweight plain connection to
+/// the live DB and only ever writes the local, non-CRR queue table.
+#[tauri::command]
+#[specta::specta]
+pub fn audio_enqueue_session(app: tauri::AppHandle, session_id: String) -> Result<u32, String> {
+    // Only meaningful once sync is on — otherwise the queue has no drainer.
+    match load_session()? {
+        Some(s) if s.sync_enabled => {}
+        _ => return Ok(0),
+    }
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, file_path FROM session_audio_parts \
+             WHERE session_id = ?1 AND file_path IS NOT NULL AND file_path <> ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let parts: Vec<(String, String)> = rows.filter_map(Result::ok).collect();
+    drop(stmt);
+
+    let mut enqueued = 0u32;
+    for (part_id, file_path) in parts {
+        match yapstack_sync::audio::enqueue_on_save(&conn, &part_id, &file_path, &session_id) {
+            Ok(true) => enqueued += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("audio_enqueue_session: enqueue {part_id}: {e}"),
+        }
+    }
+    Ok(enqueued)
+}
+
+/// S2 manual-retry seam for the Sync panel: re-arm every `failed` audio-upload entry so the
+/// uploader picks them up on its next cycle (D9 — failed entries retry on app start PLUS
+/// manual retry). Returns the number re-armed. No-op when sync is disabled.
+#[tauri::command]
+#[specta::specta]
+pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> {
+    match load_session()? {
+        Some(s) if s.sync_enabled => {}
+        _ => return Ok(0),
+    }
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let n = yapstack_sync::audio::retry_failed(&conn).map_err(|e| e.to_string())?;
+    Ok(n as u32)
 }
 
 // --- Relay auth ceremony (CRYPTO_SPEC §3/§6/§7). All key derivation is client-side;

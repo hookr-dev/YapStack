@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   shouldShowUpgrade,
   normalizeCode,
@@ -11,7 +11,12 @@ import {
   formatCatchingUp,
   formatBytes,
   formatLastSynced,
+  deriveAudioBackup,
+  enqueueAudioForSession,
 } from "./sync";
+
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 describe("shouldShowUpgrade", () => {
   it("shows upgrade only when a billing_url is advertised", () => {
@@ -129,5 +134,103 @@ describe("formatLastSynced", () => {
     expect(formatLastSynced("2026-07-07T11:58:00Z", now)).toBe("2m ago");
     expect(formatLastSynced("2026-07-07T09:00:00Z", now)).toBe("3h ago");
     expect(formatLastSynced("2026-07-05T12:00:00Z", now)).toBe("2d ago");
+  });
+});
+
+describe("deriveAudioBackup", () => {
+  const base = {
+    audioUploadOutstanding: 0,
+    audioBackfillOutstanding: 0,
+    audioUploadFailed: 0,
+    audioUploadedTotal: 0,
+  };
+
+  it("is hidden when nothing is outstanding, failed, or ever uploaded", () => {
+    expect(deriveAudioBackup(base).state).toBe("hidden");
+  });
+
+  it("failures take precedence and pluralize", () => {
+    expect(deriveAudioBackup({ ...base, audioUploadFailed: 1 })).toEqual({
+      state: "failed",
+      label: "1 recording failed to back up",
+    });
+    // Failed wins even while uploads are outstanding.
+    const d = deriveAudioBackup({
+      ...base,
+      audioUploadFailed: 3,
+      audioUploadOutstanding: 5,
+    });
+    expect(d.state).toBe("failed");
+    expect(d.label).toBe("3 recordings failed to back up");
+  });
+
+  it("in-flight uploads show a count, singular/plural", () => {
+    expect(deriveAudioBackup({ ...base, audioUploadOutstanding: 1 })).toEqual({
+      state: "uploading",
+      label: "Backing up 1 recording",
+    });
+    expect(deriveAudioBackup({ ...base, audioUploadOutstanding: 4 }).label).toBe(
+      "Backing up 4 recordings",
+    );
+  });
+
+  it("distinguishes existing-library backfill", () => {
+    // Entirely backfill.
+    expect(
+      deriveAudioBackup({
+        ...base,
+        audioUploadOutstanding: 6,
+        audioBackfillOutstanding: 6,
+      }).label,
+    ).toBe("Backing up 6 recordings from your existing library");
+    // Mixed new + backfill.
+    expect(
+      deriveAudioBackup({
+        ...base,
+        audioUploadOutstanding: 10,
+        audioBackfillOutstanding: 4,
+      }).label,
+    ).toBe("Backing up 10 recordings (4 from your existing library)");
+  });
+
+  it("rests on an all-backed-up line once idle", () => {
+    expect(deriveAudioBackup({ ...base, audioUploadedTotal: 1 })).toEqual({
+      state: "complete",
+      label: "1 recording backed up",
+    });
+    expect(
+      deriveAudioBackup({ ...base, audioUploadedTotal: 42 }).label,
+    ).toBe("42 recordings backed up");
+  });
+});
+
+describe("enqueueAudioForSession (fire-and-forget)", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("invokes the enqueue command with the session id", () => {
+    invokeMock.mockResolvedValue(2);
+    enqueueAudioForSession("sess-1");
+    expect(invokeMock).toHaveBeenCalledWith("audio_enqueue_session", {
+      sessionId: "sess-1",
+    });
+  });
+
+  it("attaches a catch so a rejection is swallowed (fire-and-forget)", () => {
+    // The swallow mechanism is `invoke(...).catch(...)`. Assert the `.catch` is attached
+    // (so a no-sync build's "command not found" rejection never surfaces) via a thenable
+    // spy — never create a real rejected promise, which would trip the unhandled-rejection
+    // watcher regardless of the handler.
+    const catchSpy = vi.fn().mockReturnValue(undefined);
+    invokeMock.mockReturnValue({ catch: catchSpy });
+    expect(() => enqueueAudioForSession("sess-2")).not.toThrow();
+    expect(invokeMock).toHaveBeenCalledWith("audio_enqueue_session", {
+      sessionId: "sess-2",
+    });
+    expect(catchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a no-op for an empty session id", () => {
+    enqueueAudioForSession("");
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

@@ -50,6 +50,11 @@ function makeStatus(overrides: Partial<SyncStatus> = {}): SyncStatus {
     ackedThisSession: 0,
     lastSuccess: null,
     pullBehind: 0,
+    audioUploadOutstanding: 0,
+    audioBackfillOutstanding: 0,
+    audioUploadFailed: 0,
+    audioUploadedTotal: 0,
+    audioBackfillComplete: false,
     ...overrides,
   };
 }
@@ -237,5 +242,57 @@ describe("SyncTab", () => {
     await waitFor(() =>
       expect(useAppStore.getState().setSyncStatus).toHaveBeenCalledWith(null),
     );
+  });
+});
+
+describe("SyncTab — audio backup card (S2)", () => {
+  it("is hidden when there is no audio activity", () => {
+    setup({ status: makeStatus() });
+    render(<SyncTab />);
+    expect(screen.queryByText("Audio backup")).not.toBeInTheDocument();
+  });
+
+  it("shows an in-flight upload count with the library-backfill nuance", () => {
+    setup({
+      status: makeStatus({
+        audioUploadOutstanding: 10,
+        audioBackfillOutstanding: 4,
+      }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Audio backup")).toBeInTheDocument();
+    expect(
+      screen.getByText("Backing up 10 recordings (4 from your existing library)"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an all-backed-up resting line", () => {
+    setup({ status: makeStatus({ audioUploadedTotal: 7 }) });
+    render(<SyncTab />);
+    expect(screen.getByText("7 recordings backed up")).toBeInTheDocument();
+  });
+
+  it("surfaces failures with a Retry that re-arms the lane", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockResolvedValue(3);
+    setup({ status: makeStatus({ audioUploadFailed: 2 }) });
+    render(<SyncTab />);
+    expect(
+      screen.getByText("2 recordings failed to back up"),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    await waitFor(() =>
+      expect(vi.mocked(invoke)).toHaveBeenCalledWith(
+        "audio_retry_failed_uploads",
+      ),
+    );
+  });
+
+  it("is not shown before sync is enabled", () => {
+    setup({
+      status: makeStatus({ syncEnabled: false, audioUploadOutstanding: 5 }),
+    });
+    render(<SyncTab />);
+    expect(screen.queryByText("Audio backup")).not.toBeInTheDocument();
   });
 });

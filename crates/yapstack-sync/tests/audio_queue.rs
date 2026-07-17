@@ -267,6 +267,43 @@ async fn reset_in_flight_rearms_crashed_entries() {
     let _ = (PRIORITY_NORMAL, PRIORITY_BACKFILL);
 }
 
+#[test]
+fn sweep_orphan_temps_removes_only_prefixed_files() {
+    // A3: a crash mid-seal can strand a `SEAL_TEMP_PREFIX` temp; the startup sweep must
+    // reclaim exactly those and NEVER touch anything else in the dir.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // Two orphaned seal temps (ours).
+    let orphan_a = root.join(format!("{}abcd123", audio::SEAL_TEMP_PREFIX));
+    let orphan_b = root.join(format!("{}ef56789", audio::SEAL_TEMP_PREFIX));
+    std::fs::write(&orphan_a, b"garbage").unwrap();
+    std::fs::write(&orphan_b, b"garbage").unwrap();
+    // Files we must NEVER touch: an unrelated file, and a dir that happens to carry the
+    // prefix (must not be recursed into / removed).
+    let keeper = root.join("real-recording.wav");
+    std::fs::write(&keeper, b"keep me").unwrap();
+    let prefixed_dir = root.join(format!("{}not-a-file", audio::SEAL_TEMP_PREFIX));
+    std::fs::create_dir(&prefixed_dir).unwrap();
+
+    let removed = audio::sweep_orphan_temps(root).unwrap();
+    assert_eq!(
+        removed, 2,
+        "only the two prefixed regular files are reclaimed"
+    );
+    assert!(!orphan_a.exists());
+    assert!(!orphan_b.exists());
+    assert!(keeper.exists(), "unrelated file untouched");
+    assert!(prefixed_dir.is_dir(), "prefixed directory untouched");
+
+    // Idempotent + missing-dir tolerant.
+    assert_eq!(audio::sweep_orphan_temps(root).unwrap(), 0);
+    assert_eq!(
+        audio::sweep_orphan_temps(&root.join("does-not-exist")).unwrap(),
+        0
+    );
+}
+
 fn uuid16(s: &str) -> [u8; 16] {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     let raw = hex::decode(hex).unwrap();

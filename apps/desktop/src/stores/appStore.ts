@@ -110,6 +110,7 @@ import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
 import {
   DEFAULT_SYNC_SERVER_URL,
+  enqueueAudioForSession,
   syncCommands,
   type RelayConnState,
   type RelayProbeError,
@@ -900,6 +901,14 @@ function createAppStore() {
               await completeSession(capturedSessionId, durationSeconds).catch((e) => {
                 console.error("Failed to complete session:", e);
               });
+
+              // S2 audio round-trip: enqueue this session's finalized part(s) for
+              // background upload to the relay (server-completeness invariant). The
+              // part rows landed above (insert_audio_part_row / onSessionPartReady, same
+              // queue), so they are visible now. Fire-and-forget — recording is never
+              // blocked, the durable queue survives restart, and on a no-sync build the
+              // command is simply absent and the call is swallowed.
+              enqueueAudioForSession(capturedSessionId);
 
               set({
                 activeSessionId: null,
@@ -1693,6 +1702,12 @@ function createAppStore() {
               ackedThisSession: prev?.ackedThisSession ?? 0,
               lastSuccess: prev?.lastSuccess ?? null,
               pullBehind: prev?.pullBehind ?? 0,
+              // Audio lane: preserve the last-known counts across a status-fetch blip.
+              audioUploadOutstanding: prev?.audioUploadOutstanding ?? 0,
+              audioBackfillOutstanding: prev?.audioBackfillOutstanding ?? 0,
+              audioUploadFailed: prev?.audioUploadFailed ?? 0,
+              audioUploadedTotal: prev?.audioUploadedTotal ?? 0,
+              audioBackfillComplete: prev?.audioBackfillComplete ?? false,
             },
           });
         }

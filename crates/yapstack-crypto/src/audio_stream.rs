@@ -193,7 +193,10 @@ fn write_all<W: Write>(dst: &mut W, bytes: &[u8]) -> Result<(), CryptoError> {
 /// prefix use [`seal_blob`]; this is the core segment layer the KATs pin.
 ///
 /// # Errors
-/// [`CryptoError::Seal`] on AEAD failure, [`CryptoError::Io`] on read/write failure.
+/// [`CryptoError::Malformed`] when `chunk_size` is zero (a zero chunk cannot frame a
+/// stream — advisory A2: a caller-supplied invalid framing parameter is a recoverable
+/// error, never a panic/`assert!`), [`CryptoError::Seal`] on AEAD failure,
+/// [`CryptoError::Io`] on read/write failure.
 pub fn seal_segments<R: Read, W: Write>(
     data_key: &[u8; 32],
     nonce_prefix: &[u8; NONCE_PREFIX_LEN],
@@ -201,7 +204,11 @@ pub fn seal_segments<R: Read, W: Write>(
     mut src: R,
     dst: &mut W,
 ) -> Result<(), CryptoError> {
-    assert!(chunk_size > 0, "chunk_size must be non-zero");
+    // A2: an invalid framing parameter must NOT panic — it is a recoverable malformed-input
+    // error the sealer surfaces to its caller (the uploader marks the queue entry failed).
+    if chunk_size == 0 {
+        return Err(CryptoError::Malformed);
+    }
     let header = audio_header(chunk_size, nonce_prefix);
     write_all(dst, &header)?;
 
@@ -404,6 +411,17 @@ mod tests {
             open_segments(&sealed[..], &data_key, &mut out).unwrap();
             assert_eq!(out, pt, "roundtrip for len {}", pt.len());
         }
+    }
+
+    #[test]
+    fn zero_chunk_size_is_malformed_not_panic() {
+        // A2: a zero framing parameter must be a recoverable error, never a panic.
+        let data_key = [7u8; 32];
+        let prefix = [9u8; NONCE_PREFIX_LEN];
+        let mut sealed = Vec::new();
+        let err = seal_segments(&data_key, &prefix, 0, &b"hello"[..], &mut sealed);
+        assert!(matches!(err, Err(CryptoError::Malformed)));
+        assert!(sealed.is_empty(), "no header written on the reject path");
     }
 
     #[test]

@@ -34,6 +34,12 @@ use crate::transport::SyncTransport;
 use crate::SyncError;
 use yapstack_crypto::audio_stream::{seal_blob, AudioIdentity};
 
+/// Filename prefix for the encrypted seal temp files the uploader writes (advisory A3).
+/// A distinct, unambiguous prefix makes an orphaned temp (left by a crash mid-seal)
+/// identifiable so [`sweep_orphan_temps`] can reclaim it WITHOUT ever touching a file it
+/// did not create.
+pub const SEAL_TEMP_PREFIX: &str = "yapstack-audio-seal-";
+
 /// NORMAL lane — new recordings; drained before the backfill lane.
 pub const PRIORITY_NORMAL: i64 = 0;
 /// LOW lane — the D9 backfill of the existing local library; drains only when NORMAL empty.
@@ -308,6 +314,43 @@ pub fn retry_failed(conn: &Connection) -> Result<usize, SyncError> {
     Ok(n)
 }
 
+/// Bounded startup sweep for orphaned seal temp files (advisory A3). A crash between
+/// creating the encrypted temp and finishing the upload can leave a
+/// [`SEAL_TEMP_PREFIX`]-named file in `temp_dir`; the drain is idempotent (it re-seals on
+/// retry) so those temps are pure garbage. Removes ONLY files whose name starts with
+/// [`SEAL_TEMP_PREFIX`] — every non-matching entry (and any directory) is left untouched —
+/// and returns the count reclaimed. A missing `temp_dir` is not an error (nothing to
+/// sweep). Best-effort per file: an individual unlink error is logged by the caller via the
+/// returned error only if it is the sweep-opening `read_dir` that fails; per-file failures
+/// are skipped so one stuck file never blocks uploader start.
+///
+/// # Errors
+/// Propagates only a failure to OPEN `temp_dir` for reading (other than not-found).
+pub fn sweep_orphan_temps(temp_dir: &Path) -> Result<u64, SyncError> {
+    let entries = match std::fs::read_dir(temp_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(SyncError::Transport(format!("audio temp sweep: {e}"))),
+    };
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        // Only ever touch a regular file whose name carries OUR prefix.
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(SEAL_TEMP_PREFIX) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {}
+            _ => continue, // never recurse into / remove a directory
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// The next entry to process: NORMAL before LOW, oldest first, only `pending`. `done`,
 /// `failed`, and in-flight entries are skipped (failed is re-armed via [`retry_failed`]).
 fn next_ready(conn: &Connection) -> Result<Option<QueueEntry>, SyncError> {
@@ -456,7 +499,9 @@ async fn upload_entry<T: SyncTransport + ?Sized>(
     // Seal source file → encrypted temp file, computing sha256 + size in the SAME pass.
     std::fs::create_dir_all(temp_dir)
         .map_err(|e| SyncError::Transport(format!("audio temp dir: {e}")))?;
-    let temp = tempfile::NamedTempFile::new_in(temp_dir)
+    let temp = tempfile::Builder::new()
+        .prefix(SEAL_TEMP_PREFIX)
+        .tempfile_in(temp_dir)
         .map_err(|e| SyncError::Transport(format!("audio temp file: {e}")))?;
     let src = std::fs::File::open(&entry.source_path)
         .map_err(|e| SyncError::Transport(format!("open audio source: {e}")))?;

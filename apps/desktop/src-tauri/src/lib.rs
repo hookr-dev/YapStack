@@ -391,6 +391,8 @@ pub fn run() {
             sync::sync_enable,
             sync::sync_approve_device,
             sync::sync_sign_out,
+            sync::audio_enqueue_session,
+            sync::audio_retry_failed_uploads,
         ]);
 
     #[cfg(debug_assertions)]

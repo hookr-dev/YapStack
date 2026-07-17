@@ -141,6 +141,17 @@ export interface SyncStatus {
    *  up or the tip is unknown). Drives the "catching up (N to go)" copy. A device is
    *  "up to date" only when this is 0 AND `pendingEntries` is 0. */
   pullBehind: number;
+  /** S2 — audio-upload lane, DISTINCT from changeset sync. Recordings still to
+   *  seal+upload across both priorities (0 == every local recording is backed up). */
+  audioUploadOutstanding: number;
+  /** Of `audioUploadOutstanding`, the low-priority backfill of the existing library. */
+  audioBackfillOutstanding: number;
+  /** Audio blobs that failed to upload (needs attention; app-start + manual retry). */
+  audioUploadFailed: number;
+  /** Cumulative recordings the relay confirms it holds for this device. */
+  audioUploadedTotal: number;
+  /** Whether the one-time idempotent backfill walk has completed on this device. */
+  audioBackfillComplete: boolean;
 }
 
 export interface SignupRequest {
@@ -213,7 +224,25 @@ export const syncCommands = {
     invoke("sync_approve_device", { fingerprint }),
 
   signOut: (): Promise<void> => invoke("sync_sign_out"),
+
+  /** S2 manual-retry for the audio-upload lane: re-arm every `failed` blob so the
+   *  uploader retries it next cycle. Resolves with the count re-armed. */
+  retryFailedAudioUploads: (): Promise<number> =>
+    invoke("audio_retry_failed_uploads"),
 };
+
+/**
+ * S2 producer seam — FIRE-AND-FORGET enqueue of a finalized session's audio parts onto
+ * the durable upload queue (NORMAL priority). Recording is NEVER blocked by this and the
+ * queue is durable, so we intentionally do not await or surface failures here: on a
+ * default (no-sync) build the command is absent and `invoke` rejects with "command not
+ * found", which we swallow; when sync is off the command is a harmless no-op. The backfill
+ * walk re-enqueues on next enable, so a dropped call is self-healing.
+ */
+export function enqueueAudioForSession(sessionId: string): void {
+  if (!sessionId) return;
+  void invoke("audio_enqueue_session", { sessionId }).catch(() => {});
+}
 
 // ----- Pure display / parsing helpers (unit-tested, no Tauri) -----
 
@@ -338,4 +367,61 @@ export function formatLastSynced(iso: string | null, now: number = Date.now()): 
   if (hours < 24) return `${hours}h ago`;
   const days = Math.round(hours / 24);
   return `${days}d ago`;
+}
+
+// ----- S2 audio-upload lane display -----
+
+export type AudioBackupState = "hidden" | "uploading" | "failed" | "complete";
+
+export interface AudioBackupDisplay {
+  /** `hidden` when there is nothing to show (nothing outstanding, failed, or ever
+   *  uploaded) — the card is omitted entirely. */
+  state: AudioBackupState;
+  /** The single steady-state line rendered in the card. */
+  label: string;
+}
+
+type AudioLaneFields = Pick<
+  SyncStatus,
+  | "audioUploadOutstanding"
+  | "audioBackfillOutstanding"
+  | "audioUploadFailed"
+  | "audioUploadedTotal"
+>;
+
+/**
+ * Derive the audio-upload lane's steady-state line for the Sync panel. Precedence:
+ * failures (needs attention) → in-flight uploads (with the library-backfill nuance) →
+ * an "all backed up" resting state → hidden. Pure so the panel and its tests share one
+ * source of truth. Distinct from the changeset `deriveSyncDisplay` — audio is its own lane.
+ */
+export function deriveAudioBackup(s: AudioLaneFields): AudioBackupDisplay {
+  const out = Math.max(0, s.audioUploadOutstanding);
+  const back = Math.max(0, s.audioBackfillOutstanding);
+  const failed = Math.max(0, s.audioUploadFailed);
+  const done = Math.max(0, s.audioUploadedTotal);
+
+  if (failed > 0) {
+    const noun = failed === 1 ? "recording" : "recordings";
+    return { state: "failed", label: `${failed} ${noun} failed to back up` };
+  }
+  if (out > 0) {
+    const noun = out === 1 ? "recording" : "recordings";
+    const base = `Backing up ${out} ${noun}`;
+    if (back >= out) {
+      return { state: "uploading", label: `${base} from your existing library` };
+    }
+    if (back > 0) {
+      return {
+        state: "uploading",
+        label: `${base} (${back} from your existing library)`,
+      };
+    }
+    return { state: "uploading", label: base };
+  }
+  if (done > 0) {
+    const noun = done === 1 ? "recording" : "recordings";
+    return { state: "complete", label: `${done} ${noun} backed up` };
+  }
+  return { state: "hidden", label: "" };
 }

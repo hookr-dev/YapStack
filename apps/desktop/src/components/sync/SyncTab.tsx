@@ -36,6 +36,7 @@ import {
   ExternalLink,
   AlertTriangle,
   ChevronDown,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -43,6 +44,7 @@ import {
   syncCommands,
   shouldShowUpgrade,
   formatFingerprint,
+  deriveAudioBackup,
 } from "@/lib/sync";
 import type { SyncStatus } from "@/lib/sync";
 import { deriveSyncDisplay, type SyncDisplay } from "@/lib/syncDisplay";
@@ -233,6 +235,15 @@ export function SyncTab() {
       {/* Steady-state status line (replaces the Enable card once enabled). */}
       {signedIn && syncEnabled && syncStatus && (
         <SyncStatusLine status={syncStatus} display={display} />
+      )}
+
+      {/* Audio backup lane — DISTINCT from changeset sync (S2). Only shown once
+          enabled and when there is something to report. */}
+      {signedIn && syncEnabled && syncStatus && (
+        <AudioBackupCard
+          status={syncStatus}
+          onRetried={() => void refreshSyncStatus()}
+        />
       )}
 
       {/* Upgrade — only when a billing_url is advertised (unchanged). */}
@@ -504,6 +515,90 @@ function SyncStatusLine({
         {display.label}
       </div>
     </div>
+  );
+}
+
+/**
+ * Audio backup card (S2): the audio-upload lane surfaced DISTINCTLY from changeset
+ * sync (never merged, per repo posture). Shows an in-flight line (with the
+ * existing-library backfill nuance), an "all backed up" resting line, or a failed
+ * state with a manual Retry — hidden entirely when there is nothing to report.
+ */
+function AudioBackupCard({
+  status,
+  onRetried,
+}: {
+  status: SyncStatus;
+  onRetried: () => void;
+}) {
+  const [retrying, setRetrying] = useState(false);
+  const audio = deriveAudioBackup(status);
+  if (audio.state === "hidden") return null;
+
+  const handleRetry = async () => {
+    setRetrying(true);
+    try {
+      const n = await syncCommands.retryFailedAudioUploads();
+      toast.success(
+        n > 0 ? `Retrying ${n} upload${n === 1 ? "" : "s"}…` : "Nothing to retry.",
+      );
+      onRetried();
+    } catch (e) {
+      // Surface verbatim — never auto-route.
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const icon =
+    audio.state === "uploading" ? (
+      <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+    ) : audio.state === "failed" ? (
+      <AlertTriangle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+    ) : (
+      <ShieldCheck className="h-3.5 w-3.5 text-primary" />
+    );
+
+  return (
+    <Card className={CARD}>
+      <CardHeader className={HEAD}>
+        <CardTitle className="text-sm">Audio backup</CardTitle>
+        <CardDescription className="text-xs">
+          Your recordings are encrypted on this device, then uploaded so any of
+          your devices can play them.
+        </CardDescription>
+      </CardHeader>
+      <CardContent
+        className={`${BODY} flex items-center justify-between gap-3`}
+      >
+        <div
+          className={`flex items-center gap-1.5 text-xs ${
+            audio.state === "failed"
+              ? "text-amber-600 dark:text-amber-400"
+              : "text-muted-foreground"
+          }`}
+        >
+          {icon}
+          {audio.label}
+        </div>
+        {audio.state === "failed" && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRetry}
+            disabled={retrying}
+          >
+            {retrying ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Retry
+          </Button>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
