@@ -239,14 +239,23 @@ share-link audio; server GC + delete-driven blob release (D10 follow-on); "keep 
 default-on mirror (opt-in, S4/follow-on); iOS/web; cellular/metered gating (D7, N/A on
 LAN).
 
-## Open questions (owner)
+## Resolved questions (owner, 2026-07-17)
 
-1. **Keep-all-audio default** — leave OFF (on-demand only) for v1, or opt-in a background
-   full mirror in S4? (Recommend OFF; S4 opt-in.)
-2. **Cache eviction** for on-demand-fetched audio — LRU-bound the local cache, or keep
-   until manual clear? (Recommend keep-until-clear on LAN; ample disk. Note D10 relies on
-   cache policy to reclaim delete-orphaned entries — keep-until-clear means those persist
-   until a manual clear, which is acceptable but worth the owner's nod.)
-3. **Backfill timing** — start the one-time backfill (D9, default ON) immediately when the
-   audio tranche ships, or behind a one-click "upload existing library" confirmation given
-   the 2.7 GB first pass? (Recommend immediate + visible progress; it's LAN.)
+1. **Keep-all-audio default — on-demand fetch confirmed, NO mirroring.** Owner: *"A machine
+   should pull audio files it doesn't have from the server on demand, no need to mirror
+   everything."* The S4 keep-all-audio mirror stays a deferred opt-in. The owner added a
+   sharpening that becomes an explicit invariant:
+
+   > **SERVER COMPLETENESS INVARIANT** (owner: *"The server should have the full history
+   > always though so it can be served."*) — every device treats audio that exists locally
+   > but not on the server as an **outstanding upload debt**. Enforcing mechanism: the
+   > durable upload queue (finalize-enqueue, D4) + the re-runnable idempotent backfill walk
+   > (D9) — and the walk applies on **EVERY device** (any device that ever recorded
+   > locally), not only the historical back-catalog device. A periodic/on-demand
+   > completeness audit (compare local parts vs server mappings) is a cheap follow-on
+   > hardening, not v1-blocking.
+
+2. **Cache eviction — keep-until-manual-clear** (owner: follow recommended). Accepted
+   consequence, as noted in D10: delete-orphaned cache entries persist until manual clear.
+3. **Backfill timing — starts immediately when the tranche ships, with visible progress**
+   (owner: follow recommended). No confirmation gate.
