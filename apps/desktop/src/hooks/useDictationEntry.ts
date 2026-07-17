@@ -25,11 +25,15 @@ export function useDictationEntry(entry: DbDictationHistory) {
   const [playing, setPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Pause + release on unmount.
+  // Pause + release on unmount. Detach `onerror` BEFORE clearing `src` so
+  // resetting the element to an empty source doesn't fire the missing-file
+  // toast on teardown.
   useEffect(() => {
     return () => {
       const audio = audioRef.current;
       if (audio) {
+        audio.onerror = null;
+        audio.onended = null;
         audio.pause();
         audio.src = "";
         audioRef.current = null;
@@ -64,8 +68,12 @@ export function useDictationEntry(entry: DbDictationHistory) {
       audioRef.current = null;
     };
     audio.onerror = () => {
+      // Fires when the media element can't load/decode the source — most often
+      // a missing or unreadable file (e.g. dictation audio that never reached
+      // this device). Surface it instead of resetting state silently.
       setPlaying(false);
       audioRef.current = null;
+      toast.error("Couldn't play audio — file missing or unreadable");
     };
     audioRef.current = audio;
     setPlaying(true);

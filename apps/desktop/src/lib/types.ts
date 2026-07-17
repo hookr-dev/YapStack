@@ -115,6 +115,21 @@ async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Batch existence probe for audio part files. Returns a `Vec<bool>` parallel
+ * to `paths`: `true` when the file both lives under a trusted audio directory
+ * and is present on disk, `false` otherwise. Infallible — a bad path is
+ * reported as `false`, never an error, so one absent file can't blank the
+ * whole batch.
+ *
+ * This is how the note view learns that a session's part metadata synced from
+ * another device but its audio bytes did not, so it can render an honest
+ * "audio is on <other device>" state instead of a play control that silently
+ * no-ops. Audio files themselves are NOT synced in this release.
+ */
+async audioFilesExist(paths: string[]) : Promise<boolean[]> {
+    return await TAURI_INVOKE("audio_files_exist", { paths });
+},
 async getAvailableModels() : Promise<Result<ModelInfoDto[], CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_available_models") };

@@ -1,6 +1,8 @@
-import { useCallback, useMemo } from "react";
-import { ArrowLeft } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Play } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
+import { Button } from "@/components/ui/button";
+import { commands } from "@/lib/tauri";
 import { SessionHeader } from "@/components/SessionHeader";
 import { ChatView } from "@/components/ChatView";
 import { NoteEditor } from "@/components/NoteEditor";
@@ -53,6 +55,48 @@ export function isRemoteLiveSession(
     !!myFingerprint &&
     owner !== myFingerprint
   );
+}
+
+export interface AudioAvailability {
+  /** Parts to hand to `<AudioPlayer>`, in original order. Empty when the track
+   *  is unavailable and the honest "audio is on <device>" state renders. */
+  playableParts: AudioPart[];
+  /** True when at least one expected part's file is absent on this device —
+   *  the sync case where the metadata arrived but the audio bytes did not. */
+  unavailable: boolean;
+}
+
+/**
+ * All-or-nothing audio availability selection (v1). `exists[i]` is the on-disk
+ * presence of `parts[i]` as reported by the `audio_files_exist` command; `null`
+ * (or a length mismatch) means "not checked yet" — we stay optimistic so a
+ * local session's player renders immediately on mount rather than flashing an
+ * unavailable state.
+ *
+ * When every part is present the full ordered list plays. When ANY part is
+ * missing we withhold the player entirely instead of compressing the timeline:
+ * transcript timestamp clicks seek by GLOBAL time (a cumulative offset across
+ * the full part list), so playing a subset would mis-seek every click. In the
+ * sync scenario a session's parts are either all-local (recorded here) or
+ * all-foreign (synced from a peer, no bytes), so all-or-nothing is the honest
+ * common case; a rare genuinely-mixed session degrades to the unavailable
+ * state rather than to silent mis-seeking. Pure so the branch is unit-testable.
+ */
+export function selectAudioAvailability(
+  parts: AudioPart[],
+  exists: boolean[] | null,
+): AudioAvailability {
+  if (parts.length === 0) {
+    return { playableParts: [], unavailable: false };
+  }
+  // Optimistic while the async check is unresolved or shape-mismatched.
+  if (exists === null || exists.length !== parts.length) {
+    return { playableParts: parts, unavailable: false };
+  }
+  const allPresent = exists.every(Boolean);
+  return allPresent
+    ? { playableParts: parts, unavailable: false }
+    : { playableParts: [], unavailable: true };
 }
 
 export function NoteDetailView() {
@@ -178,6 +222,49 @@ export function NoteDetailView() {
     [setPlaybackTime],
   );
 
+  // Audio-file presence check (honest player). `session_audio_parts.file_path`
+  // is the RECORDING device's absolute path, synced verbatim; on a peer device
+  // that file is absent because audio bytes are NOT synced in this release —
+  // only metadata. Probe existence off the render path (resolves post-mount)
+  // and re-check when the parts change (session switch / D4 reload replaces the
+  // parts array) or the window regains focus (the user may have copied the
+  // file over). `partsExist` stays `null` (optimistic) until the probe lands.
+  const partPaths = useMemo(
+    () =>
+      (isActiveSession ? activeSessionParts : viewSessionParts).map(
+        (p) => p.file_path,
+      ),
+    [isActiveSession, activeSessionParts, viewSessionParts],
+  );
+  const [partsExist, setPartsExist] = useState<boolean[] | null>(null);
+  useEffect(() => {
+    if (partPaths.length === 0) {
+      setPartsExist(null);
+      return;
+    }
+    let cancelled = false;
+    const check = () => {
+      commands
+        .audioFilesExist(partPaths)
+        .then((res) => {
+          if (!cancelled) setPartsExist(res);
+        })
+        .catch(() => {
+          // Command unavailable (older backend) → stay optimistic; the
+          // player's own play-error toast still catches a genuinely missing
+          // file when the user hits play.
+          if (!cancelled) setPartsExist(null);
+        });
+    };
+    setPartsExist(null); // reset to optimistic while re-checking
+    check();
+    window.addEventListener("focus", check);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", check);
+    };
+  }, [partPaths]);
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -195,6 +282,17 @@ export function NoteDetailView() {
     duration: p.duration_seconds,
   }));
   const hasAudio = partsForPlayer.length > 0;
+  const audioAvailability = selectAudioAvailability(partsForPlayer, partsExist);
+  // `hasAudio` = the session claims audio parts; `audioPlayable` = those files
+  // are actually present here. When parts exist but the files don't, we render
+  // an honest unavailable bar and withhold every playback affordance
+  // (transcript-timestamp seeking included, since there is no audio element).
+  const audioMissing = hasAudio && audioAvailability.unavailable;
+  const audioPlayable = hasAudio && !audioAvailability.unavailable;
+  const audioDeviceLabel =
+    syncStatus?.roster.find(
+      (r) => r.fingerprint === session.recording_device_id,
+    )?.label ?? "another device";
 
   const chatBar = selectedSessionId ? (
     <AIContextProvider
@@ -268,9 +366,24 @@ export function NoteDetailView() {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} />
-        {hasAudio && (
+        {audioMissing ? (
+          // Metadata synced from another device but the audio bytes did not.
+          // Distinct unavailable state: disabled control + factual attribution.
+          <div className="flex items-center gap-3 border-b px-4 py-2 text-muted-foreground">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              disabled
+              aria-label="Audio unavailable"
+              title="Audio is not on this device"
+            >
+              <Play className="h-4 w-4" />
+            </Button>
+            <span className="text-xs">Audio is on {audioDeviceLabel}</span>
+          </div>
+        ) : hasAudio ? (
           <AudioPlayer
-            parts={partsForPlayer}
+            parts={audioAvailability.playableParts}
             onTimeUpdate={setPlaybackTime}
             onPlayStateChange={setIsPlaying}
             onResume={
@@ -284,7 +397,7 @@ export function NoteDetailView() {
                 : undefined
             }
           />
-        )}
+        ) : null}
         <ResizablePanelGroup orientation="horizontal" className="flex-1">
           <ResizablePanel defaultSize="40%" minSize="20%">
             <div className="flex flex-col h-full min-h-0">
@@ -292,15 +405,15 @@ export function NoteDetailView() {
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 isEditable={isEditable}
-                currentPlaybackTime={hasAudio ? playbackTime : undefined}
-                onTimestampClick={hasAudio ? handleSeek : undefined}
+                currentPlaybackTime={audioPlayable ? playbackTime : undefined}
+                onTimestampClick={audioPlayable ? handleSeek : undefined}
               />
             </div>
           </ResizablePanel>
           <ResizableHandle />
           <ResizablePanel defaultSize="60%" minSize="25%">
             <div className="relative flex flex-col h-full min-h-0 pb-24">
-              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={hasAudio ? handleSeek : undefined} />
+              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={audioPlayable ? handleSeek : undefined} />
               {chatBar}
             </div>
           </ResizablePanel>

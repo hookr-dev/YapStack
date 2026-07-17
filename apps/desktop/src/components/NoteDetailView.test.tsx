@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   tauriCoreMock,
@@ -24,7 +24,15 @@ vi.mock("sonner", () => ({
 }));
 
 import { useAppStore } from "@/stores/appStore";
-import { NoteDetailView, isRemoteLiveSession } from "./NoteDetailView";
+import { commands } from "@/lib/tauri";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { AudioPart } from "@/components/AudioPlayer";
+import type { DbAudioPart } from "@/lib/db";
+import {
+  NoteDetailView,
+  isRemoteLiveSession,
+  selectAudioAvailability,
+} from "./NoteDetailView";
 
 function makeSession(over: Partial<DbSession> = {}): DbSession {
   return {
@@ -186,5 +194,138 @@ describe("NoteDetailView remote-live rendering (D3)", () => {
     });
     render(<NoteDetailView />);
     expect(screen.getByText("Live on another device")).toBeInTheDocument();
+  });
+});
+
+describe("selectAudioAvailability (honest player selection)", () => {
+  const parts: AudioPart[] = [
+    { src: "a.wav", duration: 1 },
+    { src: "b.wav", duration: 2 },
+  ];
+
+  it("no parts → available, empty (nothing to render)", () => {
+    expect(selectAudioAvailability([], null)).toEqual({
+      playableParts: [],
+      unavailable: false,
+    });
+  });
+
+  it("unresolved check → optimistic full player", () => {
+    expect(selectAudioAvailability(parts, null)).toEqual({
+      playableParts: parts,
+      unavailable: false,
+    });
+  });
+
+  it("length mismatch (stale check) → optimistic full player", () => {
+    expect(selectAudioAvailability(parts, [true])).toEqual({
+      playableParts: parts,
+      unavailable: false,
+    });
+  });
+
+  it("all present → full player", () => {
+    expect(selectAudioAvailability(parts, [true, true])).toEqual({
+      playableParts: parts,
+      unavailable: false,
+    });
+  });
+
+  it("all missing → unavailable, no playable parts", () => {
+    expect(selectAudioAvailability(parts, [false, false])).toEqual({
+      playableParts: [],
+      unavailable: true,
+    });
+  });
+
+  it("mixed (some missing) → unavailable all-or-nothing (timeline honesty)", () => {
+    expect(selectAudioAvailability(parts, [true, false])).toEqual({
+      playableParts: [],
+      unavailable: true,
+    });
+  });
+});
+
+function makePart(over: Partial<DbAudioPart> = {}): DbAudioPart {
+  return {
+    id: "p0",
+    session_id: "s-remote",
+    part_index: 0,
+    file_path: "/peer/audio/s-remote.0.wav",
+    format: "wav",
+    duration_seconds: 12,
+    sample_rate: 16000,
+    created_at: "2026-07-15 12:00:00",
+    ...over,
+  } as DbAudioPart;
+}
+
+function openCompleted(parts: DbAudioPart[]) {
+  useAppStore.setState({
+    selectedSessionId: "s-remote",
+    activeSessionId: null,
+    viewSession: makeSession({
+      status: "completed",
+      recording_device_id: "PEER",
+    }),
+    viewSessionSegments: [makeSegment("g1", "recorded on the peer")],
+    viewSessionParts: parts,
+    sessions: [],
+    syncStatus: syncStatus(),
+  });
+}
+
+describe("NoteDetailView audio availability (honest player rendering)", () => {
+  it("renders a disabled control + 'Audio is on <label>' when the file is absent", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    expect(await screen.findByText("Audio is on Windows")).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: "Audio unavailable" });
+    expect(btn).toBeDisabled();
+    // The transcript still renders read-through; only the play affordance is
+    // withheld.
+    expect(screen.getByText("recorded on the peer")).toBeInTheDocument();
+  });
+
+  it("labels an unknown recording device 'another device'", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    openCompleted([makePart()]);
+    useAppStore.setState({
+      viewSession: makeSession({
+        status: "completed",
+        recording_device_id: "GHOST",
+      }),
+    });
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(
+      await screen.findByText("Audio is on another device"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the normal player (no unavailable copy) when the file is present", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([true]);
+    openCompleted([makePart({ file_path: "/local/audio/s-remote.0.wav" })]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() =>
+      expect(commands.audioFilesExist).toHaveBeenCalledWith([
+        "/local/audio/s-remote.0.wav",
+      ]),
+    );
+    expect(screen.queryByText(/Audio is on/)).not.toBeInTheDocument();
   });
 });

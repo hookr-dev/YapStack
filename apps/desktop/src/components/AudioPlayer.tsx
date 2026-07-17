@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { toast } from "sonner";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -48,6 +49,13 @@ export function AudioPlayer({
   const lastEmitRef = useRef(0);
   const pendingSeekRef = useRef<number | null>(null);
   const wantPlayingAfterSwapRef = useRef(false);
+
+  // Surface playback failures to the user instead of swallowing them to the
+  // console. The common cause is a missing/unreadable file (e.g. audio that
+  // never reached this device); keep the copy factual, no stack traces.
+  const surfacePlaybackError = useCallback(() => {
+    toast.error("Couldn't play audio — file missing or unreadable");
+  }, []);
 
   const safePartIndex = Math.min(partIndex, Math.max(parts.length - 1, 0));
   const activePart = parts[safePartIndex];
@@ -190,8 +198,8 @@ export function AudioPlayer({
       setIsPlaying(false);
       onPlayStateChange?.(false);
     } else {
-      audio.play().catch((e) => {
-        console.error("Audio playback failed:", e);
+      audio.play().catch(() => {
+        surfacePlaybackError();
         setIsPlaying(false);
         onPlayStateChange?.(false);
       });
@@ -228,6 +236,7 @@ export function AudioPlayer({
         onTimeUpdate?.(clamped);
         if (wantPlay && audio.paused) {
           audio.play().catch(() => {
+            surfacePlaybackError();
             setIsPlaying(false);
             onPlayStateChange?.(false);
           });
@@ -242,6 +251,7 @@ export function AudioPlayer({
       isPlaying,
       onTimeUpdate,
       onPlayStateChange,
+      surfacePlaybackError,
     ],
   );
 
