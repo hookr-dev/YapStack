@@ -1,8 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Play } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Play, X, RefreshCw, AlertTriangle } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { commands } from "@/lib/tauri";
+import {
+  deriveTrackFetch,
+  formatFetchProgress,
+  syncCommands,
+  type AudioPartPrepare,
+  type TrackFetch,
+} from "@/lib/sync";
 import { SessionHeader } from "@/components/SessionHeader";
 import { ChatView } from "@/components/ChatView";
 import { NoteEditor } from "@/components/NoteEditor";
@@ -14,7 +21,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { canResumeSession, getSession, type DbSession } from "@/lib/db";
+import { canResumeSession, getSession, type DbSession, type DbAudioPart } from "@/lib/db";
 import type { AudioPart } from "@/components/AudioPlayer";
 import {
   createSessionSources,
@@ -97,6 +104,135 @@ export function selectAudioAvailability(
   return allPresent
     ? { playableParts: parts, unavailable: false }
     : { playableParts: [], unavailable: true };
+}
+
+/**
+ * Assemble the ordered player parts from the raw part rows, this device's on-disk presence
+ * (`presentFlags`, aligned to `rawParts`; `null` = optimistic/unchecked), and any fetched
+ * cache paths (`cacheByPart`, part id → decrypted cache file). A part's src resolves in D2
+ * order: locally present → `file_path` (same-device fast path); else fetched → the cache
+ * path; else `""` (unresolved). `allPlayable` is the all-or-nothing gate — every part must
+ * resolve before the timeline (which seeks by global time) is honest. Pure & unit-testable.
+ */
+export function assembleTrack(
+  rawParts: DbAudioPart[],
+  presentFlags: boolean[] | null,
+  cacheByPart: Record<string, string>,
+  toStreamUrl: (filePath: string) => string,
+): { parts: AudioPart[]; allPlayable: boolean } {
+  const aligned = presentFlags && presentFlags.length === rawParts.length ? presentFlags : null;
+  const parts = rawParts.map((p, i) => {
+    const present = aligned ? aligned[i] !== false : true;
+    const cache = cacheByPart[p.id];
+    const src = present
+      ? toStreamUrl(p.file_path)
+      : cache
+        ? toStreamUrl(cache)
+        : "";
+    return { src, duration: p.duration_seconds };
+  });
+  const allPlayable = rawParts.length > 0 && parts.every((pp) => pp.src !== "");
+  return { parts, allPlayable };
+}
+
+/**
+ * The honest missing-audio bar for a synced session whose bytes are not on this device (S3).
+ * Renders one of: the classic disabled "audio is on <device>" (sync off — nothing to fetch);
+ * an enabled Fetch affordance (idle); a "Fetching N%" bar with cancel; or a terminal
+ * error/on-device state. Never silent. Pure presentational — all wiring is passed in.
+ */
+function AudioFetchBar({
+  deviceLabel,
+  syncEnabled,
+  started,
+  track,
+  onFetch,
+  onCancel,
+  onRetry,
+}: {
+  deviceLabel: string;
+  syncEnabled: boolean;
+  started: boolean;
+  track: TrackFetch | null;
+  onFetch: () => void;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const barCls =
+    "flex items-center gap-3 border-b px-4 py-2 text-muted-foreground";
+
+  // Sync off (or no relay): the audio can only be fetched via sync — stay honest & disabled.
+  if (!syncEnabled) {
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Audio is not on this device">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel}</span>
+      </div>
+    );
+  }
+
+  // Not started yet: offer to fetch it from the relay.
+  if (!started || !track) {
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" onClick={onFetch} aria-label="Fetch and play audio" title="Fetch audio from sync">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel} — click to fetch</span>
+      </div>
+    );
+  }
+
+  if (track.kind === "fetching") {
+    return (
+      <div className={barCls}>
+        <span className="text-xs tabular-nums">{formatFetchProgress(track.percent)}</span>
+        <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
+          <div className="h-full bg-primary transition-[width]" style={{ width: `${track.percent}%` }} />
+        </div>
+        <Button variant="ghost" size="icon-xs" onClick={onCancel} aria-label="Cancel fetch" title="Cancel">
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
+  if (track.kind === "on_device") {
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Not yet backed up to sync">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel}</span>
+      </div>
+    );
+  }
+
+  if (track.kind === "verification_failed") {
+    return (
+      <div className={barCls}>
+        <AlertTriangle className="h-4 w-4 text-amber-500" />
+        <span className="text-xs">Audio failed verification</span>
+      </div>
+    );
+  }
+
+  // ready shouldn't reach here (the player renders instead) — guard for exhaustiveness.
+  if (track.kind === "ready") return null;
+
+  // unreachable / error → surface verbatim + offer retry.
+  const message = track.kind === "unreachable" ? "Can't reach sync server" : track.message;
+  return (
+    <div className={barCls}>
+      <AlertTriangle className="h-4 w-4 text-amber-500" />
+      <span className="min-w-0 flex-1 truncate text-xs" title={message}>{message}</span>
+      <Button variant="ghost" size="icon-xs" onClick={onRetry} aria-label="Retry fetch" title="Retry">
+        <RefreshCw className="h-4 w-4" />
+      </Button>
+    </div>
+  );
 }
 
 export function NoteDetailView() {
@@ -265,6 +401,90 @@ export function NoteDetailView() {
     };
   }, [partPaths]);
 
+  // ---- S3 fetch-on-demand playback ----
+  // When a synced session's audio is missing locally but the relay may hold it, the user
+  // fetches on demand (D3): click play → GET → decrypt-to-cache → play, with progress +
+  // cancel. Single-flight coalescing lives in Rust; here we POLL `audio_prepare_part` per
+  // missing part and aggregate to one honest track state.
+  const rawParts = useMemo(
+    () => (isActiveSession ? activeSessionParts : viewSessionParts),
+    [isActiveSession, activeSessionParts, viewSessionParts],
+  );
+  const syncEnabled = !!syncStatus?.syncEnabled;
+  const missingPartIds = useMemo(() => {
+    if (!partsExist || partsExist.length !== rawParts.length) return [];
+    return rawParts.filter((_, i) => partsExist[i] === false).map((p) => p.id);
+  }, [rawParts, partsExist]);
+  const [prepareStates, setPrepareStates] = useState<Record<string, AudioPartPrepare>>({});
+  const [fetchStarted, setFetchStarted] = useState(false);
+  const [fetchNonce, setFetchNonce] = useState(0);
+  // A stable key for the missing-set so effects/handlers don't churn on array identity.
+  const missingKey = missingPartIds.join(",");
+  const missingRef = useRef(missingPartIds);
+  missingRef.current = missingPartIds;
+
+  // Reset the fetch flow whenever the track changes (session switch / parts reload).
+  useEffect(() => {
+    setFetchStarted(false);
+    setPrepareStates({});
+  }, [missingKey]);
+
+  // Poll the fetch while it is in flight; stop on any terminal state.
+  useEffect(() => {
+    if (!fetchStarted || !syncEnabled) return;
+    const ids = missingRef.current;
+    if (ids.length === 0) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      const results = await Promise.all(
+        ids.map(async (id): Promise<[string, AudioPartPrepare]> => {
+          try {
+            return [id, await syncCommands.prepareAudioPart(id)];
+          } catch (e) {
+            return [id, { state: "error", message: String(e) }];
+          }
+        }),
+      );
+      if (cancelled) return;
+      const next: Record<string, AudioPartPrepare> = {};
+      for (const [id, st] of results) next[id] = st;
+      setPrepareStates(next);
+      const track = deriveTrackFetch(ids.map((id) => next[id]));
+      if (track.kind === "fetching") timer = setTimeout(() => void tick(), 600);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [fetchStarted, syncEnabled, missingKey, fetchNonce]);
+
+  const startFetch = useCallback(() => {
+    setPrepareStates({});
+    setFetchStarted(true);
+    setFetchNonce((n) => n + 1);
+  }, []);
+  const cancelFetch = useCallback(() => {
+    missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
+    setFetchStarted(false);
+    setPrepareStates({});
+  }, []);
+  const retryFetch = useCallback(() => {
+    missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
+    setPrepareStates({});
+    setFetchStarted(true);
+    setFetchNonce((n) => n + 1);
+  }, []);
+
+  const cacheByPart = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const [id, st] of Object.entries(prepareStates)) {
+      if (st.state === "ready") out[id] = st.path;
+    }
+    return out;
+  }, [prepareStates]);
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -275,20 +495,26 @@ export function NoteDetailView() {
   const isEditable = isActiveSession || session.status === "completed";
   const isManual = session.session_type === "manual";
   const isTranscription = !isManual;
-  const partsForPlayer: AudioPart[] = (
-    isActiveSession ? activeSessionParts : viewSessionParts
-  ).map((p) => ({
-    src: audioStreamUrl(p.file_path),
-    duration: p.duration_seconds,
-  }));
-  const hasAudio = partsForPlayer.length > 0;
-  const audioAvailability = selectAudioAvailability(partsForPlayer, partsExist);
-  // `hasAudio` = the session claims audio parts; `audioPlayable` = those files
-  // are actually present here. When parts exist but the files don't, we render
-  // an honest unavailable bar and withhold every playback affordance
-  // (transcript-timestamp seeking included, since there is no audio element).
-  const audioMissing = hasAudio && audioAvailability.unavailable;
-  const audioPlayable = hasAudio && !audioAvailability.unavailable;
+  // D2-ordered assembly: local file_path for present parts, fetched cache path for the rest.
+  const assembled = assembleTrack(rawParts, partsExist, cacheByPart, audioStreamUrl);
+  const partsForPlayer: AudioPart[] = assembled.parts;
+  const hasAudio = rawParts.length > 0;
+  // Aggregate fetch state across the MISSING parts (all-or-nothing: the timeline seeks by
+  // global time, so every part must resolve before we render the player).
+  const trackFetch: TrackFetch | null =
+    fetchStarted && missingPartIds.length > 0
+      ? deriveTrackFetch(
+          missingPartIds.map(
+            (id) =>
+              prepareStates[id] ?? { state: "fetching", received: 0, total: 0 },
+          ),
+        )
+      : null;
+  // `audioPlayable` = every part has a resolved src (local or freshly fetched). When parts
+  // are missing and not (yet) fetched we render the honest fetch/unavailable bar and withhold
+  // every playback affordance (transcript-timestamp seeking included).
+  const audioPlayable = hasAudio && assembled.allPlayable;
+  const audioMissing = hasAudio && missingPartIds.length > 0 && !assembled.allPlayable;
   const audioDeviceLabel =
     syncStatus?.roster.find(
       (r) => r.fingerprint === session.recording_device_id,
@@ -367,23 +593,20 @@ export function NoteDetailView() {
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} />
         {audioMissing ? (
-          // Metadata synced from another device but the audio bytes did not.
-          // Distinct unavailable state: disabled control + factual attribution.
-          <div className="flex items-center gap-3 border-b px-4 py-2 text-muted-foreground">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              disabled
-              aria-label="Audio unavailable"
-              title="Audio is not on this device"
-            >
-              <Play className="h-4 w-4" />
-            </Button>
-            <span className="text-xs">Audio is on {audioDeviceLabel}</span>
-          </div>
+          // Metadata synced from another device but the audio bytes did not. S3: offer
+          // fetch-on-demand (progress + cancel) instead of a dead disabled control.
+          <AudioFetchBar
+            deviceLabel={audioDeviceLabel}
+            syncEnabled={syncEnabled}
+            started={fetchStarted}
+            track={trackFetch}
+            onFetch={startFetch}
+            onCancel={cancelFetch}
+            onRetry={retryFetch}
+          />
         ) : hasAudio ? (
           <AudioPlayer
-            parts={audioAvailability.playableParts}
+            parts={partsForPlayer}
             onTimeUpdate={setPlaybackTime}
             onPlayStateChange={setIsPlaying}
             onResume={

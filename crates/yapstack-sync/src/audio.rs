@@ -26,13 +26,22 @@
 //!
 //! Deleted-part entries are dropped SILENTLY (not surfaced as errors), per D9.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
 use crate::transport::SyncTransport;
 use crate::SyncError;
-use yapstack_crypto::audio_stream::{seal_blob, AudioIdentity};
+use yapstack_crypto::audio_stream::{open_blob, seal_blob, AudioIdentity};
+
+/// Filename prefix for the encrypted download temp files the fetch path writes (S3). A
+/// distinct prefix (separate from the upload [`SEAL_TEMP_PREFIX`]) lets a startup sweep
+/// reclaim a partial download a crash left behind WITHOUT ever touching a file it did not
+/// create.
+pub const FETCH_TEMP_PREFIX: &str = "yapstack-audio-fetch-";
 
 /// Filename prefix for the encrypted seal temp files the uploader writes (advisory A3).
 /// A distinct, unambiguous prefix makes an orphaned temp (left by a crash mid-seal)
@@ -246,6 +255,39 @@ where
             report.enqueued += 1;
         }
     }
+
+    // S3 dictation fold-in: dictation audio has NO session_audio_parts row (the synthetic
+    // dictation session_id has no `sessions` row, so the finalize path skips part
+    // persistence). Its part identity is the dictation_history row's own UUID, with the AAD
+    // `session_id` self-referential (the same value used at enqueue-on-save). Walk those rows
+    // too so every dictation WAV that exists on THIS device becomes upload debt — the
+    // server-completeness invariant covers dictation, not only session recordings.
+    if table_exists(conn, "dictation_history") {
+        let mut dstmt = conn.prepare(
+            "SELECT id, wav_file_path FROM dictation_history \
+             WHERE wav_file_path IS NOT NULL AND wav_file_path <> ''",
+        )?;
+        let drows =
+            dstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut dparts: Vec<(String, String)> = Vec::new();
+        for row in drows {
+            dparts.push(row?);
+        }
+        drop(dstmt);
+        for (dict_id, file_path) in dparts {
+            report.examined += 1;
+            if !file_exists(&file_path) {
+                report.missing_file += 1;
+                continue;
+            }
+            // session_id == part_id (self): dictation has no owning session; the identity is
+            // immutable so upload and fetch derive the SAME AAD regardless of later linking.
+            if enqueue(conn, &dict_id, &file_path, &dict_id, PRIORITY_BACKFILL)? {
+                report.enqueued += 1;
+            }
+        }
+    }
+
     // Record completion (a timestamp; presence is the "walk ran" signal — re-runnable).
     crate::state::set_meta(conn, WALK_DONE_KEY, &chrono_now())?;
     Ok(report)
@@ -412,15 +454,42 @@ fn delete_entry(conn: &Connection, part_id: &str) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Whether the part row still exists in `session_audio_parts` (a deleted part → drop the
-/// queue entry silently, D9).
-fn part_row_exists(conn: &Connection, part_id: &str) -> Result<bool, SyncError> {
+/// Whether a table exists (used to make the dictation fold-in tolerant of older schemas /
+/// engine test DBs that predate `dictation_history`).
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Whether the audio part's SOURCE row still exists (a deleted source → drop the queue entry
+/// silently, D9). An audio part is identified by its own UUID, which is EITHER a
+/// `session_audio_parts.id` (session recordings) OR a `dictation_history.id` (dictation
+/// audio — S3 dictation data-model fold-in: dictation WAVs have no `session_audio_parts`
+/// row, so their `dictation_history.id` IS the part identity, self-referential as the AAD
+/// `session_id`). Checking both tables keeps the drain, the fetch path, and the deleted-part
+/// drop consistent across the two audio sources.
+fn part_source_exists(conn: &Connection, part_id: &str) -> Result<bool, SyncError> {
     let n: i64 = conn.query_row(
-        "SELECT count(*) FROM session_audio_parts WHERE id=?1",
+        "SELECT EXISTS(SELECT 1 FROM session_audio_parts WHERE id=?1)",
         [part_id],
         |r| r.get(0),
     )?;
-    Ok(n > 0)
+    if n > 0 {
+        return Ok(true);
+    }
+    if table_exists(conn, "dictation_history") {
+        let n: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dictation_history WHERE id=?1)",
+            [part_id],
+            |r| r.get(0),
+        )?;
+        return Ok(n > 0);
+    }
+    Ok(false)
 }
 
 /// Process ONE queued blob (the one-in-flight throttle): pick the next entry, seal its
@@ -447,8 +516,9 @@ pub async fn drain_one<T: SyncTransport + ?Sized>(
         return Ok(DrainStep::Idle);
     };
 
-    // Deleted-part entries are dropped SILENTLY (D9).
-    if !part_row_exists(conn, &entry.part_id)? {
+    // Deleted-part entries are dropped SILENTLY (D9). "Part row" here is the source row in
+    // EITHER session_audio_parts or dictation_history (S3 dictation fold-in).
+    if !part_source_exists(conn, &entry.part_id)? {
         delete_entry(conn, &entry.part_id)?;
         return Ok(DrainStep::DroppedDeleted {
             part_id: entry.part_id,
@@ -589,4 +659,227 @@ fn chrono_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     now.to_string()
+}
+
+// ===================== Fetch-on-demand playback (S3, D2/D3) =====================
+//
+// When a synced session/dictation is opened on a peer, the audio bytes are not local
+// (`file_path` is the SOURCE device's absolute path). The player resolves a part in D2
+// order — (1) local fetch cache, (2) same-device legacy `file_path`, (3) fetch — and this
+// module owns step 3: stream the encrypted blob down (O(frame) memory), streaming-decrypt it
+// (`open_blob`, O(chunk) memory) into the keep-until-clear cache, and never hold the whole
+// blob in memory. One in-flight fetch per part is enforced by [`FetchRegistry`] (single-flight
+// coalescing); concurrent player views subscribe to the SAME [`FetchProgress`].
+
+/// Live, pollable progress + cancel signal for a single in-flight fetch. Shared (behind an
+/// `Arc` in the [`FetchRegistry`] slot) so every view watching the same part reads one set of
+/// counters and a single cancel toggles the one download. All fields are lock-free atomics.
+#[derive(Debug, Default)]
+pub struct FetchProgress {
+    /// Encrypted bytes downloaded so far.
+    pub received: AtomicU64,
+    /// Server-declared content-length (0 until known / unknown).
+    pub total: AtomicU64,
+    /// Cooperative cancel: the transport aborts the stream at the next frame boundary.
+    pub cancel: AtomicBool,
+}
+
+impl FetchProgress {
+    /// `(received, total)` for the "Fetching N%" bar; `total == 0` means not yet known.
+    #[must_use]
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.received.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+    /// Request cancellation of the in-flight download (idempotent).
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    /// Whether a cancel has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Terminal classification of a fetch attempt. Transport-unreachable and decrypt/verification
+/// failures ride as [`SyncError`] (`is_network()` / `SyncError::Crypto`) so the desktop can map
+/// them to distinct honest player states; the outcomes here are the non-error terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchResult {
+    /// The decrypted audio is now in the cache (or already was) — playable.
+    Fetched,
+    /// The relay has no blob for this part yet (row converged before its audio uploaded, or
+    /// the source device never uploaded it). Stays the honest "audio is on <device>" state.
+    NotOnServer,
+    /// The caller cancelled the download mid-flight; the partial file was discarded.
+    Cancelled,
+}
+
+/// Resolve a part in D2 order for the fetch layer: a present cache file is an immediate hit
+/// (step 1) and short-circuits any network work. `cache_path` is this device's cache entry
+/// for the part (keyed by the caller — see the desktop's cache-key choice). Pure filesystem
+/// check so the resolution order is unit-testable.
+#[must_use]
+pub fn cache_hit(cache_path: &Path) -> bool {
+    cache_path.is_file()
+}
+
+/// Fetch one blob to the local cache (fetch-path step 3). Streams the encrypted blob to a
+/// temp file (progress-reported, cancellable), then streaming-decrypts it (`open_blob`,
+/// verifying the identity wrap AAD for THIS `part_id`/`session_id`/`epoch`) into a temp in the
+/// cache dir, and atomically promotes it to `cache_path`. Never holds the whole blob in
+/// memory. Idempotent under coalescing: a pre-existing cache file returns [`FetchResult::Fetched`]
+/// without touching the network (D2 step 1).
+///
+/// # Errors
+/// - [`SyncError::Network`] — relay unreachable (desktop → "can't reach sync server").
+/// - [`SyncError::Crypto`] — decrypt/verification failure (desktop → "audio failed
+///   verification"; a tamper signal, logged at warn per the spec posture).
+/// - other [`SyncError`] — transport/IO faults, surfaced verbatim.
+pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
+    transport: &T,
+    vault_key: &[u8; 32],
+    id: &AudioIdentity,
+    part_id: &str,
+    temp_dir: &Path,
+    cache_path: &Path,
+    progress: &FetchProgress,
+) -> Result<FetchResult, SyncError> {
+    // D2 step 1: a present cache file wins outright — no network, no re-decrypt.
+    if cache_hit(cache_path) {
+        return Ok(FetchResult::Fetched);
+    }
+    if progress.is_cancelled() {
+        return Ok(FetchResult::Cancelled);
+    }
+    std::fs::create_dir_all(temp_dir)
+        .map_err(|e| SyncError::Transport(format!("audio fetch temp dir: {e}")))?;
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SyncError::Transport(format!("audio cache dir: {e}")))?;
+    }
+
+    // 1. Stream the ENCRYPTED blob to a temp file (O(frame) memory, progress-reported).
+    let enc_tmp = tempfile::Builder::new()
+        .prefix(FETCH_TEMP_PREFIX)
+        .tempfile_in(temp_dir)
+        .map_err(|e| SyncError::Transport(format!("audio fetch temp file: {e}")))?;
+    let available = match transport
+        .get_audio_streaming(part_id, enc_tmp.path(), progress)
+        .await
+    {
+        Ok(a) => a,
+        Err(SyncError::Transport(m)) if m == crate::transport::FETCH_CANCELLED => {
+            return Ok(FetchResult::Cancelled);
+        }
+        Err(e) => return Err(e),
+    };
+    if !available {
+        return Ok(FetchResult::NotOnServer);
+    }
+
+    // 2. Streaming-decrypt (identity-verified) → a temp in the cache dir → atomic rename. A
+    //    decrypt/verification failure leaves NO cache file (the temp is dropped), so a tamper
+    //    never poisons the cache and a retry re-downloads cleanly.
+    let cache_dir = cache_path
+        .parent()
+        .ok_or_else(|| SyncError::Transport("audio cache path has no parent".into()))?;
+    let dec_tmp = tempfile::Builder::new()
+        .prefix(FETCH_TEMP_PREFIX)
+        .tempfile_in(cache_dir)
+        .map_err(|e| SyncError::Transport(format!("audio cache temp: {e}")))?;
+    {
+        let src = std::fs::File::open(enc_tmp.path())
+            .map_err(|e| SyncError::Transport(format!("open fetched blob: {e}")))?;
+        let mut w = std::io::BufWriter::new(
+            std::fs::File::create(dec_tmp.path())
+                .map_err(|e| SyncError::Transport(format!("create cache temp: {e}")))?,
+        );
+        // CryptoError → SyncError::Crypto (verification/tamper); IO wrapped by open_blob.
+        open_blob(vault_key, id, src, &mut w)?;
+        use std::io::Write;
+        w.flush()
+            .map_err(|e| SyncError::Transport(format!("flush cache temp: {e}")))?;
+    }
+    dec_tmp
+        .persist(cache_path)
+        .map_err(|e| SyncError::Transport(format!("promote cache file: {e}")))?;
+    Ok(FetchResult::Fetched)
+}
+
+/// A single-flight fetch slot: the shared [`FetchProgress`] every subscriber polls, plus the
+/// terminal outcome once the one download finishes. `Ok(FetchResult)` on a clean terminal;
+/// `Err(code)` for the error terminals, where `code` is a stable classifier
+/// (`"unreachable"` / `"verification"` / `"error:<detail>"`) the desktop maps to a player
+/// state — kept a `String` so this engine type needs no desktop-specific error enum.
+#[derive(Debug, Default)]
+pub struct FetchSlot {
+    pub progress: FetchProgress,
+    outcome: Mutex<Option<Result<FetchResult, String>>>,
+}
+
+impl FetchSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    /// Record the terminal outcome (called once by the fetch worker).
+    pub fn finish(&self, outcome: Result<FetchResult, String>) {
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    }
+    /// The terminal outcome, or `None` while the fetch is still in flight.
+    #[must_use]
+    pub fn outcome(&self) -> Option<Result<FetchResult, String>> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// Single-flight registry: at most ONE in-flight fetch per `part_id`, so concurrent player
+/// views coalesce onto the same download and share its [`FetchProgress`] (the S3
+/// coalescing requirement). The desktop owns one process-wide instance; the fetch execution
+/// (thread + runtime + transport) is the desktop's, keeping this a pure coordination type.
+#[derive(Default)]
+pub struct FetchRegistry {
+    slots: Mutex<HashMap<String, Arc<FetchSlot>>>,
+}
+
+impl FetchRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Get the existing slot for `part_id`, or create one. Returns `(slot, is_new)`: only the
+    /// caller that receives `is_new == true` should START the download; every other caller
+    /// subscribes to the returned slot's progress/outcome (coalescing).
+    pub fn get_or_create(&self, part_id: &str) -> (Arc<FetchSlot>, bool) {
+        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.get(part_id) {
+            return (s.clone(), false);
+        }
+        let s = FetchSlot::new();
+        g.insert(part_id.to_string(), s.clone());
+        (s, true)
+    }
+    /// The current slot for `part_id`, if one exists.
+    #[must_use]
+    pub fn get(&self, part_id: &str) -> Option<Arc<FetchSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(part_id)
+            .cloned()
+    }
+    /// Drop the slot (cancel/reset). A subsequent [`get_or_create`] starts a fresh fetch — the
+    /// retry seam after an error terminal and the reset after a user cancel.
+    pub fn remove(&self, part_id: &str) {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(part_id);
+    }
 }

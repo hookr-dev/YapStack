@@ -78,7 +78,34 @@ pub trait SyncTransport: Send + Sync {
     ) -> Result<bool, SyncError> {
         Err(SyncError::Transport("audio get not supported".into()))
     }
+
+    /// Fetch the blob for `part_id` to `dest_path` (S3 on-demand playback), reporting live
+    /// download progress into `progress` (`received` bytes and the server-declared `total`
+    /// content-length) and honouring cooperative cancellation (`progress.cancel`). Same
+    /// availability contract as [`get_audio`]: `Ok(false)` = blob not yet on the relay
+    /// (HTTP 404), `Ok(true)` = completed download. A caller-requested cancel aborts the
+    /// stream, removes the partial file, and returns [`SyncError::Transport`] carrying
+    /// [`FETCH_CANCELLED`] so the fetch layer can classify it as a user cancel (not an
+    /// error) WITHOUT a new shared-error variant. The body is streamed frame-by-frame —
+    /// never buffered whole (O(frame) memory, matching the upload path's discipline).
+    ///
+    /// Default: fall back to the coarse [`get_audio`] (no progress/cancel granularity), so a
+    /// transport that never plays audio still compiles.
+    async fn get_audio_streaming(
+        &self,
+        part_id: &str,
+        dest_path: &std::path::Path,
+        _progress: &crate::audio::FetchProgress,
+    ) -> Result<bool, SyncError> {
+        self.get_audio(part_id, dest_path).await
+    }
 }
+
+/// Cancellation sentinel carried in a [`SyncError::Transport`] when a streaming fetch is
+/// aborted via [`crate::audio::FetchProgress::request_cancel`]. Kept a string marker rather
+/// than a new [`SyncError`] variant so the fetch layer can classify a user cancel distinctly
+/// without touching the shared error enum.
+pub const FETCH_CANCELLED: &str = "fetch cancelled by caller";
 
 // ---- snapshot endpoint wire DTOs (client side) --------------------------------
 //
@@ -390,6 +417,61 @@ impl SyncTransport for HttpTransport {
             .map_err(|e| SyncError::Transport(format!("flush audio cache file: {e}")))?;
         Ok(true)
     }
+
+    async fn get_audio_streaming(
+        &self,
+        part_id: &str,
+        dest_path: &std::path::Path,
+        progress: &crate::audio::FetchProgress,
+    ) -> Result<bool, SyncError> {
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncWriteExt;
+
+        let resp = self
+            .client
+            .get(format!("{}/audio/part/{}", self.base_url, part_id))
+            .bearer_auth(self.bearer())
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        // Row present but blob not yet uploaded on the source device → not-yet-available.
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let resp = check_auth(resp)?; // 401 → refreshable; other non-2xx → error_for_status
+
+        // Publish the total up front (drives the "Fetching N%" bar) when the relay/storage
+        // declares a content-length; 0 stays "unknown".
+        if let Some(total) = resp.content_length() {
+            progress.total.store(total, Ordering::Relaxed);
+        }
+
+        let mut file = tokio::fs::File::create(dest_path)
+            .await
+            .map_err(|e| SyncError::Transport(format!("create audio fetch temp: {e}")))?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            // Cooperative cancel: checked BEFORE each frame write so a large in-flight fetch
+            // stops promptly, discarding the partial file (never a truncated cache entry).
+            if progress.cancel.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Err(SyncError::Transport(FETCH_CANCELLED.into()));
+            }
+            let chunk = chunk?; // reqwest::Error → SyncError::Http
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| SyncError::Transport(format!("write audio fetch temp: {e}")))?;
+            progress
+                .received
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+        file.flush()
+            .await
+            .map_err(|e| SyncError::Transport(format!("flush audio fetch temp: {e}")))?;
+        Ok(true)
+    }
 }
 
 // --------------------------------------------------------------- mock relay
@@ -594,6 +676,38 @@ impl SyncTransport for MockRelay {
         };
         std::fs::write(dest_path, &bytes)
             .map_err(|e| SyncError::Transport(format!("mock get write: {e}")))?;
+        Ok(true)
+    }
+
+    async fn get_audio_streaming(
+        &self,
+        part_id: &str,
+        dest_path: &std::path::Path,
+        progress: &crate::audio::FetchProgress,
+    ) -> Result<bool, SyncError> {
+        use std::sync::atomic::Ordering;
+        let bytes = {
+            let g = self.inner.lock().unwrap();
+            match g
+                .audio_mappings
+                .get(part_id)
+                .and_then(|h| g.audio_present.get(h))
+            {
+                Some(b) => b.clone(),
+                None => return Ok(false), // mapping unknown or object not yet uploaded
+            }
+        };
+        // Faithfully model the streaming transport: declare the total, then honour a cancel
+        // requested before the (single) frame lands, and report received bytes on success.
+        progress.total.store(bytes.len() as u64, Ordering::Relaxed);
+        if progress.cancel.load(Ordering::Relaxed) {
+            return Err(SyncError::Transport(FETCH_CANCELLED.into()));
+        }
+        std::fs::write(dest_path, &bytes)
+            .map_err(|e| SyncError::Transport(format!("mock get write: {e}")))?;
+        progress
+            .received
+            .store(bytes.len() as u64, Ordering::Relaxed);
         Ok(true)
     }
 }

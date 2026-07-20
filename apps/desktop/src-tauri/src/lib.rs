@@ -393,6 +393,9 @@ pub fn run() {
             sync::sync_sign_out,
             sync::audio_enqueue_session,
             sync::audio_retry_failed_uploads,
+            sync::audio_enqueue_dictation,
+            sync::audio_prepare_part,
+            sync::audio_cancel_part,
         ]);
 
     #[cfg(debug_assertions)]

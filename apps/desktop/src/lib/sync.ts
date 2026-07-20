@@ -229,7 +229,93 @@ export const syncCommands = {
    *  uploader retries it next cycle. Resolves with the count re-armed. */
   retryFailedAudioUploads: (): Promise<number> =>
     invoke("audio_retry_failed_uploads"),
+
+  /** S3 fetch-on-demand: resolve a missing part in D2 order (cache → fetch), joining the
+   *  single in-flight download (one per part; concurrent views coalesce). Poll this while a
+   *  track is fetching; it returns progress or a terminal state. `NotOnServer` stays the
+   *  honest "audio is on <device>" case. */
+  prepareAudioPart: (partId: string): Promise<AudioPartPrepare> =>
+    invoke("audio_prepare_part", { partId }),
+
+  /** S3: cancel an in-flight fetch AND reset the part's slot (also the retry seam — a
+   *  subsequent `prepareAudioPart` starts a fresh download). */
+  cancelAudioPart: (partId: string): Promise<void> =>
+    invoke("audio_cancel_part", { partId }),
 };
+
+/**
+ * S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
+ * queue. Dictation audio has no `session_audio_parts` row; the part identity is the
+ * `dictation_history.id` itself. Mirrors {@link enqueueAudioForSession}: durable + idempotent
+ * + backfill-healed, so we never await or surface failures (absent on no-sync builds).
+ */
+export function enqueueAudioForDictation(dictationId: string): void {
+  if (!dictationId) return;
+  void invoke("audio_enqueue_dictation", { dictationId }).catch(() => {});
+}
+
+// ----- S3 fetch-on-demand playback state machine (pure, unit-tested) -----
+
+/** Per-part fetch state as reported by the Rust `audio_prepare_part` command (poll). */
+export type AudioPartPrepare =
+  | { state: "ready"; path: string }
+  | { state: "fetching"; received: number; total: number }
+  | { state: "not_on_server" }
+  | { state: "unreachable" }
+  | { state: "verification_failed" }
+  | { state: "error"; message: string };
+
+/**
+ * Aggregate track-level fetch state (a track = the ordered parts of ONE session/dictation).
+ * Playback is all-or-nothing (global-time seeking spans every part), so the track is only
+ * `ready` when every missing part is cached. Distinct honest terminals, never silent.
+ */
+export type TrackFetch =
+  | { kind: "ready" } // all (missing) parts are now local — build the player
+  | { kind: "fetching"; percent: number; received: number; total: number }
+  | { kind: "on_device" } // at least one part has no server copy — can't assemble here
+  | { kind: "unreachable" } // can't reach the sync server
+  | { kind: "verification_failed" } // a part failed to decrypt/verify (tamper signal)
+  | { kind: "error"; message: string };
+
+/**
+ * Reduce the per-part prepare states (of the MISSING parts only — locally-present parts are
+ * excluded by the caller) into one track state. Precedence puts the states that BLOCK
+ * assembly first: verification failure → unreachable → generic error → any part with no
+ * server copy (`on_device`) → still fetching → all ready. An empty input means nothing is
+ * missing, i.e. `ready`. Pure so the player and its tests share one source of truth.
+ */
+export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
+  if (parts.length === 0) return { kind: "ready" };
+  if (parts.some((p) => p.state === "verification_failed")) {
+    return { kind: "verification_failed" };
+  }
+  if (parts.some((p) => p.state === "unreachable")) return { kind: "unreachable" };
+  const err = parts.find((p) => p.state === "error");
+  if (err && err.state === "error") return { kind: "error", message: err.message };
+  // Any part with no server copy means the full track can never assemble here.
+  if (parts.some((p) => p.state === "not_on_server")) return { kind: "on_device" };
+  if (parts.some((p) => p.state === "fetching")) {
+    let received = 0;
+    let total = 0;
+    for (const p of parts) {
+      if (p.state === "fetching") {
+        received += Math.max(0, p.received);
+        total += Math.max(0, p.total);
+      }
+    }
+    const percent =
+      total > 0 ? Math.min(100, Math.max(0, Math.round((received / total) * 100))) : 0;
+    return { kind: "fetching", percent, received, total };
+  }
+  return { kind: "ready" };
+}
+
+/** "Fetching 42%" / "Fetching…" copy for the in-progress bar. */
+export function formatFetchProgress(percent: number): string {
+  if (!Number.isFinite(percent) || percent <= 0) return "Fetching…";
+  return `Fetching ${Math.min(100, Math.round(percent))}%`;
+}
 
 /**
  * S2 producer seam — FIRE-AND-FORGET enqueue of a finalized session's audio parts onto

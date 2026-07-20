@@ -4249,6 +4249,294 @@ pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> 
     Ok(n as u32)
 }
 
+/// S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
+/// queue (NORMAL priority). Dictation audio has no `session_audio_parts` row; the part
+/// identity IS the `dictation_history.id` (self-referential AAD `session_id`, matching the
+/// backfill walk + fetch path). Idempotent (INSERT-OR-IGNORE by part_id). No-op when sync is
+/// off. Returns 1 if newly enqueued, else 0.
+#[tauri::command]
+#[specta::specta]
+pub fn audio_enqueue_dictation(app: tauri::AppHandle, dictation_id: String) -> Result<u32, String> {
+    match load_session()? {
+        Some(s) if s.sync_enabled => {}
+        _ => return Ok(0),
+    }
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
+    let wav: Option<String> = conn
+        .query_row(
+            "SELECT wav_file_path FROM dictation_history \
+             WHERE id = ?1 AND wav_file_path IS NOT NULL AND wav_file_path <> ''",
+            [&dictation_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(wav) = wav else { return Ok(0) };
+    // session_id == part_id (self): dictation has no owning session.
+    match yapstack_sync::audio::enqueue_on_save(&conn, &dictation_id, &wav, &dictation_id) {
+        Ok(true) => Ok(1),
+        Ok(false) => Ok(0),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// ----- Fetch-on-demand playback (S3, D2/D3) -----
+//
+// The single-flight registry + fetch worker live here (the desktop owns the transport, the
+// vault key, and the cache dir); the coalescing/decrypt-to-cache primitives are the engine's
+// (`yapstack_sync::audio`). Player views POLL `audio_prepare_part` per missing part — it
+// resolves D2 order (cache hit → same-device path is handled FE-side via `audio_files_exist`
+// → fetch), joins/starts the single in-flight fetch, and reports progress or a terminal
+// state. `audio_cancel_part` cancels an in-flight fetch AND clears the slot (the retry seam).
+
+/// Process-wide single-flight fetch registry (one in-flight download per part_id).
+fn fetch_registry() -> &'static yapstack_sync::audio::FetchRegistry {
+    static CELL: OnceLock<yapstack_sync::audio::FetchRegistry> = OnceLock::new();
+    CELL.get_or_init(yapstack_sync::audio::FetchRegistry::new)
+}
+
+/// Keep-until-clear fetch cache dir (this device's dir, D2 — never the source device's path).
+fn fetch_cache_dir(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("audio-fetch-cache")
+}
+
+/// Encrypted-download scratch dir (beside the cache, on this device).
+fn fetch_temp_dir(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("audio-fetch-tmp")
+}
+
+/// Player-facing fetch state for one part (polled). Distinct honest states, never silent.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AudioPreparePartDto {
+    /// The decrypted audio is in the local cache (or was already local) — `path` is a
+    /// trusted absolute path the `audio-stream://` protocol serves.
+    Ready { path: String },
+    /// A download is in flight; `received`/`total` (bytes) drive the "Fetching N%" bar
+    /// (`total == 0` = not yet known).
+    Fetching { received: u64, total: u64 },
+    /// The relay has no blob for this part (source device hasn't uploaded it) — stays the
+    /// honest "audio is on <device>" state.
+    NotOnServer,
+    /// Can't reach the sync server (relay unreachable).
+    Unreachable,
+    /// The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
+    /// fetch worker). Distinct copy: "audio failed verification".
+    VerificationFailed,
+    /// Any other fetch/IO fault, surfaced verbatim (never auto-routed).
+    Error { message: String },
+}
+
+/// Parse a hyphenated- or simple-format UUID string into its 16 raw bytes for the crypto AAD.
+fn uuid16(s: &str) -> Result<[u8; 16], String> {
+    Uuid::parse_str(s)
+        .map(|u| *u.as_bytes())
+        .map_err(|_| format!("not a UUID: {s}"))
+}
+
+/// The part's owning-session id (for the AAD) + file extension, resolved from the local DB.
+/// Session recordings come from `session_audio_parts`; dictation audio's identity is its own
+/// `dictation_history.id` (self-referential session_id) — the S3 dictation fold-in.
+fn resolve_part_identity(conn: &rusqlite::Connection, part_id: &str) -> Option<(String, String)> {
+    if let Ok((session_id, format)) = conn.query_row(
+        "SELECT session_id, format FROM session_audio_parts WHERE id = ?1",
+        [part_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    ) {
+        let ext = if format.eq_ignore_ascii_case("mp3") {
+            "mp3"
+        } else {
+            "wav"
+        };
+        return Some((session_id, ext.to_string()));
+    }
+    if let Ok(wav) = conn.query_row(
+        "SELECT wav_file_path FROM dictation_history WHERE id = ?1",
+        [part_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        let ext = if wav.to_ascii_lowercase().ends_with(".mp3") {
+            "mp3"
+        } else {
+            "wav"
+        };
+        // session_id == part_id (self) — matches the enqueue + backfill dictation identity.
+        return Some((part_id.to_string(), ext.to_string()));
+    }
+    None
+}
+
+/// Build the player-facing DTO from a slot's live progress + terminal outcome. On a retryable
+/// error terminal (unreachable / other error) the slot is cleared so the NEXT poll after a
+/// user retry starts fresh; `Ready`/`NotOnServer`/`VerificationFailed` are stable terminals.
+fn slot_to_dto(
+    part_id: &str,
+    slot: &yapstack_sync::audio::FetchSlot,
+    cache_path: &Path,
+) -> AudioPreparePartDto {
+    use yapstack_sync::audio::FetchResult;
+    match slot.outcome() {
+        None => {
+            let (received, total) = slot.progress.snapshot();
+            AudioPreparePartDto::Fetching { received, total }
+        }
+        Some(Ok(FetchResult::Fetched)) => AudioPreparePartDto::Ready {
+            path: cache_path.to_string_lossy().into_owned(),
+        },
+        Some(Ok(FetchResult::NotOnServer)) => AudioPreparePartDto::NotOnServer,
+        Some(Ok(FetchResult::Cancelled)) => {
+            // A cancel leaves the slot idle; clear it so a replay starts a fresh fetch.
+            fetch_registry().remove(part_id);
+            AudioPreparePartDto::NotOnServer
+        }
+        Some(Err(code)) => {
+            let dto = match code.as_str() {
+                "unreachable" => AudioPreparePartDto::Unreachable,
+                "verification" => AudioPreparePartDto::VerificationFailed,
+                other => AudioPreparePartDto::Error {
+                    message: other.strip_prefix("error:").unwrap_or(other).to_string(),
+                },
+            };
+            // Verification is a stable terminal (re-download would fail identically); the
+            // transient errors clear so a manual retry re-attempts.
+            if !matches!(dto, AudioPreparePartDto::VerificationFailed) {
+                fetch_registry().remove(part_id);
+            }
+            dto
+        }
+    }
+}
+
+/// S3 fetch-on-demand entry point (polled per missing part). Resolves D2 order, joins the
+/// single in-flight fetch (starting it on the first call), and returns the current state.
+#[tauri::command]
+#[specta::specta]
+pub fn audio_prepare_part(
+    app: tauri::AppHandle,
+    part_id: String,
+) -> Result<AudioPreparePartDto, String> {
+    let session = match load_session()? {
+        Some(s) if s.sync_enabled => s,
+        // No server to fetch from → stays the honest on-device state.
+        _ => return Ok(AudioPreparePartDto::NotOnServer),
+    };
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let Some((session_id, ext)) = resolve_part_identity(&conn, &part_id) else {
+        return Err(format!("unknown audio part: {part_id}"));
+    };
+    drop(conn);
+
+    let cache_dir = fetch_cache_dir(&db_path);
+    let cache_path = cache_dir.join(format!("{part_id}.{ext}"));
+
+    // D2 step 1: a present cache file wins outright. Register the cache dir as trusted so the
+    // audio-stream:// handler serves it, then hand back the path.
+    if yapstack_sync::audio::cache_hit(&cache_path) {
+        crate::register_trusted_audio_dir(&app, &cache_dir);
+        return Ok(AudioPreparePartDto::Ready {
+            path: cache_path.to_string_lossy().into_owned(),
+        });
+    }
+
+    let (slot, is_new) = fetch_registry().get_or_create(&part_id);
+    if is_new {
+        // Start the ONE fetch for this part on a dedicated thread (a 599 MB download must not
+        // block the command runtime), sharing the slot's progress with every later poll.
+        let vault_key = match session.vault_key() {
+            Ok(k) => k,
+            Err(e) => {
+                fetch_registry().remove(&part_id);
+                return Err(e);
+            }
+        };
+        let id = yapstack_crypto::audio_stream::AudioIdentity {
+            tenant_id: *session.tenant_id.as_bytes(),
+            session_id: uuid16(&session_id)?,
+            part_id: uuid16(&part_id)?,
+            epoch: session.epoch,
+        };
+        let server_url = session.server_url.clone();
+        let bearer = session.bearer.clone();
+        let temp_dir = fetch_temp_dir(&db_path);
+        let cache_for_worker = cache_path.clone();
+        let part_for_worker = part_id.clone();
+        let slot_for_worker = slot.clone();
+        let app_for_worker = app.clone();
+        let cache_dir_for_worker = cache_dir.clone();
+        let spawn = std::thread::Builder::new()
+            .name("yapstack-audio-fetch".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        slot_for_worker.finish(Err(format!("error:runtime: {e}")));
+                        return;
+                    }
+                };
+                let transport = HttpTransport::new(server_url, bearer);
+                let result = rt.block_on(yapstack_sync::audio::fetch_blob_to_cache(
+                    &transport,
+                    &vault_key,
+                    &id,
+                    &part_for_worker,
+                    &temp_dir,
+                    &cache_for_worker,
+                    &slot_for_worker.progress,
+                ));
+                let terminal = match result {
+                    Ok(r) => Ok(r),
+                    Err(e) if e.is_network() => Err("unreachable".to_string()),
+                    Err(yapstack_sync::SyncError::Crypto(_)) => {
+                        tracing::warn!(
+                            "audio fetch: decrypt/verification failed for part {part_for_worker} \
+                             (tamper signal)"
+                        );
+                        Err("verification".to_string())
+                    }
+                    Err(e) => Err(format!("error:{e}")),
+                };
+                if matches!(terminal, Ok(yapstack_sync::audio::FetchResult::Fetched)) {
+                    crate::register_trusted_audio_dir(&app_for_worker, &cache_dir_for_worker);
+                }
+                slot_for_worker.finish(terminal);
+            });
+        if let Err(e) = spawn {
+            fetch_registry().remove(&part_id);
+            return Err(format!("audio fetch spawn failed: {e}"));
+        }
+    }
+    Ok(slot_to_dto(&part_id, &slot, &cache_path))
+}
+
+/// Cancel an in-flight fetch AND clear the part's slot (also the retry-reset seam: a
+/// subsequent `audio_prepare_part` starts a fresh download).
+#[tauri::command]
+#[specta::specta]
+pub fn audio_cancel_part(part_id: String) -> Result<(), String> {
+    if let Some(slot) = fetch_registry().get(&part_id) {
+        slot.progress.request_cancel();
+    }
+    fetch_registry().remove(&part_id);
+    Ok(())
+}
+
 // --- Relay auth ceremony (CRYPTO_SPEC §3/§6/§7). All key derivation is client-side;
 //     the client transmits only auth_key / recovery_auth_key + opaque wrapped blobs +
 //     the signed roster. Password / master_key / vault_key / recovery code never leave

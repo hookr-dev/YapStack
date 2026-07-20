@@ -32,6 +32,7 @@ import {
   NoteDetailView,
   isRemoteLiveSession,
   selectAudioAvailability,
+  assembleTrack,
 } from "./NoteDetailView";
 
 function makeSession(over: Partial<DbSession> = {}): DbSession {
@@ -265,6 +266,39 @@ function makePart(over: Partial<DbAudioPart> = {}): DbAudioPart {
   } as DbAudioPart;
 }
 
+describe("assembleTrack (S3 D2 src resolution)", () => {
+  const url = (p: string) => `stream://${p}`;
+  const p0 = makePart({ id: "p0", file_path: "/local/a.wav" });
+  const p1 = makePart({ id: "p1", part_index: 1, file_path: "/local/b.wav" });
+
+  it("uses local file_path for present parts (same-device fast path)", () => {
+    const r = assembleTrack([p0, p1], [true, true], {}, url);
+    expect(r.allPlayable).toBe(true);
+    expect(r.parts).toEqual([
+      { src: "stream:///local/a.wav", duration: 12 },
+      { src: "stream:///local/b.wav", duration: 12 },
+    ]);
+  });
+
+  it("stays optimistic (local) when presence is unchecked (null)", () => {
+    const r = assembleTrack([p0], null, {}, url);
+    expect(r.allPlayable).toBe(true);
+    expect(r.parts[0].src).toBe("stream:///local/a.wav");
+  });
+
+  it("uses the fetched cache path for a missing-but-cached part", () => {
+    const r = assembleTrack([p0, p1], [true, false], { p1: "/cache/p1.wav" }, url);
+    expect(r.allPlayable).toBe(true);
+    expect(r.parts[1].src).toBe("stream:///cache/p1.wav");
+  });
+
+  it("is not all-playable while a missing part has no cache yet", () => {
+    const r = assembleTrack([p0, p1], [true, false], {}, url);
+    expect(r.allPlayable).toBe(false);
+    expect(r.parts[1].src).toBe("");
+  });
+});
+
 function openCompleted(parts: DbAudioPart[]) {
   useAppStore.setState({
     selectedSessionId: "s-remote",
@@ -290,12 +324,31 @@ describe("NoteDetailView audio availability (honest player rendering)", () => {
       </TooltipProvider>,
     );
 
-    expect(await screen.findByText("Audio is on Windows")).toBeInTheDocument();
-    const btn = screen.getByRole("button", { name: "Audio unavailable" });
-    expect(btn).toBeDisabled();
-    // The transcript still renders read-through; only the play affordance is
-    // withheld.
+    // S3: with sync ENABLED the honest missing state offers fetch-on-demand (not a dead
+    // disabled control) — an enabled "fetch" affordance labelled by the source device.
+    expect(
+      await screen.findByText("Audio is on Windows — click to fetch"),
+    ).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: "Fetch and play audio" });
+    expect(btn).not.toBeDisabled();
+    // The transcript still renders read-through; playback seeking stays withheld until fetched.
     expect(screen.getByText("recorded on the peer")).toBeInTheDocument();
+  });
+
+  it("falls back to the disabled 'Audio is on <label>' bar when sync is OFF", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    openCompleted([makePart()]);
+    // Sync disabled → nothing to fetch from; the honest disabled bar remains.
+    useAppStore.setState({ syncStatus: syncStatus({ syncEnabled: false }) });
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Audio is on Windows")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Audio unavailable" }),
+    ).toBeDisabled();
   });
 
   it("labels an unknown recording device 'another device'", async () => {
@@ -313,7 +366,7 @@ describe("NoteDetailView audio availability (honest player rendering)", () => {
       </TooltipProvider>,
     );
     expect(
-      await screen.findByText("Audio is on another device"),
+      await screen.findByText("Audio is on another device — click to fetch"),
     ).toBeInTheDocument();
   });
 

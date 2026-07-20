@@ -13,6 +13,10 @@ import {
   formatLastSynced,
   deriveAudioBackup,
   enqueueAudioForSession,
+  enqueueAudioForDictation,
+  deriveTrackFetch,
+  formatFetchProgress,
+  type AudioPartPrepare,
 } from "./sync";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -231,6 +235,108 @@ describe("enqueueAudioForSession (fire-and-forget)", () => {
 
   it("is a no-op for an empty session id", () => {
     enqueueAudioForSession("");
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("deriveTrackFetch (S3 player state machine)", () => {
+  const ready = (path = "/c/x.wav"): AudioPartPrepare => ({ state: "ready", path });
+  const fetching = (received: number, total: number): AudioPartPrepare => ({
+    state: "fetching",
+    received,
+    total,
+  });
+
+  it("is ready when nothing is missing (empty input)", () => {
+    expect(deriveTrackFetch([])).toEqual({ kind: "ready" });
+  });
+
+  it("is ready when every missing part is now cached (fetch complete)", () => {
+    expect(deriveTrackFetch([ready(), ready("/c/y.wav")])).toEqual({ kind: "ready" });
+  });
+
+  it("is on_device when any part has no server copy (can't assemble here)", () => {
+    // Even mid-fetch of another part: the track can never fully assemble.
+    expect(deriveTrackFetch([fetching(10, 100), { state: "not_on_server" }])).toEqual({
+      kind: "on_device",
+    });
+  });
+
+  it("aggregates progress across in-flight parts into a percent", () => {
+    const t = deriveTrackFetch([fetching(50, 100), fetching(50, 300)]);
+    expect(t).toEqual({ kind: "fetching", percent: 25, received: 100, total: 400 });
+  });
+
+  it("reports fetching with 0% when the total is not yet known", () => {
+    expect(deriveTrackFetch([fetching(0, 0)])).toEqual({
+      kind: "fetching",
+      percent: 0,
+      received: 0,
+      total: 0,
+    });
+  });
+
+  it("surfaces unreachable (transient) over not_on_server", () => {
+    expect(
+      deriveTrackFetch([{ state: "unreachable" }, { state: "not_on_server" }]),
+    ).toEqual({ kind: "unreachable" });
+  });
+
+  it("surfaces verification failure with highest precedence (tamper signal)", () => {
+    expect(
+      deriveTrackFetch([
+        { state: "verification_failed" },
+        { state: "unreachable" },
+        fetching(1, 2),
+      ]),
+    ).toEqual({ kind: "verification_failed" });
+  });
+
+  it("surfaces a generic error message", () => {
+    expect(
+      deriveTrackFetch([{ state: "error", message: "disk full" }, fetching(1, 2)]),
+    ).toEqual({ kind: "error", message: "disk full" });
+  });
+});
+
+describe("formatFetchProgress", () => {
+  it("shows a percent once progress is known", () => {
+    expect(formatFetchProgress(42)).toBe("Fetching 42%");
+  });
+  it("falls back to an indeterminate label at 0 / unknown", () => {
+    expect(formatFetchProgress(0)).toBe("Fetching…");
+    expect(formatFetchProgress(NaN)).toBe("Fetching…");
+  });
+});
+
+describe("prepareAudioPart / cancelAudioPart / enqueueAudioForDictation IPC", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("prepareAudioPart invokes with the part id and returns the DTO", async () => {
+    const { syncCommands } = await import("./sync");
+    invokeMock.mockResolvedValue({ state: "fetching", received: 1, total: 2 });
+    const r = await syncCommands.prepareAudioPart("part-9");
+    expect(invokeMock).toHaveBeenCalledWith("audio_prepare_part", { partId: "part-9" });
+    expect(r).toEqual({ state: "fetching", received: 1, total: 2 });
+  });
+
+  it("cancelAudioPart invokes with the part id", async () => {
+    const { syncCommands } = await import("./sync");
+    invokeMock.mockResolvedValue(undefined);
+    await syncCommands.cancelAudioPart("part-9");
+    expect(invokeMock).toHaveBeenCalledWith("audio_cancel_part", { partId: "part-9" });
+  });
+
+  it("enqueueAudioForDictation is fire-and-forget and no-ops on empty id", () => {
+    const catchSpy = vi.fn();
+    invokeMock.mockReturnValue({ catch: catchSpy });
+    enqueueAudioForDictation("dict-1");
+    expect(invokeMock).toHaveBeenCalledWith("audio_enqueue_dictation", {
+      dictationId: "dict-1",
+    });
+    expect(catchSpy).toHaveBeenCalledTimes(1);
+    invokeMock.mockReset();
+    enqueueAudioForDictation("");
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });

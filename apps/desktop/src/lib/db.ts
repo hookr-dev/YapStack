@@ -1,6 +1,7 @@
 import Database, { type DbConnection } from "./db-backend";
 import { log } from "./logger";
 import { stripHtml } from "./utils";
+import { enqueueAudioForDictation } from "./sync";
 
 // --- Types ---
 
@@ -1545,6 +1546,11 @@ export async function insertDictationHistory(
       entry.session_id,
     ],
   );
+  // S3 dictation fold-in: back the dictation's WAV up to the sync relay so it can round-trip
+  // to peers (fire-and-forget; durable + backfill-healed, no-op when sync is off).
+  if (entry.wav_file_path) {
+    enqueueAudioForDictation(entry.id);
+  }
 }
 
 export async function listDictationHistory(
