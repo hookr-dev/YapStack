@@ -4322,9 +4322,18 @@ pub enum AudioPreparePartDto {
     /// A download is in flight; `received`/`total` (bytes) drive the "Fetching N%" bar
     /// (`total == 0` = not yet known).
     Fetching { received: u64, total: u64 },
-    /// The relay has no blob for this part (source device hasn't uploaded it) — stays the
-    /// honest "audio is on <device>" state.
+    /// Admitted but not yet started — the global concurrency cap (2) is busy and this part
+    /// waits in the FIFO admission queue. The player renders "waiting".
+    Queued,
+    /// The relay has no blob for this part (source device hasn't uploaded it) — the
+    /// honest "audio is on <device>" state. NOT a stable terminal anymore: the slot is
+    /// cleared so the player's 30s re-probe re-attempts, and the fetch starts by itself
+    /// once the source device's upload lands.
     NotOnServer,
+    /// The cache volume positively reported insufficient space (disk precheck) — `needed`
+    /// bytes is the full clean-disk budget for the "Not enough disk space (need ~X)" copy.
+    /// Slot cleared, so a retry after freeing space starts fresh.
+    NoSpace { needed: u64 },
     /// Can't reach the sync server (relay unreachable).
     Unreachable,
     /// The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
@@ -4374,8 +4383,10 @@ fn resolve_part_identity(conn: &rusqlite::Connection, part_id: &str) -> Option<(
 }
 
 /// Build the player-facing DTO from a slot's live progress + terminal outcome. On a retryable
-/// error terminal (unreachable / other error) the slot is cleared so the NEXT poll after a
-/// user retry starts fresh; `Ready`/`NotOnServer`/`VerificationFailed` are stable terminals.
+/// terminal (unreachable / not-on-server / no-space / other error) the slot is cleared so the
+/// NEXT poll (a user retry, or the player's automatic 30s re-probe for not-on-server) starts
+/// fresh; `Ready` and `VerificationFailed` are the only stable terminals (a re-download of a
+/// tampered blob would fail identically).
 fn slot_to_dto(
     part_id: &str,
     slot: &yapstack_sync::audio::FetchSlot,
@@ -4383,6 +4394,7 @@ fn slot_to_dto(
 ) -> AudioPreparePartDto {
     use yapstack_sync::audio::FetchResult;
     match slot.outcome() {
+        None if slot.is_queued() => AudioPreparePartDto::Queued,
         None => {
             let (received, total) = slot.progress.snapshot();
             AudioPreparePartDto::Fetching { received, total }
@@ -4390,7 +4402,18 @@ fn slot_to_dto(
         Some(Ok(FetchResult::Fetched)) => AudioPreparePartDto::Ready {
             path: cache_path.to_string_lossy().into_owned(),
         },
-        Some(Ok(FetchResult::NotOnServer)) => AudioPreparePartDto::NotOnServer,
+        Some(Ok(FetchResult::NotOnServer)) => {
+            // Clear the slot (auto-fetch S3.5): the source device may simply not have
+            // uploaded YET, so the player re-probes on a 30s cadence and each probe must be
+            // a real re-attempt, not a read of this stale terminal.
+            fetch_registry().remove(part_id);
+            AudioPreparePartDto::NotOnServer
+        }
+        Some(Ok(FetchResult::NoSpace { needed })) => {
+            // Clear so a retry AFTER the user frees space starts a fresh download.
+            fetch_registry().remove(part_id);
+            AudioPreparePartDto::NoSpace { needed }
+        }
         Some(Ok(FetchResult::Cancelled)) => {
             // A cancel leaves the slot idle; clear it so a replay starts a fresh fetch.
             fetch_registry().remove(part_id);
@@ -4411,6 +4434,56 @@ fn slot_to_dto(
             }
             dto
         }
+    }
+}
+
+/// Available bytes on the volume holding `path` (walking up to the nearest existing
+/// ancestor), or `None` when the platform can't say — the disk precheck FAILS OPEN on
+/// `None` (engine contract: never fabricate a NoSpace). Unix: `statvfs` (`f_bavail *
+/// f_frsize` — the unprivileged-available figure, matching what a write can actually use).
+/// Windows: `GetDiskFreeSpaceExW`'s caller-available counter.
+fn volume_free_space(path: &Path) -> Option<u64> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `c` is a valid NUL-terminated path and `st` is sized for statvfs; the
+        // struct is only read after a 0 (success) return.
+        let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let st = unsafe { st.assume_init() };
+        // Field widths differ per libc target (u32 on macOS, u64 on Linux) — widen to u64.
+        // The cast is a no-op on targets where the field is already u64, hence the allow.
+        #[allow(clippy::unnecessary_cast)]
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = probe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut avail: u64 = 0;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path; `avail` outlives the call; the
+        // two totals are explicitly optional (null) per the API contract.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut avail,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(avail)
     }
 }
 
@@ -4452,31 +4525,38 @@ pub fn audio_prepare_part(
         });
     }
 
-    let (slot, is_new) = fetch_registry().get_or_create(&part_id);
-    if is_new {
-        // Start the ONE fetch for this part on a dedicated thread (a 599 MB download must not
-        // block the command runtime), sharing the slot's progress with every later poll.
-        let vault_key = match session.vault_key() {
-            Ok(k) => k,
-            Err(e) => {
-                fetch_registry().remove(&part_id);
-                return Err(e);
-            }
+    // Coalesce onto an existing slot (queued or in flight) without re-reading the keychain.
+    if let Some(slot) = fetch_registry().get(&part_id) {
+        return Ok(slot_to_dto(&part_id, &slot, &cache_path));
+    }
+
+    // Build the deferred starter: when the registry admits this part (immediately if a
+    // permit is free, else FIFO after a running fetch finishes) it spawns the ONE download
+    // worker thread (a 599 MB download must not block the command runtime). Every started
+    // worker calls `task_finished` exactly once so the global cap (2) frees correctly.
+    let vault_key = session.vault_key()?;
+    let id = yapstack_crypto::audio_stream::AudioIdentity {
+        tenant_id: *session.tenant_id.as_bytes(),
+        session_id: uuid16(&session_id)?,
+        part_id: uuid16(&part_id)?,
+        epoch: session.epoch,
+    };
+    let server_url = session.server_url.clone();
+    let bearer = session.bearer.clone();
+    let temp_dir = fetch_temp_dir(&db_path);
+    let cache_for_worker = cache_path.clone();
+    let part_for_worker = part_id.clone();
+    let app_for_worker = app.clone();
+    let cache_dir_for_worker = cache_dir.clone();
+    let part_for_starter = part_id.clone();
+    let starter: yapstack_sync::audio::FetchStarter = Box::new(move || {
+        // The slot exists by the time the registry runs any starter; a missing slot means
+        // it was removed while queued, which cancel_if_queued prevents for queued entries —
+        // guard anyway so a race can only ever no-op (still releasing the permit).
+        let Some(slot_for_worker) = fetch_registry().get(&part_for_starter) else {
+            fetch_registry().task_finished();
+            return;
         };
-        let id = yapstack_crypto::audio_stream::AudioIdentity {
-            tenant_id: *session.tenant_id.as_bytes(),
-            session_id: uuid16(&session_id)?,
-            part_id: uuid16(&part_id)?,
-            epoch: session.epoch,
-        };
-        let server_url = session.server_url.clone();
-        let bearer = session.bearer.clone();
-        let temp_dir = fetch_temp_dir(&db_path);
-        let cache_for_worker = cache_path.clone();
-        let part_for_worker = part_id.clone();
-        let slot_for_worker = slot.clone();
-        let app_for_worker = app.clone();
-        let cache_dir_for_worker = cache_dir.clone();
         let spawn = std::thread::Builder::new()
             .name("yapstack-audio-fetch".into())
             .spawn(move || {
@@ -4487,10 +4567,13 @@ pub fn audio_prepare_part(
                     Ok(rt) => rt,
                     Err(e) => {
                         slot_for_worker.finish(Err(format!("error:runtime: {e}")));
+                        fetch_registry().task_finished();
                         return;
                     }
                 };
                 let transport = HttpTransport::new(server_url, bearer);
+                // Disk precheck probe (S3 auto-fetch): platform free-space, fail-open.
+                let probe = |p: &Path| volume_free_space(p);
                 let result = rt.block_on(yapstack_sync::audio::fetch_blob_to_cache(
                     &transport,
                     &vault_key,
@@ -4499,6 +4582,7 @@ pub fn audio_prepare_part(
                     &temp_dir,
                     &cache_for_worker,
                     &slot_for_worker.progress,
+                    Some(&probe),
                 ));
                 let terminal = match result {
                     Ok(r) => Ok(r),
@@ -4516,17 +4600,24 @@ pub fn audio_prepare_part(
                     crate::register_trusted_audio_dir(&app_for_worker, &cache_dir_for_worker);
                 }
                 slot_for_worker.finish(terminal);
+                fetch_registry().task_finished();
             });
         if let Err(e) = spawn {
-            fetch_registry().remove(&part_id);
-            return Err(format!("audio fetch spawn failed: {e}"));
+            // Can't run: record the honest error terminal on the slot and free the permit
+            // (the starter may have been run from the queue, long after the command call).
+            if let Some(slot) = fetch_registry().get(&part_for_starter) {
+                slot.finish(Err(format!("error:audio fetch spawn failed: {e}")));
+            }
+            fetch_registry().task_finished();
         }
-    }
+    });
+    let slot = fetch_registry().submit(&part_id, starter);
     Ok(slot_to_dto(&part_id, &slot, &cache_path))
 }
 
-/// Cancel an in-flight fetch AND clear the part's slot (also the retry-reset seam: a
-/// subsequent `audio_prepare_part` starts a fresh download).
+/// Cancel an in-flight fetch AND clear the part's slot (the user-facing X / retry-reset
+/// seam: a subsequent `audio_prepare_part` starts a fresh download). Also purges a queued,
+/// not-yet-started entry.
 #[tauri::command]
 #[specta::specta]
 pub fn audio_cancel_part(part_id: String) -> Result<(), String> {
@@ -4535,6 +4626,65 @@ pub fn audio_cancel_part(part_id: String) -> Result<(), String> {
     }
     fetch_registry().remove(&part_id);
     Ok(())
+}
+
+/// Navigate-away semantics (auto-fetch S3.5): drop the part ONLY if it is still waiting in
+/// the admission queue; an in-flight download is left to complete into the cache (bounded
+/// by the global cap), so reopening the session finds it cached or nearly there. Returns
+/// whether a queued entry was dropped.
+#[tauri::command]
+#[specta::specta]
+pub fn audio_release_part(part_id: String) -> Result<bool, String> {
+    Ok(fetch_registry().cancel_if_queued(&part_id))
+}
+
+/// Fetched-audio cache footprint for the sync panel row ("Fetched audio: N MB — Clear").
+#[derive(Debug, Clone, Copy, serde::Serialize, specta::Type)]
+pub struct AudioCacheStatsDto {
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// Total bytes + file count of this device's audio-fetch cache (decrypt temps excluded).
+#[tauri::command]
+#[specta::specta]
+pub fn audio_cache_stats(app: tauri::AppHandle) -> Result<AudioCacheStatsDto, String> {
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let s = yapstack_sync::audio::cache_stats(&fetch_cache_dir(&db_path));
+    Ok(AudioCacheStatsDto {
+        bytes: s.bytes,
+        files: s.files,
+    })
+}
+
+/// Clear the audio-fetch cache: deletes settled cache files ONLY — never the fetch-tmp of
+/// in-flight downloads (a sibling dir this command doesn't touch), never in-cache-dir
+/// decrypt temps, and never a file whose part has a live fetch slot (in-flight or
+/// unobserved-terminal — the simplest rule that can't corrupt a running fetch). Source
+/// audio is untouched by construction (the cache dir only ever holds fetched copies).
+/// Returns the remaining footprint (what the skips kept).
+#[tauri::command]
+#[specta::specta]
+pub fn audio_cache_clear(app: tauri::AppHandle) -> Result<AudioCacheStatsDto, String> {
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    let cache_dir = fetch_cache_dir(&db_path);
+    let _removed =
+        yapstack_sync::audio::cache_clear(&cache_dir, |part| fetch_registry().is_active(part));
+    let s = yapstack_sync::audio::cache_stats(&cache_dir);
+    Ok(AudioCacheStatsDto {
+        bytes: s.bytes,
+        files: s.files,
+    })
 }
 
 // --- Relay auth ceremony (CRYPTO_SPEC §3/§6/§7). All key derivation is client-side;

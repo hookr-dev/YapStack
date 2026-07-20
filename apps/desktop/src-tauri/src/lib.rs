@@ -396,6 +396,9 @@ pub fn run() {
             sync::audio_enqueue_dictation,
             sync::audio_prepare_part,
             sync::audio_cancel_part,
+            sync::audio_release_part,
+            sync::audio_cache_stats,
+            sync::audio_cache_clear,
         ]);
 
     #[cfg(debug_assertions)]

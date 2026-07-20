@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   tauriCoreMock,
@@ -25,6 +25,8 @@ vi.mock("sonner", () => ({
 
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import type { AudioPartPrepare } from "@/lib/sync";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { AudioPart } from "@/components/AudioPlayer";
 import type { DbAudioPart } from "@/lib/db";
@@ -314,9 +316,31 @@ function openCompleted(parts: DbAudioPart[]) {
   });
 }
 
-describe("NoteDetailView audio availability (honest player rendering)", () => {
-  it("renders a disabled control + 'Audio is on <label>' when the file is absent", async () => {
+/** Route the mocked `invoke` per command: prepare responses by part id, everything else
+ *  resolves benignly. Returns the mock for call assertions. */
+function mockSyncInvoke(byPart: Record<string, AudioPartPrepare>) {
+  const m = vi.mocked(invoke);
+  m.mockImplementation(async (cmd, args) => {
+    if (cmd === "audio_prepare_part") {
+      const id = String((args as Record<string, unknown>)?.partId ?? "");
+      return byPart[id] ?? { state: "queued" };
+    }
+    if (cmd === "audio_release_part") return false;
+    return null;
+  });
+  return m;
+}
+
+const prepareCalls = () =>
+  vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "audio_prepare_part")
+    .map(([, args]) => (args as Record<string, unknown>)?.partId);
+
+describe("NoteDetailView audio auto-fetch (S3.5, honest player rendering)", () => {
+  it("arms the fetch BY ITSELF when a synced session with missing audio opens", async () => {
     vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "fetching", received: 25, total: 100 } });
     openCompleted([makePart()]);
     render(
       <TooltipProvider>
@@ -324,35 +348,124 @@ describe("NoteDetailView audio availability (honest player rendering)", () => {
       </TooltipProvider>,
     );
 
-    // S3: with sync ENABLED the honest missing state offers fetch-on-demand (not a dead
-    // disabled control) — an enabled "fetch" affordance labelled by the source device.
+    // No click: the progress bar appears on its own and the idle affordance never shows.
+    expect(await screen.findByText("Fetching… 25%")).toBeInTheDocument();
+    expect(screen.queryByText(/click to fetch/)).not.toBeInTheDocument();
+    await waitFor(() => expect(prepareCalls()).toContain("p0"));
+    // The transcript still renders read-through; seeking stays withheld until fetched.
+    expect(screen.getByText("recorded on the peer")).toBeInTheDocument();
+    // Cancel affordance is present while fetching.
+    expect(
+      screen.getByRole("button", { name: "Cancel fetch" }),
+    ).toBeInTheDocument();
+  });
+
+  it("submits multi-part fetches in part_index order and shows 'part K of M' copy", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false, false]);
+    mockSyncInvoke({
+      p0: { state: "ready", path: "/cache/p0.wav" },
+      p1: { state: "fetching", received: 50, total: 100 },
+    });
+    openCompleted([
+      makePart({ id: "p0" }),
+      makePart({ id: "p1", part_index: 1, file_path: "/peer/audio/s-remote.1.wav" }),
+    ]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    // K = first in-flight part's ordinal among missing (p1 → 2), M = total missing (2).
+    expect(await screen.findByText("Fetching part 2 of 2 — 50%")).toBeInTheDocument();
+    // Ordered submission: p0 was prepared before p1 on the first tick.
+    const calls = prepareCalls();
+    expect(calls.indexOf("p0")).toBeLessThan(calls.indexOf("p1"));
+  });
+
+  it("renders the queued 'waiting' state while the global cap holds a part back", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "queued" } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Waiting to fetch…")).toBeInTheDocument();
+  });
+
+  it("does NOT arm on a remote-LIVE session, then fires when D4 flips it to completed", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "fetching", received: 1, total: 100 } });
+    // Foreign `recording` session with a (missing) part: remote-live branch, no fetch.
+    useAppStore.setState({
+      selectedSessionId: "s-remote",
+      activeSessionId: null,
+      viewSession: makeSession({ status: "recording", recording_device_id: "PEER" }),
+      viewSessionSegments: [],
+      viewSessionParts: [makePart()],
+      sessions: [],
+      syncStatus: syncStatus(),
+    });
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Live on Windows")).toBeInTheDocument();
+    await waitFor(() => expect(commands.audioFilesExist).toHaveBeenCalled());
+    expect(prepareCalls()).toHaveLength(0);
+
+    // The D4 live-refresh flips the row to completed while the view stays open → the arm
+    // predicate re-evaluates and the fetch fires unprompted.
+    useAppStore.setState({
+      viewSession: makeSession({ status: "completed", recording_device_id: "PEER" }),
+    });
+    await waitFor(() => expect(prepareCalls()).toContain("p0"));
+  });
+
+  it("cancel (X) suppresses auto-fetch and offers the manual re-start affordance", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "fetching", received: 25, total: 100 } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    // fireEvent (not userEvent): the resizable-panels lib's global pointer handlers
+    // are not jsdom-safe, and this interaction only needs the click itself.
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel fetch" }));
+    // Suppressed: back to the idle affordance (auto-fetch must not instantly re-arm).
     expect(
       await screen.findByText("Audio is on Windows — click to fetch"),
     ).toBeInTheDocument();
-    const btn = screen.getByRole("button", { name: "Fetch and play audio" });
-    expect(btn).not.toBeDisabled();
-    // The transcript still renders read-through; playback seeking stays withheld until fetched.
-    expect(screen.getByText("recorded on the peer")).toBeInTheDocument();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("audio_cancel_part", {
+      partId: "p0",
+    });
   });
 
-  it("falls back to the disabled 'Audio is on <label>' bar when sync is OFF", async () => {
+  it("surfaces the no_space terminal with the need-~X copy and a Retry", async () => {
     vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({
+      p0: { state: "no_space", needed: 2 * 1024 * 1024 * 1024 },
+    });
     openCompleted([makePart()]);
-    // Sync disabled → nothing to fetch from; the honest disabled bar remains.
-    useAppStore.setState({ syncStatus: syncStatus({ syncEnabled: false }) });
     render(
       <TooltipProvider>
         <NoteDetailView />
       </TooltipProvider>,
     );
-    expect(await screen.findByText("Audio is on Windows")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Audio unavailable" }),
-    ).toBeDisabled();
+      await screen.findByText("Not enough disk space (need ~2.0 GB)"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry fetch" })).toBeInTheDocument();
   });
 
-  it("labels an unknown recording device 'another device'", async () => {
+  it("labels an unknown recording device 'another device' (on_device re-probe state)", async () => {
     vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "not_on_server" } });
     openCompleted([makePart()]);
     useAppStore.setState({
       viewSession: makeSession({
@@ -365,9 +478,28 @@ describe("NoteDetailView audio availability (honest player rendering)", () => {
         <NoteDetailView />
       </TooltipProvider>,
     );
+    // The source device hasn't uploaded yet: honest on-device copy (re-probed on the slow
+    // cadence — the fetch self-starts when the upload lands).
     expect(
-      await screen.findByText("Audio is on another device — click to fetch"),
+      await screen.findByText("Audio is on another device"),
     ).toBeInTheDocument();
+  });
+
+  it("falls back to the disabled 'Audio is on <label>' bar when sync is OFF", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    openCompleted([makePart()]);
+    // Sync disabled → nothing to fetch from; the honest disabled bar remains, no fetch.
+    useAppStore.setState({ syncStatus: syncStatus({ syncEnabled: false }) });
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Audio is on Windows")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Audio unavailable" }),
+    ).toBeDisabled();
+    expect(prepareCalls()).toHaveLength(0);
   });
 
   it("keeps the normal player (no unavailable copy) when the file is present", async () => {
@@ -385,5 +517,6 @@ describe("NoteDetailView audio availability (honest player rendering)", () => {
       ]),
     );
     expect(screen.queryByText(/Audio is on/)).not.toBeInTheDocument();
+    expect(prepareCalls()).toHaveLength(0);
   });
 });

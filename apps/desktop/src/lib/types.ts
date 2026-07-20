@@ -621,6 +621,118 @@ async syncSignOut() : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * S2 producer seam: enqueue every finalized audio part of `session_id` onto the durable
+ * upload queue at NORMAL priority (jumps ahead of the LOW-priority backfill). Called
+ * FIRE-AND-FORGET from the frontend on session finalize — recording is never blocked by
+ * this, and the durable queue survives a restart. Idempotent (INSERT-OR-IGNORE by
+ * `part_id`), so a re-finalize or an overlap with the backfill walk never double-uploads.
+ * A no-op when sync is not enabled on this device (nothing drains the queue yet; the
+ * backfill walk will re-enqueue on next enable). Opens a lightweight plain connection to
+ * the live DB and only ever writes the local, non-CRR queue table.
+ */
+async audioEnqueueSession(sessionId: string) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_enqueue_session", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S2 manual-retry seam for the Sync panel: re-arm every `failed` audio-upload entry so the
+ * uploader picks them up on its next cycle (D9 — failed entries retry on app start PLUS
+ * manual retry). Returns the number re-armed. No-op when sync is disabled.
+ */
+async audioRetryFailedUploads() : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_retry_failed_uploads") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
+ * queue (NORMAL priority). Dictation audio has no `session_audio_parts` row; the part
+ * identity IS the `dictation_history.id` (self-referential AAD `session_id`, matching the
+ * backfill walk + fetch path). Idempotent (INSERT-OR-IGNORE by part_id). No-op when sync is
+ * off. Returns 1 if newly enqueued, else 0.
+ */
+async audioEnqueueDictation(dictationId: string) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_enqueue_dictation", { dictationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S3 fetch-on-demand entry point (polled per missing part). Resolves D2 order, joins the
+ * single in-flight fetch (starting it on the first call), and returns the current state.
+ */
+async audioPreparePart(partId: string) : Promise<Result<AudioPreparePartDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_prepare_part", { partId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel an in-flight fetch AND clear the part's slot (the user-facing X / retry-reset
+ * seam: a subsequent `audio_prepare_part` starts a fresh download). Also purges a queued,
+ * not-yet-started entry.
+ */
+async audioCancelPart(partId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cancel_part", { partId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate-away semantics (auto-fetch S3.5): drop the part ONLY if it is still waiting in
+ * the admission queue; an in-flight download is left to complete into the cache (bounded
+ * by the global cap), so reopening the session finds it cached or nearly there. Returns
+ * whether a queued entry was dropped.
+ */
+async audioReleasePart(partId: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_release_part", { partId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Total bytes + file count of this device's audio-fetch cache (decrypt temps excluded).
+ */
+async audioCacheStats() : Promise<Result<AudioCacheStatsDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cache_stats") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Clear the audio-fetch cache: deletes settled cache files ONLY — never the fetch-tmp of
+ * in-flight downloads (a sibling dir this command doesn't touch), never in-cache-dir
+ * decrypt temps, and never a file whose part has a live fetch slot (in-flight or
+ * unobserved-terminal — the simplest rule that can't corrupt a running fetch). Source
+ * audio is untouched by construction (the cache dir only ever holds fetched copies).
+ * Returns the remaining footprint (what the skips kept).
+ */
+async audioCacheClear() : Promise<Result<AudioCacheStatsDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cache_clear") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -634,6 +746,10 @@ async syncSignOut() : Promise<Result<null, string>> {
 
 /** user-defined types **/
 
+/**
+ * Fetched-audio cache footprint for the sync panel row ("Fetched audio: N MB — Clear").
+ */
+export type AudioCacheStatsDto = { bytes: number; files: number }
 export type AudioDeviceInfoDto = { id: string | null; name: string; device_type: DeviceTypeDto; is_default: boolean }
 /**
  * Typed surface for the audio finalize format. Lowercase serde tags match
@@ -643,6 +759,51 @@ export type AudioDeviceInfoDto = { id: string | null; name: string; device_type:
  * a `"wav" | "mp3"` discriminated union instead of `string | null`.
  */
 export type AudioExportFormatDto = "wav" | "mp3"
+/**
+ * Player-facing fetch state for one part (polled). Distinct honest states, never silent.
+ */
+export type AudioPreparePartDto =
+/**
+ * The decrypted audio is in the local cache (or was already local) — `path` is a
+ * trusted absolute path the `audio-stream://` protocol serves.
+ */
+{ state: "ready"; path: string } |
+/**
+ * A download is in flight; `received`/`total` (bytes) drive the "Fetching N%" bar
+ * (`total == 0` = not yet known).
+ */
+{ state: "fetching"; received: number; total: number } |
+/**
+ * Admitted but not yet started — the global concurrency cap (2) is busy and this part
+ * waits in the FIFO admission queue. The player renders "waiting".
+ */
+{ state: "queued" } |
+/**
+ * The relay has no blob for this part (source device hasn't uploaded it) — the
+ * honest "audio is on <device>" state. NOT a stable terminal anymore: the slot is
+ * cleared so the player's 30s re-probe re-attempts, and the fetch starts by itself
+ * once the source device's upload lands.
+ */
+{ state: "not_on_server" } |
+/**
+ * The cache volume positively reported insufficient space (disk precheck) — `needed`
+ * bytes is the full clean-disk budget for the "Not enough disk space (need ~X)" copy.
+ * Slot cleared, so a retry after freeing space starts fresh.
+ */
+{ state: "no_space"; needed: number } |
+/**
+ * Can't reach the sync server (relay unreachable).
+ */
+{ state: "unreachable" } |
+/**
+ * The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
+ * fetch worker). Distinct copy: "audio failed verification".
+ */
+{ state: "verification_failed" } |
+/**
+ * Any other fetch/IO fault, surfaced verbatim (never auto-routed).
+ */
+{ state: "error"; message: string }
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
@@ -927,7 +1088,30 @@ lastSuccess: string | null;
  * (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
  * device is honestly "up to date" only when this is 0 AND the outbox is empty.
  */
-pullBehind: number }
+pullBehind: number;
+/**
+ * S2 — audio upload lane (DISTINCT from changeset sync). Blobs (recordings) still to
+ * seal+upload to the relay across both priorities (0 == every local recording is backed
+ * up). Surfaced under the "audio-upload" label in the panel; never merged with the
+ * changeset backlog.
+ */
+audioUploadOutstanding: number;
+/**
+ * Of `audio_upload_outstanding`, the low-priority backfill of the existing library (D9).
+ */
+audioBackfillOutstanding: number;
+/**
+ * Audio blobs the uploader marked `failed` (needs attention; app-start + manual retry).
+ */
+audioUploadFailed: number;
+/**
+ * Cumulative recordings the relay confirms it holds for this device.
+ */
+audioUploadedTotal: number;
+/**
+ * Whether the one-time idempotent backfill walk has completed on this device (D9).
+ */
+audioBackfillComplete: boolean }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

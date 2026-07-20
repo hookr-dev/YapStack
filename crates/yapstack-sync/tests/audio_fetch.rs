@@ -133,9 +133,10 @@ async fn fetch_streams_decrypts_and_caches_byte_equal() {
     let progress = FetchProgress::default();
     let id = identity(SESSION_A, PART_1);
 
-    let res = audio::fetch_blob_to_cache(&relay, &VAULT, &id, PART_1, &temp, &cache, &progress)
-        .await
-        .unwrap();
+    let res =
+        audio::fetch_blob_to_cache(&relay, &VAULT, &id, PART_1, &temp, &cache, &progress, None)
+            .await
+            .unwrap();
     assert_eq!(res, FetchResult::Fetched);
     assert_eq!(
         std::fs::read(&cache).unwrap(),
@@ -172,6 +173,7 @@ async fn cache_hit_short_circuits_before_any_network() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap();
@@ -194,6 +196,7 @@ async fn missing_server_blob_is_not_on_server() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap();
@@ -229,6 +232,7 @@ async fn decrypt_verification_failure_leaves_no_cache_entry() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap_err();
@@ -267,6 +271,7 @@ async fn wrong_part_identity_fails_verification() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap_err();
@@ -301,6 +306,7 @@ async fn cancel_before_download_yields_cancelled_no_cache() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap();
@@ -308,21 +314,38 @@ async fn cancel_before_download_yields_cancelled_no_cache() {
     assert!(!cache.exists());
 }
 
-// ---- single-flight coalescing --------------------------------------------------
+// ---- single-flight coalescing + global cap / FIFO admission ---------------------
+
+use std::sync::{Arc, Mutex};
+
+/// A submit whose starter just records the part id — the registry runs starters inline
+/// (production starters spawn the worker thread; tests observe start order directly) and
+/// `task_finished()` stands in for a worker completing.
+fn recording_starter(
+    log: &Arc<Mutex<Vec<&'static str>>>,
+    id: &'static str,
+) -> Box<dyn FnOnce() + Send + 'static> {
+    let log = log.clone();
+    Box::new(move || log.lock().unwrap().push(id))
+}
 
 #[test]
 fn registry_coalesces_one_slot_per_part() {
     let reg = FetchRegistry::new();
-    let (a, a_new) = reg.get_or_create(PART_1);
-    assert!(a_new, "first caller starts the fetch");
-    let (b, b_new) = reg.get_or_create(PART_1);
-    assert!(!b_new, "second caller subscribes to the same slot");
-    assert!(std::sync::Arc::ptr_eq(&a, &b), "same shared slot");
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let a = reg.submit(PART_1, recording_starter(&started, "p1"));
+    assert_eq!(*started.lock().unwrap(), vec!["p1"], "first submit starts");
+    let b = reg.submit(PART_1, recording_starter(&started, "p1-again"));
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["p1"],
+        "second submit coalesces — its starter is dropped"
+    );
+    assert!(Arc::ptr_eq(&a, &b), "same shared slot");
 
     // Different part → its own slot.
-    let (c, c_new) = reg.get_or_create(DICT_1);
-    assert!(c_new);
-    assert!(!std::sync::Arc::ptr_eq(&a, &c));
+    let c = reg.submit(DICT_1, recording_starter(&started, "d1"));
+    assert!(!Arc::ptr_eq(&a, &c));
 
     // Shared progress: a write through one handle is visible through the other.
     a.progress.received.store(4096, Ordering::Relaxed);
@@ -332,8 +355,271 @@ fn registry_coalesces_one_slot_per_part() {
     a.finish(Ok(FetchResult::Fetched));
     assert_eq!(b.outcome(), Some(Ok(FetchResult::Fetched)));
     reg.remove(PART_1);
-    let (_d, d_new) = reg.get_or_create(PART_1);
-    assert!(d_new, "after remove, the next caller starts a fresh fetch");
+    reg.task_finished(); // the worker's permit release
+    let started_before = started.lock().unwrap().len();
+    let _d = reg.submit(PART_1, recording_starter(&started, "p1-retry"));
+    assert_eq!(
+        started.lock().unwrap().len(),
+        started_before + 1,
+        "after remove, the next submit starts a fresh fetch"
+    );
+}
+
+#[test]
+fn cap_runs_two_queues_third_then_starts_it() {
+    let reg = FetchRegistry::with_cap(2);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let s1 = reg.submit("part-a", recording_starter(&started, "a"));
+    let s2 = reg.submit("part-b", recording_starter(&started, "b"));
+    let s3 = reg.submit("part-c", recording_starter(&started, "c"));
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["a", "b"],
+        "only cap=2 downloads start"
+    );
+    assert!(!s1.is_queued() && !s2.is_queued());
+    assert!(s3.is_queued(), "third part waits in the admission queue");
+
+    // One running fetch finishes → the queued part starts and stops reading queued.
+    reg.task_finished();
+    assert_eq!(*started.lock().unwrap(), vec!["a", "b", "c"]);
+    assert!(!s3.is_queued());
+}
+
+#[test]
+fn queue_starts_in_fifo_submission_order() {
+    let reg = FetchRegistry::with_cap(1);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    for (id, tag) in [
+        ("part-a", "a"),
+        ("part-b", "b"),
+        ("part-c", "c"),
+        ("part-d", "d"),
+    ] {
+        reg.submit(id, recording_starter(&started, tag));
+    }
+    assert_eq!(*started.lock().unwrap(), vec!["a"]);
+    reg.task_finished();
+    reg.task_finished();
+    reg.task_finished();
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["a", "b", "c", "d"],
+        "queued parts start in the order they were submitted"
+    );
+}
+
+#[test]
+fn cancel_if_queued_removes_queued_but_leaves_in_flight() {
+    let reg = FetchRegistry::with_cap(1);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    reg.submit("part-a", recording_starter(&started, "a")); // running
+    reg.submit("part-b", recording_starter(&started, "b")); // queued
+
+    // In-flight → left alone (the download completes into the cache).
+    assert!(!reg.cancel_if_queued("part-a"));
+    assert!(reg.get("part-a").is_some());
+
+    // Queued → removed before it ever starts; its slot is gone.
+    assert!(reg.cancel_if_queued("part-b"));
+    assert!(reg.get("part-b").is_none());
+    reg.task_finished(); // part-a's worker ends
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["a"],
+        "a cancelled-while-queued part never starts"
+    );
+}
+
+#[test]
+fn remove_purges_a_queued_entry_too() {
+    let reg = FetchRegistry::with_cap(1);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    reg.submit("part-a", recording_starter(&started, "a"));
+    reg.submit("part-b", recording_starter(&started, "b")); // queued
+    reg.remove("part-b"); // e.g. user X on a queued part
+    reg.task_finished();
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["a"],
+        "a removed queued part must not start later"
+    );
+    assert!(reg.get("part-b").is_none());
+}
+
+/// The still-uploading re-probe seam: after a NotOnServer terminal the desktop CLEARS the
+/// slot (it is no longer a stable terminal), so a later re-probe submit starts a genuinely
+/// fresh attempt — this is what lets the fetch begin automatically once the source device's
+/// upload lands.
+#[test]
+fn not_on_server_clear_then_resubmit_reattempts() {
+    let reg = FetchRegistry::with_cap(2);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let slot = reg.submit(PART_1, recording_starter(&started, "probe-1"));
+    slot.finish(Ok(FetchResult::NotOnServer));
+    reg.task_finished(); // worker ended
+    reg.remove(PART_1); // the desktop's NotOnServer slot-clear
+    assert!(!reg.is_active(PART_1));
+
+    let slot2 = reg.submit(PART_1, recording_starter(&started, "probe-2"));
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["probe-1", "probe-2"],
+        "the re-probe starts a fresh fetch attempt"
+    );
+    assert_eq!(slot2.outcome(), None, "fresh slot, no stale terminal");
+}
+
+// ---- disk precheck (NoSpace terminal) ------------------------------------------
+
+#[tokio::test]
+async fn insufficient_space_yields_no_space_terminal_and_no_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db();
+    let relay = MockRelay::new();
+    let plaintext = b"big audio payload".repeat(1000);
+    upload_blob(
+        &conn,
+        &relay,
+        dir.path(),
+        PART_1,
+        SESSION_A,
+        &plaintext,
+        false,
+    )
+    .await;
+
+    let cache = dir.path().join("cache").join(format!("{PART_1}.wav"));
+    let progress = FetchProgress::default();
+    let id = identity(SESSION_A, PART_1);
+    // The probe positively reports a nearly-full volume.
+    let probe: &audio::FreeSpaceFn = &|_p: &std::path::Path| Some(1024);
+    let res = audio::fetch_blob_to_cache(
+        &relay,
+        &VAULT,
+        &id,
+        PART_1,
+        &dir.path().join("tmp"),
+        &cache,
+        &progress,
+        Some(probe),
+    )
+    .await
+    .unwrap();
+    match res {
+        FetchResult::NoSpace { needed } => {
+            // Budget: blob*2 + 256MB headroom (from the true encrypted length, ≥ plaintext).
+            assert!(
+                needed >= plaintext.len() as u64 * 2 + audio::NO_SPACE_HEADROOM_BYTES,
+                "needed={needed}"
+            );
+        }
+        other => panic!("expected NoSpace, got {other:?}"),
+    }
+    assert!(!cache.exists(), "no cache entry on a NoSpace terminal");
+}
+
+#[tokio::test]
+async fn indeterminate_probe_fails_open_and_fetches() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db();
+    let relay = MockRelay::new();
+    let plaintext = b"fits fine".repeat(500);
+    upload_blob(
+        &conn,
+        &relay,
+        dir.path(),
+        PART_1,
+        SESSION_A,
+        &plaintext,
+        false,
+    )
+    .await;
+
+    let cache = dir.path().join("cache").join(format!("{PART_1}.wav"));
+    let id = identity(SESSION_A, PART_1);
+    // Probe can't determine → NEVER fabricate NoSpace; the fetch proceeds.
+    let none_probe: &audio::FreeSpaceFn = &|_p: &std::path::Path| None;
+    let res = audio::fetch_blob_to_cache(
+        &relay,
+        &VAULT,
+        &id,
+        PART_1,
+        &dir.path().join("tmp"),
+        &cache,
+        &FetchProgress::default(),
+        Some(none_probe),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res, FetchResult::Fetched);
+    assert_eq!(std::fs::read(&cache).unwrap(), plaintext);
+
+    // And a roomy volume also fetches (the check passes, not merely skips).
+    let cache2 = dir.path().join("cache").join("second-copy.wav");
+    std::fs::remove_file(&cache).unwrap();
+    let roomy: &audio::FreeSpaceFn = &|_p: &std::path::Path| Some(u64::MAX);
+    let res2 = audio::fetch_blob_to_cache(
+        &relay,
+        &VAULT,
+        &id,
+        PART_1,
+        &dir.path().join("tmp"),
+        &cache2,
+        &FetchProgress::default(),
+        Some(roomy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res2, FetchResult::Fetched);
+}
+
+// ---- cache stats / clear safety -------------------------------------------------
+
+#[test]
+fn cache_stats_counts_settled_files_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("aaa.wav"), vec![0u8; 100]).unwrap();
+    std::fs::write(cache.join("bbb.mp3"), vec![0u8; 50]).unwrap();
+    // An in-flight decrypt temp must not count as settled cache content.
+    std::fs::write(
+        cache.join(format!("{}partial", audio::FETCH_TEMP_PREFIX)),
+        vec![0u8; 999],
+    )
+    .unwrap();
+    let stats = audio::cache_stats(&cache);
+    assert_eq!(stats.files, 2);
+    assert_eq!(stats.bytes, 150);
+
+    // Missing dir = empty cache, not an error.
+    assert_eq!(
+        audio::cache_stats(&dir.path().join("nope")),
+        audio::CacheStats::default()
+    );
+}
+
+#[test]
+fn cache_clear_skips_in_flight_parts_and_decrypt_temps() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("active.wav"), vec![0u8; 10]).unwrap();
+    std::fs::write(cache.join("settled.wav"), vec![0u8; 20]).unwrap();
+    let temp_name = format!("{}dl", audio::FETCH_TEMP_PREFIX);
+    std::fs::write(cache.join(&temp_name), vec![0u8; 30]).unwrap();
+
+    // "active" has a live registry slot (its fetch is in flight) → must be skipped.
+    let reg = FetchRegistry::with_cap(2);
+    reg.submit("active", Box::new(|| {}));
+    let removed = audio::cache_clear(&cache, |part| reg.is_active(part));
+
+    assert_eq!(removed.files, 1, "only the settled file is removed");
+    assert_eq!(removed.bytes, 20);
+    assert!(cache.join("active.wav").exists(), "in-flight part survives");
+    assert!(cache.join(&temp_name).exists(), "decrypt temp survives");
+    assert!(!cache.join("settled.wav").exists());
 }
 
 // ---- dictation data-model fold-in ---------------------------------------------
@@ -382,6 +668,7 @@ async fn dictation_audio_backfills_and_round_trips_like_session_audio() {
         &dir.path().join("tmp"),
         &cache,
         &progress,
+        None,
     )
     .await
     .unwrap();

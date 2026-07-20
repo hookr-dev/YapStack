@@ -5,7 +5,9 @@ import { Button } from "@/components/ui/button";
 import { commands } from "@/lib/tauri";
 import {
   deriveTrackFetch,
-  formatFetchProgress,
+  formatTrackFetchLabel,
+  formatNoSpace,
+  nextPollDelayMs,
   syncCommands,
   type AudioPartPrepare,
   type TrackFetch,
@@ -137,14 +139,17 @@ export function assembleTrack(
 
 /**
  * The honest missing-audio bar for a synced session whose bytes are not on this device (S3).
- * Renders one of: the classic disabled "audio is on <device>" (sync off — nothing to fetch);
- * an enabled Fetch affordance (idle); a "Fetching N%" bar with cancel; or a terminal
- * error/on-device state. Never silent. Pure presentational — all wiring is passed in.
+ * With auto-fetch (S3.5) the happy path never needs a click: the bar shows queued/fetching
+ * progress with a cancel X. Renders one of: the classic disabled "audio is on <device>"
+ * (sync off — nothing to fetch); a re-start affordance (only reachable after the user
+ * cancelled); "Waiting to fetch…" (admission-queued); "Fetching [part K of M —] N%" with
+ * cancel; or a terminal error / on-device / no-space state with Retry where a retry can
+ * help. Never silent. Pure presentational — all wiring is passed in.
  */
 function AudioFetchBar({
   deviceLabel,
   syncEnabled,
-  started,
+  active,
   track,
   onFetch,
   onCancel,
@@ -152,7 +157,8 @@ function AudioFetchBar({
 }: {
   deviceLabel: string;
   syncEnabled: boolean;
-  started: boolean;
+  /** Auto-fetch armed (or manually re-started) — false only after a user cancel. */
+  active: boolean;
   track: TrackFetch | null;
   onFetch: () => void;
   onCancel: () => void;
@@ -173,8 +179,9 @@ function AudioFetchBar({
     );
   }
 
-  // Not started yet: offer to fetch it from the relay.
-  if (!started || !track) {
+  // Only reachable after an explicit user cancel (auto-fetch is otherwise always armed):
+  // offer to start it again.
+  if (!active || !track) {
     return (
       <div className={barCls}>
         <Button variant="ghost" size="icon-xs" onClick={onFetch} aria-label="Fetch and play audio" title="Fetch audio from sync">
@@ -185,10 +192,22 @@ function AudioFetchBar({
     );
   }
 
+  if (track.kind === "queued") {
+    return (
+      <div className={barCls}>
+        <span className="text-xs">Waiting to fetch…</span>
+        <div className="h-1 flex-1 overflow-hidden rounded bg-muted" />
+        <Button variant="ghost" size="icon-xs" onClick={onCancel} aria-label="Cancel fetch" title="Cancel">
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
   if (track.kind === "fetching") {
     return (
       <div className={barCls}>
-        <span className="text-xs tabular-nums">{formatFetchProgress(track.percent)}</span>
+        <span className="text-xs tabular-nums">{formatTrackFetchLabel(track)}</span>
         <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
           <div className="h-full bg-primary transition-[width]" style={{ width: `${track.percent}%` }} />
         </div>
@@ -200,9 +219,11 @@ function AudioFetchBar({
   }
 
   if (track.kind === "on_device") {
+    // The server doesn't (fully) hold the track yet; the poll re-probes every 30s and the
+    // fetch self-starts when the source device's upload lands.
     return (
       <div className={barCls}>
-        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Not yet backed up to sync">
+        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Not yet backed up to sync — retries automatically">
           <Play className="h-4 w-4" />
         </Button>
         <span className="text-xs">Audio is on {deviceLabel}</span>
@@ -222,8 +243,13 @@ function AudioFetchBar({
   // ready shouldn't reach here (the player renders instead) — guard for exhaustiveness.
   if (track.kind === "ready") return null;
 
-  // unreachable / error → surface verbatim + offer retry.
-  const message = track.kind === "unreachable" ? "Can't reach sync server" : track.message;
+  // no_space / unreachable / error → surface verbatim + offer retry.
+  const message =
+    track.kind === "unreachable"
+      ? "Can't reach sync server"
+      : track.kind === "no_space"
+        ? formatNoSpace(track.needed)
+        : track.message;
   return (
     <div className={barCls}>
       <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -401,22 +427,31 @@ export function NoteDetailView() {
     };
   }, [partPaths]);
 
-  // ---- S3 fetch-on-demand playback ----
-  // When a synced session's audio is missing locally but the relay may hold it, the user
-  // fetches on demand (D3): click play → GET → decrypt-to-cache → play, with progress +
-  // cancel. Single-flight coalescing lives in Rust; here we POLL `audio_prepare_part` per
-  // missing part and aggregate to one honest track state.
+  // ---- S3.5 auto-fetch playback ----
+  // When a synced session's audio is missing locally, fetching starts BY ITSELF the moment
+  // the session opens (owner directive — no click gate): GET → decrypt-to-cache → player,
+  // with progress + cancel. Single-flight + the global cap (2) + FIFO admission live in
+  // Rust; here we POLL `audio_prepare_part` per missing part IN part_index ORDER (the
+  // submission order IS the queue order) and aggregate to one honest track state. A
+  // remote-LIVE session (foreign `recording`) is excluded — its parts are still growing —
+  // but the arm predicate re-evaluates when the D4 live-refresh flips it to `completed`
+  // (session.status is part of `remoteLive` below), so the fetch then fires unprompted.
   const rawParts = useMemo(
     () => (isActiveSession ? activeSessionParts : viewSessionParts),
     [isActiveSession, activeSessionParts, viewSessionParts],
   );
   const syncEnabled = !!syncStatus?.syncEnabled;
+  const remoteLive = session
+    ? isRemoteLiveSession(session, isActiveSession, myFingerprint)
+    : false;
   const missingPartIds = useMemo(() => {
     if (!partsExist || partsExist.length !== rawParts.length) return [];
     return rawParts.filter((_, i) => partsExist[i] === false).map((p) => p.id);
   }, [rawParts, partsExist]);
   const [prepareStates, setPrepareStates] = useState<Record<string, AudioPartPrepare>>({});
-  const [fetchStarted, setFetchStarted] = useState(false);
+  // Set ONLY by the user's explicit cancel (X): auto-fetch must not re-arm right after a
+  // cancel. Reset on track change and by the manual re-start affordance.
+  const [fetchSuppressed, setFetchSuppressed] = useState(false);
   const [fetchNonce, setFetchNonce] = useState(0);
   // A stable key for the missing-set so effects/handlers don't churn on array identity.
   const missingKey = missingPartIds.join(",");
@@ -425,55 +460,70 @@ export function NoteDetailView() {
 
   // Reset the fetch flow whenever the track changes (session switch / parts reload).
   useEffect(() => {
-    setFetchStarted(false);
+    setFetchSuppressed(false);
     setPrepareStates({});
   }, [missingKey]);
 
-  // Poll the fetch while it is in flight; stop on any terminal state.
+  // The auto-arm predicate (deliverable: session open + sync on + missing parts + not
+  // remote-live, minus an explicit user cancel).
+  const fetchArmed =
+    syncEnabled && !remoteLive && missingPartIds.length > 0 && !fetchSuppressed;
+
+  // Poll while armed: submit/poll every missing part in order, re-arm per the derived
+  // track state (600ms while queued/fetching, 30s while the server lacks a blob — the
+  // still-uploading re-probe; stop on ready/terminals). On unmount (or disarm) drop the
+  // QUEUED parts only — an in-flight download completes into the cache, so reopening the
+  // session re-submits idempotently (cache hits short-circuit in Rust).
   useEffect(() => {
-    if (!fetchStarted || !syncEnabled) return;
+    if (!fetchArmed) return;
     const ids = missingRef.current;
     if (ids.length === 0) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
-      const results = await Promise.all(
-        ids.map(async (id): Promise<[string, AudioPartPrepare]> => {
-          try {
-            return [id, await syncCommands.prepareAudioPart(id)];
-          } catch (e) {
-            return [id, { state: "error", message: String(e) }];
-          }
-        }),
-      );
-      if (cancelled) return;
       const next: Record<string, AudioPartPrepare> = {};
-      for (const [id, st] of results) next[id] = st;
+      // Sequential, ordered submission: part_index order = FIFO admission order in Rust.
+      for (const id of ids) {
+        try {
+          const st = await syncCommands.prepareAudioPart(id);
+          // IPC boundary: never trust the shape blindly (an older backend or a bad
+          // serialization must degrade to an honest error, not a render crash).
+          next[id] =
+            st && typeof st === "object" && "state" in st
+              ? st
+              : { state: "error", message: "invalid prepare response" };
+        } catch (e) {
+          next[id] = { state: "error", message: String(e) };
+        }
+      }
+      if (cancelled) return;
       setPrepareStates(next);
-      const track = deriveTrackFetch(ids.map((id) => next[id]));
-      if (track.kind === "fetching") timer = setTimeout(() => void tick(), 600);
+      const delay = nextPollDelayMs(deriveTrackFetch(ids.map((id) => next[id])));
+      if (delay !== null) timer = setTimeout(() => void tick(), delay);
     };
     void tick();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      // Navigate-away: cancel queued (never-started) parts; leave in-flight ones to land.
+      ids.forEach((id) => void syncCommands.releaseAudioPart(id).catch(() => {}));
     };
-  }, [fetchStarted, syncEnabled, missingKey, fetchNonce]);
+  }, [fetchArmed, missingKey, fetchNonce]);
 
   const startFetch = useCallback(() => {
     setPrepareStates({});
-    setFetchStarted(true);
+    setFetchSuppressed(false);
     setFetchNonce((n) => n + 1);
   }, []);
   const cancelFetch = useCallback(() => {
     missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
-    setFetchStarted(false);
+    setFetchSuppressed(true);
     setPrepareStates({});
   }, []);
   const retryFetch = useCallback(() => {
     missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
     setPrepareStates({});
-    setFetchStarted(true);
+    setFetchSuppressed(false);
     setFetchNonce((n) => n + 1);
   }, []);
 
@@ -502,7 +552,7 @@ export function NoteDetailView() {
   // Aggregate fetch state across the MISSING parts (all-or-nothing: the timeline seeks by
   // global time, so every part must resolve before we render the player).
   const trackFetch: TrackFetch | null =
-    fetchStarted && missingPartIds.length > 0
+    fetchArmed && missingPartIds.length > 0
       ? deriveTrackFetch(
           missingPartIds.map(
             (id) =>
@@ -598,7 +648,7 @@ export function NoteDetailView() {
           <AudioFetchBar
             deviceLabel={audioDeviceLabel}
             syncEnabled={syncEnabled}
-            started={fetchStarted}
+            active={fetchArmed}
             track={trackFetch}
             onFetch={startFetch}
             onCancel={cancelFetch}
@@ -652,9 +702,8 @@ export function NoteDetailView() {
   // stale into "Live"/"Interrupted"); the liveness helper (isRecordingStale) already
   // exists for slice 4 to consume.
   const owner = session.recording_device_id;
-  const isRemoteLive = isRemoteLiveSession(session, isActiveSession, myFingerprint);
 
-  if (isRemoteLive) {
+  if (remoteLive) {
     const label =
       syncStatus?.roster.find((r) => r.fingerprint === owner)?.label ??
       "another device";

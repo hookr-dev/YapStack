@@ -241,7 +241,27 @@ export const syncCommands = {
    *  subsequent `prepareAudioPart` starts a fresh download). */
   cancelAudioPart: (partId: string): Promise<void> =>
     invoke("audio_cancel_part", { partId }),
+
+  /** S3.5 navigate-away: drop the part ONLY if it is still admission-queued; an in-flight
+   *  download completes into the cache (bounded by the global cap). Resolves with whether
+   *  a queued entry was dropped. */
+  releaseAudioPart: (partId: string): Promise<boolean> =>
+    invoke("audio_release_part", { partId }),
+
+  /** Fetched-audio cache footprint (bytes + file count) for the sync panel row. */
+  audioCacheStats: (): Promise<AudioCacheStats> => invoke("audio_cache_stats"),
+
+  /** Clear the fetched-audio cache (skips in-flight fetches and their temps — never
+   *  corrupts a running download; source audio is never touched). Resolves with the
+   *  remaining footprint. */
+  audioCacheClear: (): Promise<AudioCacheStats> => invoke("audio_cache_clear"),
 };
+
+/** Fetched-audio cache footprint as reported by `audio_cache_stats` / `audio_cache_clear`. */
+export interface AudioCacheStats {
+  bytes: number;
+  files: number;
+}
 
 /**
  * S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
@@ -260,8 +280,12 @@ export function enqueueAudioForDictation(dictationId: string): void {
 export type AudioPartPrepare =
   | { state: "ready"; path: string }
   | { state: "fetching"; received: number; total: number }
+  // Admitted but waiting for a global download permit (cap 2, FIFO).
+  | { state: "queued" }
   | { state: "not_on_server" }
   | { state: "unreachable" }
+  // The cache volume positively reported insufficient space; `needed` = clean-disk budget.
+  | { state: "no_space"; needed: number }
   | { state: "verification_failed" }
   | { state: "error"; message: string };
 
@@ -272,18 +296,34 @@ export type AudioPartPrepare =
  */
 export type TrackFetch =
   | { kind: "ready" } // all (missing) parts are now local — build the player
-  | { kind: "fetching"; percent: number; received: number; total: number }
-  | { kind: "on_device" } // at least one part has no server copy — can't assemble here
+  | {
+      kind: "fetching";
+      percent: number;
+      received: number;
+      total: number;
+      /** 1-based ordinal (among the missing parts) of the first in-flight part — the K in
+       *  "Fetching part K of M". */
+      currentPart: number;
+      /** Total missing parts — the M. */
+      totalParts: number;
+    }
+  | { kind: "queued" } // admitted, no part started yet (global cap busy)
+  | { kind: "on_device" } // at least one part has no server copy — can't assemble YET (auto re-probed)
   | { kind: "unreachable" } // can't reach the sync server
+  | { kind: "no_space"; needed: number } // disk precheck: not enough space on the cache volume
   | { kind: "verification_failed" } // a part failed to decrypt/verify (tamper signal)
   | { kind: "error"; message: string };
 
 /**
- * Reduce the per-part prepare states (of the MISSING parts only — locally-present parts are
- * excluded by the caller) into one track state. Precedence puts the states that BLOCK
- * assembly first: verification failure → unreachable → generic error → any part with no
- * server copy (`on_device`) → still fetching → all ready. An empty input means nothing is
- * missing, i.e. `ready`. Pure so the player and its tests share one source of truth.
+ * Reduce the per-part prepare states (of the MISSING parts only, in part_index order —
+ * locally-present parts are excluded by the caller) into one track state. Precedence puts
+ * the states that BLOCK assembly first: verification failure → unreachable → no_space →
+ * generic error → still fetching → queued → any part with no server copy (`on_device`).
+ * `on_device` ranks BELOW fetching/queued (auto-fetch S3.5): a part the server lacks is
+ * re-probed on a slow cadence while the rest keep downloading, and the fetch self-starts
+ * when the source device's upload lands — so mid-download progress stays the honest
+ * headline. An empty input means nothing is missing, i.e. `ready`. Pure so the player and
+ * its tests share one source of truth.
  */
 export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
   if (parts.length === 0) return { kind: "ready" };
@@ -291,11 +331,14 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
     return { kind: "verification_failed" };
   }
   if (parts.some((p) => p.state === "unreachable")) return { kind: "unreachable" };
+  const noSpace = parts.find((p) => p.state === "no_space");
+  if (noSpace && noSpace.state === "no_space") {
+    return { kind: "no_space", needed: noSpace.needed };
+  }
   const err = parts.find((p) => p.state === "error");
   if (err && err.state === "error") return { kind: "error", message: err.message };
-  // Any part with no server copy means the full track can never assemble here.
-  if (parts.some((p) => p.state === "not_on_server")) return { kind: "on_device" };
-  if (parts.some((p) => p.state === "fetching")) {
+  const firstFetching = parts.findIndex((p) => p.state === "fetching");
+  if (firstFetching >= 0) {
     let received = 0;
     let total = 0;
     for (const p of parts) {
@@ -306,8 +349,19 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
     }
     const percent =
       total > 0 ? Math.min(100, Math.max(0, Math.round((received / total) * 100))) : 0;
-    return { kind: "fetching", percent, received, total };
+    return {
+      kind: "fetching",
+      percent,
+      received,
+      total,
+      currentPart: firstFetching + 1,
+      totalParts: parts.length,
+    };
   }
+  if (parts.some((p) => p.state === "queued")) return { kind: "queued" };
+  // No fetch in flight and a part has no server copy: waiting for the source device's
+  // upload (the caller re-probes on the ON_DEVICE_REPROBE_MS cadence).
+  if (parts.some((p) => p.state === "not_on_server")) return { kind: "on_device" };
   return { kind: "ready" };
 }
 
@@ -315,6 +369,54 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
 export function formatFetchProgress(percent: number): string {
   if (!Number.isFinite(percent) || percent <= 0) return "Fetching…";
   return `Fetching ${Math.min(100, Math.round(percent))}%`;
+}
+
+/**
+ * Aggregate in-progress copy: single-part tracks read "Fetching… N%", multi-part tracks
+ * "Fetching part K of M — N%" (K = the first in-flight part's ordinal among the missing
+ * parts, M = total missing). While the percent is unknown (total not yet declared) the
+ * percent suffix is omitted.
+ */
+export function formatTrackFetchLabel(track: {
+  percent: number;
+  currentPart: number;
+  totalParts: number;
+}): string {
+  const pct =
+    Number.isFinite(track.percent) && track.percent > 0
+      ? `${Math.min(100, Math.round(track.percent))}%`
+      : null;
+  if (track.totalParts > 1) {
+    const base = `Fetching part ${track.currentPart} of ${track.totalParts}`;
+    return pct ? `${base} — ${pct}` : `${base}…`;
+  }
+  return pct ? `Fetching… ${pct}` : "Fetching…";
+}
+
+/** "Not enough disk space (need ~X)" copy for the no_space terminal. */
+export function formatNoSpace(needed: number): string {
+  return `Not enough disk space (need ~${formatBytes(needed)})`;
+}
+
+/** Slow cadence for re-probing a track the server doesn't (fully) hold yet. */
+export const ON_DEVICE_REPROBE_MS = 30_000;
+
+/**
+ * Poll scheduling for the auto-fetch effect: fast (600ms) while anything is downloading or
+ * waiting for a permit, slow (30s) while the server lacks a blob (still-uploading re-probe —
+ * the fetch self-starts when the upload lands), and stop (`null`) on ready + the terminals
+ * that need a user action (retry / free space). Pure so the cadence is unit-testable.
+ */
+export function nextPollDelayMs(track: TrackFetch): number | null {
+  switch (track.kind) {
+    case "fetching":
+    case "queued":
+      return 600;
+    case "on_device":
+      return ON_DEVICE_REPROBE_MS;
+    default:
+      return null;
+  }
 }
 
 /**

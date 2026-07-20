@@ -296,3 +296,54 @@ describe("SyncTab — audio backup card (S2)", () => {
     expect(screen.queryByText("Audio backup")).not.toBeInTheDocument();
   });
 });
+
+describe("SyncTab — fetched-audio cache row (S3.5)", () => {
+  async function mockCache(bytes: number, files: number) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_cache_stats") return { bytes, files };
+      if (cmd === "audio_cache_clear") return { bytes: 0, files: 0 };
+      return null;
+    });
+    return vi.mocked(invoke);
+  }
+
+  it("shows 'Fetched audio: N MB' once the cache holds fetched audio", async () => {
+    await mockCache(5 * 1024 * 1024, 3);
+    setup({ email: "user@example.com", status: makeStatus() });
+    render(<SyncTab />);
+    expect(await screen.findByText("Fetched audio: 5.0 MB")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
+  it("is hidden while the cache is empty", async () => {
+    const invoke = await mockCache(0, 0);
+    setup({ email: "user@example.com", status: makeStatus() });
+    render(<SyncTab />);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("audio_cache_stats"),
+    );
+    expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument();
+  });
+
+  it("clears only through the confirm dialog, then hides the emptied row", async () => {
+    const invoke = await mockCache(5 * 1024 * 1024, 3);
+    setup({ email: "user@example.com", status: makeStatus() });
+    render(<SyncTab />);
+    await userEvent.click(await screen.findByRole("button", { name: "Clear" }));
+    // No clear before the confirm.
+    expect(invoke).not.toHaveBeenCalledWith("audio_cache_clear");
+    const dialog = screen.getByRole("alertdialog");
+    expect(
+      within(dialog).getByText("Clear fetched audio?"),
+    ).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Clear" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("audio_cache_clear"),
+    );
+    // The refreshed (now empty) footprint hides the row.
+    await waitFor(() =>
+      expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument(),
+    );
+  });
+});

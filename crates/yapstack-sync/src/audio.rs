@@ -26,7 +26,7 @@
 //!
 //! Deleted-part entries are dropped SILENTLY (not surfaced as errors), per D9.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -716,7 +716,24 @@ pub enum FetchResult {
     NotOnServer,
     /// The caller cancelled the download mid-flight; the partial file was discarded.
     Cancelled,
+    /// The cache volume positively reported insufficient space for this blob (disk
+    /// precheck). `needed` is the TOTAL the operation requires from a clean disk —
+    /// `content_length * 2 + `[`NO_SPACE_HEADROOM_BYTES`] (encrypted temp + decrypted
+    /// output + headroom) — so the player can render "Not enough disk space (need ~X)".
+    /// An honest terminal, never fabricated: it fires only when the injected
+    /// free-space probe RETURNS a number that is too small (probe `None` = fail-open).
+    NoSpace { needed: u64 },
 }
+
+/// Headroom the disk precheck demands on top of the blob's own footprint, so a fetch never
+/// fills the volume to the brim (256 MiB).
+pub const NO_SPACE_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Injected free-space probe: available bytes on the volume containing the given path, or
+/// `None` when the platform can't say (the check FAILS OPEN — a fetch is never blocked on
+/// an indeterminate probe). The desktop supplies the real `statvfs`/`GetDiskFreeSpaceExW`
+/// implementation; the engine stays platform-free and unit-testable.
+pub type FreeSpaceFn = dyn Fn(&Path) -> Option<u64> + Send + Sync;
 
 /// Resolve a part in D2 order for the fetch layer: a present cache file is an immediate hit
 /// (step 1) and short-circuits any network work. `cache_path` is this device's cache entry
@@ -727,6 +744,26 @@ pub fn cache_hit(cache_path: &Path) -> bool {
     cache_path.is_file()
 }
 
+/// The disk-precheck core: probe the cache volume and compare against the blob budget.
+/// `blob_len` is the (encrypted ≈ decrypted) blob size; `already_on_disk` is how much of
+/// that budget is ALREADY consumed (the encrypted temp, when checking post-download).
+/// Returns `Some(needed_total)` — the full clean-disk budget, for the "need ~X" copy —
+/// only when the probe POSITIVELY reports insufficient space; `None` = enough space, no
+/// probe supplied, or the probe couldn't determine (fail-open, never fabricate).
+fn space_shortfall(
+    free_space: Option<&FreeSpaceFn>,
+    cache_dir: &Path,
+    blob_len: u64,
+    already_on_disk: u64,
+) -> Option<u64> {
+    let free = free_space?(cache_dir)?;
+    let needed_total = blob_len
+        .saturating_mul(2)
+        .saturating_add(NO_SPACE_HEADROOM_BYTES);
+    let still_needed = needed_total.saturating_sub(already_on_disk);
+    (free < still_needed).then_some(needed_total)
+}
+
 /// Fetch one blob to the local cache (fetch-path step 3). Streams the encrypted blob to a
 /// temp file (progress-reported, cancellable), then streaming-decrypts it (`open_blob`,
 /// verifying the identity wrap AAD for THIS `part_id`/`session_id`/`epoch`) into a temp in the
@@ -734,11 +771,22 @@ pub fn cache_hit(cache_path: &Path) -> bool {
 /// memory. Idempotent under coalescing: a pre-existing cache file returns [`FetchResult::Fetched`]
 /// without touching the network (D2 step 1).
 ///
+/// ## Disk precheck (S4-pulled-forward)
+/// When a `free_space` probe is supplied, the fetch checks the cache volume as soon as the
+/// server-declared content-length is known (a lightweight watcher beside the streaming
+/// download — the transport seam is untouched) and once more just before decrypt (the
+/// backstop for unknown content-length or space that shrank mid-download). Budget:
+/// `content_length * 2 + `[`NO_SPACE_HEADROOM_BYTES`] (encrypted temp + decrypted output +
+/// headroom). A positively-insufficient volume aborts the download and returns the honest
+/// [`FetchResult::NoSpace`] terminal; a probe that returns `None` fails OPEN (the fetch
+/// proceeds — never fabricate a NoSpace).
+///
 /// # Errors
 /// - [`SyncError::Network`] — relay unreachable (desktop → "can't reach sync server").
 /// - [`SyncError::Crypto`] — decrypt/verification failure (desktop → "audio failed
 ///   verification"; a tamper signal, logged at warn per the spec posture).
 /// - other [`SyncError`] — transport/IO faults, surfaced verbatim.
+#[allow(clippy::too_many_arguments)] // the fetch context is irreducible: transport+key+identity+paths+progress+probe
 pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
     transport: &T,
     vault_key: &[u8; 32],
@@ -747,6 +795,7 @@ pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
     temp_dir: &Path,
     cache_path: &Path,
     progress: &FetchProgress,
+    free_space: Option<&FreeSpaceFn>,
 ) -> Result<FetchResult, SyncError> {
     // D2 step 1: a present cache file wins outright — no network, no re-decrypt.
     if cache_hit(cache_path) {
@@ -757,23 +806,54 @@ pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
     }
     std::fs::create_dir_all(temp_dir)
         .map_err(|e| SyncError::Transport(format!("audio fetch temp dir: {e}")))?;
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| SyncError::Transport(format!("audio cache dir: {e}")))?;
-    }
+    let cache_dir = cache_path
+        .parent()
+        .ok_or_else(|| SyncError::Transport("audio cache path has no parent".into()))?;
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| SyncError::Transport(format!("audio cache dir: {e}")))?;
 
     // 1. Stream the ENCRYPTED blob to a temp file (O(frame) memory, progress-reported).
+    //    A lightweight watcher runs beside the download: the moment the transport declares
+    //    the content-length (`progress.total`), the disk precheck runs ONCE; on a
+    //    positively-insufficient volume it aborts the stream via the cooperative cancel
+    //    (classified below as NoSpace, not a user cancel) instead of downloading hundreds
+    //    of MB the disk can't hold. The temp dir and cache dir are siblings beside the DB,
+    //    so one volume probe covers both.
     let enc_tmp = tempfile::Builder::new()
         .prefix(FETCH_TEMP_PREFIX)
         .tempfile_in(temp_dir)
         .map_err(|e| SyncError::Transport(format!("audio fetch temp file: {e}")))?;
-    let available = match transport
-        .get_audio_streaming(part_id, enc_tmp.path(), progress)
-        .await
-    {
+    let mut no_space_needed: Option<u64> = None;
+    let download = transport.get_audio_streaming(part_id, enc_tmp.path(), progress);
+    tokio::pin!(download);
+    let downloaded = loop {
+        if free_space.is_none() || no_space_needed.is_some() {
+            break download.await;
+        }
+        tokio::select! {
+            res = &mut download => break res,
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                let (_, total) = progress.snapshot();
+                if total > 0 {
+                    if let Some(needed) = space_shortfall(free_space, cache_dir, total, 0) {
+                        no_space_needed = Some(needed);
+                        progress.request_cancel();
+                    } else {
+                        // Checked once with a known total and it fit — stop polling.
+                        break download.await;
+                    }
+                }
+            }
+        }
+    };
+    let available = match downloaded {
         Ok(a) => a,
         Err(SyncError::Transport(m)) if m == crate::transport::FETCH_CANCELLED => {
-            return Ok(FetchResult::Cancelled);
+            return Ok(match no_space_needed {
+                // The WATCHER aborted the stream: an honest NoSpace, not a user cancel.
+                Some(needed) => FetchResult::NoSpace { needed },
+                None => FetchResult::Cancelled,
+            });
         }
         Err(e) => return Err(e),
     };
@@ -781,12 +861,19 @@ pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
         return Ok(FetchResult::NotOnServer);
     }
 
+    // Pre-decrypt backstop: the encrypted temp is on disk (its size = the true blob
+    // length), so demand room for the decrypted output + headroom. Catches transports
+    // that never declared a content-length and space that shrank during the download.
+    let enc_len = std::fs::metadata(enc_tmp.path())
+        .map(|m| m.len())
+        .unwrap_or_else(|_| progress.snapshot().1);
+    if let Some(needed) = space_shortfall(free_space, cache_dir, enc_len, enc_len) {
+        return Ok(FetchResult::NoSpace { needed });
+    }
+
     // 2. Streaming-decrypt (identity-verified) → a temp in the cache dir → atomic rename. A
     //    decrypt/verification failure leaves NO cache file (the temp is dropped), so a tamper
     //    never poisons the cache and a retry re-downloads cleanly.
-    let cache_dir = cache_path
-        .parent()
-        .ok_or_else(|| SyncError::Transport("audio cache path has no parent".into()))?;
     let dec_tmp = tempfile::Builder::new()
         .prefix(FETCH_TEMP_PREFIX)
         .tempfile_in(cache_dir)
@@ -819,6 +906,9 @@ pub async fn fetch_blob_to_cache<T: SyncTransport + ?Sized>(
 pub struct FetchSlot {
     pub progress: FetchProgress,
     outcome: Mutex<Option<Result<FetchResult, String>>>,
+    /// True while the part sits in the registry's FIFO admission queue (cap reached) —
+    /// the observable "waiting" state the player renders as Queued.
+    queued: AtomicBool,
 }
 
 impl FetchSlot {
@@ -837,15 +927,52 @@ impl FetchSlot {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    /// Whether the part is admission-queued (submitted but not yet started — cap reached).
+    #[must_use]
+    pub fn is_queued(&self) -> bool {
+        self.queued.load(Ordering::Relaxed)
+    }
+    fn set_queued(&self, q: bool) {
+        self.queued.store(q, Ordering::Relaxed);
+    }
 }
 
-/// Single-flight registry: at most ONE in-flight fetch per `part_id`, so concurrent player
-/// views coalesce onto the same download and share its [`FetchProgress`] (the S3
-/// coalescing requirement). The desktop owns one process-wide instance; the fetch execution
-/// (thread + runtime + transport) is the desktop's, keeping this a pure coordination type.
-#[derive(Default)]
+/// The deferred fetch-start a caller hands to [`FetchRegistry::submit`]. In production it
+/// spawns the download worker thread; the registry runs it immediately (a permit was free)
+/// or from the FIFO queue when a running fetch finishes. Kept a boxed closure so the
+/// registry stays a pure coordination type — execution (thread/runtime/transport) is the
+/// caller's.
+pub type FetchStarter = Box<dyn FnOnce() + Send + 'static>;
+
+/// Default global fetch concurrency: at most this many downloads run at once; the rest
+/// wait in FIFO order (submission order = the player's part_index order).
+pub const DEFAULT_FETCH_CONCURRENCY: usize = 2;
+
+/// Single-flight registry + global admission control: at most ONE slot per `part_id`
+/// (concurrent player views coalesce onto the same download and share its
+/// [`FetchProgress`] — the S3 coalescing requirement), and at most `cap` downloads
+/// RUNNING process-wide; further submissions queue FIFO in submission order and start as
+/// running fetches call [`task_finished`](Self::task_finished). The desktop owns one
+/// process-wide instance; the fetch execution (thread + runtime + transport) is the
+/// caller-supplied [`FetchStarter`], keeping this a pure coordination type.
 pub struct FetchRegistry {
-    slots: Mutex<HashMap<String, Arc<FetchSlot>>>,
+    cap: usize,
+    inner: Mutex<RegistryInner>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    slots: HashMap<String, Arc<FetchSlot>>,
+    /// FIFO of parts admitted but not yet started (cap reached), with their starters.
+    queue: VecDeque<(String, FetchStarter)>,
+    /// Started-and-not-yet-finished count (each started task calls `task_finished` once).
+    running: usize,
+}
+
+impl Default for FetchRegistry {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_FETCH_CONCURRENCY)
+    }
 }
 
 impl FetchRegistry {
@@ -853,33 +980,188 @@ impl FetchRegistry {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Get the existing slot for `part_id`, or create one. Returns `(slot, is_new)`: only the
-    /// caller that receives `is_new == true` should START the download; every other caller
-    /// subscribes to the returned slot's progress/outcome (coalescing).
-    pub fn get_or_create(&self, part_id: &str) -> (Arc<FetchSlot>, bool) {
-        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = g.get(part_id) {
-            return (s.clone(), false);
+    /// A registry with an explicit concurrency cap (tests; `new()` uses
+    /// [`DEFAULT_FETCH_CONCURRENCY`]).
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            inner: Mutex::new(RegistryInner::default()),
         }
-        let s = FetchSlot::new();
-        g.insert(part_id.to_string(), s.clone());
-        (s, true)
     }
+
+    /// Submit a fetch for `part_id`. If a slot already exists the starter is DROPPED and the
+    /// existing slot returned (single-flight coalescing). Otherwise the slot is created and
+    /// the starter either runs immediately (a permit was free) or queues FIFO — the slot
+    /// reads [`FetchSlot::is_queued`] until promoted. Every started starter's task MUST
+    /// eventually call [`task_finished`](Self::task_finished) exactly once.
+    pub fn submit(&self, part_id: &str, starter: FetchStarter) -> Arc<FetchSlot> {
+        let (slot, run_now) = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = g.slots.get(part_id) {
+                return s.clone();
+            }
+            let s = FetchSlot::new();
+            g.slots.insert(part_id.to_string(), s.clone());
+            if g.running < self.cap {
+                g.running += 1;
+                (s, Some(starter))
+            } else {
+                s.set_queued(true);
+                g.queue.push_back((part_id.to_string(), starter));
+                (s, None)
+            }
+        };
+        if let Some(start) = run_now {
+            start(); // outside the lock — the starter may finish/re-enter synchronously
+        }
+        slot
+    }
+
+    /// A started task finished (any terminal, including cancel): release its permit and
+    /// start the next queued fetch, if any. Called exactly once per started starter.
+    pub fn task_finished(&self) {
+        let next = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.running = g.running.saturating_sub(1);
+            match g.queue.pop_front() {
+                Some((id, starter)) => {
+                    g.running += 1;
+                    if let Some(s) = g.slots.get(&id) {
+                        s.set_queued(false);
+                    }
+                    Some(starter)
+                }
+                None => None,
+            }
+        };
+        if let Some(start) = next {
+            start();
+        }
+    }
+
+    /// Navigate-away semantics: if `part_id` is still admission-QUEUED, remove it (queue
+    /// entry + slot) and return `true` — it never starts. A RUNNING (or terminal) fetch is
+    /// left untouched (`false`): the download completes into the cache, bounded by the cap.
+    pub fn cancel_if_queued(&self, part_id: &str) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = g.queue.len();
+        g.queue.retain(|(id, _)| id != part_id);
+        if g.queue.len() == before {
+            return false;
+        }
+        g.slots.remove(part_id);
+        true
+    }
+
     /// The current slot for `part_id`, if one exists.
     #[must_use]
     pub fn get(&self, part_id: &str) -> Option<Arc<FetchSlot>> {
-        self.slots
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .slots
             .get(part_id)
             .cloned()
     }
-    /// Drop the slot (cancel/reset). A subsequent [`get_or_create`] starts a fresh fetch — the
-    /// retry seam after an error terminal and the reset after a user cancel.
-    pub fn remove(&self, part_id: &str) {
-        self.slots
+
+    /// Whether `part_id` has ANY live slot (queued, running, or unobserved terminal) — the
+    /// cache-clear safety probe: a part with a live slot is skipped by the clear.
+    #[must_use]
+    pub fn is_active(&self, part_id: &str) -> bool {
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(part_id);
+            .slots
+            .contains_key(part_id)
     }
+
+    /// Drop the slot (cancel/reset). Purges a queued entry too, so a queued part never
+    /// starts after removal. A subsequent [`submit`](Self::submit) starts a fresh fetch —
+    /// the retry seam after an error terminal and the reset after a user cancel. NOTE: a
+    /// RUNNING task's permit is NOT released here — its worker still calls
+    /// [`task_finished`](Self::task_finished) when the (possibly cancelled) download ends.
+    pub fn remove(&self, part_id: &str) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.slots.remove(part_id);
+        g.queue.retain(|(id, _)| id != part_id);
+    }
+}
+
+// ---- Fetch-cache management (S4 pulled forward) --------------------------------
+//
+// The keep-until-clear cache is user-visible storage; these primitives back the sync
+// panel's "Fetched audio: N MB — Clear" row. They NEVER touch the fetch-tmp dir (in-flight
+// encrypted downloads) and the clear additionally skips both in-cache-dir decrypt temps
+// (FETCH_TEMP_PREFIX) and any file whose part has a live registry slot — the simplest rule
+// that can never corrupt an in-flight fetch.
+
+/// Point-in-time cache footprint: decrypted audio files only (decrypt temps excluded).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// Total bytes + file count of the fetch cache dir. A missing dir is an empty cache (not
+/// an error). Skips [`FETCH_TEMP_PREFIX`] decrypt temps and subdirectories; best-effort
+/// per entry (an unreadable entry is simply not counted).
+#[must_use]
+pub fn cache_stats(cache_dir: &Path) -> CacheStats {
+    let mut stats = CacheStats::default();
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return stats;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(FETCH_TEMP_PREFIX) {
+            continue; // an in-flight decrypt temp is not settled cache content
+        }
+        match entry.metadata() {
+            Ok(m) if m.is_file() => {
+                stats.bytes = stats.bytes.saturating_add(m.len());
+                stats.files += 1;
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+/// Delete the cache dir's settled audio files, skipping (a) [`FETCH_TEMP_PREFIX`] decrypt
+/// temps and (b) any file whose stem (the part_id) `is_active` reports live — an in-flight
+/// or just-finished-but-unobserved fetch is never yanked out from under the player. Only
+/// regular files directly in `cache_dir` are ever touched (no recursion, and the fetch-tmp
+/// dir is a sibling this function never sees). Best-effort per file; returns what was
+/// reclaimed. A missing dir reclaims nothing.
+pub fn cache_clear<F: Fn(&str) -> bool>(cache_dir: &Path, is_active: F) -> CacheStats {
+    let mut removed = CacheStats::default();
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(FETCH_TEMP_PREFIX) {
+            continue; // never touch an in-flight decrypt temp
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue; // never recurse into / remove a directory
+        }
+        // Cache files are `<part_id>.<ext>`; the stem is the part identity.
+        let stem = std::path::Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        if is_active(stem) {
+            continue; // live fetch slot → the part is (or may momentarily be) in use
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed.bytes = removed.bytes.saturating_add(meta.len());
+            removed.files += 1;
+        }
+    }
+    removed
 }

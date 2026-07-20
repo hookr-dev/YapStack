@@ -99,6 +99,9 @@ sync = [
     # Windows-only credential shim (R5); a no-op reference on non-Windows targets, where the
     # optional dep is not present.
     "dep:windows-sys",
+    # Unix-only free-space probe for the audio-fetch disk precheck (S3 auto-fetch); a no-op
+    # reference on Windows, where GetDiskFreeSpaceExW (windows-sys) covers it instead.
+    "dep:libc",
 ]
 
 [dev-dependencies]
@@ -116,7 +119,16 @@ tempfile = { workspace = true }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
+    # GetDiskFreeSpaceExW for the audio-fetch disk precheck (S3 auto-fetch). Feature-add on
+    # the dep we already build — no new crate (PM dependency decision).
+    "Win32_Storage_FileSystem",
 ], optional = true }
+
+# Unix free-space probe (statvfs) for the audio-fetch disk precheck. rust-lang's `libc` is
+# already in the transitive tree; a direct unix-only optional dep is the lowest possible
+# supply-chain surface (PM dependency decision — no new third-party crate).
+[target."cfg(unix)".dependencies]
+libc = { version = "0.2", optional = true }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }

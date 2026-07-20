@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -44,9 +44,10 @@ import {
   syncCommands,
   shouldShowUpgrade,
   formatFingerprint,
+  formatBytes,
   deriveAudioBackup,
 } from "@/lib/sync";
-import type { SyncStatus } from "@/lib/sync";
+import type { AudioCacheStats, SyncStatus } from "@/lib/sync";
 import { deriveSyncDisplay, type SyncDisplay } from "@/lib/syncDisplay";
 import { RelayCard } from "./RelayCard";
 import { SignupDialog } from "./SignupDialog";
@@ -245,6 +246,10 @@ export function SyncTab() {
           onRetried={() => void refreshSyncStatus()}
         />
       )}
+
+      {/* Fetched-audio cache (S3.5 auto-fetch): audio pulled from other devices is
+          keep-until-clear; this row is the clear. Hidden while the cache is empty. */}
+      {signedIn && syncEnabled && <FetchedAudioCard />}
 
       {/* Upgrade — only when a billing_url is advertised (unchanged). */}
       {syncStatus && shouldShowUpgrade(syncStatus) && syncStatus.billingUrl && (
@@ -597,6 +602,90 @@ function AudioBackupCard({
             Retry
           </Button>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Fetched-audio cache row (S3.5 auto-fetch): "Fetched audio: N MB — Clear" with a confirm
+ * dialog, in the stacked-card idiom. Hidden while the cache is empty (nothing to report).
+ * Clearing is safe against in-flight fetches by construction (the Rust command skips live
+ * fetch slots and download temps), so the row needs no in-flight special casing — a clear
+ * during a fetch simply leaves that part's bytes behind, reflected in the refreshed count.
+ */
+function FetchedAudioCard() {
+  const [stats, setStats] = useState<AudioCacheStats | null>(null);
+  const [clearing, setClearing] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await syncCommands.audioCacheStats();
+      setStats(s && typeof s.bytes === "number" ? s : null);
+    } catch {
+      // Command unavailable (older backend / feature off) → hide the row.
+      setStats(null);
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (!stats || stats.bytes <= 0) return null;
+
+  const handleClear = async () => {
+    setClearing(true);
+    try {
+      const remaining = await syncCommands.audioCacheClear();
+      setStats(remaining);
+      toast.success(
+        remaining.bytes > 0
+          ? `Cleared — ${formatBytes(remaining.bytes)} still in use by an active fetch`
+          : "Fetched audio cleared",
+      );
+    } catch (e) {
+      // Surface verbatim — never auto-route.
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return (
+    <Card className={CARD}>
+      <CardContent className={`${BODY} flex items-center justify-between gap-3`}>
+        <div className="space-y-0.5">
+          <p className="text-xs font-medium">
+            Fetched audio: {formatBytes(stats.bytes)}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            Audio downloaded from your other devices, kept for playback until
+            you clear it.
+          </p>
+        </div>
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button size="sm" variant="outline" disabled={clearing}>
+              {clearing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Clear"}
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Clear fetched audio?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Frees {formatBytes(stats.bytes)} on this device. Recordings stay
+                safe on the devices that made them and on your sync server — you
+                can fetch them again anytime.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={() => void handleClear()}>
+                Clear
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </CardContent>
     </Card>
   );

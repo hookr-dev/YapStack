@@ -16,6 +16,10 @@ import {
   enqueueAudioForDictation,
   deriveTrackFetch,
   formatFetchProgress,
+  formatTrackFetchLabel,
+  formatNoSpace,
+  nextPollDelayMs,
+  ON_DEVICE_REPROBE_MS,
   type AudioPartPrepare,
 } from "./sync";
 
@@ -255,16 +259,40 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
     expect(deriveTrackFetch([ready(), ready("/c/y.wav")])).toEqual({ kind: "ready" });
   });
 
-  it("is on_device when any part has no server copy (can't assemble here)", () => {
-    // Even mid-fetch of another part: the track can never fully assemble.
+  it("keeps fetching as the headline while another part has no server copy yet", () => {
+    // Auto-fetch S3.5: a not-yet-uploaded part is re-probed on the slow cadence while the
+    // rest keep downloading — mid-download progress stays the honest headline.
     expect(deriveTrackFetch([fetching(10, 100), { state: "not_on_server" }])).toEqual({
-      kind: "on_device",
+      kind: "fetching",
+      percent: 10,
+      received: 10,
+      total: 100,
+      currentPart: 1,
+      totalParts: 2,
     });
+  });
+
+  it("is on_device when a part has no server copy and nothing is in flight", () => {
+    expect(
+      deriveTrackFetch([ready(), { state: "not_on_server" }]),
+    ).toEqual({ kind: "on_device" });
   });
 
   it("aggregates progress across in-flight parts into a percent", () => {
     const t = deriveTrackFetch([fetching(50, 100), fetching(50, 300)]);
-    expect(t).toEqual({ kind: "fetching", percent: 25, received: 100, total: 400 });
+    expect(t).toEqual({
+      kind: "fetching",
+      percent: 25,
+      received: 100,
+      total: 400,
+      currentPart: 1,
+      totalParts: 2,
+    });
+  });
+
+  it("reports the FIRST in-flight part's ordinal among the missing parts (the K)", () => {
+    const t = deriveTrackFetch([ready(), fetching(5, 10), { state: "queued" }]);
+    expect(t).toMatchObject({ kind: "fetching", currentPart: 2, totalParts: 3 });
   });
 
   it("reports fetching with 0% when the total is not yet known", () => {
@@ -273,7 +301,29 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
       percent: 0,
       received: 0,
       total: 0,
+      currentPart: 1,
+      totalParts: 1,
     });
+  });
+
+  it("is queued while parts wait for a download permit and none is in flight", () => {
+    expect(
+      deriveTrackFetch([{ state: "queued" }, { state: "queued" }]),
+    ).toEqual({ kind: "queued" });
+    // A queued part never outranks live progress.
+    expect(
+      deriveTrackFetch([{ state: "queued" }, fetching(1, 2)]),
+    ).toMatchObject({ kind: "fetching", currentPart: 2, totalParts: 2 });
+  });
+
+  it("surfaces no_space (disk precheck) over fetching/queued with the needed budget", () => {
+    expect(
+      deriveTrackFetch([
+        { state: "no_space", needed: 1_500_000_000 },
+        fetching(1, 2),
+        { state: "queued" },
+      ]),
+    ).toEqual({ kind: "no_space", needed: 1_500_000_000 });
   });
 
   it("surfaces unreachable (transient) over not_on_server", () => {
@@ -309,6 +359,57 @@ describe("formatFetchProgress", () => {
   });
 });
 
+describe("formatTrackFetchLabel (aggregate copy)", () => {
+  it("single-part → 'Fetching… N%'", () => {
+    expect(
+      formatTrackFetchLabel({ percent: 42, currentPart: 1, totalParts: 1 }),
+    ).toBe("Fetching… 42%");
+  });
+  it("single-part with unknown percent → 'Fetching…'", () => {
+    expect(
+      formatTrackFetchLabel({ percent: 0, currentPart: 1, totalParts: 1 }),
+    ).toBe("Fetching…");
+  });
+  it("multi-part → 'Fetching part K of M — N%'", () => {
+    expect(
+      formatTrackFetchLabel({ percent: 37, currentPart: 2, totalParts: 3 }),
+    ).toBe("Fetching part 2 of 3 — 37%");
+  });
+  it("multi-part with unknown percent omits the suffix", () => {
+    expect(
+      formatTrackFetchLabel({ percent: 0, currentPart: 1, totalParts: 4 }),
+    ).toBe("Fetching part 1 of 4…");
+  });
+});
+
+describe("formatNoSpace", () => {
+  it("renders the honest need-~X copy from the byte budget", () => {
+    expect(formatNoSpace(2 * 1024 * 1024 * 1024)).toBe(
+      "Not enough disk space (need ~2.0 GB)",
+    );
+  });
+});
+
+describe("nextPollDelayMs (auto-fetch cadence)", () => {
+  const fetching = (): ReturnType<typeof deriveTrackFetch> =>
+    deriveTrackFetch([{ state: "fetching", received: 1, total: 2 }]);
+  it("polls fast while downloading or waiting for a permit", () => {
+    expect(nextPollDelayMs(fetching())).toBe(600);
+    expect(nextPollDelayMs({ kind: "queued" })).toBe(600);
+  });
+  it("re-probes on the slow 30s cadence while the server lacks a blob", () => {
+    expect(nextPollDelayMs({ kind: "on_device" })).toBe(30_000);
+    expect(ON_DEVICE_REPROBE_MS).toBe(30_000);
+  });
+  it("stops on ready and on the terminals that need a user action", () => {
+    expect(nextPollDelayMs({ kind: "ready" })).toBeNull();
+    expect(nextPollDelayMs({ kind: "unreachable" })).toBeNull();
+    expect(nextPollDelayMs({ kind: "no_space", needed: 1 })).toBeNull();
+    expect(nextPollDelayMs({ kind: "verification_failed" })).toBeNull();
+    expect(nextPollDelayMs({ kind: "error", message: "x" })).toBeNull();
+  });
+});
+
 describe("prepareAudioPart / cancelAudioPart / enqueueAudioForDictation IPC", () => {
   beforeEach(() => invokeMock.mockReset());
 
@@ -325,6 +426,29 @@ describe("prepareAudioPart / cancelAudioPart / enqueueAudioForDictation IPC", ()
     invokeMock.mockResolvedValue(undefined);
     await syncCommands.cancelAudioPart("part-9");
     expect(invokeMock).toHaveBeenCalledWith("audio_cancel_part", { partId: "part-9" });
+  });
+
+  it("releaseAudioPart invokes cancel-if-queued semantics with the part id", async () => {
+    const { syncCommands } = await import("./sync");
+    invokeMock.mockResolvedValue(true);
+    await expect(syncCommands.releaseAudioPart("part-9")).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("audio_release_part", { partId: "part-9" });
+  });
+
+  it("audioCacheStats / audioCacheClear round-trip the cache footprint", async () => {
+    const { syncCommands } = await import("./sync");
+    invokeMock.mockResolvedValue({ bytes: 42, files: 2 });
+    await expect(syncCommands.audioCacheStats()).resolves.toEqual({
+      bytes: 42,
+      files: 2,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("audio_cache_stats");
+    invokeMock.mockResolvedValue({ bytes: 0, files: 0 });
+    await expect(syncCommands.audioCacheClear()).resolves.toEqual({
+      bytes: 0,
+      files: 0,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("audio_cache_clear");
   });
 
   it("enqueueAudioForDictation is fire-and-forget and no-ops on empty id", () => {

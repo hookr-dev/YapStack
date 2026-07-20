@@ -8653,6 +8653,7 @@ dependencies = [
  "futures-util",
  "hound",
  "keyring",
+ "libc",
  "memory-stats",
  "percent-encoding",
  "rand 0.8.5",
