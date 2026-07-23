@@ -43,6 +43,10 @@ function makeEntries(n: number): LogEntry[] {
   }));
 }
 
+// Each update renders 250–500 log rows into jsdom, which pushes these tests
+// past the default 5s timeout on slow CI runners.
+vi.setConfig({ testTimeout: 20_000 });
+
 beforeEach(() => {
   vi.clearAllMocks();
   // Default: subscription is a no-op unsubscribe.
