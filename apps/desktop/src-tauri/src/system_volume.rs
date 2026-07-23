@@ -679,9 +679,8 @@ mod tests {
         use std::time::Duration;
 
         let snap = Arc::new(Mutex::new(None::<Snapshot>));
-        let ctrl = Arc::new(
-            MockController::with_device(0.80).with_set_delay(Duration::from_millis(50)),
-        );
+        let ctrl =
+            Arc::new(MockController::with_device(0.80).with_set_delay(Duration::from_millis(50)));
 
         let snap_a = Arc::clone(&snap);
         let ctrl_a = Arc::clone(&ctrl);
