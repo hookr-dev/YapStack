@@ -4,7 +4,8 @@ import { Button } from "@/components/ui/button";
 import { Copy, Eye, EyeOff, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import type { DbSegment } from "@/lib/db";
-import { segmentsToPlainText } from "@/lib/export";
+import { segmentsToAttributedMarkdown } from "@/lib/export";
+import { trackTranscriptExported } from "@/lib/analytics";
 
 export function BulkActionsBar({
   segments,
@@ -29,10 +30,20 @@ export function BulkActionsBar({
   const ids = selected.map((s) => s.id);
 
   const handleCopy = async () => {
-    const text = segmentsToPlainText(selected);
+    const text = segmentsToAttributedMarkdown(selected);
+    if (text.length === 0) {
+      toast.info("Nothing to copy");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(text);
       toast.success(`Copied ${selected.length} segments`);
+      trackTranscriptExported({
+        scope: "selection",
+        mechanism: "clipboard",
+        kind: "full",
+        segments: selected.length,
+      });
     } catch {
       toast.error("Clipboard copy failed");
     }

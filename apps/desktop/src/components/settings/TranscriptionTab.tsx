@@ -169,6 +169,8 @@ export function TranscriptionTab() {
   }, [activeDescriptor, language]);
 
   const supportsDiarization = activeDescriptor?.supports_diarization ?? false;
+  const supportsInitialPrompt =
+    activeDescriptor?.supports_initial_prompt ?? false;
 
   const handleEngineChange = async (engine: EngineKindDto) => {
     if (engine === selectedEngine) return;
@@ -327,20 +329,25 @@ export function TranscriptionTab() {
             currentValue={silenceDurationMs}
             onChange={(v) => updateSettings({ silenceDurationMs: v })}
           />
-          <ButtonGroupSetting
-            label="Prompt Context"
-            description="Characters of prior transcript fed to Whisper for continuity (Whisper only)"
-            options={PROMPT_CONTEXT_OPTIONS}
-            currentValue={promptContextChars}
-            onChange={(v) => updateSettings({ promptContextChars: v })}
-          />
-          <ButtonGroupSetting
-            label="Prompt Decay"
-            description="Clear prompt context after this much silence to prevent hallucination (Whisper only)"
-            options={PROMPT_DECAY_OPTIONS}
-            currentValue={promptDecaySilenceSeconds}
-            onChange={(v) => updateSettings({ promptDecaySilenceSeconds: v })}
-          />
+          {/* Hidden rows keep their persisted values for engine switch-back. */}
+          {supportsInitialPrompt && (
+            <>
+              <ButtonGroupSetting
+                label="Prompt Context"
+                description="Characters of prior transcript fed to the engine for continuity"
+                options={PROMPT_CONTEXT_OPTIONS}
+                currentValue={promptContextChars}
+                onChange={(v) => updateSettings({ promptContextChars: v })}
+              />
+              <ButtonGroupSetting
+                label="Prompt Decay"
+                description="Clear prompt context after this much silence to prevent hallucination"
+                options={PROMPT_DECAY_OPTIONS}
+                currentValue={promptDecaySilenceSeconds}
+                onChange={(v) => updateSettings({ promptDecaySilenceSeconds: v })}
+              />
+            </>
+          )}
         </CollapsibleContent>
       </Collapsible>
     </>

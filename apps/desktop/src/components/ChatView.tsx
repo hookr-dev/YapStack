@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useScrollAnchor } from "@/hooks/useScrollAnchor";
 import { TranscriptSegments } from "@/components/TranscriptSegments";
 import {
   MarqueeOverlay,
@@ -156,11 +157,31 @@ export function ChatView({
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
 
-  // Stick-to-bottom: follow new segments unless the user has scrolled away.
+  // Backfill prepends older segments mid-stream; anchoring keeps visible
+  // content fixed on prepend and follows the bottom only when pinned.
+  const getViewport = useCallback(
+    () =>
+      (scrollAreaRef.current?.querySelector(
+        "[data-slot='scroll-area-viewport']",
+      ) as HTMLElement | null) ?? null,
+    [],
+  );
+  const { isAdjustingRef } = useScrollAnchor({
+    getViewport,
+    dep: segments.length,
+    topKey: segments[0]?.id ?? null,
+    userScrolled,
+    scrollToBottom: () => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    },
+  });
+
+  // Resume following when userScrolled clears, even without a new segment.
   useEffect(() => {
-    if (userScrolled) return;
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [segments.length, userScrolled]);
+    if (!userScrolled) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [userScrolled]);
 
   useEffect(() => {
     if (initialScrollToBottom) {
@@ -205,6 +226,12 @@ export function ChatView({
 
     const handleScroll = () => {
       const newScrollTop = viewport.scrollTop;
+      // Programmatic compensation: update the baseline without flipping
+      // userScrolled or scrollDirection.
+      if (isAdjustingRef.current) {
+        lastScrollTopRef.current = newScrollTop;
+        return;
+      }
       const wentUp = newScrollTop < lastScrollTopRef.current - 1;
       lastScrollTopRef.current = newScrollTop;
 
@@ -232,7 +259,7 @@ export function ChatView({
 
     viewport.addEventListener("scroll", handleScroll, { passive: true });
     return () => viewport.removeEventListener("scroll", handleScroll);
-  }, [isPlaying]);
+  }, [isPlaying, isAdjustingRef]);
 
   const handleJumpToCurrent = useCallback(() => {
     setUserScrolled(false);

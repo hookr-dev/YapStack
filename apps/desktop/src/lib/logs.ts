@@ -4,6 +4,21 @@ import { commands, type LogEntry } from "./types";
 
 export type { LogEntry };
 
+/**
+ * Size of the backend in-memory ring buffer (`LogBuffer::new(500)` in
+ * `logging.rs`) — the ceiling for "load older" re-fetches.
+ */
+export const LOG_BUFFER_CAPACITY = 500;
+
+/**
+ * Initial snapshot size on mount. Kept below `LOG_BUFFER_CAPACITY` so
+ * "load older" has room to reach the rest of the buffer.
+ */
+export const INITIAL_LOG_FETCH = 250;
+
+/** How much further back each "load older" re-fetch reaches. */
+export const LOG_FETCH_STEP = 250;
+
 /** Last N entries from the backend ring buffer. */
 export async function getRecentLogs(limit?: number): Promise<LogEntry[]> {
   const res = await commands.getRecentLogs(limit ?? null);
