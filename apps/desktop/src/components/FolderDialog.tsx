@@ -48,8 +48,6 @@ export function FolderDialog({
   const [icon, setIcon] = useState<string | null>(null);
   const [color, setColor] = useState<string | null>(null);
   const [description, setDescription] = useState("");
-  // Icon grid is collapsed by default so it stops dominating the dialog;
-  // the selected icon stays visible in the trigger while collapsed.
   const [iconPickerOpen, setIconPickerOpen] = useState(false);
 
   const initName = initialData?.name;
@@ -120,9 +118,8 @@ export function FolderDialog({
             />
           </div>
 
-          {/* Icon picker — a compact trigger opens a floating grid (Popover) so
-              the ~36-icon set never reflows the dialog. `modal` gives the
-              popover its own focus scope inside the Radix Dialog. */}
+          {/* Icon picker. `modal` gives the popover its own focus scope
+              inside the Radix Dialog. */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">
               Icon
@@ -234,8 +231,7 @@ export function FolderDialog({
             </div>
           </div>
 
-          {/* Context for AI — the primary field. Feeds the AI chat that runs
-              over sessions in this folder, so it gets the most room. */}
+          {/* Context for AI */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">
               Context for AI{" "}

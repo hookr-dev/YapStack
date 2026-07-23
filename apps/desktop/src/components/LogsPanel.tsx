@@ -107,36 +107,26 @@ function LogRow({ entry }: { entry: LogEntry }) {
 
 export function LogsPanel() {
   const [entries, setEntries] = useState<LogEntry[]>([]);
-  // How many entries we last asked the backend for. Grows when the user loads
-  // older history; the live cap tracks this so freshly-loaded older entries
-  // aren't immediately trimmed by an incoming `log://entry` event.
+  // Last requested snapshot size; grows as the user loads older history.
   const [fetchLimit, setFetchLimit] = useState(INITIAL_LOG_FETCH);
-  // True until a snapshot comes back with fewer entries than we asked for,
-  // which means we've reached the oldest entry the ring buffer still holds.
+  // False once a snapshot returns fewer entries than requested.
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
-  // Set when an entries change is driven by prepended history (load older)
-  // rather than a new live tail entry. The tail effect reads this to keep the
-  // viewport stable instead of yanking the user back to the bottom.
+  // Distance-from-bottom to restore after a load-older prepend, so the tail
+  // effect holds the viewport in place instead of jumping to the bottom.
   const preserveScrollFromBottom = useRef<number | null>(null);
-  // The live cap can't drop below what's currently loaded, or a single live
-  // entry would silently discard older entries the user just fetched. Held in
-  // a ref so the (mount-once) live subscription always trims to the current
-  // window without needing to re-subscribe.
+  // Ref so the mount-once live subscription trims to the current window; the
+  // cap never drops below what's loaded, or a live entry would discard
+  // just-fetched history.
   const liveCapRef = useRef(INITIAL_LOG_FETCH);
   liveCapRef.current = Math.max(fetchLimit, INITIAL_LOG_FETCH);
 
-  // Re-fetch a larger window of history. Re-applies on top of the live stream
-  // by replacing `entries` with the bigger snapshot; the tail effect is told
-  // (via `preserveScrollFromBottom`) to hold the viewport in place.
   const loadOlder = useCallback(async () => {
     const vp = viewportRef.current;
     if (vp) {
-      // Distance from the bottom we want to keep constant across the re-render
-      // so the rows the user is reading don't jump under them.
       preserveScrollFromBottom.current = vp.scrollHeight - vp.scrollTop;
     }
     const nextLimit = Math.min(fetchLimit + LOG_FETCH_STEP, LOG_BUFFER_CAPACITY);
@@ -145,8 +135,6 @@ export function LogsPanel() {
       const snapshot = await getRecentLogs(nextLimit);
       setFetchLimit(nextLimit);
       setEntries(snapshot);
-      // Fewer than requested (or we've already reached the buffer ceiling) =>
-      // there is no older history left to load.
       setHasMoreHistory(
         snapshot.length >= nextLimit && nextLimit < LOG_BUFFER_CAPACITY,
       );
@@ -166,10 +154,7 @@ export function LogsPanel() {
         const snapshot = await getRecentLogs(INITIAL_LOG_FETCH);
         if (cancelled) return;
         setEntries(snapshot);
-        // Older history exists only if the buffer handed back a *full* initial
-        // window (a short snapshot means we already have everything buffered)
-        // and the initial window is below the buffer ceiling (otherwise there's
-        // nothing further to reach for).
+        // A short initial snapshot means the whole buffer is already loaded.
         setHasMoreHistory(
           snapshot.length >= INITIAL_LOG_FETCH &&
             INITIAL_LOG_FETCH < LOG_BUFFER_CAPACITY,
@@ -196,8 +181,7 @@ export function LogsPanel() {
   // Tail: when pinned to bottom, jump to the end on every entries change
   // (including the initial snapshot load). useLayoutEffect so the scroll
   // happens before paint — avoids a brief flicker at the top on first mount.
-  // A load-older change instead restores the prior distance-from-bottom so the
-  // viewport stays put over the rows the user is reading.
+  // A load-older change instead restores the prior distance-from-bottom.
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     if (!vp) return;
@@ -256,8 +240,6 @@ export function LogsPanel() {
     try {
       await clearLogs();
       setEntries([]);
-      // The buffer is empty now, so reset the history window back to its
-      // initial size and re-hide "load older" until enough entries accrue.
       setFetchLimit(INITIAL_LOG_FETCH);
       setHasMoreHistory(false);
     } catch (err) {

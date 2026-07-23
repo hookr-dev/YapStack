@@ -3,12 +3,10 @@
 
 use super::error::CommandError;
 
-/// Text-export file extensions this command is willing to write. Constrains the
-/// renderer-callable write to transcript-style text exports rather than letting
-/// it target arbitrary files.
+/// Extensions this command is willing to write; keeps the renderer-callable
+/// write bounded to text exports.
 const ALLOWED_EXPORT_EXTENSIONS: [&str; 4] = ["md", "markdown", "txt", "text"];
 
-/// Whether `path` ends in one of [`ALLOWED_EXPORT_EXTENSIONS`] (case-insensitive).
 fn is_allowed_export_path(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -20,15 +18,11 @@ fn is_allowed_export_path(path: &str) -> bool {
 
 /// Write UTF-8 `contents` to `path`.
 ///
-/// **Trusted-renderer boundary.** `path` is the destination the user picked in
-/// the frontend save dialog; the command cannot itself prove that, so this is a
-/// renderer-callable file-write primitive. That is consistent with the app's
-/// existing posture for a local-first desktop app whose renderer runs only
-/// first-party code (`delete_audio_files` / `delete_session_wav` already accept
-/// renderer-supplied paths). To bound the blast radius it (a) refuses any path
-/// whose extension is not a known text-export type, and (b) leaves the `fs`
-/// plugin grant read-only so this stays the *only* renderer write path. It does
-/// not create directories.
+/// Trusted-renderer boundary: `path` comes from the frontend save dialog and
+/// cannot be verified here, so this is a renderer-callable file-write
+/// primitive. It refuses non-text-export extensions, does not create
+/// directories, and the `fs` plugin grant stays read-only so this remains the
+/// only renderer write path.
 #[tauri::command]
 #[specta::specta]
 pub async fn write_text_file(path: String, contents: String) -> Result<(), CommandError> {

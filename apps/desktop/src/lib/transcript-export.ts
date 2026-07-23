@@ -5,12 +5,11 @@ import { revealAudioFile } from "@/lib/reveal-file";
 
 /**
  * Save transcript text to a user-chosen file and offer to reveal it. Returns
- * `true` when a file was written, `false` when the user cancelled or there was
- * nothing to export. Toasts on success/failure — callers don't add their own.
+ * `true` when a file was written. Toasts on success/failure — callers don't
+ * add their own.
  *
- * The write goes through the `write_text_file` app command rather than the `fs`
- * plugin, so the renderer's filesystem grant stays read-only; the destination
- * is the user's explicit save-dialog choice.
+ * The write goes through the `write_text_file` app command so the renderer's
+ * `fs` plugin grant stays read-only.
  */
 export async function exportTranscriptToFile(
   content: string,
@@ -35,8 +34,6 @@ export async function exportTranscriptToFile(
       return false;
     }
     toast.success("Transcript exported", {
-      // revealAudioFile reveals any path and handles its own errors (toast +
-      // log), so a moved/deleted file after export fails gracefully.
       action: { label: "Reveal", onClick: () => void revealAudioFile(path) },
     });
     return true;

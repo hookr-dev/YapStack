@@ -157,12 +157,8 @@ export function ChatView({
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
 
-  // Scroll anchoring. The transcript is time-ordered, so backfill brings in
-  // OLDER segments that sort to the TOP and prepend mid-stream. Anchoring keeps
-  // the visible content fixed on prepend (no "bounce") and only follows the
-  // bottom (live tail) when the user is genuinely pinned there and content was
-  // appended. `isAdjustingRef` flags the programmatic compensation so the scroll
-  // handler below ignores it instead of mistaking it for a user scroll.
+  // Backfill prepends older segments mid-stream; anchoring keeps visible
+  // content fixed on prepend and follows the bottom only when pinned.
   const getViewport = useCallback(
     () =>
       (scrollAreaRef.current?.querySelector(
@@ -173,19 +169,14 @@ export function ChatView({
   const { isAdjustingRef } = useScrollAnchor({
     getViewport,
     dep: segments.length,
-    // Identity of the top (earliest) row. A backfill prepend changes it; a
-    // live append at the bottom does not — that's how the hook tells a prepend
-    // (compensate) from an append (leave a scrolled-up reader alone).
     topKey: segments[0]?.id ?? null,
     userScrolled,
-    // Smooth bottom-follow for the live-tail (append-while-pinned) case only.
     scrollToBottom: () => {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     },
   });
 
-  // Resume following on demand (e.g. playback stops -> userScrolled cleared)
-  // even without a new segment, matching the prior stick-to-bottom behavior.
+  // Resume following when userScrolled clears, even without a new segment.
   useEffect(() => {
     if (!userScrolled) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -235,10 +226,8 @@ export function ChatView({
 
     const handleScroll = () => {
       const newScrollTop = viewport.scrollTop;
-      // Prepend compensation moves scrollTop programmatically. Track the new
-      // position (so the next real scroll deltas off the right baseline) but
-      // do not let it flip userScrolled or scrollDirection — it isn't a user
-      // gesture.
+      // Programmatic compensation: update the baseline without flipping
+      // userScrolled or scrollDirection.
       if (isAdjustingRef.current) {
         lastScrollTopRef.current = newScrollTop;
         return;

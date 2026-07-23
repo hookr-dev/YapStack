@@ -169,11 +169,6 @@ export function TranscriptionTab() {
   }, [activeDescriptor, language]);
 
   const supportsDiarization = activeDescriptor?.supports_diarization ?? false;
-  // The Prompt Context / Prompt Decay rows only apply to engines that seed an
-  // initial prompt (Whisper). We gate on the capability flag rather than an
-  // engine-name string so new engines inherit the right behaviour from the
-  // catalogue. Hiding is UI-only — the persisted values stay in the store and
-  // survive switching to a non-prompt engine (e.g. Parakeet) and back.
   const supportsInitialPrompt =
     activeDescriptor?.supports_initial_prompt ?? false;
 
@@ -334,9 +329,7 @@ export function TranscriptionTab() {
             currentValue={silenceDurationMs}
             onChange={(v) => updateSettings({ silenceDurationMs: v })}
           />
-          {/* Prompt Context / Decay are capability-gated: only engines that
-              seed an initial prompt (Whisper) expose them. When hidden the
-              persisted values are left untouched so they return on switch-back. */}
+          {/* Hidden rows keep their persisted values for engine switch-back. */}
           {supportsInitialPrompt && (
             <>
               <ButtonGroupSetting

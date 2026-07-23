@@ -1,14 +1,13 @@
 import type { DbSegment } from "@/lib/db";
 
-/** Mic = the user ("Me"), System = the other party ("Them"). Decided upstream. */
+/** Mic = the user ("Me"), System = the other party ("Them"). */
 type SpeakerSource = DbSegment["source"];
 
 /** A run of consecutive same-speaker segments, merged into one turn. */
 interface Turn {
   source: SpeakerSource;
-  /** Offset of the FIRST segment in the merged turn (first-offset-wins). */
+  /** Offset of the first segment in the merged turn. */
   offsetSeconds: number;
-  /** The turn's text: member segments joined by a single space. */
   text: string;
 }
 
@@ -53,11 +52,9 @@ function speakerLabel(source: SpeakerSource): string {
 }
 
 /**
- * Renders segments as attributed markdown: one turn per paragraph, each prefixed
- * with a bold `**Me:**` / `**Them:**` label, consecutive same-speaker segments
- * merged. With `includeTimestamps`, a `[mm:ss]` (or `[h:mm:ss]`) tag derived from
- * the merged turn's first offset follows the label. Turns are separated by a
- * blank line. Returns "" for empty input.
+ * Renders segments as attributed markdown: one merged turn per paragraph,
+ * prefixed with `**Me:**` / `**Them:**` and, with `includeTimestamps`, a
+ * `[mm:ss]` tag from the turn's first offset.
  */
 export function segmentsToAttributedMarkdown(
   segments: DbSegment[],
@@ -73,12 +70,9 @@ export function segmentsToAttributedMarkdown(
 }
 
 /**
- * Returns only the given speaker's turns as plain text — no labels, no
- * timestamps — time-ordered with consecutive same-speaker segments merged and
- * turns separated by a blank line. Turn boundaries are computed on the full
- * timeline first, so a turn break in the original conversation (a turn by the
- * other speaker in between) still yields a paragraph break here. Returns "" when
- * that speaker has no text.
+ * Returns only the given speaker's turns as plain text, one paragraph per
+ * turn. Turn boundaries are computed on the full timeline first, so a turn by
+ * the other speaker still yields a paragraph break here.
  */
 export function segmentsForSpeaker(segments: DbSegment[], source: SpeakerSource): string {
   return segmentsToTurns(segments)

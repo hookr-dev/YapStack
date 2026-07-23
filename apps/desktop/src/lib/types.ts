@@ -440,19 +440,11 @@ async getLogDir() : Promise<Result<string, CommandError>> {
 }
 },
 /**
- * Open Finder / Explorer with the current log highlighted so the user can grab
- * the files to send to support.
+ * Open Finder / Explorer with the current log file highlighted, falling back
+ * to the log directory when no log file exists yet.
  *
- * Uses `reveal_item_in_dir` (covered by `opener:allow-reveal-item-in-dir`)
- * rather than `open_path` (which would need the un-granted
- * `opener:allow-open-path` and is denied at runtime). `reveal_item_in_dir`
- * highlights the passed item inside its *parent* folder:
- * - If a current rolling log file exists (`yapstack.log.YYYY-MM-DD`, see
- * `crate::logging::init`), we reveal that file so the user lands on the
- * actual log highlighted in the log directory.
- * - Otherwise we fall back to revealing the log directory item itself, which
- * opens its parent with the log folder highlighted — still useful with no
- * logs yet.
+ * Must use `reveal_item_in_dir`: `open_path` would need the un-granted
+ * `opener:allow-open-path` permission and is denied at runtime.
  */
 async revealLogDir() : Promise<Result<null, CommandError>> {
     try {
@@ -488,15 +480,11 @@ async logFrontend(level: FrontendLogLevel, module: string | null, message: strin
 /**
  * Write UTF-8 `contents` to `path`.
  *
- * **Trusted-renderer boundary.** `path` is the destination the user picked in
- * the frontend save dialog; the command cannot itself prove that, so this is a
- * renderer-callable file-write primitive. That is consistent with the app's
- * existing posture for a local-first desktop app whose renderer runs only
- * first-party code (`delete_audio_files` / `delete_session_wav` already accept
- * renderer-supplied paths). To bound the blast radius it (a) refuses any path
- * whose extension is not a known text-export type, and (b) leaves the `fs`
- * plugin grant read-only so this stays the *only* renderer write path. It does
- * not create directories.
+ * Trusted-renderer boundary: `path` comes from the frontend save dialog and
+ * cannot be verified here, so this is a renderer-callable file-write
+ * primitive. It refuses non-text-export extensions, does not create
+ * directories, and the `fs` plugin grant stays read-only so this remains the
+ * only renderer write path.
  */
 async writeTextFile(path: string, contents: string) : Promise<Result<null, CommandError>> {
     try {

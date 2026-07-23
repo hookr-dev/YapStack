@@ -92,8 +92,7 @@ export function NoteCardList() {
     [filteredSessions],
   );
 
-  // Each filter keeps its own scroll position across remounts (this list fully
-  // unmounts when the user opens a session and re-mounts on back-nav).
+  // Each filter keeps its own scroll position across remounts.
   const scrollKey =
     listFilter.type === "folder"
       ? `folder:${listFilter.folderId ?? ""}`

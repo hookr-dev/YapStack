@@ -105,19 +105,11 @@ pub async fn log_frontend(
     Ok(())
 }
 
-/// Open Finder / Explorer with the current log highlighted so the user can grab
-/// the files to send to support.
+/// Open Finder / Explorer with the current log file highlighted, falling back
+/// to the log directory when no log file exists yet.
 ///
-/// Uses `reveal_item_in_dir` (covered by `opener:allow-reveal-item-in-dir`)
-/// rather than `open_path` (which would need the un-granted
-/// `opener:allow-open-path` and is denied at runtime). `reveal_item_in_dir`
-/// highlights the passed item inside its *parent* folder:
-///   - If a current rolling log file exists (`yapstack.log.YYYY-MM-DD`, see
-///     `crate::logging::init`), we reveal that file so the user lands on the
-///     actual log highlighted in the log directory.
-///   - Otherwise we fall back to revealing the log directory item itself, which
-///     opens its parent with the log folder highlighted — still useful with no
-///     logs yet.
+/// Must use `reveal_item_in_dir`: `open_path` would need the un-granted
+/// `opener:allow-open-path` permission and is denied at runtime.
 #[tauri::command]
 #[specta::specta]
 pub async fn reveal_log_dir(app: AppHandle) -> Result<(), CommandError> {
@@ -128,9 +120,6 @@ pub async fn reveal_log_dir(app: AppHandle) -> Result<(), CommandError> {
             message: format!("failed to resolve log dir: {e}"),
         })?;
 
-    // The rolling daily appender writes `yapstack.log.YYYY-MM-DD` (basename
-    // `yapstack.log`, dated suffix). Pick the most recently modified matching
-    // file so the user is dropped on the active log, not an old rotation.
     let target = latest_log_file(&dir).unwrap_or(dir);
 
     app.opener()
@@ -140,9 +129,7 @@ pub async fn reveal_log_dir(app: AppHandle) -> Result<(), CommandError> {
         })
 }
 
-/// Find the newest rolling log file (`yapstack.log*`) in `dir`, if any.
-/// Returns `None` when the directory cannot be read or holds no log files yet,
-/// so the caller can fall back to revealing the directory itself.
+/// Most recently modified `yapstack.log*` file in `dir`, if any.
 fn latest_log_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries

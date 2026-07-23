@@ -171,14 +171,12 @@ export function SessionHeader({
   const [titleText, setTitleText] = useState(session.title);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
 
-  // Copy/Export operate on the whole session transcript, excluding segments the
-  // user deliberately hid. Selection-scoped copy lives on the bulk bar.
+  // Hidden segments are excluded from copy/export.
   const exportable = segments.filter((s) => s.hidden === 0);
   const micCount = exportable.filter((s) => s.source === "Mic").length;
   const systemCount = exportable.filter((s) => s.source === "System").length;
   const hasMic = micCount > 0;
   const hasSystem = systemCount > 0;
-  // Segments actually included for a given export kind, for the analytics count.
   const segmentCountForKind = (kind: string) =>
     kind === "mine" ? micCount : kind === "theirs" ? systemCount : exportable.length;
   // Filesystem-safe stem for the save dialog's default filename.
@@ -186,9 +184,6 @@ export function SessionHeader({
     (session.title || "transcript").replace(/[/\\:*?"<>|]/g, "").trim() ||
     "transcript";
 
-  // Menu grouping: "manage the session" (resume / folders) and "get its content
-  // out" (audio file / transcript) are distinct intents, divided by one
-  // separator when both are present. Delete stays fenced as the destructive tail.
   const canResume =
     !isRecording &&
     canResumeSession(
