@@ -34,6 +34,8 @@ use std::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
+    // Windows has a real controller, so nothing constructs this variant there.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     #[error("system output volume control is not supported on this platform")]
     Unsupported,
     #[cfg(target_os = "macos")]
@@ -423,6 +425,17 @@ mod tests {
 
     // ---- Mock controller: drives the inner functions without real hardware. ----
 
+    /// Builds a platform `DeviceId` from a test-friendly integer
+    /// (`u32` on macOS/stub, `String` on Windows).
+    #[cfg(not(target_os = "windows"))]
+    fn dev(n: u32) -> DeviceId {
+        n
+    }
+    #[cfg(target_os = "windows")]
+    fn dev(n: u32) -> DeviceId {
+        n.to_string()
+    }
+
     struct MockController {
         default: Mutex<DeviceId>,
         volumes: Mutex<HashMap<DeviceId, f32>>,
@@ -436,7 +449,7 @@ mod tests {
         fn with_devices(devices: &[(DeviceId, f32)], default: DeviceId) -> Self {
             let mut volumes = HashMap::new();
             for (id, vol) in devices {
-                volumes.insert(*id, *vol);
+                volumes.insert(id.clone(), *vol);
             }
             Self {
                 default: Mutex::new(default),
@@ -457,30 +470,32 @@ mod tests {
         fn snapshot_of(&self, device: DeviceId) -> f32 {
             *self.volumes.lock().unwrap().get(&device).unwrap()
         }
+
+        fn with_device(vol: f32) -> Self {
+            Self::with_devices(&[(dev(1), vol)], dev(1))
+        }
     }
 
     impl SystemOutputVolume for MockController {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
-            Ok(*self.default.lock().unwrap())
+            Ok(self.default.lock().unwrap().clone())
         }
         fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
-            let device = *device;
             self.volumes
                 .lock()
                 .unwrap()
-                .get(&device)
+                .get(device)
                 .copied()
                 .ok_or(VolumeError::Unsupported)
         }
         fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
-            let device = *device;
             if !self.set_delay.is_zero() {
                 std::thread::sleep(self.set_delay);
             }
             self.volumes
                 .lock()
                 .unwrap()
-                .insert(device, level.clamp(0.0, 1.0));
+                .insert(device.clone(), level.clamp(0.0, 1.0));
             Ok(())
         }
     }
@@ -500,20 +515,20 @@ mod tests {
     fn applied_lowers_and_snapshots() {
         // current=0.80, amount=0.80 → absolute = 0.80 * 0.20 = 0.16.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         let outcome = apply_duck_inner(&snap, &ctrl, 0.80).expect("apply_duck");
         match outcome {
             DuckOutcome::Applied { device, from, to } => {
-                assert_eq!(device, 1);
+                assert_eq!(device, dev(1));
                 close(from, 0.80);
                 close(to, 0.16);
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        close(ctrl.snapshot_of(1), 0.16);
+        close(ctrl.snapshot_of(dev(1)), 0.16);
         let s = snap.lock().unwrap().clone().expect("snapshot present");
-        assert_eq!(s.device, 1);
+        assert_eq!(s.device, dev(1));
         close(s.level, 0.80);
     }
 
@@ -527,9 +542,9 @@ mod tests {
             (0.40, 0.70, 0.12),
         ] {
             let snap = fresh_snap();
-            let ctrl = MockController::with_devices(&[(1, current)], 1);
+            let ctrl = MockController::with_device(current);
             apply_duck_inner(&snap, &ctrl, amount).expect("apply");
-            close(ctrl.snapshot_of(1), expected);
+            close(ctrl.snapshot_of(dev(1)), expected);
         }
     }
 
@@ -538,7 +553,7 @@ mod tests {
         // amount=0 means "reduce by 0%" — write current back to itself,
         // but still capture a snapshot so restore is well-defined.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         let outcome = apply_duck_inner(&snap, &ctrl, 0.0).expect("apply_duck");
         match outcome {
@@ -548,34 +563,34 @@ mod tests {
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
         assert!(snap.lock().unwrap().is_some(), "snapshot captured");
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn amount_one_mutes() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         apply_duck_inner(&snap, &ctrl, 1.0).expect("apply");
-        close(ctrl.snapshot_of(1), 0.0);
+        close(ctrl.snapshot_of(dev(1)), 0.0);
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn restore_recovers_snapshotted_level_and_clears_state() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("apply");
         restore_inner(&snap, &ctrl).expect("restore");
 
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
         assert!(snap.lock().unwrap().is_none(), "snapshot cleared");
     }
 
@@ -584,34 +599,34 @@ mod tests {
         // Real-world: built-in speakers ducked, then AirPods connect and
         // become default. Restore must put speakers back, not AirPods.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80), (2, 0.50)], 1);
+        let ctrl = MockController::with_devices(&[(dev(1), 0.80), (dev(2), 0.50)], dev(1));
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("apply on device 1");
-        close(ctrl.snapshot_of(1), 0.16);
-        close(ctrl.snapshot_of(2), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.16);
+        close(ctrl.snapshot_of(dev(2)), 0.50);
 
         // User connects AirPods mid-dictation → default switches.
-        ctrl.set_default(2);
+        ctrl.set_default(dev(2));
 
         restore_inner(&snap, &ctrl).expect("restore");
 
-        close(ctrl.snapshot_of(1), 0.80);
-        close(ctrl.snapshot_of(2), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
+        close(ctrl.snapshot_of(dev(2)), 0.50);
     }
 
     #[test]
     fn restore_is_noop_when_no_snapshot_held() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         restore_inner(&snap, &ctrl).expect("restore should noop");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn already_ducked_does_not_clobber_snapshot() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("first apply");
         // A re-entrant duck call (e.g. retry) must not capture the now-ducked
@@ -620,7 +635,7 @@ mod tests {
         assert!(matches!(outcome, DuckOutcome::AlreadyDucked { .. }));
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
     }
 
     #[test]
@@ -629,19 +644,19 @@ mod tests {
         // against the original level. Computing from the *currently-ducked*
         // level would compound (e.g., 0.80 → 0.40 → 0.20 → 0.10 …).
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("first apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("second apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("third apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
     }
 
     #[test]
@@ -664,9 +679,8 @@ mod tests {
         use std::time::Duration;
 
         let snap = Arc::new(Mutex::new(None::<Snapshot>));
-        let ctrl = Arc::new(
-            MockController::with_devices(&[(1, 0.80)], 1).with_set_delay(Duration::from_millis(50)),
-        );
+        let ctrl =
+            Arc::new(MockController::with_device(0.80).with_set_delay(Duration::from_millis(50)));
 
         let snap_a = Arc::clone(&snap);
         let ctrl_a = Arc::clone(&ctrl);
@@ -684,7 +698,7 @@ mod tests {
             .expect("apply thread")
             .expect("apply ok");
 
-        let vol = ctrl.snapshot_of(1);
+        let vol = ctrl.snapshot_of(dev(1));
         let snap_final = snap.lock().unwrap();
 
         // Consistent post-states only — no broken interleave.
