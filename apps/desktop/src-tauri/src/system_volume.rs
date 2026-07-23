@@ -34,6 +34,8 @@ use std::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
+    // Windows has a real controller, so nothing constructs this variant there.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     #[error("system output volume control is not supported on this platform")]
     Unsupported,
     #[cfg(target_os = "macos")]

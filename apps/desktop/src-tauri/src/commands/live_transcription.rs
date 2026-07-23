@@ -4954,7 +4954,7 @@ async fn build_effective_prompt(
     };
 
     if vocab_budget > 0 && !context_part.is_empty() {
-        Some(format!("{}. {}", &vocab_truncated, context_part))
+        Some(format!("{}. {}", vocab_truncated, context_part))
     } else if vocab_budget > 0 {
         Some(vocab_truncated)
     } else {
