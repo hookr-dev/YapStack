@@ -712,6 +712,13 @@ Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcriptio
 
 Writes `text` to system clipboard via `pbcopy` (macOS) or `clip` (Windows). If `auto_paste` is true, waits 50ms then simulates Cmd+V via `osascript` (macOS only).
 
+### Export Commands (`commands/export.rs`)
+| Command | Args | Returns |
+|---------|------|---------|
+| `write_text_file` | `path: String, contents: String` | `()` |
+
+Writes `contents` to `path` (the user's save-dialog choice) for transcript export. A trusted-renderer boundary: it refuses any path whose extension is not a text-export type (`md`/`markdown`/`txt`/`text`), and the `fs` plugin grant stays read-only so this is the only renderer-side write path.
+
 ### System Volume Commands (`commands/system_volume.rs`)
 | Command | Args | Returns |
 |---------|------|---------|

@@ -315,6 +315,7 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
+            commands::export::write_text_file,
         ]);
 
     #[cfg(debug_assertions)]

@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Camera, Copy, FolderOpen, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronUp, Camera, Copy, FolderOpen, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,9 @@ import {
   clearLogs,
   formatLogEntries,
   getRecentLogs,
+  INITIAL_LOG_FETCH,
+  LOG_BUFFER_CAPACITY,
+  LOG_FETCH_STEP,
   revealLogDir,
   subscribeLogs,
   type LogEntry,
@@ -14,10 +17,6 @@ import {
 import { captureDiagnostics } from "@/lib/logger";
 import { useAppStore } from "@/stores/appStore";
 
-// Cap for the tailed live stream (the initial snapshot is already
-// bounded by the backend ring buffer, but incoming `log://entry`
-// events would grow without bound otherwise).
-const CLIENT_CAP = 500;
 const AUTO_SCROLL_THRESHOLD_PX = 40;
 
 type LevelStyle = {
@@ -108,8 +107,43 @@ function LogRow({ entry }: { entry: LogEntry }) {
 
 export function LogsPanel() {
   const [entries, setEntries] = useState<LogEntry[]>([]);
+  // Last requested snapshot size; grows as the user loads older history.
+  const [fetchLimit, setFetchLimit] = useState(INITIAL_LOG_FETCH);
+  // False once a snapshot returns fewer entries than requested.
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
+  // Distance-from-bottom to restore after a load-older prepend, so the tail
+  // effect holds the viewport in place instead of jumping to the bottom.
+  const preserveScrollFromBottom = useRef<number | null>(null);
+  // Ref so the mount-once live subscription trims to the current window; the
+  // cap never drops below what's loaded, or a live entry would discard
+  // just-fetched history.
+  const liveCapRef = useRef(INITIAL_LOG_FETCH);
+  liveCapRef.current = Math.max(fetchLimit, INITIAL_LOG_FETCH);
+
+  const loadOlder = useCallback(async () => {
+    const vp = viewportRef.current;
+    if (vp) {
+      preserveScrollFromBottom.current = vp.scrollHeight - vp.scrollTop;
+    }
+    const nextLimit = Math.min(fetchLimit + LOG_FETCH_STEP, LOG_BUFFER_CAPACITY);
+    setLoadingOlder(true);
+    try {
+      const snapshot = await getRecentLogs(nextLimit);
+      setFetchLimit(nextLimit);
+      setEntries(snapshot);
+      setHasMoreHistory(
+        snapshot.length >= nextLimit && nextLimit < LOG_BUFFER_CAPACITY,
+      );
+    } catch (err) {
+      console.error("failed to load older logs", err);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [fetchLimit]);
 
   useEffect(() => {
     let cancelled = false;
@@ -117,17 +151,23 @@ export function LogsPanel() {
 
     (async () => {
       try {
-        const snapshot = await getRecentLogs(200);
+        const snapshot = await getRecentLogs(INITIAL_LOG_FETCH);
         if (cancelled) return;
         setEntries(snapshot);
+        // A short initial snapshot means the whole buffer is already loaded.
+        setHasMoreHistory(
+          snapshot.length >= INITIAL_LOG_FETCH &&
+            INITIAL_LOG_FETCH < LOG_BUFFER_CAPACITY,
+        );
       } catch (err) {
         if (!cancelled) console.error("failed to load recent logs", err);
       }
 
       unlisten = await subscribeLogs((entry) => {
+        const cap = liveCapRef.current;
         setEntries((prev) => {
           const next = prev.concat(entry);
-          return next.length > CLIENT_CAP ? next.slice(next.length - CLIENT_CAP) : next;
+          return next.length > cap ? next.slice(next.length - cap) : next;
         });
       });
     })();
@@ -141,9 +181,16 @@ export function LogsPanel() {
   // Tail: when pinned to bottom, jump to the end on every entries change
   // (including the initial snapshot load). useLayoutEffect so the scroll
   // happens before paint — avoids a brief flicker at the top on first mount.
+  // A load-older change instead restores the prior distance-from-bottom.
   useLayoutEffect(() => {
     const vp = viewportRef.current;
-    if (!vp || !pinnedToBottom.current) return;
+    if (!vp) return;
+    if (preserveScrollFromBottom.current !== null) {
+      vp.scrollTop = vp.scrollHeight - preserveScrollFromBottom.current;
+      preserveScrollFromBottom.current = null;
+      return;
+    }
+    if (!pinnedToBottom.current) return;
     vp.scrollTop = vp.scrollHeight;
   }, [entries]);
 
@@ -193,6 +240,8 @@ export function LogsPanel() {
     try {
       await clearLogs();
       setEntries([]);
+      setFetchLimit(INITIAL_LOG_FETCH);
+      setHasMoreHistory(false);
     } catch (err) {
       toast.error("Failed to clear logs");
       console.error(err);
@@ -209,9 +258,25 @@ export function LogsPanel() {
         {entries.length === 0 ? (
           <div className="text-muted-foreground/60">No log entries yet.</div>
         ) : (
-          entries.map((e, i) => (
-            <LogRow key={`${e.ts_ms}-${i}`} entry={e} />
-          ))
+          <>
+            {hasMoreHistory && (
+              <div className="flex justify-center py-0.5">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 gap-1 px-2 text-[10px] text-muted-foreground"
+                  onClick={loadOlder}
+                  disabled={loadingOlder}
+                >
+                  <ChevronUp className="h-3 w-3" />
+                  {loadingOlder ? "Loading…" : "Load older entries"}
+                </Button>
+              </div>
+            )}
+            {entries.map((e, i) => (
+              <LogRow key={`${e.ts_ms}-${i}`} entry={e} />
+            ))}
+          </>
         )}
       </div>
       <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
