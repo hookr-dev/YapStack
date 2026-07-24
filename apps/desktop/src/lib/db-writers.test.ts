@@ -15,7 +15,11 @@ vi.mock("@/lib/db-backend", () => ({
   },
 }));
 
-import { createSession, markSessionRecording } from "@/lib/db";
+import {
+  createSession,
+  markSessionRecording,
+  markSessionCompleted,
+} from "@/lib/db";
 
 function lastCall() {
   return executeMock.mock.calls[executeMock.mock.calls.length - 1];
@@ -52,5 +56,29 @@ describe("markSessionRecording re-attribution (LIVE_SESSION_STATE D2)", () => {
     await markSessionRecording("s4");
     const [, values] = lastCall();
     expect(values).toEqual(["s4", null]);
+  });
+});
+
+describe("markSessionCompleted escape hatch (LIVE_SESSION_STATE Q1)", () => {
+  beforeEach(() => executeMock.mockClear());
+
+  it("is a plain LWW status flip: status + updated_at only, id-bound", async () => {
+    await markSessionCompleted("s5");
+    const [query, values] = lastCall();
+    expect(query).toContain("status = 'completed'");
+    expect(query).toContain("updated_at = datetime('now')");
+    expect(query).toContain("WHERE id = $1");
+    expect(values).toEqual(["s5"]);
+  });
+
+  it("does NOT recompute totals (no destructive duration/total_segments rewrite)", async () => {
+    // A non-owner must not derive totals from partial synced data — unlike
+    // completeSession, this write leaves duration_seconds/total_segments untouched
+    // so the real recorder's completeSession rewrite wins by LWW.
+    await markSessionCompleted("s6");
+    const [query] = lastCall();
+    expect(query).not.toContain("duration_seconds");
+    expect(query).not.toContain("total_segments");
+    expect(query).not.toMatch(/SUM\(/i);
   });
 });

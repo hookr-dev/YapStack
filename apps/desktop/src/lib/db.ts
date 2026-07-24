@@ -598,6 +598,25 @@ export async function markSessionRecording(
   );
 }
 
+/**
+ * Escape-hatch finalize (LIVE_SESSION_STATE.md resolved Q1): flip a foreign-and-
+ * stale `recording` session to `completed`. Deliberately a **plain LWW write** —
+ * `status='completed'` + `updated_at` only, with **no** `duration_seconds` /
+ * `total_segments` recompute (unlike {@link completeSession}). This device is not
+ * the recorder, so it must not derive totals from partial synced data; the write
+ * is the minimal ownership-neutral status flip. If the real recorder ever returns,
+ * its `completeSession` rewrite-at-stop wins by LWW (the mis-click is self-
+ * correcting — see Q1 rationale), and `insertSegment` never checks status so no
+ * arriving segment is dropped in the interim.
+ */
+export async function markSessionCompleted(id: string): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "UPDATE sessions SET status = 'completed', updated_at = datetime('now') WHERE id = $1",
+    [id],
+  );
+}
+
 export async function deleteSession(id: string): Promise<void> {
   const db = await getDb();
   await db.execute("DELETE FROM sessions WHERE id = $1", [id]);

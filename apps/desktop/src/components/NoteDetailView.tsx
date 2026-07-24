@@ -1,7 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Play, X, RefreshCw, AlertTriangle } from "lucide-react";
+import { ArrowLeft, Play, X, RefreshCw, AlertTriangle, MoreHorizontal, CheckCircle2 } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { commands } from "@/lib/tauri";
 import {
   deriveTrackFetch,
@@ -23,7 +39,14 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { canResumeSession, getSession, type DbSession, type DbAudioPart } from "@/lib/db";
+import {
+  canResumeSession,
+  getSession,
+  isRecordingStale,
+  type DbSession,
+  type DbSegment,
+  type DbAudioPart,
+} from "@/lib/db";
 import type { AudioPart } from "@/components/AudioPlayer";
 import {
   createSessionSources,
@@ -64,6 +87,65 @@ export function isRemoteLiveSession(
     !!myFingerprint &&
     owner !== myFingerprint
   );
+}
+
+/** Render branch for a non-active `recording` row. `null` = not a remote-recording
+ *  row (single-device fallback). */
+export type RemoteRecordingView = "remote-live" | "interrupted" | null;
+
+/**
+ * Render-branch selection for the remote-recording lifecycle (LIVE_SESSION_STATE.md
+ * §Lifecycle state machine, slice 4). Covers **all** non-active `recording` rows so
+ * the "Start speaking" fallback is never reached for them:
+ *   - fresh foreign owner → `"remote-live"` (● Live follow-along),
+ *   - everything else (stale-foreign, own-crashed, legacy-NULL) → `"interrupted"`.
+ * Sync off / pre-enrollment (`myFingerprint` NULL) → `null`: D7 keeps single-device
+ * behavior unchanged (no comparison can be truthy without a fingerprint).
+ *
+ * Staleness is derived from `segments` (heartbeat = max `segments.created_at`), so
+ * once the D4 live refresh reloads the open session's segments the selection
+ * **recomputes** — a resuming session flips `"interrupted"` back to `"remote-live"`
+ * on the next applied batch. Pure so both directions are unit-testable unmounted.
+ */
+export function selectRemoteRecordingView(
+  session: Pick<DbSession, "status" | "recording_device_id" | "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+  nowMs: number = Date.now(),
+): RemoteRecordingView {
+  if (isActiveSession || session.status !== "recording" || !myFingerprint) {
+    return null;
+  }
+  const owner = session.recording_device_id;
+  const foreign = !!owner && owner !== myFingerprint;
+  const stale = isRecordingStale(session, segments, nowMs);
+  return foreign && !stale ? "remote-live" : "interrupted";
+}
+
+/**
+ * Escape-hatch visibility (LIVE_SESSION_STATE.md resolved Q1): the "Mark completed"
+ * action is shown **only** for a `{status:'recording', foreign owner, stale}` row —
+ * i.e. a dead device's stranded session OR a same-hardware re-pair orphan (the new
+ * fingerprint makes this device's own old rows foreign-to-self; foreign+stale is the
+ * whole condition, so re-pair is covered naturally). Own-crashed and legacy-NULL
+ * rows are finalized by the owner-only boot sweep (D6), so they never expose the
+ * hatch; a fresh-live foreign row is structurally excluded by `!stale`. Pure so the
+ * visibility matrix is unit-testable unmounted.
+ */
+export function canMarkSessionCompleted(
+  session: Pick<DbSession, "status" | "recording_device_id" | "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+  nowMs: number = Date.now(),
+): boolean {
+  if (isActiveSession || session.status !== "recording" || !myFingerprint) {
+    return false;
+  }
+  const owner = session.recording_device_id;
+  const foreign = !!owner && owner !== myFingerprint;
+  return foreign && isRecordingStale(session, segments, nowMs);
 }
 
 export interface AudioAvailability {
@@ -287,6 +369,9 @@ export function NoteDetailView() {
   const sessionStopping = useAppStore((s) => s.sessionStopping);
   const syncStatus = useAppStore((s) => s.syncStatus);
   const navigateTo = useAppStore((s) => s.navigateTo);
+  const markSessionCompleted = useAppStore((s) => s.markSessionCompleted);
+  // Escape-hatch confirm dialog (Q1). Component-local; hooks stay unconditional.
+  const [markCompletedOpen, setMarkCompletedOpen] = useState(false);
 
   const isActiveSession = selectedSessionId === activeSessionId;
   const myFingerprint = syncStatus?.deviceFingerprint ?? null;
@@ -695,18 +780,25 @@ export function NoteDetailView() {
     );
   }
 
-  // Remote-live follow-along (D3): a `recording` session owned by ANOTHER device.
-  // Read-only — every write affordance (record/resume/edit/delete, the notes editor,
-  // the chat bar) is withheld; the transcript streams in as D4 refreshes fire. For
-  // this slice any non-mine 'recording' row renders here (slice 4 will split fresh vs
-  // stale into "Live"/"Interrupted"); the liveness helper (isRecordingStale) already
-  // exists for slice 4 to consume.
+  // Remote-recording lifecycle (LIVE_SESSION_STATE.md §state machine): a non-active
+  // `recording` row rendered on this device. Read-only in every case — record/resume/
+  // edit/delete, the notes editor, and the chat bar are all withheld. Fresh foreign
+  // owner → "● Live on <label>" follow-along (D3); every other non-active recording
+  // row (stale-foreign, own-crashed, legacy-NULL) → "Interrupted" (D5, no live pulse).
+  // Staleness derives from `segments`, which the D4 live refresh reloads — so a
+  // resuming foreign session flips Interrupted → Live on the next applied batch.
   const owner = session.recording_device_id;
+  const remoteView = selectRemoteRecordingView(
+    session,
+    segments,
+    isActiveSession,
+    myFingerprint,
+  );
+  const ownerLabel =
+    syncStatus?.roster.find((r) => r.fingerprint === owner)?.label ??
+    "another device";
 
-  if (remoteLive) {
-    const label =
-      syncStatus?.roster.find((r) => r.fingerprint === owner)?.label ??
-      "another device";
+  if (remoteView === "remote-live") {
     return (
       <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
         <div className="flex items-center justify-between border-b px-4 py-2">
@@ -727,7 +819,7 @@ export function NoteDetailView() {
             aria-live="polite"
           >
             <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span>Live on {label}</span>
+            <span>Live on {ownerLabel}</span>
           </div>
         </div>
         {segments.length > 0 ? (
@@ -739,10 +831,103 @@ export function NoteDetailView() {
         ) : (
           <div className="flex flex-1 items-center justify-center">
             <p className="text-sm text-muted-foreground">
-              Waiting for {label} to start speaking…
+              Waiting for {ownerLabel} to start speaking…
             </p>
           </div>
         )}
+      </div>
+    );
+  }
+
+  // Interrupted (D5): a non-active `recording` row whose heartbeat has gone stale, or
+  // an own-crashed / legacy-NULL row. Read-only, visually distinct from Live (static
+  // amber badge, no pulse). The "Mark completed" escape hatch (Q1) appears in the
+  // overflow menu ONLY for a foreign+stale row — a dead device's stranded session or a
+  // same-hardware re-pair orphan; own-crashed & legacy-NULL rows are finalized by the
+  // owner-only boot sweep instead.
+  if (remoteView === "interrupted") {
+    const isForeign = !!owner && owner !== myFingerprint;
+    const badgeLabel = isForeign ? `Interrupted on ${ownerLabel}` : "Interrupted";
+    const showMarkCompleted = canMarkSessionCompleted(
+      session,
+      segments,
+      isActiveSession,
+      myFingerprint,
+    );
+    return (
+      <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
+        <div className="flex items-center justify-between border-b px-4 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <button
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted"
+              onClick={() => navigateTo("note-list")}
+              aria-label="Back to notes"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <span className="truncate text-sm font-medium">
+              {session.title || "Untitled"}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <div
+              className="flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-600 dark:text-amber-400"
+              aria-live="polite"
+            >
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              <span>{badgeLabel}</span>
+            </div>
+            {showMarkCompleted && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Session actions"
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={() => setMarkCompletedOpen(true)}>
+                    <CheckCircle2 />
+                    Mark completed
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </div>
+        </div>
+        {segments.length > 0 ? (
+          <ChatView
+            sessionId={selectedSessionId ?? undefined}
+            segments={segments}
+          />
+        ) : (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">
+              No transcript was captured before this session was interrupted.
+            </p>
+          </div>
+        )}
+        <AlertDialog open={markCompletedOpen} onOpenChange={setMarkCompletedOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Mark session completed?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This session appears interrupted on {ownerLabel}. Mark it completed?
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => markSessionCompleted(session.id)}
+              >
+                Mark completed
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     );
   }

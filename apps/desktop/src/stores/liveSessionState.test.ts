@@ -204,6 +204,30 @@ describe("refreshOpenViewSession (D4 live refresh, Gap 2)", () => {
   });
 });
 
+describe("markSessionCompleted escape-hatch action (LIVE_SESSION_STATE Q1)", () => {
+  it("flips the row to completed and reloads the open view as completed", async () => {
+    getSessionMock.mockResolvedValue(
+      makeSession({ status: "completed", recording_device_id: "PEER" }),
+    );
+    useAppStore.setState({
+      selectedSessionId: "open",
+      viewSession: makeSession({
+        status: "recording",
+        recording_device_id: "PEER",
+      }),
+      sessions: [],
+    });
+
+    await useAppStore.getState().markSessionCompleted("open");
+
+    // Reloaded the open view row (the LWW write already landed on the db mock).
+    expect(getSessionMock).toHaveBeenCalledWith("open");
+    expect(useAppStore.getState().viewSession?.status).toBe("completed");
+    // No error toast on the happy path.
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+});
+
 describe("resume guard (resume-race defense-in-depth)", () => {
   function armCaptureReady() {
     useAppStore.setState({

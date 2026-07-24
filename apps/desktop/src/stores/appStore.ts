@@ -54,6 +54,7 @@ import {
   createSession as dbCreateSession,
   updateSessionTitle,
   completeSession,
+  markSessionCompleted as dbMarkSessionCompleted,
   markSessionRecording as dbMarkSessionRecording,
   deleteSession as dbDeleteSession,
   listSessions,
@@ -551,6 +552,7 @@ interface AppState {
   stopActiveSession: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  markSessionCompleted: (id: string) => Promise<void>;
   navigateTo: (
     view: "note-list" | "note-detail" | "settings",
     sessionId?: string,
@@ -1624,6 +1626,26 @@ function createAppStore() {
         } catch (e) {
           console.error("Failed to delete session:", e);
           toast.error("Failed to delete session");
+        }
+      },
+
+      // Escape hatch (LIVE_SESSION_STATE.md Q1): finalize a foreign-and-stale
+      // 'recording' row the owner-only boot sweep will never touch (dead device or
+      // same-hardware re-pair orphan). The DB write is a plain LWW status flip
+      // (no destructive recompute — see db.markSessionCompleted). Reload the list +
+      // the open view row so the flip renders immediately.
+      markSessionCompleted: async (id: string) => {
+        try {
+          await dbMarkSessionCompleted(id);
+          const sessions = await listSessions();
+          set({ sessions });
+          if (get().selectedSessionId === id) {
+            const row = await getSession(id);
+            if (row) set({ viewSession: row });
+          }
+        } catch (e) {
+          console.error("Failed to mark session completed:", e);
+          toast.error("Failed to mark session completed");
         }
       },
 

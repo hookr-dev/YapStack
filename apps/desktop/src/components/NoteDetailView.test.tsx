@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   tauriCoreMock,
@@ -33,16 +34,29 @@ import type { DbAudioPart } from "@/lib/db";
 import {
   NoteDetailView,
   isRemoteLiveSession,
+  selectRemoteRecordingView,
+  canMarkSessionCompleted,
   selectAudioAvailability,
   assembleTrack,
 } from "./NoteDetailView";
+
+// A SQLite `datetime('now')`-shaped UTC timestamp `deltaSec` seconds from real now.
+// Staleness (LIVE_SESSION_STATE D5) compares the heartbeat to Date.now(), so the
+// render-branch fixtures MUST be relative to now — a fixed calendar date would read
+// permanently stale and mis-route every "Live" case to "Interrupted".
+function dbTs(deltaSec: number): string {
+  return new Date(Date.now() + deltaSec * 1000)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d+Z$/, "");
+}
 
 function makeSession(over: Partial<DbSession> = {}): DbSession {
   return {
     id: "s-remote",
     title: "Meeting notes",
-    created_at: "2026-07-15 12:00:00",
-    updated_at: "2026-07-15 12:00:00",
+    created_at: dbTs(-5),
+    updated_at: dbTs(-5),
     source: "MicOnly",
     status: "recording",
     duration_seconds: null,
@@ -57,7 +71,7 @@ function makeSession(over: Partial<DbSession> = {}): DbSession {
   };
 }
 
-function makeSegment(id: string, text: string): DbSegment {
+function makeSegment(id: string, text: string, createdAt: string = dbTs(-3)): DbSegment {
   return {
     id,
     session_id: "s-remote",
@@ -66,7 +80,7 @@ function makeSegment(id: string, text: string): DbSegment {
     audio_offset_seconds: 0,
     chunk_duration_seconds: 1,
     confidence: 1,
-    created_at: "2026-07-15 12:00:05",
+    created_at: createdAt,
     chunk_index: 0,
     original_text: null,
     edited_at: null,
@@ -202,6 +216,264 @@ describe("NoteDetailView remote-live rendering (D3)", () => {
     });
     render(<NoteDetailView />);
     expect(screen.getByText("Live on another device")).toBeInTheDocument();
+  });
+});
+
+describe("selectRemoteRecordingView (slice 4: fresh → live, stale → interrupted)", () => {
+  const me = "ME";
+  const freshSeg = [makeSegment("s1", "x", dbTs(-10))];
+  const staleSeg = [makeSegment("s1", "x", dbTs(-600))];
+
+  it("fresh foreign owner → remote-live", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: "PEER" }),
+        freshSeg,
+        false,
+        me,
+      ),
+    ).toBe("remote-live");
+  });
+
+  it("stale foreign owner → interrupted", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: "PEER", created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        me,
+      ),
+    ).toBe("interrupted");
+  });
+
+  it("own-owned recording → interrupted (own crash, never renders live)", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: "ME" }),
+        freshSeg,
+        false,
+        me,
+      ),
+    ).toBe("interrupted");
+  });
+
+  it("NULL-owner recording → interrupted (legacy, never renders live)", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: null }),
+        freshSeg,
+        false,
+        me,
+      ),
+    ).toBe("interrupted");
+  });
+
+  it("completed foreign → null (not a remote-recording row)", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ status: "completed", recording_device_id: "PEER" }),
+        freshSeg,
+        false,
+        me,
+      ),
+    ).toBe(null);
+  });
+
+  it("locally active → null (local live branch wins)", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: "PEER" }),
+        freshSeg,
+        true,
+        me,
+      ),
+    ).toBe(null);
+  });
+
+  it("sync off (NULL fingerprint) → null (single-device unchanged, D7)", () => {
+    expect(
+      selectRemoteRecordingView(
+        makeSession({ recording_device_id: "PEER" }),
+        freshSeg,
+        false,
+        null,
+      ),
+    ).toBe(null);
+  });
+
+  it("flips interrupted → remote-live when a fresh segment arrives (D4 recompute)", () => {
+    const s = makeSession({
+      recording_device_id: "PEER",
+      created_at: dbTs(-600),
+    });
+    // A long silence: only an old heartbeat → interrupted.
+    expect(selectRemoteRecordingView(s, staleSeg, false, me)).toBe("interrupted");
+    // The recorder resumes; a freshly-merged segment (new heartbeat) flips it back.
+    expect(
+      selectRemoteRecordingView(
+        s,
+        [...staleSeg, makeSegment("s2", "resumed", dbTs(-2))],
+        false,
+        me,
+      ),
+    ).toBe("remote-live");
+  });
+});
+
+describe("canMarkSessionCompleted visibility matrix (escape hatch, Q1)", () => {
+  const me = "ME";
+  const freshSeg = [makeSegment("s1", "x", dbTs(-10))];
+  const staleSeg = [makeSegment("s1", "x", dbTs(-600))];
+
+  it("fresh-foreign → hidden (a live session can never be marked completed)", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: "PEER" }),
+        freshSeg,
+        false,
+        me,
+      ),
+    ).toBe(false);
+  });
+
+  it("stale-foreign → shown (dead device / stranded session)", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: "PEER", created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        me,
+      ),
+    ).toBe(true);
+  });
+
+  it("own stale → hidden (owner-only boot sweep finalizes it, D6)", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: "ME", created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        me,
+      ),
+    ).toBe(false);
+  });
+
+  it("NULL-owner stale → hidden (legacy; sweep finalizes)", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: null, created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        me,
+      ),
+    ).toBe(false);
+  });
+
+  it("completed foreign → hidden", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({
+          status: "completed",
+          recording_device_id: "PEER",
+          created_at: dbTs(-600),
+        }),
+        staleSeg,
+        false,
+        me,
+      ),
+    ).toBe(false);
+  });
+
+  it("sync off (NULL fingerprint) → hidden", () => {
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: "PEER", created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        null,
+      ),
+    ).toBe(false);
+  });
+
+  it("same-hardware re-pair: this device's own pre-re-pair row is foreign-to-self + stale → shown", () => {
+    // A credential clear / fresh install mints a NEW fingerprint ("ME-NEW"); the device's
+    // own old rows still carry the OLD self-fingerprint ("ME-OLD"), so they now read as
+    // foreign and, being stale, expose the same escape hatch — the only recovery under
+    // owner-only finalization (D6). foreign+stale is the whole predicate, so re-pair needs
+    // no special-casing.
+    expect(
+      canMarkSessionCompleted(
+        makeSession({ recording_device_id: "ME-OLD", created_at: dbTs(-600) }),
+        staleSeg,
+        false,
+        "ME-NEW",
+      ),
+    ).toBe(true);
+  });
+});
+
+function openInterrupted(over: Partial<DbSession> = {}, segments: DbSegment[] = []) {
+  useAppStore.setState({
+    selectedSessionId: "s-remote",
+    activeSessionId: null,
+    viewSession: makeSession({ created_at: dbTs(-600), ...over }),
+    viewSessionSegments: segments,
+    viewSessionParts: [],
+    sessions: [],
+    syncStatus: syncStatus(),
+  });
+}
+
+describe("NoteDetailView interrupted rendering + escape hatch (slice 4)", () => {
+  it("renders 'Interrupted on <label>' (no live pulse) for a stale foreign row", () => {
+    openInterrupted({ recording_device_id: "PEER" }, [
+      makeSegment("g1", "older text", dbTs(-600)),
+    ]);
+    render(<NoteDetailView />);
+    expect(screen.getByText("Interrupted on Windows")).toBeInTheDocument();
+    expect(screen.queryByText("Live on Windows")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Start speaking to begin transcription"),
+    ).not.toBeInTheDocument();
+    // Transcript still renders (read-only follow-along of what was captured).
+    expect(screen.getByText("older text")).toBeInTheDocument();
+  });
+
+  it("confirm dialog names the device and invokes the plain LWW mark-completed action", async () => {
+    const markSpy = vi.fn();
+    openInterrupted({ recording_device_id: "PEER" }, []);
+    useAppStore.setState({ markSessionCompleted: markSpy });
+    render(<NoteDetailView />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Session actions" }));
+    await userEvent.click(await screen.findByText("Mark completed"));
+    // Exact Q1 dialog copy, naming the device.
+    expect(
+      await screen.findByText(
+        /This session appears interrupted on Windows\. Mark it completed\?/,
+      ),
+    ).toBeInTheDocument();
+    // Confirm → the escape-hatch action fires with this session id.
+    await userEvent.click(screen.getByRole("button", { name: "Mark completed" }));
+    expect(markSpy).toHaveBeenCalledWith("s-remote");
+  });
+
+  it("hides the escape hatch for an own-crashed row (Interrupted, no actions menu)", () => {
+    openInterrupted({ recording_device_id: "ME" }, []);
+    render(<NoteDetailView />);
+    expect(screen.getByText("Interrupted")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Session actions" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the escape hatch for a legacy NULL-owner row", () => {
+    openInterrupted({ recording_device_id: null }, []);
+    render(<NoteDetailView />);
+    expect(screen.getByText("Interrupted")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Session actions" }),
+    ).not.toBeInTheDocument();
   });
 });
 
