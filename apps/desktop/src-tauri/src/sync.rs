@@ -44,8 +44,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -107,9 +107,36 @@ const WRAP_VAULT_REC_DOMAIN: &[u8] = b"yapstack.wrap.vault.rec.v1";
 /// construction: there are ZERO production installs and dev builds use the plaintext debug
 /// store, so no migration path is owed (T029 compatibility call).
 const SESSION_STORE_DOMAIN: &[u8] = b"yapstack.session.store.v2";
-/// How often the drain cycles when idle. SSE wakeups (T008) can shorten this
-/// later; a fixed poll is correct and simplest for v1.
+/// How often the drain cycles when idle. This is the FALLBACK floor: it always runs
+/// (SSE wakeups + local-write kicks only ADD earlier cycles, never replace it), so a
+/// dead SSE stream or a missed kick degrades to at-worst this latency — never to no sync.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Trailing debounce for the local-write kick (deliverable 2). On each committed local
+/// write (`db_service::db_execute`) the kick deadline is pushed to `now + KICK_DEBOUNCE`;
+/// the debouncer fires ONE drain wake only once writes stay quiet for this long. Chosen at
+/// 400 ms: long enough to batch a multi-statement UI save (a note + its rows committed in
+/// quick succession) into a single push-capturing cycle, short enough that a deliberate
+/// one-off edit syncs sub-second.
+///
+/// RECORDING-WORKLOAD REASONING (why this needs no explicit "is recording" gate): a live
+/// recording streams segment writes CONTINUOUSLY, faster than 400 ms apart, so the trailing
+/// deadline is perpetually pushed forward and the kick NEVER settles — the session rides the
+/// existing `DRAIN_INTERVAL` instead of spawning a cycle per segment. That is exactly the
+/// "suppress kicks while a live recording is active in favour of the interval" behaviour,
+/// achieved structurally (continuous writes = no settle) rather than by reaching into the
+/// async recording state from this sync writer. When writes finally quiesce (recording
+/// stops / editing pauses) the kick fires once for a prompt final sync. Worst-case latency
+/// under a sustained write stream is therefore `DRAIN_INTERVAL` — never worse than today.
+const KICK_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// First reconnect delay after the SSE stream drops (deliverable 1). Doubles each
+/// consecutive failure up to [`SSE_BACKOFF_MAX`]; resets on a successful (re)connect.
+const SSE_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the SSE reconnect backoff. The polling interval keeps running underneath the
+/// whole time, so an unreachable relay still syncs at the [`DRAIN_INTERVAL`] floor while the
+/// stream retries no more often than this.
+const SSE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How often the INDEPENDENT audio-upload lane cycles once idle (S2). Longer than the
 /// changeset interval — audio is best-effort background work, not correctness-critical.
 const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_secs(8);
@@ -2378,6 +2405,272 @@ fn rollback_to_backup(
     let _ = db_service.reopen();
 }
 
+// ----- SSE / local-write LIVENESS: wake the drain instead of waiting the full interval -----
+//
+// The drain's idle wait (deliverable-A loop) is normally a fixed `DRAIN_INTERVAL` sleep. Two
+// sources shorten it to near-round-trip latency WITHOUT ever replacing the interval floor:
+//   1. the relay SSE stream (`GET /sync/stream`) — a peer's push wakes us to pull promptly;
+//   2. a local write committing through `db_service::db_execute` — nudges a push-capturing
+//      cycle promptly (debounced).
+// Both funnel into ONE process-global `tokio::sync::Notify`. Because `notify_one` stores AT
+// MOST ONE permit, any number of wakes arriving DURING an in-flight cycle collapse into a
+// single queued follow-up cycle — never a busy-loop. Neither source ever touches DrainHealth:
+// a dead SSE stream with a working poll is NOT "unreachable" (the drain's own transport result
+// stays the sole source of drain-health truth, R12/R3).
+
+/// The single wake channel every liveness source notifies and the drain's idle wait awaits.
+/// Runtime-agnostic (`Notify` is not bound to a runtime), so it survives drain re-spawns.
+fn drain_wake() -> &'static tokio::sync::Notify {
+    static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    WAKE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// The drain's latest LOCAL pull watermark, published each cycle (and seeded at start) so the
+/// SSE lane can gate wakes: an incoming `changeset_seq <= watermark` is already merged and must
+/// NOT trigger a redundant cycle. `i64::MIN` = not yet known (wake conservatively).
+fn pull_watermark_pub() -> &'static AtomicI64 {
+    static WM: OnceLock<AtomicI64> = OnceLock::new();
+    WM.get_or_init(|| AtomicI64::new(i64::MIN))
+}
+
+/// True if an SSE wake carrying `event_seq` should trigger a drain cycle given the last-known
+/// local pull `watermark`. Unknown watermark (`i64::MIN`) always wakes (we cannot prove we are
+/// caught up); otherwise only a seq strictly beyond what we have merged is worth a pull. Pure
+/// so the gate is unit-testable without a live relay.
+fn should_wake(event_seq: i64, watermark: i64) -> bool {
+    watermark == i64::MIN || event_seq > watermark
+}
+
+/// Next SSE reconnect backoff: double `prev`, capped at [`SSE_BACKOFF_MAX`]. Pure so the
+/// 1s→2s→4s→…→30s→30s schedule is unit-testable. The caller resets to [`SSE_BACKOFF_INITIAL`]
+/// on a successful (re)connect.
+fn next_sse_backoff(prev: Duration) -> Duration {
+    (prev * 2).min(SSE_BACKOFF_MAX)
+}
+
+// --- local-write kick debouncer ------------------------------------------------------------
+//
+// `note_local_write` (called from `db_service::db_execute`) pushes a trailing deadline; a
+// dedicated debouncer thread fires ONE `drain_wake` once writes stay quiet for `KICK_DEBOUNCE`.
+// The channel is a process global so the write path can reach it without threading a handle
+// through Tauri state; `KICK_ARMED` makes `note_local_write` a cheap no-op whenever no drain
+// (hence no debouncer) is running.
+
+struct KickChannel {
+    /// The trailing deadline: fire a wake once `Instant::now()` reaches it and no later write
+    /// has pushed it forward. `None` = no write pending.
+    deadline: Mutex<Option<Instant>>,
+    cv: Condvar,
+}
+
+fn kick_channel() -> &'static KickChannel {
+    static CH: OnceLock<KickChannel> = OnceLock::new();
+    CH.get_or_init(|| KickChannel {
+        deadline: Mutex::new(None),
+        cv: Condvar::new(),
+    })
+}
+
+/// True while a drain's debouncer thread is live and willing to consume kicks.
+static KICK_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Nudge the drain to run a push-capturing cycle soon after a local write commits. Debounced
+/// (see [`KICK_DEBOUNCE`]): a burst of writes collapses to one wake once they quiesce, and a
+/// continuous stream (a live recording's segments) never settles so it rides the interval
+/// instead of spawning a cycle per write. A cheap no-op when no drain is running.
+pub fn note_local_write() {
+    if !KICK_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    let ch = kick_channel();
+    *ch.deadline.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + KICK_DEBOUNCE);
+    ch.cv.notify_one();
+}
+
+/// The debouncer's per-wait decision, factored out so the trailing-debounce settle logic is
+/// unit-testable without sleeping.
+#[derive(Debug, PartialEq, Eq)]
+enum KickWait {
+    /// No write pending — block until a kick arrives.
+    Idle,
+    /// A write is pending but its deadline is in the future — wait this long, then re-check
+    /// (a later write may have pushed the deadline out again).
+    WaitFor(Duration),
+    /// The deadline has passed with no newer write — fire one wake now.
+    Fire,
+}
+
+fn kick_wait(deadline: Option<Instant>, now: Instant) -> KickWait {
+    match deadline {
+        None => KickWait::Idle,
+        Some(dl) if now >= dl => KickWait::Fire,
+        Some(dl) => KickWait::WaitFor(dl - now),
+    }
+}
+
+/// Spawn the trailing-debounce thread that turns local-write kicks into drain wakes. Returns
+/// its shutdown flag + join handle (bundled into [`DrainHandle`] so every stop-site tears it
+/// down). Cheap: it sleeps on a condvar until a kick arrives, and re-checks `stop` at most
+/// once a second so shutdown is prompt.
+fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>), String> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stop = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("yapstack-sync-writekick".into())
+        .spawn(move || {
+            let ch = kick_channel();
+            // Drop any stale deadline a prior drain left behind, then arm.
+            *ch.deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            KICK_ARMED.store(true, Ordering::Release);
+            let poll_cap = Duration::from_secs(1);
+            while !stop.load(Ordering::SeqCst) {
+                let mut g = ch.deadline.lock().unwrap_or_else(|e| e.into_inner());
+                match kick_wait(*g, Instant::now()) {
+                    KickWait::Idle => {
+                        // Block until a kick (or the periodic re-check) wakes us.
+                        let (ng, _) = ch
+                            .cv
+                            .wait_timeout(g, poll_cap)
+                            .unwrap_or_else(|e| e.into_inner());
+                        drop(ng);
+                    }
+                    KickWait::WaitFor(d) => {
+                        let (ng, _) = ch
+                            .cv
+                            .wait_timeout(g, d.min(poll_cap))
+                            .unwrap_or_else(|e| e.into_inner());
+                        drop(ng);
+                    }
+                    KickWait::Fire => {
+                        *g = None;
+                        drop(g);
+                        drain_wake().notify_one();
+                    }
+                }
+            }
+            KICK_ARMED.store(false, Ordering::Release);
+        })
+        .map_err(|e| e.to_string())?;
+    Ok((shutdown, join))
+}
+
+/// Spawn the long-lived SSE subscriber lane (deliverable 1). Runs on its own thread + runtime
+/// (like the audio uploader), subscribes to `GET /sync/stream` with the DRAIN-PERSISTED bearer
+/// (reloaded on every (re)connect — never self-refreshed), and on a wake whose seq is beyond
+/// the local pull watermark fires a [`drain_wake`]. The stream ending / erroring triggers an
+/// exponential backoff reconnect (cap [`SSE_BACKOFF_MAX`]); the polling interval keeps running
+/// underneath the whole time, so SSE only ever ADDS wakes. Never touches DrainHealth: a dead
+/// stream with a working poll is not "unreachable".
+fn spawn_sse_subscriber(
+    server_url: String,
+    bearer: String,
+) -> Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>), String> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stop = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("yapstack-sync-sse".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("sync sse: runtime build failed: {e}");
+                    return;
+                }
+            };
+            let client = reqwest::Client::new();
+            let mut current_bearer = bearer;
+            let mut backoff = SSE_BACKOFF_INITIAL;
+            // Log only on transitions so a flapping relay does not spam the log (mirrors the
+            // drain-health surface discipline). `connected` tracks the last emitted state.
+            let mut connected = false;
+
+            while !stop.load(Ordering::SeqCst) {
+                // Reload the freshest persisted bearer before each (re)connect: the drain
+                // rotates + persists the access token on refresh, and a long-lived stream
+                // established under an old token must reconnect under the new one. Never
+                // refresh here — that would race the drain's reuse-detection family rotation.
+                if let Ok(Some(s)) = load_session() {
+                    if s.bearer != current_bearer {
+                        current_bearer = s.bearer;
+                    }
+                }
+
+                // Race the (long-lived) stream against the shutdown flag so teardown is prompt:
+                // on stop, the select drops the `stream_wakeups` future, which drops the reqwest
+                // stream and closes the connection — otherwise `join()` would block until the
+                // relay closed a keep-alive stream (possibly never). `None` = shutdown requested.
+                let result = rt.block_on(async {
+                    tokio::select! {
+                        r = yapstack_sync::transport::stream_wakeups(
+                            &client,
+                            &server_url,
+                            &current_bearer,
+                            |seq| {
+                                if should_wake(seq, pull_watermark_pub().load(Ordering::Acquire)) {
+                                    drain_wake().notify_one();
+                                }
+                            },
+                        ) => Some(r),
+                        () = async {
+                            while !stop.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                        } => None,
+                    }
+                });
+
+                let result = match result {
+                    Some(r) => r,
+                    None => break, // shutdown requested mid-stream
+                };
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Observability (throttled, transition-only — never DrainHealth): did this
+                // attempt REACH the relay stream at all? Only a connect/timeout failure
+                // (`Network`) means unreachable; a clean close, a 401, or a mid-stream error all
+                // reached it. A dead stream here is NOT the drain's "unreachable" state — the
+                // poll remains the sole drain-health authority.
+                let reached = !matches!(result, Err(yapstack_sync::SyncError::Network(_)));
+                if reached != connected {
+                    if reached {
+                        tracing::info!("sync sse: subscribed to relay wakeup stream");
+                    } else {
+                        tracing::info!(
+                            "sync sse: relay wakeup stream unreachable, retrying (poll continues)"
+                        );
+                    }
+                    connected = reached;
+                }
+
+                match &result {
+                    // A healthy stream the relay closed — reconnect promptly from the base delay.
+                    Ok(()) => backoff = SSE_BACKOFF_INITIAL,
+                    // Any error (a 401 with a stale bearer, an unreachable relay, a mid-stream
+                    // fault) backs off exponentially so no case can hot-loop. On a 401 the loop
+                    // reloads the drain-rotated bearer on the next attempt — it never
+                    // self-refreshes (that would race the drain's reuse-detection rotation).
+                    Err(_) => backoff = next_sse_backoff(backoff),
+                }
+
+                // Interruptible backoff: sleep in short slices so shutdown is prompt.
+                let mut waited = Duration::ZERO;
+                while waited < backoff && !stop.load(Ordering::SeqCst) {
+                    let slice = (backoff - waited).min(Duration::from_millis(250));
+                    std::thread::sleep(slice);
+                    waited += slice;
+                }
+            }
+            tracing::info!("sync sse subscriber stopped");
+        })
+        .map_err(|e| e.to_string())?;
+    Ok((shutdown, join))
+}
+
 // ----- Dedicated single-thread drain runtime (deliverable A) -----
 
 /// Handle to the running drain thread. Dropping/`stop`-ing sets the shutdown
@@ -2390,16 +2683,40 @@ pub struct DrainHandle {
     /// together — no separate managed state to keep in lock-step.
     audio_shutdown: Arc<AtomicBool>,
     audio_join: Option<std::thread::JoinHandle<()>>,
+    /// The SSE wakeup subscriber lane (deliverable 1) + local-write kick debouncer
+    /// (deliverable 2). Both only ADD drain wakes; bundled here so they tear down with the
+    /// drain. Best-effort: a spawn failure logs and leaves the interval-only drain running.
+    sse_shutdown: Option<Arc<AtomicBool>>,
+    sse_join: Option<std::thread::JoinHandle<()>>,
+    kick_shutdown: Option<Arc<AtomicBool>>,
+    kick_join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DrainHandle {
     fn stop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.audio_shutdown.store(true, Ordering::SeqCst);
+        if let Some(sd) = &self.sse_shutdown {
+            sd.store(true, Ordering::SeqCst);
+        }
+        if let Some(sd) = &self.kick_shutdown {
+            sd.store(true, Ordering::SeqCst);
+            // Nudge the debouncer off its condvar so it observes the shutdown promptly.
+            kick_channel().cv.notify_all();
+        }
+        // Break the drain's idle wait so it observes the shutdown at once (not after a full
+        // interval). Harmless if it is mid-cycle — the loop re-checks `shutdown` at the top.
+        drain_wake().notify_one();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
         if let Some(join) = self.audio_join.take() {
+            let _ = join.join();
+        }
+        if let Some(join) = self.sse_join.take() {
+            let _ = join.join();
+        }
+        if let Some(join) = self.kick_join.take() {
             let _ = join.join();
         }
     }
@@ -2903,6 +3220,25 @@ fn spawn_drain(
         }
     };
 
+    // Deliverable 1: the SSE wakeup subscriber. Best-effort — a spawn failure logs and leaves
+    // the interval-only drain running (SSE only ADDS wakes). Uses its own copy of the
+    // server_url + bearer (the drain closure below moves the originals).
+    let (sse_shutdown, sse_join) = match spawn_sse_subscriber(server_url.clone(), bearer.clone()) {
+        Ok((sd, jh)) => (Some(sd), Some(jh)),
+        Err(e) => {
+            tracing::error!("sync: sse subscriber spawn failed (live wakeups disabled): {e}");
+            (None, None)
+        }
+    };
+    // Deliverable 2: the local-write kick debouncer.
+    let (kick_shutdown, kick_join) = match spawn_write_kick_debouncer() {
+        Ok((sd, jh)) => (Some(sd), Some(jh)),
+        Err(e) => {
+            tracing::error!("sync: write-kick debouncer spawn failed (local kicks disabled): {e}");
+            (None, None)
+        }
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = shutdown.clone();
 
@@ -3059,6 +3395,12 @@ fn spawn_drain(
             // direction. Flips the panel to a distinct failing state past the threshold; any
             // clean cycle (or a sticky Oversized) resets it.
             let mut consecutive_errors: u32 = 0;
+
+            // Seed the SSE lane's watermark gate with our starting local pull position so an
+            // early wake for an already-merged seq is skipped (deliverable 1).
+            if let Ok(wm) = state::pull_watermark(conn) {
+                pull_watermark_pub().store(wm, Ordering::Release);
+            }
 
             while !stop.load(Ordering::SeqCst) {
                 // R12: BEFORE the (possibly long, multi-page) drain, publish the catching-up
@@ -3255,6 +3597,9 @@ fn spawn_drain(
                 // shortfall so we never claim "up to date" over an un-merged peer backlog.
                 let pull_behind = last_server_max
                     .map_or(0i64, |m| (m - report.pull_watermark).max(0)) as u64;
+                // Publish the LOCAL pull watermark for the SSE lane's wake gate (deliverable 1):
+                // a subsequent wake at or below this seq is already merged and skipped.
+                pull_watermark_pub().store(report.pull_watermark, Ordering::Release);
 
                 // T024 progress: recompute the backlog from the outbox after this cycle's
                 // push, accumulate the session ack count, and log ONLY on real progress /
@@ -3323,7 +3668,17 @@ fn spawn_drain(
                     Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
                 }
 
-                std::thread::sleep(DRAIN_INTERVAL);
+                // Idle wait: wake EARLY on an SSE wakeup or a debounced local-write kick, else
+                // fall through after DRAIN_INTERVAL (the fallback floor — the poll never stops).
+                // A wake stored during the cycle above returns this immediately (coalesced to
+                // one follow-up). `stop` is re-checked at the loop head; `DrainHandle::stop`
+                // also notifies to break this wait promptly.
+                rt.block_on(async {
+                    tokio::select! {
+                        () = drain_wake().notified() => {}
+                        () = tokio::time::sleep(DRAIN_INTERVAL) => {}
+                    }
+                });
             }
             tracing::info!("sync drain stopped");
         })
@@ -3334,6 +3689,10 @@ fn spawn_drain(
         join: Some(join),
         audio_shutdown,
         audio_join,
+        sse_shutdown,
+        sse_join,
+        kick_shutdown,
+        kick_join,
     })
 }
 
@@ -7081,6 +7440,94 @@ mod tests {
             assert!(!chain_looks_like_tls(
                 "dns error: failed to lookup address information"
             ));
+        }
+    }
+
+    /// SSE-latency tranche: the wake gate, the reconnect backoff schedule, the write-kick
+    /// debounce settle logic, and the wake-coalescing invariant.
+    mod liveness {
+        use super::super::*;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn wake_gate_skips_already_merged_seqs() {
+            // Unknown watermark → always wake (we cannot prove we are caught up).
+            assert!(should_wake(1, i64::MIN));
+            assert!(should_wake(0, i64::MIN));
+            // Known watermark → only a seq strictly beyond what we merged is worth a pull.
+            assert!(should_wake(11, 10), "a newer seq wakes");
+            assert!(!should_wake(10, 10), "our own tip does not re-trigger");
+            assert!(!should_wake(9, 10), "an already-merged seq is skipped");
+        }
+
+        #[test]
+        fn sse_backoff_doubles_and_caps() {
+            // 1s → 2 → 4 → 8 → 16 → 30 (capped) → 30 (stays capped).
+            let mut d = SSE_BACKOFF_INITIAL;
+            assert_eq!(d, Duration::from_secs(1));
+            let expected = [2u64, 4, 8, 16, 30, 30, 30];
+            for want in expected {
+                d = next_sse_backoff(d);
+                assert_eq!(d, Duration::from_secs(want), "backoff step to {want}s");
+            }
+            assert_eq!(d, SSE_BACKOFF_MAX, "never exceeds the cap");
+        }
+
+        #[test]
+        fn kick_wait_is_trailing_debounce() {
+            let now = Instant::now();
+            // No pending write → block for a kick.
+            assert_eq!(kick_wait(None, now), KickWait::Idle);
+            // Deadline reached (or passed) with no newer write → fire once.
+            assert_eq!(kick_wait(Some(now), now), KickWait::Fire);
+            assert_eq!(
+                kick_wait(Some(now - Duration::from_millis(1)), now),
+                KickWait::Fire
+            );
+            // Deadline in the future (a write pushed it out) → keep waiting, do not fire yet.
+            // This is the recording-workload guard: continuous writes keep pushing the deadline
+            // so the kick never settles and the session rides DRAIN_INTERVAL.
+            match kick_wait(Some(now + KICK_DEBOUNCE), now) {
+                KickWait::WaitFor(d) => assert!(d <= KICK_DEBOUNCE && d > Duration::ZERO),
+                other => panic!("expected WaitFor, got {other:?}"),
+            }
+        }
+
+        /// The load-bearing anti-busy-loop invariant: `Notify::notify_one` stores AT MOST ONE
+        /// permit, so N wakes arriving during an in-flight cycle collapse into exactly ONE
+        /// queued follow-up cycle — never a storm. Uses a local `Notify` (identical primitive
+        /// to `drain_wake`) so the assertion is deterministic and isolated from other tests.
+        #[tokio::test(flavor = "current_thread")]
+        async fn wakes_coalesce_to_one_followup() {
+            let n = tokio::sync::Notify::new();
+            // Five wakes arrive while the "drain" is busy (nobody awaiting yet).
+            for _ in 0..5 {
+                n.notify_one();
+            }
+            // The next idle wait returns immediately (the single stored permit)...
+            tokio::time::timeout(Duration::from_millis(100), n.notified())
+                .await
+                .expect("one coalesced permit must wake the first follow-up");
+            // ...but a SECOND wait blocks: the five wakes produced only ONE follow-up.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), n.notified())
+                    .await
+                    .is_err(),
+                "coalesced wakes must not queue a second follow-up cycle"
+            );
+        }
+
+        /// `note_local_write` is a cheap no-op when no drain (hence no debouncer) is armed —
+        /// it must never panic or set a stray deadline that a later drain would over-fire on.
+        #[test]
+        fn note_local_write_is_noop_when_unarmed() {
+            // KICK_ARMED starts false in a unit-test process (no debouncer thread).
+            note_local_write();
+            assert_eq!(
+                *kick_channel().deadline.lock().unwrap(),
+                None,
+                "an unarmed kick must not set a deadline"
+            );
         }
     }
 }

@@ -474,6 +474,76 @@ impl SyncTransport for HttpTransport {
     }
 }
 
+// --------------------------------------------------------------- SSE wakeups
+
+/// Parse ONE line of the relay's `GET /sync/stream` SSE body into a wakeup
+/// `changeset_seq`, or `None` for any line that is not a `data:` payload (the
+/// `event: wakeup` field line, `:`-prefixed keep-alive comments, blank inter-event
+/// delimiters, or a malformed value). The relay's contract is `event: wakeup\n
+/// data: <seq>\n\n`, so the load-bearing signal is the integer on the `data:` line.
+///
+/// The value is ONLY a hint to pull — never authoritative (see `sse.rs` on the
+/// server) — so a garbled `data:` line is safely dropped rather than trusted.
+#[must_use]
+pub fn parse_sse_data_seq(line: &str) -> Option<i64> {
+    // SSE permits `data:<v>` and `data: <v>`; trim either. Other fields/comments → None.
+    let rest = line.strip_prefix("data:")?;
+    rest.trim().parse::<i64>().ok()
+}
+
+/// Subscribe to the relay's `GET /sync/stream` SSE wakeup stream, invoking `on_wake`
+/// with each `changeset_seq` the relay publishes (best-effort liveness — the caller
+/// still pulls to learn the real state; the SSE value is NEVER authoritative). This is
+/// the client half of the server's `sse::SseHub`.
+///
+/// Returns:
+/// - `Ok(())` when the stream ends cleanly (the relay closed it) — the caller reconnects;
+/// - `Err(SyncError::Unauthorized)` on a 401 (the bearer expired — the caller reloads the
+///   drain-persisted token and re-subscribes; this fn NEVER refreshes tokens itself);
+/// - `Err(SyncError::Network(_))` on a connect/timeout failure (relay unreachable — the
+///   caller backs off and retries);
+/// - `Err(SyncError::Http(_))` on any other transport/stream error.
+///
+/// The body is parsed frame-by-frame off `bytes_stream()` (O(line) working set); it never
+/// buffers the whole never-ending response. The bearer is sent as an `Authorization`
+/// header and is absent from any returned error (which carries at most the relay URL).
+pub async fn stream_wakeups(
+    client: &reqwest::Client,
+    base_url: &str,
+    bearer: &str,
+    mut on_wake: impl FnMut(i64),
+) -> Result<(), SyncError> {
+    use futures_util::StreamExt;
+
+    let resp = client
+        .get(format!("{base_url}/sync/stream"))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    // 401 → refreshable (caller reloads the persisted token); other non-2xx → error_for_status.
+    let resp = check_auth(resp)?;
+
+    let mut stream = resp.bytes_stream();
+    // Accumulate bytes and process each complete LF-terminated line as it arrives. SSE lines
+    // end in `\n` (a `\r\n` producer is tolerated by trimming the trailing `\r`).
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?; // reqwest::Error → SyncError::Http
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let text = std::str::from_utf8(&line[..line.len() - 1])
+                .unwrap_or("")
+                .trim_end_matches('\r');
+            if let Some(seq) = parse_sse_data_seq(text) {
+                on_wake(seq);
+            }
+        }
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- mock relay
 
 struct StoredChange {
@@ -874,5 +944,100 @@ mod tests {
             "a refused connection must classify as Network (relay unreachable), got {err:?}"
         );
         assert!(err.is_network(), "SyncError::is_network() must agree");
+    }
+
+    #[test]
+    fn parse_sse_data_seq_isolates_data_lines() {
+        // The load-bearing `data:` payload parses (with or without the space); every other
+        // SSE line — the event field, keep-alive comments, blanks — and any garbled value is
+        // dropped rather than trusted (the seq is only a pull hint, never authoritative).
+        assert_eq!(parse_sse_data_seq("data: 42"), Some(42));
+        assert_eq!(parse_sse_data_seq("data:7"), Some(7));
+        assert_eq!(parse_sse_data_seq("data: 0"), Some(0));
+        assert_eq!(parse_sse_data_seq("event: wakeup"), None);
+        assert_eq!(parse_sse_data_seq(": keep-alive"), None);
+        assert_eq!(parse_sse_data_seq(""), None);
+        assert_eq!(parse_sse_data_seq("data: not-a-number"), None);
+        assert_eq!(parse_sse_data_seq("data:"), None);
+    }
+
+    /// End-to-end over a real socket: `stream_wakeups` parses a canned `text/event-stream`
+    /// body into the sequence of wakeup seqs and returns `Ok(())` when the relay closes the
+    /// stream — the exact behaviour the desktop SSE lane loops over (reconnect on clean end).
+    /// A tiny raw HTTP responder serves two events (no extra deps, no live relay).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_wakeups_parses_events_until_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Interleave a keep-alive comment + the event field lines; only the two `data:`
+            // seqs must surface. Close the socket after → clean stream end.
+            let body =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                : keep-alive\n\nevent: wakeup\ndata: 1\n\nevent: wakeup\ndata: 2\n\n";
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.flush();
+        });
+
+        let client = reqwest::Client::new();
+        let mut wakes = Vec::new();
+        let r = stream_wakeups(&client, &format!("http://{addr}"), "access-token", |s| {
+            wakes.push(s)
+        })
+        .await;
+        assert!(r.is_ok(), "clean stream end must be Ok, got {r:?}");
+        assert_eq!(wakes, vec![1, 2], "only the two data: seqs must surface");
+        server.join().unwrap();
+    }
+
+    /// A relay `401` on the stream must surface as [`SyncError::Unauthorized`] (the caller
+    /// reloads the drain-persisted bearer and re-subscribes) — never a silent hang, never a
+    /// self-refresh here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_wakeups_maps_401_to_unauthorized() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp =
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        });
+
+        let client = reqwest::Client::new();
+        let err = stream_wakeups(&client, &format!("http://{addr}"), "stale", |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SyncError::Unauthorized),
+            "a 401 stream must map to Unauthorized, got {err:?}"
+        );
+        server.join().unwrap();
     }
 }

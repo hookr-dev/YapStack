@@ -704,10 +704,18 @@ pub async fn db_execute(
     values: Vec<JsonValue>,
 ) -> Result<DbExecuteResult, String> {
     let svc = service.inner().clone();
-    tokio::task::spawn_blocking(move || svc.execute(&query, &values))
+    let result = tokio::task::spawn_blocking(move || svc.execute(&query, &values))
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Local-write kick (SSE-latency deliverable 2): a committed local write nudges the sync
+    // drain to run a push-capturing cycle promptly (debounced). No-op when sync is off or no
+    // drain is running; never affects the command's result.
+    #[cfg(feature = "sync")]
+    if result.is_ok() {
+        crate::sync::note_local_write();
+    }
+    result
 }
 
 /// `db.select(sql, params)` — read path. Returns rows as JSON objects.
