@@ -9,8 +9,11 @@
 //! added/removed) via three property selectors on the same system object.
 //! Construct one `DefaultDeviceWatcher` per kind.
 //!
-//! On non-macOS builds this is a no-op stub so call sites don't need
-//! `#[cfg]` gates.
+//! On Windows the same primitive is implemented via WASAPI's
+//! `IMMNotificationClient` (`OnDefaultDeviceChanged` / `OnDeviceAdded` /
+//! `OnDeviceRemoved` / `OnDeviceStateChanged`) registered on a dedicated
+//! COM (MTA) thread. On remaining platforms (Linux) this is a no-op stub
+//! so call sites don't need `#[cfg]` gates.
 //!
 //! # Why we do this in-house instead of relying on cpal
 //!
@@ -118,9 +121,9 @@ pub enum DefaultDeviceKind {
 }
 
 impl DefaultDeviceKind {
-    // Only the macOS watcher imp calls this today; the Windows watcher
-    // (windows-support plan #8) will too, at which point the allow can go.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    // Consumed by the macOS and Windows watcher imps; dead only on the
+    // remaining stub platforms (Linux).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn to_event(self) -> DeviceEvent {
         match self {
             Self::Input => DeviceEvent::DefaultInputChanged,
@@ -265,20 +268,223 @@ mod imp {
     }
 }
 
-/// Watches for default-device changes on macOS for a single direction
-/// (input or output). On other platforms this is a no-op stub that never
-/// invokes the sink.
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::*;
+    use std::sync::mpsc;
+    use tracing::{info, warn};
+    use windows::core::{implement, PCWSTR};
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Media::Audio::{
+        eCapture, eConsole, eRender, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
+        IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    /// COM callback object registered with
+    /// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. One
+    /// client is registered per watcher kind; each filters the firehose of
+    /// endpoint notifications down to its kind's single `DeviceEvent`.
+    #[implement(IMMNotificationClient)]
+    struct NotificationClient {
+        sink: SharedSinkSlot,
+        kind: DefaultDeviceKind,
+    }
+
+    impl NotificationClient {
+        fn fire(&self) {
+            // Snapshot the sink under read lock and release it before
+            // invoking, mirroring the macOS listener: a panicking sink must
+            // not poison the lock for future events.
+            let snapshot = self.sink.read().ok().and_then(|guard| guard.clone());
+            if let Some(sink) = snapshot {
+                sink(self.kind.to_event());
+            }
+        }
+    }
+
+    impl IMMNotificationClient_Impl for NotificationClient_Impl {
+        fn OnDeviceStateChanged(
+            &self,
+            _device_id: &PCWSTR,
+            _new_state: DEVICE_STATE,
+        ) -> windows::core::Result<()> {
+            if self.kind == DefaultDeviceKind::Devices {
+                self.fire();
+            }
+            Ok(())
+        }
+
+        fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+            if self.kind == DefaultDeviceKind::Devices {
+                self.fire();
+            }
+            Ok(())
+        }
+
+        fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+            if self.kind == DefaultDeviceKind::Devices {
+                self.fire();
+            }
+            Ok(())
+        }
+
+        fn OnDefaultDeviceChanged(
+            &self,
+            flow: EDataFlow,
+            role: ERole,
+            _default_device_id: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            // Windows fires this once per role (console/multimedia/
+            // communications) for the same physical change. Filter to
+            // eConsole — the role cpal's default-device lookups use — so one
+            // change produces one event instead of up to three.
+            if role != eConsole {
+                return Ok(());
+            }
+            match self.kind {
+                DefaultDeviceKind::Input if flow == eCapture => self.fire(),
+                DefaultDeviceKind::Output if flow == eRender => self.fire(),
+                // Windows has no separate alerts/system-sounds route: system
+                // sounds follow the console render endpoint, which the
+                // `Output` watcher above already covers. Firing this kind too
+                // would double-signal the same change into the broker.
+                DefaultDeviceKind::DefaultSystemOutput => {}
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn OnPropertyValueChanged(
+            &self,
+            _device_id: &PCWSTR,
+            _key: &PROPERTYKEY,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(super) struct WatcherInner {
+        shutdown_tx: mpsc::Sender<()>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    pub(super) fn register(
+        kind: DefaultDeviceKind,
+        sink: SharedSinkSlot,
+    ) -> Result<WatcherInner, AudioError> {
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+        // Dedicated thread: the enumerator + registered client are COM
+        // objects that live and die on this thread. COM is initialized MTA,
+        // so notification callbacks arrive on COM worker threads (delivery
+        // does not require this thread to pump messages — it just parks,
+        // keeping the registration alive until drop).
+        let join = std::thread::Builder::new()
+            .name(format!("wasapi-watch-{kind:?}"))
+            .spawn(move || {
+                let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                if hr.is_err() {
+                    // Fresh thread: RPC_E_CHANGED_MODE can't apply; any
+                    // failure here is a real COM failure.
+                    let _ = ready_tx.send(Err(format!("CoInitializeEx failed: {hr}")));
+                    return;
+                }
+                let registration =
+                    (|| -> windows::core::Result<(IMMDeviceEnumerator, IMMNotificationClient)> {
+                        let enumerator: IMMDeviceEnumerator =
+                            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+                        let client: IMMNotificationClient =
+                            NotificationClient { sink, kind }.into();
+                        unsafe { enumerator.RegisterEndpointNotificationCallback(&client)? };
+                        Ok((enumerator, client))
+                    })();
+                match registration {
+                    Ok((enumerator, client)) => {
+                        let _ = ready_tx.send(Ok(()));
+                        // Park until the watcher drops (Err means the sender
+                        // was dropped without an explicit shutdown — treat
+                        // the same).
+                        let _ = shutdown_rx.recv();
+                        unsafe {
+                            let _ = enumerator.UnregisterEndpointNotificationCallback(&client);
+                        }
+                        drop(client);
+                        drop(enumerator);
+                        unsafe { CoUninitialize() };
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        unsafe { CoUninitialize() };
+                    }
+                }
+            })
+            .map_err(|e| {
+                warn!("WASAPI watcher thread spawn failed: {e}");
+                AudioError::PlatformNotSupported
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                info!(
+                    "WASAPI default-{:?} device change listener registered",
+                    kind
+                );
+                Ok(WatcherInner {
+                    shutdown_tx,
+                    join: Some(join),
+                })
+            }
+            Ok(Err(msg)) => {
+                let _ = join.join();
+                warn!(
+                    "WASAPI default-{:?} listener registration failed: {msg}",
+                    kind
+                );
+                Err(AudioError::PlatformNotSupported)
+            }
+            Err(_) => {
+                // Thread died without reporting (panic before send).
+                let _ = join.join();
+                warn!(
+                    "WASAPI default-{:?} listener thread died during setup",
+                    kind
+                );
+                Err(AudioError::PlatformNotSupported)
+            }
+        }
+    }
+
+    impl Drop for WatcherInner {
+        fn drop(&mut self) {
+            // Wake the parked thread; it unregisters the callback and
+            // uninitializes COM before exiting.
+            let _ = self.shutdown_tx.send(());
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+/// Watches for default-device changes for a single direction (input or
+/// output) — Core Audio property listeners on macOS, WASAPI
+/// `IMMNotificationClient` on Windows. On remaining platforms this is a
+/// no-op stub that never invokes the sink.
 pub struct DefaultDeviceWatcher {
     kind: DefaultDeviceKind,
     sink: SharedSinkSlot,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     _inner: imp::WatcherInner,
 }
 
 impl DefaultDeviceWatcher {
     pub fn new(kind: DefaultDeviceKind) -> Result<Self, AudioError> {
         let sink: SharedSinkSlot = Arc::new(RwLock::new(None));
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let inner = imp::register(kind, Arc::clone(&sink))?;
             Ok(Self {
@@ -287,7 +493,7 @@ impl DefaultDeviceWatcher {
                 _inner: inner,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Ok(Self { kind, sink })
         }

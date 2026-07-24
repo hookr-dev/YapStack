@@ -22,13 +22,17 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { ArrowLeft, Check, FolderMinus, FolderOpen, FolderPlus, Loader2, Mic, MoreHorizontal, Square, Trash2 } from "lucide-react";
-import type { DbSession } from "@/lib/db";
+import { ArrowLeft, Check, Copy, Download, FolderMinus, FolderOpen, FolderPlus, Loader2, Mic, MoreHorizontal, Square, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import type { DbSession, DbSegment } from "@/lib/db";
 import {
   canResumeSession,
   updateSessionTitle,
   getSession,
 } from "@/lib/db";
+import { segmentsToAttributedMarkdown, segmentsForSpeaker } from "@/lib/export";
+import { exportTranscriptToFile } from "@/lib/transcript-export";
+import { trackTranscriptExported } from "@/lib/analytics";
 import { formatDuration, formatElapsed } from "@/lib/utils";
 import { ICON_MAP } from "@/lib/folder-constants";
 import type { FolderTreeNode } from "@/lib/folder-tree";
@@ -139,7 +143,13 @@ function FolderMenuNode({
   );
 }
 
-export function SessionHeader({ session }: { session: DbSession }) {
+export function SessionHeader({
+  session,
+  segments = [],
+}: {
+  session: DbSession;
+  segments?: DbSegment[];
+}) {
   const deleteSession = useAppStore((s) => s.deleteSession);
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const navigateTo = useAppStore((s) => s.navigateTo);
@@ -160,6 +170,70 @@ export function SessionHeader({ session }: { session: DbSession }) {
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleText, setTitleText] = useState(session.title);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+
+  // Hidden segments are excluded from copy/export.
+  const exportable = segments.filter((s) => s.hidden === 0);
+  const micCount = exportable.filter((s) => s.source === "Mic").length;
+  const systemCount = exportable.filter((s) => s.source === "System").length;
+  const hasMic = micCount > 0;
+  const hasSystem = systemCount > 0;
+  const segmentCountForKind = (kind: string) =>
+    kind === "mine" ? micCount : kind === "theirs" ? systemCount : exportable.length;
+  // Filesystem-safe stem for the save dialog's default filename.
+  const exportBaseName =
+    (session.title || "transcript").replace(/[/\\:*?"<>|]/g, "").trim() ||
+    "transcript";
+
+  const canResume =
+    !isRecording &&
+    canResumeSession(
+      session,
+      viewSessionParts,
+      liveTranscriptionActive,
+      sessionStopping,
+    );
+  const hasAudioFile = !isRecording && viewSessionParts.length > 0;
+  const hasTranscript = exportable.length > 0;
+  const hasManageActions = canResume || folderTree.length > 0;
+  const hasContentActions = hasAudioFile || hasTranscript;
+
+  const copyTranscript = async (
+    text: string,
+    kind: string,
+    successMessage: string,
+  ) => {
+    if (text.length === 0) {
+      toast.info("Nothing to copy");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(successMessage);
+      trackTranscriptExported({
+        scope: "session",
+        mechanism: "clipboard",
+        kind,
+        segments: segmentCountForKind(kind),
+      });
+    } catch {
+      toast.error("Clipboard copy failed");
+    }
+  };
+
+  const exportTranscript = async (
+    text: string,
+    kind: string,
+    fileName: string,
+  ) => {
+    if (await exportTranscriptToFile(text, fileName)) {
+      trackTranscriptExported({
+        scope: "session",
+        mechanism: "file",
+        kind,
+        segments: segmentCountForKind(kind),
+      });
+    }
+  };
 
   // Sync local titleText when session prop changes (e.g. after AI tool updates title)
   const prevTitleRef = useRef(session.title);
@@ -255,28 +329,15 @@ export function SessionHeader({ session }: { session: DbSession }) {
       {/* Right: dropdown actions */}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon-xs" className="shrink-0">
+          <Button variant="ghost" size="icon-xs" className="shrink-0" aria-label="Session actions">
             <MoreHorizontal className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          {!isRecording && canResumeSession(session, viewSessionParts, liveTranscriptionActive, sessionStopping) && (
+          {canResume && (
             <DropdownMenuItem onClick={() => resumeSession(session.id)}>
               <Mic />
               Resume recording
-            </DropdownMenuItem>
-          )}
-          {!isRecording && viewSessionParts.length > 0 && (
-            <DropdownMenuItem
-              onClick={() => {
-                // Reveal the most recent part. The other parts live in the
-                // same directory, so this gets the user there either way.
-                const latest = viewSessionParts[viewSessionParts.length - 1];
-                if (latest) revealAudioFile(latest.file_path);
-              }}
-            >
-              <FolderOpen />
-              Show audio file
             </DropdownMenuItem>
           )}
           {folderTree.length > 0 && (
@@ -308,6 +369,112 @@ export function SessionHeader({ session }: { session: DbSession }) {
                 )}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
+          )}
+
+          {hasManageActions && hasContentActions && <DropdownMenuSeparator />}
+
+          {hasAudioFile && (
+            <DropdownMenuItem
+              onClick={() => {
+                // Reveal the most recent part. The other parts live in the
+                // same directory, so this gets the user there either way.
+                const latest = viewSessionParts[viewSessionParts.length - 1];
+                if (latest) revealAudioFile(latest.file_path);
+              }}
+            >
+              <FolderOpen />
+              Show audio file
+            </DropdownMenuItem>
+          )}
+          {hasTranscript && (
+            <>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Copy />
+                  <span className="flex-1">Copy transcript</span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuItem
+                    onClick={() =>
+                      copyTranscript(
+                        segmentsToAttributedMarkdown(exportable),
+                        "full",
+                        "Copied transcript",
+                      )
+                    }
+                  >
+                    Full transcript
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={!hasMic}
+                    onClick={() =>
+                      copyTranscript(
+                        segmentsForSpeaker(exportable, "Mic"),
+                        "mine",
+                        "Copied my side",
+                      )
+                    }
+                  >
+                    My side
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={!hasSystem}
+                    onClick={() =>
+                      copyTranscript(
+                        segmentsForSpeaker(exportable, "System"),
+                        "theirs",
+                        "Copied their side",
+                      )
+                    }
+                  >
+                    Their side
+                  </DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Download />
+                  <span className="flex-1">Export transcript</span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuItem
+                    onClick={() =>
+                      exportTranscript(
+                        segmentsToAttributedMarkdown(exportable),
+                        "full",
+                        `${exportBaseName}.md`,
+                      )
+                    }
+                  >
+                    Full transcript
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={!hasMic}
+                    onClick={() =>
+                      exportTranscript(
+                        segmentsForSpeaker(exportable, "Mic"),
+                        "mine",
+                        `${exportBaseName} - my side.txt`,
+                      )
+                    }
+                  >
+                    My side
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={!hasSystem}
+                    onClick={() =>
+                      exportTranscript(
+                        segmentsForSpeaker(exportable, "System"),
+                        "theirs",
+                        `${exportBaseName} - their side.txt`,
+                      )
+                    }
+                  >
+                    Their side
+                  </DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            </>
           )}
           <DropdownMenuSeparator />
           {isRecording ? (

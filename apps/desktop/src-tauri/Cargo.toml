@@ -107,6 +107,7 @@ sync = [
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[target."cfg(target_os = \"windows\")".dependencies]
 # Windows credential shim (R5). `keyring` 3.x's Windows backend hardcodes
 # `Persist: CRED_PERSIST_ENTERPRISE` (keyring-3.6.3/src/windows.rs:246), which can fail to
 # survive logoff on some account/domain configurations — silently killing the owner's session
@@ -115,7 +116,6 @@ tempfile = { workspace = true }
 # macOS `apple-native` path. Same `windows-sys` 0.60 + feature set `keyring` already pulls
 # (keyring-3.6.3/Cargo.toml:200), so cargo deduplicates — no new distinct crate build. Optional
 # and gated into the `sync` feature; absent on non-Windows targets.
-[target."cfg(target_os = \"windows\")".dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
@@ -123,6 +123,17 @@ windows-sys = { version = "0.60", features = [
     # the dep we already build — no new crate (PM dependency decision).
     "Win32_Storage_FileSystem",
 ], optional = true }
+# WASAPI FFI for the dictation volume duck (IAudioEndpointVolume on the
+# default render endpoint). Same crate/version tauri and yapstack-audio
+# already pull on Windows, so Cargo deduplicates the build.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
 
 # Unix free-space probe (statvfs) for the audio-fetch disk precheck. rust-lang's `libc` is
 # already in the transitive tree; a direct unix-only optional dep is the lowest possible

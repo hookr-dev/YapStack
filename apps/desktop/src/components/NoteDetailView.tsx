@@ -590,7 +590,7 @@ export function NoteDetailView() {
   if (isManual) {
     return (
       <div className="relative flex flex-1 flex-col min-h-0 pb-16 view-enter">
-        <SessionHeader session={session} />
+        <SessionHeader session={session} segments={segments} />
         <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} />
         {chatBar}
       </div>
@@ -601,7 +601,7 @@ export function NoteDetailView() {
   if (isActiveSession) {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
-        <SessionHeader session={session} />
+        <SessionHeader session={session} segments={segments} />
         <AutoTagSuggestions
           suggestions={suggestions}
           folders={autoTagFolders}
@@ -641,7 +641,7 @@ export function NoteDetailView() {
   if (isTranscription && isEditable) {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
-        <SessionHeader session={session} />
+        <SessionHeader session={session} segments={segments} />
         {audioMissing ? (
           // Metadata synced from another device but the audio bytes did not. S3: offer
           // fetch-on-demand (progress + cancel) instead of a dead disabled control.
@@ -750,7 +750,7 @@ export function NoteDetailView() {
   // Fallback: transcript only
   return (
     <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
-      <SessionHeader session={session} />
+      <SessionHeader session={session} segments={segments} />
       <ChatView sessionId={selectedSessionId ?? undefined} segments={segments} />
     </div>
   );

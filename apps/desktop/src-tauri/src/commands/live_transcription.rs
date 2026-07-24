@@ -4954,7 +4954,7 @@ async fn build_effective_prompt(
     };
 
     if vocab_budget > 0 && !context_part.is_empty() {
-        Some(format!("{}. {}", &vocab_truncated, context_part))
+        Some(format!("{}. {}", vocab_truncated, context_part))
     } else if vocab_budget > 0 {
         Some(vocab_truncated)
     } else {
@@ -5515,8 +5515,10 @@ pub async fn start_live_transcription(
                 (Some(v), None) | (None, Some(v)) => v,
                 (None, None) => 0.0,
             };
-            // 5% safety margin: avoid reading data near the ring buffer write head
-            config.backfill_seconds.min(available * 0.95)
+            yapstack_audio::ring_buffer::clamp_backfill_to_available(
+                config.backfill_seconds,
+                available,
+            )
         } else {
             0.0
         }

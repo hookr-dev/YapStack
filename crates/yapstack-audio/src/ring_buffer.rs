@@ -415,6 +415,40 @@ impl AudioRingBuffer {
     }
 }
 
+/// Fixed time guard (seconds) subtracted from `available_seconds` when a
+/// backfill rewind requests more than the buffer holds.
+///
+/// It covers the gap between sampling `available_seconds` and the actual
+/// rewind + extraction (separate lock acquisitions), during which the producer
+/// keeps overwriting the oldest samples. That race window is bounded by
+/// elapsed wall-clock time, not buffer capacity, so the guard must be a fixed
+/// constant — a percentage margin would scale with capacity and shave real
+/// audio off large buffers.
+pub const BACKFILL_WRITE_HEAD_GUARD_SECONDS: f32 = 0.05;
+
+/// Clamps a requested backfill rewind to what the ring buffer can safely
+/// yield, returning the effective rewind in seconds. Pure helper — no buffer
+/// access — so the clamp policy is unit testable.
+///
+/// - `requested <= available` -> `requested`, unchanged. The exact-equal
+///   boundary is deliberately unguarded: real callers reach it only with a
+///   slightly-stale, strictly-smaller `available`, and `snapshot_since` clamps
+///   any residual over-read to committed samples.
+/// - `requested > available` -> `available` minus
+///   [`BACKFILL_WRITE_HEAD_GUARD_SECONDS`] (never below 0), staying clear of
+///   the live write head.
+pub fn clamp_backfill_to_available(requested_seconds: f32, available_seconds: f32) -> f32 {
+    if requested_seconds <= 0.0 || available_seconds <= 0.0 {
+        return 0.0;
+    }
+
+    if requested_seconds <= available_seconds {
+        requested_seconds
+    } else {
+        (available_seconds - BACKFILL_WRITE_HEAD_GUARD_SECONDS).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +849,135 @@ mod tests {
         assert_eq!(
             snap,
             vec![15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0]
+        );
+    }
+
+    // --- clamp_backfill_to_available -----------------------------------------
+
+    /// A request the buffer holds comes back unchanged — no proportional shave.
+    #[test]
+    fn test_clamp_backfill_requested_within_available_returns_requested() {
+        assert_eq!(clamp_backfill_to_available(300.0, 300.0), 300.0);
+        assert_eq!(clamp_backfill_to_available(120.0, 300.0), 120.0);
+        assert_eq!(clamp_backfill_to_available(5.0, 300.0), 5.0);
+    }
+
+    /// `requested == available` yields exactly `available`.
+    #[test]
+    fn test_clamp_backfill_at_boundary_no_percentage_shave() {
+        assert_eq!(clamp_backfill_to_available(300.0, 300.0), 300.0);
+        assert_eq!(clamp_backfill_to_available(42.0, 42.0), 42.0);
+    }
+
+    /// Over-requesting clamps to `available` minus the fixed guard, with the
+    /// same gap regardless of buffer size. (Epsilon comparisons: f32
+    /// subtraction of large magnitudes is not bit-exact.)
+    #[test]
+    fn test_clamp_backfill_over_available_uses_exact_fixed_guard() {
+        let effective = clamp_backfill_to_available(500.0, 300.0);
+        assert!((effective - (300.0 - BACKFILL_WRITE_HEAD_GUARD_SECONDS)).abs() < 1e-3);
+        assert!(effective < 300.0);
+        let small = clamp_backfill_to_available(50.0, 10.0);
+        assert!((10.0 - small - BACKFILL_WRITE_HEAD_GUARD_SECONDS).abs() < 1e-3);
+        let large = clamp_backfill_to_available(5000.0, 1000.0);
+        assert!((1000.0 - large - BACKFILL_WRITE_HEAD_GUARD_SECONDS).abs() < 1e-3);
+    }
+
+    /// Zero / negative inputs collapse to 0.0; a guard larger than
+    /// `available` never underflows below 0.
+    #[test]
+    fn test_clamp_backfill_zero_inputs() {
+        assert_eq!(clamp_backfill_to_available(0.0, 300.0), 0.0);
+        assert_eq!(clamp_backfill_to_available(120.0, 0.0), 0.0);
+        assert_eq!(clamp_backfill_to_available(-5.0, 300.0), 0.0);
+        assert_eq!(clamp_backfill_to_available(10.0, 0.01), 0.0);
+    }
+
+    // --- backfill extraction path (clamp + rewind + snapshot) ----------------
+
+    /// Mirrors the real caller's rewind arithmetic
+    /// (`build_initial_sources_and_backfill`): rewind `write_pos` by
+    /// `effective_seconds`, frame-aligned, then extract via
+    /// `snapshot_since_with_pos`. Returns `(extracted_samples, cursor)`.
+    fn rewind_and_extract(buf: &AudioRingBuffer, effective_seconds: f32) -> (Vec<f32>, usize) {
+        let write_pos = buf.samples_written();
+        let raw = (effective_seconds * buf.sample_rate() as f32 * buf.channels() as f32) as usize;
+        let ch = buf.channels() as usize;
+        let rewind = raw - (raw % ch);
+        let cursor = write_pos.saturating_sub(rewind);
+        let (snap, _new_pos) = buf.snapshot_since_with_pos(cursor);
+        (snap, cursor)
+    }
+
+    /// Full-window request through the real extraction path (clamp -> rewind
+    /// cursor -> snapshot): the extracted region must cover the entire window,
+    /// starting at the oldest committed sample.
+    #[test]
+    fn test_backfill_extraction_full_window_keeps_oldest_samples() {
+        // 100 Hz mono keeps the buffer small; each sample value is its
+        // monotonic index so the oldest sample is identifiable as `0.0`.
+        let sample_rate = 100;
+        let channels = 1;
+        let window_seconds = 300.0_f32;
+        let total = (window_seconds * sample_rate as f32 * channels as f32) as usize;
+
+        let buf = AudioRingBuffer::new(total, sample_rate, channels);
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let available = buf.info().available_seconds;
+        assert!((available - window_seconds).abs() < 1e-3);
+
+        let effective = clamp_backfill_to_available(window_seconds, available);
+        assert_eq!(effective, window_seconds);
+
+        let (extracted, cursor) = rewind_and_extract(&buf, effective);
+
+        assert_eq!(
+            extracted.len(),
+            total,
+            "extraction must yield the full requested window, not a shaved subset"
+        );
+
+        assert_eq!(cursor, 0, "rewind must reach the oldest committed sample");
+        assert_eq!(
+            extracted.first().copied(),
+            Some(0.0),
+            "the oldest (first) requested sample must be present — tail not dropped"
+        );
+        assert_eq!(
+            extracted.last().copied(),
+            Some((total - 1) as f32),
+            "the newest requested sample must still be present"
+        );
+    }
+
+    /// Over-requesting drops only the fixed guard's worth of oldest samples.
+    #[test]
+    fn test_backfill_extraction_over_request_drops_only_fixed_guard() {
+        let sample_rate = 100;
+        let channels = 1;
+        let window_seconds = 300.0_f32;
+        let total = (window_seconds * sample_rate as f32 * channels as f32) as usize;
+
+        let buf = AudioRingBuffer::new(total, sample_rate, channels);
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let available = buf.info().available_seconds;
+
+        let effective = clamp_backfill_to_available(10_000.0, available);
+        assert!((effective - (available - BACKFILL_WRITE_HEAD_GUARD_SECONDS)).abs() < 1e-3);
+
+        let (extracted, cursor) = rewind_and_extract(&buf, effective);
+
+        let guard_samples = (BACKFILL_WRITE_HEAD_GUARD_SECONDS * sample_rate as f32) as usize;
+        assert_eq!(cursor, guard_samples, "only the fixed guard is skipped");
+        assert_eq!(extracted.len(), total - guard_samples);
+        assert_eq!(
+            extracted.first().copied(),
+            Some(guard_samples as f32),
+            "extraction starts exactly one fixed guard past the oldest sample"
         );
     }
 }

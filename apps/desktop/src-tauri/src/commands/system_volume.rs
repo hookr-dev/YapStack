@@ -14,9 +14,13 @@ use crate::system_volume;
 /// the caller.
 #[tauri::command]
 #[specta::specta]
-// Off macOS, VolumeError has only the Unsupported variant, so the catch-all
-// arm (there for the macOS-only variants) is unreachable.
-#[cfg_attr(not(target_os = "macos"), allow(unreachable_patterns))]
+// On stub platforms (Linux), VolumeError has only the Unsupported variant,
+// so the catch-all arm (for the macOS/Windows-specific variants) is
+// unreachable there.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(unreachable_patterns)
+)]
 pub async fn apply_volume_duck(amount: f32) {
     match system_volume::apply_duck(amount) {
         Ok(outcome) => debug!("volume duck: {:?}", outcome),
@@ -33,8 +37,11 @@ pub async fn apply_volume_duck(amount: f32) {
 /// call. No-op if no snapshot is held.
 #[tauri::command]
 #[specta::specta]
-// Same as apply_volume_duck: the catch-all arm is unreachable off macOS.
-#[cfg_attr(not(target_os = "macos"), allow(unreachable_patterns))]
+// Same as apply_volume_duck: the catch-all arm is unreachable on stub platforms.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(unreachable_patterns)
+)]
 pub async fn restore_volume() {
     match system_volume::restore() {
         Ok(()) => debug!("volume restore: ok"),

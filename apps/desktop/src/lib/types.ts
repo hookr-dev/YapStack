@@ -455,8 +455,11 @@ async getLogDir() : Promise<Result<string, CommandError>> {
 }
 },
 /**
- * Open Finder / Explorer to the log directory so the user can grab the files
- * to send to support.
+ * Open Finder / Explorer with the current log file highlighted, falling back
+ * to the log directory when no log file exists yet.
+ *
+ * Must use `reveal_item_in_dir`: `open_path` would need the un-granted
+ * `opener:allow-open-path` permission and is denied at runtime.
  */
 async revealLogDir() : Promise<Result<null, CommandError>> {
     try {
@@ -729,6 +732,23 @@ async audioCacheStats() : Promise<Result<AudioCacheStatsDto, string>> {
 async audioCacheClear() : Promise<Result<AudioCacheStatsDto, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("audio_cache_clear") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Write UTF-8 `contents` to `path`.
+ *
+ * Trusted-renderer boundary: `path` comes from the frontend save dialog and
+ * cannot be verified here, so this is a renderer-callable file-write
+ * primitive. It refuses non-text-export extensions, does not create
+ * directories, and the `fs` plugin grant stays read-only so this remains the
+ * only renderer write path.
+ */
+async writeTextFile(path: string, contents: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("write_text_file", { path, contents }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

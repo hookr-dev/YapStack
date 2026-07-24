@@ -329,6 +329,7 @@ pub fn run() {
             commands::logs::log_frontend,
             db_service::db_execute,
             db_service::db_select,
+            commands::export::write_text_file,
         ]);
     #[cfg(feature = "sync")]
     let specta_builder =
@@ -399,6 +400,7 @@ pub fn run() {
             sync::audio_release_part,
             sync::audio_cache_stats,
             sync::audio_cache_clear,
+            commands::export::write_text_file,
         ]);
 
     #[cfg(debug_assertions)]

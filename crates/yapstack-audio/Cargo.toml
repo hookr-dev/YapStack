@@ -21,3 +21,16 @@ mp3lame-encoder = { workspace = true }
 # transitively, so Cargo deduplicates to a single build.
 [target."cfg(target_os = \"macos\")".dependencies]
 coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+
+# WASAPI FFI for the Windows default-device-change watcher
+# (IMMNotificationClient) and device_liveness (IMMDevice::GetState). Same
+# crate cpal/tauri already pull on Windows, so Cargo deduplicates the build.
+[target."cfg(target_os = \"windows\")".dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+] }
+# Direct dep required by #[implement]: the macro expands to `windows_core::`
+# paths, which only resolve if this crate names windows-core itself.
+windows-core = "0.61"

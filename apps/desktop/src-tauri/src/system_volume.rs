@@ -24,23 +24,35 @@
 //! speakers, AirPods, USB DACs, and aggregate devices, including those whose
 //! hardware doesn't expose a true master scalar on the main element.
 //!
-//! Windows / Linux are stubs that return `Unsupported`; future ports plug in
-//! against the same `SystemOutputVolume` trait.
+//! Windows drives `IAudioEndpointVolume::SetMasterVolumeLevelScalar` on the
+//! default render endpoint — the same scalar the taskbar volume slider
+//! drives — with the endpoint ID string as the device identity. Linux is a
+//! stub that returns `Unsupported`; a future port plugs in against the same
+//! `SystemOutputVolume` trait.
 
 use std::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
+    // Windows has a real controller, so nothing constructs this variant there.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     #[error("system output volume control is not supported on this platform")]
     Unsupported,
     #[cfg(target_os = "macos")]
     #[error("CoreAudio call failed: OSStatus={0}")]
     CoreAudio(i32),
+    #[cfg(target_os = "windows")]
+    #[error("WASAPI call failed: {0}")]
+    Wasapi(String),
 }
 
 /// Opaque identifier for an output device. On macOS this is an
-/// `AudioObjectID`; on stub platforms it's a placeholder that's never read.
+/// `AudioObjectID`; on Windows the WASAPI endpoint ID string; on stub
+/// platforms a placeholder that's never read.
+#[cfg(not(target_os = "windows"))]
 pub type DeviceId = u32;
+#[cfg(target_os = "windows")]
+pub type DeviceId = String;
 
 pub trait SystemOutputVolume: Send + Sync {
     /// Resolve the current default output device. Returns `Unsupported` on
@@ -49,12 +61,12 @@ pub trait SystemOutputVolume: Send + Sync {
     /// `kAudioObjectUnknown` / 0).
     fn default_device(&self) -> Result<DeviceId, VolumeError>;
     /// Read the volume of `device` in [0.0, 1.0].
-    fn get(&self, device: DeviceId) -> Result<f32, VolumeError>;
+    fn get(&self, device: &DeviceId) -> Result<f32, VolumeError>;
     /// Set `device`'s volume. `level` is clamped to [0.0, 1.0].
-    fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError>;
+    fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DuckOutcome {
     /// Volume on `device` was set from `from` to `to` (= `from * (1 - amount)`),
     /// and `(device, from)` is now snapshotted. With `amount = 0` this still
@@ -71,7 +83,7 @@ pub enum DuckOutcome {
     AlreadyDucked { amount: f32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Snapshot {
     device: DeviceId,
     level: f32,
@@ -84,7 +96,11 @@ fn controller() -> Box<dyn SystemOutputVolume> {
     {
         Box::new(macos::CoreAudioController)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows_impl::WasapiController)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Box::new(stub::StubController)
     }
@@ -107,7 +123,7 @@ fn apply_duck_inner(
 ) -> Result<DuckOutcome, VolumeError> {
     let amount = amount.clamp(0.0, 1.0);
     let device = ctrl.default_device()?;
-    let current = ctrl.get(device)?;
+    let current = ctrl.get(&device)?;
 
     // Hold the snapshot mutex across BOTH the snapshot write AND the volume
     // set. Without this, a concurrent `restore_inner` call landing between
@@ -118,13 +134,13 @@ fn apply_duck_inner(
     // CoreAudio call, typically sub-millisecond on macOS), in exchange for
     // strict apply/restore atomicity.
     let mut snap = snap_cell.lock().expect("system_volume snapshot poisoned");
-    if let Some(snapped) = *snap {
+    if let Some(snapped) = snap.clone() {
         // Already ducked — re-apply against the snapshotted *original*
         // level (not the currently-ducked level, which would compound).
         // Only set if we'd actually be lowering; never raise.
         let absolute = (snapped.level * (1.0 - amount)).clamp(0.0, 1.0);
-        if ctrl.get(snapped.device)? > absolute {
-            ctrl.set(snapped.device, absolute)?;
+        if ctrl.get(&snapped.device)? > absolute {
+            ctrl.set(&snapped.device, absolute)?;
         }
         return Ok(DuckOutcome::AlreadyDucked { amount });
     }
@@ -134,11 +150,16 @@ fn apply_duck_inner(
     // Write snapshot first, then apply. If the set call fails, the snapshot
     // is rolled back so a later restore can't try to "recover" to a level
     // we never actually reached.
-    *snap = Some(Snapshot {
-        device,
-        level: current,
-    });
-    if let Err(e) = ctrl.set(device, absolute) {
+    // DeviceId is Copy (u32) on macOS but String on Windows; the clone is
+    // load-bearing for the cross-platform type.
+    #[allow(clippy::clone_on_copy)]
+    {
+        *snap = Some(Snapshot {
+            device: device.clone(),
+            level: current,
+        });
+    }
+    if let Err(e) = ctrl.set(&device, absolute) {
         *snap = None;
         return Err(e);
     }
@@ -172,7 +193,7 @@ fn restore_inner(
     let Some(snapped) = snap.take() else {
         return Ok(());
     };
-    ctrl.set(snapped.device, snapped.level)
+    ctrl.set(&snapped.device, snapped.level)
 }
 
 #[cfg(target_os = "macos")]
@@ -239,7 +260,8 @@ mod macos {
             Ok(device_id as DeviceId)
         }
 
-        fn get(&self, device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
+            let device = *device;
             let address = volume_address();
             let mut value: f32 = 0.0;
             let mut size = mem::size_of::<f32>() as u32;
@@ -260,7 +282,8 @@ mod macos {
             Ok(value.clamp(0.0, 1.0))
         }
 
-        fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError> {
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
+            let device = *device;
             let address = volume_address();
             let value: f32 = level.clamp(0.0, 1.0);
             let size = mem::size_of::<f32>() as u32;
@@ -283,7 +306,99 @@ mod macos {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::{DeviceId, SystemOutputVolume, VolumeError};
+    use windows::core::PCWSTR;
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+        COINIT_MULTITHREADED,
+    };
+
+    /// Drives `IAudioEndpointVolume` master scalar on the default render
+    /// endpoint — the same value the taskbar volume slider moves. The
+    /// device identity is the WASAPI endpoint ID string, so `restore`
+    /// targets the originally-ducked endpoint even if the default output
+    /// changed mid-dictation (same contract as the macOS controller).
+    pub struct WasapiController;
+
+    fn wasapi_err(e: windows::core::Error) -> VolumeError {
+        VolumeError::Wasapi(e.to_string())
+    }
+
+    /// Duck/restore fire from arbitrary (tokio) worker threads: initialize
+    /// COM per call. S_OK/S_FALSE must be balanced with `CoUninitialize`;
+    /// RPC_E_CHANGED_MODE (thread already STA) leaves COM usable but must
+    /// NOT be balanced — the same rules cpal's guard follows.
+    fn with_com<T>(f: impl FnOnce() -> Result<T, VolumeError>) -> Result<T, VolumeError> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let need_uninit = hr.is_ok();
+        let out = f();
+        if need_uninit {
+            unsafe { CoUninitialize() };
+        }
+        out
+    }
+
+    fn enumerator() -> Result<IMMDeviceEnumerator, VolumeError> {
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(wasapi_err)
+    }
+
+    fn device_by_id(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<IMMDevice, VolumeError> {
+        let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { enumerator.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(wasapi_err)
+    }
+
+    fn endpoint_volume(device: &IMMDevice) -> Result<IAudioEndpointVolume, VolumeError> {
+        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(wasapi_err)
+    }
+
+    impl SystemOutputVolume for WasapiController {
+        fn default_device(&self) -> Result<DeviceId, VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+                    .map_err(wasapi_err)?;
+                let pw = unsafe { device.GetId() }.map_err(wasapi_err)?;
+                let id = unsafe { pw.to_string() }
+                    .map_err(|e| VolumeError::Wasapi(format!("endpoint id not UTF-16: {e}")));
+                // GetId allocates via CoTaskMemAlloc; free unconditionally,
+                // including on the to_string error path.
+                unsafe { CoTaskMemFree(Some(pw.0 as *const _)) };
+                id
+            })
+        }
+
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = device_by_id(&enumerator, device)?;
+                let volume = endpoint_volume(&device)?;
+                unsafe { volume.GetMasterVolumeLevelScalar() }.map_err(wasapi_err)
+            })
+        }
+
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
+            with_com(|| {
+                let enumerator = enumerator()?;
+                let device = device_by_id(&enumerator, device)?;
+                let volume = endpoint_volume(&device)?;
+                // Null event-context GUID: we don't need to correlate our own
+                // change notifications.
+                unsafe {
+                    volume.SetMasterVolumeLevelScalar(level.clamp(0.0, 1.0), std::ptr::null())
+                }
+                .map_err(wasapi_err)
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod stub {
     use super::{DeviceId, SystemOutputVolume, VolumeError};
 
@@ -293,10 +408,10 @@ mod stub {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
             Err(VolumeError::Unsupported)
         }
-        fn get(&self, _device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, _device: &DeviceId) -> Result<f32, VolumeError> {
             Err(VolumeError::Unsupported)
         }
-        fn set(&self, _device: DeviceId, _level: f32) -> Result<(), VolumeError> {
+        fn set(&self, _device: &DeviceId, _level: f32) -> Result<(), VolumeError> {
             Err(VolumeError::Unsupported)
         }
     }
@@ -309,6 +424,17 @@ mod tests {
     use std::sync::Mutex;
 
     // ---- Mock controller: drives the inner functions without real hardware. ----
+
+    /// Builds a platform `DeviceId` from a test-friendly integer
+    /// (`u32` on macOS/stub, `String` on Windows).
+    #[cfg(not(target_os = "windows"))]
+    fn dev(n: u32) -> DeviceId {
+        n
+    }
+    #[cfg(target_os = "windows")]
+    fn dev(n: u32) -> DeviceId {
+        n.to_string()
+    }
 
     struct MockController {
         default: Mutex<DeviceId>,
@@ -323,7 +449,7 @@ mod tests {
         fn with_devices(devices: &[(DeviceId, f32)], default: DeviceId) -> Self {
             let mut volumes = HashMap::new();
             for (id, vol) in devices {
-                volumes.insert(*id, *vol);
+                volumes.insert(id.clone(), *vol);
             }
             Self {
                 default: Mutex::new(default),
@@ -344,28 +470,32 @@ mod tests {
         fn snapshot_of(&self, device: DeviceId) -> f32 {
             *self.volumes.lock().unwrap().get(&device).unwrap()
         }
+
+        fn with_device(vol: f32) -> Self {
+            Self::with_devices(&[(dev(1), vol)], dev(1))
+        }
     }
 
     impl SystemOutputVolume for MockController {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
-            Ok(*self.default.lock().unwrap())
+            Ok(self.default.lock().unwrap().clone())
         }
-        fn get(&self, device: DeviceId) -> Result<f32, VolumeError> {
+        fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
             self.volumes
                 .lock()
                 .unwrap()
-                .get(&device)
+                .get(device)
                 .copied()
                 .ok_or(VolumeError::Unsupported)
         }
-        fn set(&self, device: DeviceId, level: f32) -> Result<(), VolumeError> {
+        fn set(&self, device: &DeviceId, level: f32) -> Result<(), VolumeError> {
             if !self.set_delay.is_zero() {
                 std::thread::sleep(self.set_delay);
             }
             self.volumes
                 .lock()
                 .unwrap()
-                .insert(device, level.clamp(0.0, 1.0));
+                .insert(device.clone(), level.clamp(0.0, 1.0));
             Ok(())
         }
     }
@@ -385,20 +515,20 @@ mod tests {
     fn applied_lowers_and_snapshots() {
         // current=0.80, amount=0.80 → absolute = 0.80 * 0.20 = 0.16.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         let outcome = apply_duck_inner(&snap, &ctrl, 0.80).expect("apply_duck");
         match outcome {
             DuckOutcome::Applied { device, from, to } => {
-                assert_eq!(device, 1);
+                assert_eq!(device, dev(1));
                 close(from, 0.80);
                 close(to, 0.16);
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        close(ctrl.snapshot_of(1), 0.16);
-        let s = snap.lock().unwrap().expect("snapshot present");
-        assert_eq!(s.device, 1);
+        close(ctrl.snapshot_of(dev(1)), 0.16);
+        let s = snap.lock().unwrap().clone().expect("snapshot present");
+        assert_eq!(s.device, dev(1));
         close(s.level, 0.80);
     }
 
@@ -412,9 +542,9 @@ mod tests {
             (0.40, 0.70, 0.12),
         ] {
             let snap = fresh_snap();
-            let ctrl = MockController::with_devices(&[(1, current)], 1);
+            let ctrl = MockController::with_device(current);
             apply_duck_inner(&snap, &ctrl, amount).expect("apply");
-            close(ctrl.snapshot_of(1), expected);
+            close(ctrl.snapshot_of(dev(1)), expected);
         }
     }
 
@@ -423,7 +553,7 @@ mod tests {
         // amount=0 means "reduce by 0%" — write current back to itself,
         // but still capture a snapshot so restore is well-defined.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         let outcome = apply_duck_inner(&snap, &ctrl, 0.0).expect("apply_duck");
         match outcome {
@@ -433,34 +563,34 @@ mod tests {
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
         assert!(snap.lock().unwrap().is_some(), "snapshot captured");
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn amount_one_mutes() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         apply_duck_inner(&snap, &ctrl, 1.0).expect("apply");
-        close(ctrl.snapshot_of(1), 0.0);
+        close(ctrl.snapshot_of(dev(1)), 0.0);
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn restore_recovers_snapshotted_level_and_clears_state() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("apply");
         restore_inner(&snap, &ctrl).expect("restore");
 
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
         assert!(snap.lock().unwrap().is_none(), "snapshot cleared");
     }
 
@@ -469,34 +599,34 @@ mod tests {
         // Real-world: built-in speakers ducked, then AirPods connect and
         // become default. Restore must put speakers back, not AirPods.
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80), (2, 0.50)], 1);
+        let ctrl = MockController::with_devices(&[(dev(1), 0.80), (dev(2), 0.50)], dev(1));
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("apply on device 1");
-        close(ctrl.snapshot_of(1), 0.16);
-        close(ctrl.snapshot_of(2), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.16);
+        close(ctrl.snapshot_of(dev(2)), 0.50);
 
         // User connects AirPods mid-dictation → default switches.
-        ctrl.set_default(2);
+        ctrl.set_default(dev(2));
 
         restore_inner(&snap, &ctrl).expect("restore");
 
-        close(ctrl.snapshot_of(1), 0.80);
-        close(ctrl.snapshot_of(2), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
+        close(ctrl.snapshot_of(dev(2)), 0.50);
     }
 
     #[test]
     fn restore_is_noop_when_no_snapshot_held() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+        let ctrl = MockController::with_device(0.50);
 
         restore_inner(&snap, &ctrl).expect("restore should noop");
-        close(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(dev(1)), 0.50);
     }
 
     #[test]
     fn already_ducked_does_not_clobber_snapshot() {
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.80).expect("first apply");
         // A re-entrant duck call (e.g. retry) must not capture the now-ducked
@@ -505,7 +635,7 @@ mod tests {
         assert!(matches!(outcome, DuckOutcome::AlreadyDucked { .. }));
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
     }
 
     #[test]
@@ -514,19 +644,19 @@ mod tests {
         // against the original level. Computing from the *currently-ducked*
         // level would compound (e.g., 0.80 → 0.40 → 0.20 → 0.10 …).
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
+        let ctrl = MockController::with_device(0.80);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("first apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("second apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         apply_duck_inner(&snap, &ctrl, 0.50).expect("third apply");
-        close(ctrl.snapshot_of(1), 0.40);
+        close(ctrl.snapshot_of(dev(1)), 0.40);
 
         restore_inner(&snap, &ctrl).expect("restore");
-        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(dev(1)), 0.80);
     }
 
     #[test]
@@ -549,9 +679,8 @@ mod tests {
         use std::time::Duration;
 
         let snap = Arc::new(Mutex::new(None::<Snapshot>));
-        let ctrl = Arc::new(
-            MockController::with_devices(&[(1, 0.80)], 1).with_set_delay(Duration::from_millis(50)),
-        );
+        let ctrl =
+            Arc::new(MockController::with_device(0.80).with_set_delay(Duration::from_millis(50)));
 
         let snap_a = Arc::clone(&snap);
         let ctrl_a = Arc::clone(&ctrl);
@@ -569,7 +698,7 @@ mod tests {
             .expect("apply thread")
             .expect("apply ok");
 
-        let vol = ctrl.snapshot_of(1);
+        let vol = ctrl.snapshot_of(dev(1));
         let snap_final = snap.lock().unwrap();
 
         // Consistent post-states only — no broken interleave.
@@ -598,7 +727,7 @@ mod tests {
     fn hardware_get_returns_unit_interval() {
         let ctrl = controller();
         let device = ctrl.default_device().expect("default device");
-        let v = ctrl.get(device).expect("get system volume");
+        let v = ctrl.get(&device).expect("get system volume");
         assert!((0.0..=1.0).contains(&v), "volume out of range: {v}");
     }
 
@@ -609,17 +738,17 @@ mod tests {
         let snap = fresh_snap();
         let ctrl = controller();
         let device = ctrl.default_device().expect("default device");
-        let original = ctrl.get(device).expect("get original");
+        let original = ctrl.get(&device).expect("get original");
 
         // Force a known starting point well above any plausible duck target.
         let start = 0.6_f32;
-        ctrl.set(device, start).expect("set start");
-        let observed_start = ctrl.get(device).expect("get observed start");
+        ctrl.set(&device, start).expect("set start");
+        let observed_start = ctrl.get(&device).expect("get observed start");
 
         let amount = 0.8_f32;
         let expected = observed_start * (1.0 - amount);
         apply_duck_inner(&snap, ctrl.as_ref(), amount).expect("apply_duck");
-        let after_duck = ctrl.get(device).expect("get after duck");
+        let after_duck = ctrl.get(&device).expect("get after duck");
         assert!(
             (after_duck - expected).abs() < 0.05,
             "expected duck near {expected} (= {observed_start} * {}), got {after_duck}",
@@ -627,13 +756,13 @@ mod tests {
         );
 
         restore_inner(&snap, ctrl.as_ref()).expect("restore");
-        let after_restore = ctrl.get(device).expect("get after restore");
+        let after_restore = ctrl.get(&device).expect("get after restore");
         assert!(
             (after_restore - observed_start).abs() < 0.05,
             "expected restore near {observed_start}, got {after_restore}"
         );
 
         // Best-effort cleanup.
-        let _ = ctrl.set(device, original);
+        let _ = ctrl.set(&device, original);
     }
 }

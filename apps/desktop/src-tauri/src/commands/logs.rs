@@ -105,8 +105,11 @@ pub async fn log_frontend(
     Ok(())
 }
 
-/// Open Finder / Explorer to the log directory so the user can grab the files
-/// to send to support.
+/// Open Finder / Explorer with the current log file highlighted, falling back
+/// to the log directory when no log file exists yet.
+///
+/// Must use `reveal_item_in_dir`: `open_path` would need the un-granted
+/// `opener:allow-open-path` permission and is denied at runtime.
 #[tauri::command]
 #[specta::specta]
 pub async fn reveal_log_dir(app: AppHandle) -> Result<(), CommandError> {
@@ -116,9 +119,28 @@ pub async fn reveal_log_dir(app: AppHandle) -> Result<(), CommandError> {
         .map_err(|e| CommandError::Internal {
             message: format!("failed to resolve log dir: {e}"),
         })?;
+
+    let target = latest_log_file(&dir).unwrap_or(dir);
+
     app.opener()
-        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .reveal_item_in_dir(&target)
         .map_err(|e| CommandError::Internal {
-            message: format!("failed to open log dir: {e}"),
+            message: format!("failed to reveal log dir: {e}"),
         })
+}
+
+/// Most recently modified `yapstack.log*` file in `dir`, if any.
+fn latest_log_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("yapstack.log"))
+                && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+        })
+        .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+        .map(|entry| entry.path())
 }
