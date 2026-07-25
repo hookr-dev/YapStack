@@ -186,6 +186,43 @@ pub async fn object_exists(cfg: &StorageConfig, key: &str) -> Result<bool, crate
     }
 }
 
+/// Delete an object from storage (relay blob GC). Presigns a `DELETE` and issues it. S3/MinIO
+/// DELETE is IDEMPOTENT: a missing object still returns `204 No Content`, and some backends
+/// answer `404` — both mean "not present after this call", so both are treated as success.
+/// This is the ONLY mutating outbound call the relay makes, and it moves no blob bytes: it
+/// signs a delete and reads only the status line. The presigned URL is a bearer capability —
+/// the caller must never log it.
+///
+/// Ordering contract (see `gc.rs`): the caller deletes the OBJECT first, then the
+/// `audio_blobs` row. A crash between the two leaves a row without an object, which the next
+/// sweep re-deletes safely; the reverse order would orphan storage bytes forever.
+///
+/// # Errors
+/// Returns [`AppError::Unavailable`] if the HTTP client cannot be built, the request fails,
+/// or the backend returns a status that is neither 2xx nor 404 (so the caller keeps the row
+/// and retries on the next sweep rather than dropping a still-referenced blob).
+pub async fn delete_object(cfg: &StorageConfig, key: &str) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    let signed = presign(cfg, "DELETE", key, None, chrono::Utc::now());
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::Unavailable(format!("storage client: {e}")))?;
+    let resp = client
+        .delete(&signed.url)
+        .send()
+        .await
+        .map_err(|e| AppError::Unavailable(format!("storage DELETE failed: {e}")))?;
+    let code = resp.status().as_u16();
+    match code {
+        200..=299 | 404 => Ok(()),
+        other => Err(AppError::Unavailable(format!(
+            "storage DELETE returned unexpected status {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +266,17 @@ mod tests {
             pinned.url, other.url,
             "a different declared size must produce a different signature"
         );
+    }
+
+    #[test]
+    fn delete_presign_signs_only_host_and_is_deterministic() {
+        let key = object_key(uuid::Uuid::nil(), "abcd");
+        let a = presign(&cfg(), "DELETE", &key, None, ts());
+        let b = presign(&cfg(), "DELETE", &key, None, ts());
+        assert_eq!(a.url, b.url, "same inputs must yield the same signature");
+        assert!(a.url.contains("X-Amz-SignedHeaders=host"));
+        assert!(!a.url.contains("content-length"));
+        assert!(a.url.starts_with("http://minio:9000/yapstack/tenants/"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod db;
 pub mod devices;
 pub mod error;
 pub mod extract;
+pub mod gc;
 pub mod jwt;
 pub mod ratelimit;
 pub mod routes;
@@ -92,6 +93,13 @@ pub fn build_router(state: AppState) -> Router {
             .route("/admin/v1/tenants/:id/limits", put(admin::put_limits))
             .route("/admin/v1/tenants/:id/usage", get(admin::get_usage));
     }
+
+    // Relay blob GC (hardening item 5): a background sweep, NOT an admin endpoint (the admin
+    // API is unmounted in self-host). No-op unless object storage is configured and
+    // gc.enabled. Wired here — main() only calls build_router — so the same startup path
+    // arms it. Integration tests that mount the router without storage never spawn it, and
+    // the ones that do exit long before the post-boot initial delay elapses.
+    gc::spawn(&state);
 
     router.with_state(state)
 }

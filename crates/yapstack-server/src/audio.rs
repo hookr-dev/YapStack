@@ -122,8 +122,15 @@ pub async fn presign(
     // (mapping-count invariant — decrement on repoint, independent of object existence).
     if let Some(oh) = &old_hash {
         if oh != &hash {
+            // released_at (GC): stamp the "became unreferenced at" time exactly on the
+            // TRANSITION to refcount <= 0 (`refcount - 1 <= 0` against the OLD value, only
+            // when not already released). A blob that stays referenced (refcount still > 0)
+            // keeps released_at NULL and is never GC-eligible.
             sqlx::query(
-                "UPDATE audio_blobs SET refcount = GREATEST(0, refcount - 1) \
+                "UPDATE audio_blobs \
+                 SET refcount = GREATEST(0, refcount - 1), \
+                     released_at = CASE WHEN refcount - 1 <= 0 AND released_at IS NULL \
+                                        THEN now() ELSE released_at END \
                  WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
             )
             .bind(auth.tenant_id)
@@ -159,8 +166,10 @@ pub async fn presign(
         // increments the refcount — even if the OBJECT is still absent. Only the fully
         // idempotent same-part→same-blob retry does not (it never double-counts).
         if !same_part_same_blob {
+            // refcount goes UP → the blob is referenced again: clear released_at so a blob
+            // that had dipped to <= 0 is no longer GC-eligible (D8 GC invariant).
             sqlx::query(
-                "UPDATE audio_blobs SET refcount = refcount + 1 \
+                "UPDATE audio_blobs SET refcount = refcount + 1, released_at = NULL \
                  WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
             )
             .bind(auth.tenant_id)
@@ -196,8 +205,9 @@ pub async fn presign(
             .await?;
             stored_size = stored.map_or(q.size, |(s,)| s.max(0) as u64);
             if !same_part_same_blob {
+                // refcount goes UP → clear released_at (see the sibling increment above).
                 sqlx::query(
-                    "UPDATE audio_blobs SET refcount = refcount + 1 \
+                    "UPDATE audio_blobs SET refcount = refcount + 1, released_at = NULL \
                      WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
                 )
                 .bind(auth.tenant_id)

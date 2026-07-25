@@ -36,6 +36,10 @@ pub struct Config {
     /// Per-`(workspace_id, ip)` push rate limit (architecture §10). Defaulted.
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    /// Relay blob GC (deletes unreferenced audio objects + rows after a grace period).
+    /// Defaulted; env-overridable via [`GcConfig::resolved`].
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 /// S3/MinIO presigning parameters. The relay uses these only to compute SigV4
@@ -78,6 +82,83 @@ impl Default for RateLimitConfig {
 
 fn default_push_per_minute() -> u32 {
     120
+}
+
+/// Relay blob GC tunables (hardening item 5). A background sweep deletes audio blobs whose
+/// mapping-count `refcount <= 0` and whose `released_at` (the moment refcount transitioned to
+/// <= 0) is older than the grace period — object first, then row (see `gc.rs`). TOML defaults
+/// follow the server's config pattern (serde `default` fns); each field is additionally
+/// env-overridable at startup via [`GcConfig::resolved`] so an operator can tune it without
+/// editing the config file.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct GcConfig {
+    /// Master on/off. Default on. Env: `YAPSTACK_GC_ENABLED` (`1`/`true`/`0`/`false`).
+    #[serde(default = "default_gc_enabled")]
+    pub enabled: bool,
+    /// Seconds between sweeps (the interval also fires once shortly after boot). Default 24h.
+    /// Env: `YAPSTACK_GC_INTERVAL_SECS`.
+    #[serde(default = "default_gc_interval_secs")]
+    pub interval_secs: u64,
+    /// A blob is only eligible once it has been unreferenced for this many seconds. Default
+    /// 7 days. Env: `YAPSTACK_GC_GRACE_SECS`.
+    #[serde(default = "default_gc_grace_secs")]
+    pub grace_secs: u64,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gc_enabled(),
+            interval_secs: default_gc_interval_secs(),
+            grace_secs: default_gc_grace_secs(),
+        }
+    }
+}
+
+fn default_gc_enabled() -> bool {
+    true
+}
+
+fn default_gc_interval_secs() -> u64 {
+    86_400 // 24h
+}
+
+fn default_gc_grace_secs() -> u64 {
+    604_800 // 7d
+}
+
+impl GcConfig {
+    /// Layer environment overrides on top of the TOML/defaults. A malformed env value is
+    /// ignored (the TOML/default value stands) rather than crashing the relay at boot.
+    #[must_use]
+    pub fn resolved(self) -> Self {
+        fn env_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok()?.trim().parse().ok()
+        }
+        fn env_bool(key: &str) -> Option<bool> {
+            match std::env::var(key)
+                .ok()?
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        }
+        Self {
+            enabled: env_bool("YAPSTACK_GC_ENABLED").unwrap_or(self.enabled),
+            interval_secs: env_u64("YAPSTACK_GC_INTERVAL_SECS").unwrap_or(self.interval_secs),
+            grace_secs: env_u64("YAPSTACK_GC_GRACE_SECS").unwrap_or(self.grace_secs),
+        }
+    }
+
+    /// The configured grace period as a `chrono::Duration` for the sweep predicate.
+    #[must_use]
+    pub fn grace(self) -> chrono::Duration {
+        chrono::Duration::seconds(i64::try_from(self.grace_secs).unwrap_or(i64::MAX))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +288,29 @@ mod tests {
         assert!(!cfg.limits_enabled());
         assert_eq!(cfg.sync.protocol_version, 1);
         assert!(cfg.sync.billing_url.is_none());
+        // GC section absent ⇒ defaults: on, 24h interval, 7d grace.
+        assert!(cfg.gc.enabled);
+        assert_eq!(cfg.gc.interval_secs, 86_400);
+        assert_eq!(cfg.gc.grace_secs, 604_800);
+        assert_eq!(cfg.gc.grace().num_days(), 7);
+    }
+
+    #[test]
+    fn gc_section_overrides_defaults() {
+        let toml = r#"
+            database_url = "postgres://localhost/yapstack"
+            jwt_secret = "s"
+            server_pepper = "p"
+
+            [gc]
+            enabled = false
+            interval_secs = 3600
+            grace_secs = 60
+        "#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(!cfg.gc.enabled);
+        assert_eq!(cfg.gc.interval_secs, 3600);
+        assert_eq!(cfg.gc.grace_secs, 60);
     }
 
     #[test]
