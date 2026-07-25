@@ -84,9 +84,13 @@ pub struct DrainReport {
     pub applied: usize,
     pub quarantined: usize,
     pub replayed: usize,
-    /// Changesets skipped because they failed to decrypt/decode (§11.3
-    /// crypto-quarantine — surfaced, never silently dropped, never fatal).
-    pub crypto_skipped: usize,
+    /// Changesets this cycle that failed to decrypt/decode and were durably QUARANTINED
+    /// (§11.3 crypto-quarantine). Item 1: quarantine-and-advance — an undecryptable
+    /// changeset is stored in `_yapstack_crypto_quarantine` (never dropped), the pull
+    /// ADVANCES past it (it counts as PROCESSED for the watermark, R12), and this count
+    /// surfaces a persistent, non-dismissable warning. The authoritative panel figure is
+    /// the DURABLE total ([`crypto_quarantine_pending`]), not this per-cycle delta.
+    pub crypto_quarantined: usize,
     /// The push direction's non-fatal error this cycle (a transport 401 / oversized-guard /
     /// network error, or a local capture/outbox error), if any. `None` on a clean push.
     pub push_error: Option<SyncError>,
@@ -184,6 +188,149 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')));",
     )?;
     Ok(())
+}
+
+/// Create the durable crypto-quarantine table (Item 1). A pulled changeset this device
+/// CANNOT decrypt or decode (corruption, tampering, or — the recoverable case — a key-epoch
+/// mismatch where the right key has not yet arrived) is stashed here VERBATIM, keyed by its
+/// commit-ordered `changeset_seq`, so the pull can ADVANCE past it instead of wedging the
+/// whole backlog behind one unreadable changeset. Prefixed `_yapstack_` and never CRRified,
+/// so it never syncs. Rows are NEVER dropped automatically — only a successful
+/// [`retry_crypto_quarantine`] (the key became right) removes one; a genuinely
+/// corrupt/tampered changeset stays here as a permanent, visible tamper/corruption signal.
+///
+/// The stored `ciphertext` is the base64 envelope EXACTLY as received (it may itself be
+/// un-decodable), plus the AAD inputs a retry needs to re-derive the plaintext
+/// (`author_client_id`, `client_seq`, schema/engine versions) and the short non-sensitive
+/// `detail` naming the stage that failed. No key, nonce, or plaintext material is stored.
+pub fn ensure_crypto_quarantine_table(conn: &Connection) -> Result<(), SyncError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _yapstack_crypto_quarantine (\
+            changeset_seq INTEGER PRIMARY KEY, \
+            author_client_id TEXT NOT NULL, \
+            client_seq INTEGER NOT NULL, \
+            ciphertext TEXT NOT NULL, \
+            schema_version INTEGER NOT NULL, \
+            engine_version INTEGER NOT NULL, \
+            detail TEXT NOT NULL, \
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));",
+    )?;
+    Ok(())
+}
+
+/// Number of changesets currently held in the durable crypto-quarantine — the authoritative
+/// figure for the persistent "N unreadable changesets" warning the sync panel shows. Cheap
+/// `COUNT(*)`; ensures the table first so a call before any quarantine is a clean `0`.
+pub fn crypto_quarantine_pending(conn: &Connection) -> Result<u64, SyncError> {
+    ensure_crypto_quarantine_table(conn)?;
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM _yapstack_crypto_quarantine",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
+}
+
+/// Durably stash one undecryptable pulled changeset (Item 1). `INSERT OR IGNORE` on the
+/// `changeset_seq` PK makes it idempotent: re-pulling (or a retry that still fails) the same
+/// seq never double-inserts and never overwrites the original capture. Stores ONLY the
+/// verbatim envelope + AAD inputs + a non-sensitive stage label (see
+/// [`ensure_crypto_quarantine_table`]).
+fn quarantine_undecryptable(
+    conn: &Connection,
+    pc: &yapstack_common::sync::PulledChange,
+    detail: &str,
+) -> Result<(), SyncError> {
+    ensure_crypto_quarantine_table(conn)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO _yapstack_crypto_quarantine \
+         (changeset_seq, author_client_id, client_seq, ciphertext, schema_version, engine_version, detail) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        rusqlite::params![
+            pc.changeset_seq,
+            pc.client_id.to_string(),
+            pc.client_seq,
+            pc.ciphertext,
+            pc.schema_version,
+            pc.engine_version,
+            detail,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Outcome of one [`retry_crypto_quarantine`] pass (Item 1 manual retry seam).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineRetryReport {
+    /// Changesets that decrypted this pass, were merged, and had their quarantine row removed.
+    pub recovered: usize,
+    /// Rows that STILL could not be decrypted/decoded — kept in the quarantine, untouched.
+    pub still_failing: usize,
+}
+
+/// Manually re-attempt decryption of every crypto-quarantined changeset (Item 1). This is the
+/// key-epoch recovery seam: after the correct vault key / roster epoch arrives, the owner
+/// triggers this to drain the "unreadable" backlog. Each row is re-decoded under the CURRENT
+/// `cipher`; on success the changeset is merged (its ORIGINAL clock is intact, so cr-sqlite LWW
+/// converges exactly as if it had merged in commit order — the same late-apply principle as R7
+/// replay) and its row removed; on continued failure the row is kept as a durable
+/// tamper/corruption signal. Rows are processed in `changeset_seq` order; each merge is its own
+/// transaction so a concurrent writer can interleave. Never advances or rewinds the watermark —
+/// the watermark already moved past these seqs at quarantine time.
+pub fn retry_crypto_quarantine(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+) -> Result<QuarantineRetryReport, SyncError> {
+    ensure_crypto_quarantine_table(conn)?;
+    let rows: Vec<(i64, String, i64, String, i32, i32)> = {
+        let mut stmt = conn.prepare(
+            "SELECT changeset_seq, author_client_id, client_seq, ciphertext, schema_version, engine_version \
+             FROM _yapstack_crypto_quarantine ORDER BY changeset_seq",
+        )?;
+        let v = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        v
+    };
+
+    let mut report = QuarantineRetryReport::default();
+    for (seq, author, client_seq, ciphertext, schema_version, engine_version) in rows {
+        // Reconstruct the wire shape and re-run the exact decode path. A malformed stored
+        // author UUID is itself a permanent decode failure (kept, never a hard error).
+        let Ok(author_client_id) = uuid::Uuid::parse_str(&author) else {
+            report.still_failing += 1;
+            continue;
+        };
+        let pc = yapstack_common::sync::PulledChange {
+            changeset_seq: seq,
+            client_id: author_client_id,
+            client_seq,
+            ciphertext,
+            schema_version,
+            engine_version,
+        };
+        match decode_pulled_changeset(cipher, &pc) {
+            Ok(cs) => {
+                merge_changeset(conn, &cs)?;
+                conn.execute(
+                    "DELETE FROM _yapstack_crypto_quarantine WHERE changeset_seq=?1",
+                    [seq],
+                )?;
+                report.recovered += 1;
+            }
+            Err(_) => report.still_failing += 1,
+        }
+    }
+    Ok(report)
 }
 
 /// Split `rows` into bounded chunks (each ≤ [`CHUNK_ROWS`] rows AND ≤
@@ -690,13 +837,19 @@ async fn push_direction<T: SyncTransport + ?Sized>(
 /// so a download failure cannot mask push progress. Own-echo changes (matching `client_id`)
 /// are skipped as already-local.
 ///
-/// Honest crypto accounting (R5): a changeset we cannot decrypt/decode is NOT
-/// skipped-and-forgotten. Skipping it would silently DROP a peer's write while advancing the
-/// watermark past it — the "up to date" lie. Instead the pull STOPS at the first such
-/// changeset: the watermark is left at the last fully-merged seq (so the next cycle retries
-/// from exactly here) and no later, higher-seq changeset is merged out of order. The failure
-/// rides back as [`SyncError::CryptoSkip`] (→ `DrainReport::pull_error`), carrying only the
-/// seq / author `client_id` / a stage label — never key or plaintext material.
+/// Honest crypto accounting (R5 → Item 1: quarantine-and-advance). A changeset we cannot
+/// decrypt/decode is NEVER silently skipped-and-forgotten (the "up to date" lie), but it also
+/// must not WEDGE the whole pull behind it forever — one corrupt/tampered/key-epoch-mismatched
+/// changeset would otherwise halt every later peer write indefinitely. Instead it is stored
+/// DURABLY in `_yapstack_crypto_quarantine` (verbatim, never dropped — see
+/// [`quarantine_undecryptable`]) and the pull ADVANCES past it: the watermark moves forward
+/// (the quarantined seq counts as PROCESSED, R12) and later changesets merge in order. The
+/// count of quarantined changesets surfaces as a PERSISTENT, non-dismissable warning
+/// ([`crypto_quarantine_pending`], per-cycle delta on `DrainReport::crypto_quarantined`) — a
+/// potential tamper/corruption signal that must stay visible. A manual
+/// [`retry_crypto_quarantine`] re-attempts decryption once the key is right (key-epoch
+/// recovery). Only the short non-sensitive stage `detail` is retained — never key or plaintext
+/// material.
 async fn pull_direction<T: SyncTransport + ?Sized>(
     conn: &Connection,
     cipher: &ChangesetCipher,
@@ -710,27 +863,35 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
         if resp.changes.is_empty() {
             break;
         }
-        // Highest seq FULLY consumed so far this page — merged, or legitimately skipped as our
-        // own echo. On a crypto failure the watermark is pinned here so the retry resumes from
-        // the failed changeset and no later one is applied ahead of it.
-        let mut last_good = since;
         for pc in &resp.changes {
             if pc.client_id == client_id {
-                last_good = pc.changeset_seq; // our own echo; already local.
-                continue;
+                continue; // our own echo; already local — `resp.next_seq` covers the advance.
             }
             let cs = match decode_pulled_changeset(cipher, pc) {
                 Ok(cs) => cs,
                 Err(detail) => {
-                    report.crypto_skipped += 1;
-                    // Do NOT advance past this changeset. Pin the watermark at the last good
-                    // seq and stop the pull; the next cycle retries from here.
-                    state::set_pull_watermark(conn, last_good)?;
-                    return Err(SyncError::CryptoSkip {
-                        seq: pc.changeset_seq,
-                        author_client_id: pc.client_id,
-                        detail,
-                    });
+                    // Item 1 — quarantine-and-advance. Stash the undecryptable changeset
+                    // DURABLY (never dropped) and move PAST it: it counts as processed for the
+                    // watermark (R12) so it can never wedge the backlog behind one unreadable
+                    // changeset. The persistent quarantine count is surfaced as a warning; a
+                    // manual retry recovers it if the key later becomes right. Note the
+                    // deliberate change from the old R5 halt: silently dropping would be the
+                    // "up to date" lie, but halting forever is its own denial-of-service — the
+                    // durable quarantine keeps BOTH the honesty and the liveness.
+                    quarantine_undecryptable(conn, pc, &detail)?;
+                    report.crypto_quarantined += 1;
+                    tracing::warn!(
+                        target: "yapstack::sync",
+                        changeset_seq = pc.changeset_seq,
+                        author_client_id = %pc.client_id,
+                        stage = %detail,
+                        "pulled changeset could not be decrypted/decoded; quarantined and \
+                         advanced past it (durable, surfaced as a warning, retryable)"
+                    );
+                    // PROCESSED — advance the watermark PAST the quarantined seq (R12).
+                    state::set_pull_watermark(conn, pc.changeset_seq)?;
+                    tokio::task::yield_now().await;
+                    continue;
                 }
             };
             // Merge THIS changeset in its own transaction (merge_changeset BEGIN..COMMIT),
@@ -739,13 +900,13 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
             // its COMMIT, and the watermark only advances after that commit — so a concurrent
             // db_service writer (the frontend) can win the lock between changesets instead of
             // being starved for the whole page, and a crash mid-backlog resumes from exactly
-            // the last committed changeset (the R5 halt-at-first-crypto-failure invariant is
-            // unchanged: a decode failure above still pins the watermark at `last_good`).
+            // the last committed changeset. Item 1: an undecryptable changeset above no longer
+            // halts here — it is quarantined and the watermark advanced past it — so this merge
+            // path only ever sees changesets it CAN apply.
             let (a, q) = merge_changeset(conn, &cs)?;
             report.applied += a;
             report.quarantined += q;
-            last_good = pc.changeset_seq;
-            state::set_pull_watermark(conn, last_good)?;
+            state::set_pull_watermark(conn, pc.changeset_seq)?;
             // Cooperative yield point between batches. On the drain's single-thread runtime
             // this hands the executor a scheduling point between write transactions rather
             // than monopolising it across a long backlog page.
@@ -1367,11 +1528,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pull_stops_at_first_crypto_failure_and_retries() {
-        // R5: three changesets where changeset #2 fails to decode. The pull must merge #1, STOP
-        // at #2 (never merging the later #3 out of order), leave the watermark at #1, and
-        // surface a typed CryptoSkip. A later readable cycle resumes from #2 and fully catches
-        // up. This is the "up to date" lie mechanism, defused.
+    async fn pull_quarantines_and_advances_past_crypto_failure() {
+        // Item 1: three changesets where changeset #2 cannot be decoded. The pull must merge #1,
+        // QUARANTINE #2 durably, ADVANCE past it, and STILL merge the later #3 — the watermark
+        // reaches the relay tip (3) so the device is honestly caught up, WITH one unreadable
+        // changeset surfaced as a persistent warning (crypto_quarantine_pending == 1). No
+        // pull_error rides back (advance, not halt), and a genuinely-corrupt (garbage-base64)
+        // changeset stays quarantined across a retry — the durable tamper/corruption signal.
         let a = CrsqlDb::open_in_memory().unwrap();
         let b = CrsqlDb::open_in_memory().unwrap();
         make_kv(&a);
@@ -1393,7 +1556,7 @@ mod tests {
             n > 0
         };
 
-        // Cycle 1: pull through a transport that corrupts changeset seq=2.
+        // Pull through a transport that corrupts changeset seq=2 into un-decodable base64.
         let corrupt = CorruptPullAt {
             inner: relay.clone(),
             corrupt_seq: 2,
@@ -1402,69 +1565,354 @@ mod tests {
             .await
             .unwrap();
 
-        match report.pull_error {
-            Some(SyncError::CryptoSkip {
-                seq,
-                author_client_id,
-                ..
-            }) => {
-                assert_eq!(seq, 2, "stopped at the FIRST failing changeset");
-                assert_eq!(author_client_id, ca, "surfaces the authoring client_id");
-            }
-            other => panic!("expected CryptoSkip pull_error, got {other:?}"),
-        }
-        assert_eq!(
-            report.crypto_skipped, 1,
-            "exactly one crypto skip this cycle"
+        // Advance-not-halt: the pull did NOT error, exactly one changeset was quarantined this
+        // cycle, and BOTH #1 (before) and #3 (after the failure) merged.
+        assert!(
+            report.pull_error.is_none(),
+            "quarantine-and-advance never rides a pull_error: {:?}",
+            report.pull_error
         );
-        assert!(report.applied > 0, "#1 merged before the failure");
         assert_eq!(
-            state::pull_watermark(b.conn()).unwrap(),
-            1,
-            "watermark pinned at the last good seq, NOT advanced past the failure"
+            report.crypto_quarantined, 1,
+            "exactly one quarantine this cycle"
         );
         assert!(has("k1"), "#1 (before the failure) applied");
-        assert!(!has("k2"), "#2 (the failure) not applied");
-        assert!(!has("k3"), "#3 (after the failure) NOT merged out of order");
-
-        // Cycle 2: retry against the still-corrupt transport makes NO forward progress.
-        let report2 = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
-            .await
-            .unwrap();
         assert!(
-            matches!(
-                report2.pull_error,
-                Some(SyncError::CryptoSkip { seq: 2, .. })
-            ),
-            "retry re-hits the same block"
+            !has("k2"),
+            "#2 (the failure) NOT applied — it is quarantined"
         );
-        assert_eq!(
-            state::pull_watermark(b.conn()).unwrap(),
-            1,
-            "still no progress past the block"
+        assert!(
+            has("k3"),
+            "#3 (AFTER the failure) still merged — the pull advanced past #2"
         );
 
-        // Cycle 3: the changeset is readable again → resume from #2 and catch up fully.
-        let report3 = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
-            .await
-            .unwrap();
-        assert!(report3.pull_error.is_none(), "clean pull after recovery");
-        assert_eq!(report3.crypto_skipped, 0);
+        // The watermark reached the relay tip: #2 counts as PROCESSED (R12), so the device is
+        // caught up WITH a standing warning rather than wedged behind the unreadable changeset.
         assert_eq!(
             state::pull_watermark(b.conn()).unwrap(),
             3,
-            "watermark fully caught up"
+            "watermark advanced to the tip; the quarantined seq counts as processed"
         );
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            1,
+            "the durable quarantine holds the one unreadable changeset (the persistent warning)"
+        );
+
+        // A retry on a genuinely-corrupt (garbage-base64) changeset cannot recover it — it stays
+        // quarantined as a permanent tamper/corruption signal, never silently dropped.
+        let retry = retry_crypto_quarantine(b.conn(), &cipher).unwrap();
+        assert_eq!(retry.recovered, 0, "garbage ciphertext cannot be recovered");
+        assert_eq!(retry.still_failing, 1, "and is kept, not dropped");
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            1,
+            "still surfaced after a failed retry"
+        );
+
+        // A subsequent clean drain re-pulls the (uncorrupted) tip but makes no NEW quarantine and
+        // no NEW merge — everything mergeable already merged; the corrupt #2 remains flagged.
+        let report2 = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(report2.pull_error.is_none());
+        assert_eq!(
+            report2.crypto_quarantined, 0,
+            "no new quarantine on a clean re-pull"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_crypto_quarantine_recovers_after_key_becomes_right() {
+        // Item 1 key-epoch recovery: B pulls three changesets under the WRONG vault key, so ALL
+        // three fail to decrypt (valid base64, real ciphertext — but the auth tag mismatches the
+        // wrong key). They are quarantined VERBATIM and the pull advances to the tip. Once the
+        // RIGHT key arrives, `retry_crypto_quarantine` re-attempts every stored changeset and
+        // recovers them — merging with their original clocks so cr-sqlite LWW converges. This is
+        // the seam that heals a device that synced before its key epoch was reconciled.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let right_cipher = f1_cipher();
+        // A cipher under a DIFFERENT vault key — decrypt of A's changesets fails the auth tag.
+        let wrong_cipher = ChangesetCipher::new(
+            [0x5Au8; 32],
+            0,
+            F1_TENANT,
+            SYNC_SCHEMA_VERSION,
+            CRSQLITE_ENGINE_VERSION,
+        );
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        publish_three(&a, relay.as_ref(), &right_cipher, ca).await;
+
+        // B drains with the WRONG key: all three quarantine, nothing merges, watermark advances.
+        let report = drain_once(b.conn(), &wrong_cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
         assert!(
-            has("k2") && has("k3"),
-            "the blocked and later changesets now applied"
+            report.pull_error.is_none(),
+            "advance-not-halt under a bad key"
         );
+        assert_eq!(
+            report.crypto_quarantined, 3,
+            "all three changesets quarantined"
+        );
+        assert_eq!(report.applied, 0, "none merged under the wrong key");
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            3,
+            "advanced to the tip"
+        );
+        assert_eq!(crypto_quarantine_pending(b.conn()).unwrap(), 3);
+        for k in ["k1", "k2", "k3"] {
+            let n: i64 = b
+                .conn()
+                .query_row("SELECT count(*) FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "{k} not visible while quarantined under the wrong key"
+            );
+        }
+
+        // The right key arrives: retry recovers ALL of them and empties the quarantine.
+        let retry = retry_crypto_quarantine(b.conn(), &right_cipher).unwrap();
+        assert_eq!(
+            retry.recovered, 3,
+            "every changeset recovered once the key is right"
+        );
+        assert_eq!(retry.still_failing, 0);
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            0,
+            "the warning clears once every changeset is recovered"
+        );
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            let got: String = b
+                .conn()
+                .query_row("SELECT v FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap();
+            assert_eq!(got, v, "{k} merged with its original value after recovery");
+        }
+
+        // Idempotent: a second retry on the now-empty quarantine is a clean no-op.
+        let again = retry_crypto_quarantine(b.conn(), &right_cipher).unwrap();
+        assert_eq!(again, QuarantineRetryReport::default());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn re_pull_of_same_quarantined_seq_never_duplicates_or_clobbers() {
+        // Pin (Item 2): serving the SAME quarantined changeset_seq again — a re-pull, or a relay
+        // that re-serves a mutated envelope for that seq — must NEVER add a second row nor
+        // overwrite the ORIGINAL captured envelope. The `_yapstack_crypto_quarantine`
+        // PRIMARY KEY on changeset_seq + INSERT OR IGNORE make the stash idempotent by seq:
+        // exactly one row, original ciphertext preserved, regardless of the re-served bytes.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        publish_three(&a, relay.as_ref(), &cipher, ca).await;
+
+        // First pull corrupts seq=2 into un-decodable base64 → quarantined verbatim, pull advances.
+        let corrupt = CorruptPullAt {
+            inner: relay.clone(),
+            corrupt_seq: 2,
+        };
+        let r1 = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
+            .await
+            .unwrap();
+        assert_eq!(r1.crypto_quarantined, 1);
+        assert_eq!(crypto_quarantine_pending(b.conn()).unwrap(), 1);
+
+        // Snapshot the exact stored row: count + the ORIGINAL captured ciphertext for seq=2.
+        let read_seq2 = || -> (i64, String) {
+            b.conn()
+                .query_row(
+                    "SELECT count(*), coalesce(max(ciphertext), '') \
+                     FROM _yapstack_crypto_quarantine WHERE changeset_seq=2",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let (count1, original_ct) = read_seq2();
+        assert_eq!(count1, 1);
+        assert!(!original_ct.is_empty());
+
+        // (a) REALISTIC RE-PULL of the same seq: rewind the pull watermark so the next drain
+        // re-pulls seq 1..3 through the same corrupting transport (seq=2 corrupt again). Idempotent:
+        // still exactly one quarantine row, the mergeable neighbors stay merged, no data loss.
+        state::set_pull_watermark(b.conn(), 1).unwrap();
+        let r2 = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(r2.pull_error.is_none());
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            1,
+            "no duplicate quarantine row on a re-pull of the same seq"
+        );
+        let has = |k: &str| -> bool {
+            let n: i64 = b
+                .conn()
+                .query_row("SELECT count(*) FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap();
+            n > 0
+        };
+        assert!(
+            has("k1") && has("k3"),
+            "mergeable neighbors stay applied across the re-pull"
+        );
+        assert!(!has("k2"), "the quarantined seq is still not applied");
+
+        // (b) NO-CLOBBER pin: directly re-stash seq=2 with DIFFERENT bytes (models the relay
+        // serving a mutated envelope for the same seq). INSERT OR IGNORE keeps the ORIGINAL —
+        // no second row, no overwrite.
+        let mutated = yapstack_common::sync::PulledChange {
+            changeset_seq: 2,
+            client_id: ca,
+            client_seq: 999,
+            ciphertext: "DIFFERENT-BYTES-FOR-SAME-SEQ".to_string(),
+            schema_version: sv,
+            engine_version: ev,
+        };
+        quarantine_undecryptable(b.conn(), &mutated, "test re-stash").unwrap();
+        let (count2, ct_after) = read_seq2();
+        assert_eq!(
+            count2, 1,
+            "still exactly one row for the seq (no duplicate)"
+        );
+        assert_eq!(
+            ct_after, original_ct,
+            "the original captured envelope is preserved, never clobbered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_crypto_quarantine_is_idempotent_across_a_crash_between_merge_and_delete() {
+        // Pin (Item 3): a crash AFTER a quarantined changeset's merge lands but BEFORE its
+        // quarantine row is deleted. On restart, retry_crypto_quarantine re-attempts the
+        // already-merged row: it re-merges (cr-sqlite LWW with the ORIGINAL clock = a no-op),
+        // deletes the stale row, and converges — no duplicate application, values unchanged,
+        // the warning cleared. Idempotent recovery.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let right_cipher = f1_cipher();
+        // A cipher under a DIFFERENT vault key — decrypt of A's changesets fails the auth tag.
+        let wrong_cipher = ChangesetCipher::new(
+            [0x5Au8; 32],
+            0,
+            F1_TENANT,
+            SYNC_SCHEMA_VERSION,
+            CRSQLITE_ENGINE_VERSION,
+        );
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        publish_three(&a, relay.as_ref(), &right_cipher, ca).await;
+
+        // B drains under the WRONG key: all three quarantine verbatim, nothing merges, watermark tips.
+        let report = drain_once(b.conn(), &wrong_cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert_eq!(report.crypto_quarantined, 3);
+        assert_eq!(report.applied, 0);
+        assert_eq!(crypto_quarantine_pending(b.conn()).unwrap(), 3);
+
+        let count_k = |k: &str| -> i64 {
+            b.conn()
+                .query_row("SELECT count(*) FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap()
+        };
+        let val_k = |k: &str| -> String {
+            b.conn()
+                .query_row("SELECT v FROM kv WHERE id=?1", [k], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Simulate the CRASH WINDOW for seq=1: the merge landed but the DELETE never ran. We
+        // decode that one stored row under the RIGHT key and merge it MANUALLY, deliberately
+        // leaving its quarantine row in place (the crash-before-delete state).
+        let (author, client_seq, ciphertext): (String, i64, String) = b
+            .conn()
+            .query_row(
+                "SELECT author_client_id, client_seq, ciphertext \
+                 FROM _yapstack_crypto_quarantine WHERE changeset_seq=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let pc = yapstack_common::sync::PulledChange {
+            changeset_seq: 1,
+            client_id: uuid::Uuid::parse_str(&author).unwrap(),
+            client_seq,
+            ciphertext,
+            schema_version: sv,
+            engine_version: ev,
+        };
+        let cs = decode_pulled_changeset(&right_cipher, &pc).unwrap();
+        merge_changeset(b.conn(), &cs).unwrap();
+
+        // Crash-window state: k1 is already merged, yet its quarantine row is STILL present.
+        assert_eq!(val_k("k1"), "v1", "the pre-crash merge landed");
+        assert_eq!(count_k("k2"), 0);
+        assert_eq!(count_k("k3"), 0);
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            3,
+            "the delete never ran (the crash window)"
+        );
+
+        // Recover with the RIGHT key. seq=1 re-merges idempotently (no duplicate effect, value
+        // stays v1) and its stale row is finally deleted; seq 2,3 recover normally. Convergence.
+        let retry = retry_crypto_quarantine(b.conn(), &right_cipher).unwrap();
+        assert_eq!(
+            retry.recovered, 3,
+            "all three recover, including the crash-window row"
+        );
+        assert_eq!(retry.still_failing, 0);
+        assert_eq!(
+            crypto_quarantine_pending(b.conn()).unwrap(),
+            0,
+            "the stale crash-window row is now deleted"
+        );
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            assert_eq!(val_k(k), v, "{k} converged to its single, correct value");
+        }
+        // No duplicate application: exactly one row per key despite seq=1 merging twice.
+        let kv_rows: i64 = b
+            .conn()
+            .query_row("SELECT count(*) FROM kv", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            kv_rows, 3,
+            "no duplicate rows from the double merge of seq=1"
+        );
+
+        // Idempotent tail: a further retry on the now-empty quarantine is a clean no-op.
+        let again = retry_crypto_quarantine(b.conn(), &right_cipher).unwrap();
+        assert_eq!(again, QuarantineRetryReport::default());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn all_clean_pull_advances_fully() {
         // The happy path is unchanged: no crypto failures → watermark advances to the last seq,
-        // every changeset merges, and the report is clean (no false crypto_skipped).
+        // every changeset merges, and the report is clean (no false crypto_quarantined).
         let a = CrsqlDb::open_in_memory().unwrap();
         let b = CrsqlDb::open_in_memory().unwrap();
         make_kv(&a);
@@ -1482,8 +1930,8 @@ mod tests {
             .unwrap();
         assert!(report.pull_error.is_none());
         assert_eq!(
-            report.crypto_skipped, 0,
-            "no crypto skips on the clean path"
+            report.crypto_quarantined, 0,
+            "no crypto quarantines on the clean path"
         );
         assert_eq!(
             state::pull_watermark(b.conn()).unwrap(),

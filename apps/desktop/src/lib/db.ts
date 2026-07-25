@@ -504,11 +504,11 @@ async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
   // AI Connection/Profile refactor. profile_id NULL means "use the live
   // default Chat Assignment"; non-null persists an explicit override.
   //
-  // Intentionally defined here (frontend runtime schema) rather than in the
-  // Rust `migrations()` list — same as `segments.speaker_id` and the ALTERs
-  // above. Post-"ghost v11" (see db.rs), new incremental schema is added via
-  // this idempotent IF-NOT-EXISTS path because a higher-numbered sqlx
-  // migration can be silently refused on dev DBs with inconsistent history.
+  // The canonical definition now lives in the Rust `migrations()` list (db.rs
+  // v17); this idempotent IF-NOT-EXISTS CREATE is retained as a harmless
+  // belt-and-suspenders no-op for dev DBs whose `_sqlx_migrations` history is
+  // misaligned (where a higher-numbered sqlx migration can be silently refused)
+  // — the same rationale as the session_audio_parts create above.
   await db
     .execute(
       `CREATE TABLE IF NOT EXISTS chat_context_settings (

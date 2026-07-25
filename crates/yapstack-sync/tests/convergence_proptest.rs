@@ -158,7 +158,7 @@ async fn run_program(n: usize, ops: &[Op]) -> Vec<(i64, u64)> {
                     .await
                     .expect("drain must not hard-error (crypto-quarantine is non-fatal)");
                 assert_eq!(
-                    r.crypto_skipped, 0,
+                    r.crypto_quarantined, 0,
                     "all peers share one vault key; nothing should fail to decrypt"
                 );
             }
@@ -176,7 +176,7 @@ async fn run_program(n: usize, ops: &[Op]) -> Vec<(i64, u64)> {
             let r = drain_once(peers[p].conn(), &c, &relay, clients[p], sv, ev)
                 .await
                 .expect("final-exchange drain must not hard-error");
-            assert_eq!(r.crypto_skipped, 0, "no cross-peer decrypt failures");
+            assert_eq!(r.crypto_quarantined, 0, "no cross-peer decrypt failures");
             if r.pushed > 0 || r.applied > 0 {
                 moved = true;
             }

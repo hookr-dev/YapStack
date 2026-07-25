@@ -106,6 +106,7 @@ function syncStatus(over: Partial<SyncStatus> = {}): SyncStatus {
     ackedThisSession: 0,
     lastSuccess: null,
     pullBehind: 0,
+    cryptoQuarantined: 0,
     audioUploadOutstanding: 0,
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,
@@ -624,6 +625,11 @@ describe("NoteDetailView audio auto-fetch (S3.5, honest player rendering)", () =
     expect(await screen.findByText("Fetching… 25%")).toBeInTheDocument();
     expect(screen.queryByText(/click to fetch/)).not.toBeInTheDocument();
     await waitFor(() => expect(prepareCalls()).toContain("p0"));
+    // The session view submits in the HIGH class (outranks background dictation prefetches).
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("audio_prepare_part", {
+      partId: "p0",
+      highPriority: true,
+    });
     // The transcript still renders read-through; seeking stays withheld until fetched.
     expect(screen.getByText("recorded on the peer")).toBeInTheDocument();
     // Cancel affordance is present while fetching.
@@ -716,6 +722,44 @@ describe("NoteDetailView audio auto-fetch (S3.5, honest player rendering)", () =
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("audio_cancel_part", {
       partId: "p0",
     });
+  });
+
+  it("verification_failed offers a Retry that clears the slot and re-prepares", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "verification_failed" } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Audio failed verification")).toBeInTheDocument();
+    const callsBefore = prepareCalls().length;
+    // Retry clears the sticky tamper terminal (cancel → slot removed) and re-prepares.
+    fireEvent.click(screen.getByRole("button", { name: "Retry fetch" }));
+    await waitFor(() =>
+      expect(vi.mocked(invoke)).toHaveBeenCalledWith("audio_cancel_part", {
+        partId: "p0",
+      }),
+    );
+    await waitFor(() => expect(prepareCalls().length).toBeGreaterThan(callsBefore));
+  });
+
+  it("renders the self-healing auth-expired copy (no Retry — the drain reconnects)", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "auth_expired" } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(
+      await screen.findByText("Sync session expired — reconnecting…"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry fetch" }),
+    ).not.toBeInTheDocument();
   });
 
   it("surfaces the no_space terminal with the need-~X copy and a Retry", async () => {

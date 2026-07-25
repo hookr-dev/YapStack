@@ -1510,6 +1510,12 @@ pub struct SyncStatusDto {
     /// (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
     /// device is honestly "up to date" only when this is 0 AND the outbox is empty.
     pull_behind: u64,
+    /// Item 1: DURABLE count of crypto-quarantined changesets (peer writes pulled but not
+    /// decryptable). Non-zero => the sync panel shows a persistent, non-dismissable warning
+    /// row ("N unreadable changeset(s)") with a Retry affordance. Shown INDEPENDENTLY of the
+    /// up-to-date state: a caught-up device can still carry unreadable changesets. A potential
+    /// tamper/corruption signal — never auto-dismissed.
+    crypto_quarantined: u64,
     /// S2 — audio upload lane (DISTINCT from changeset sync). Blobs (recordings) still to
     /// seal+upload to the relay across both priorities (0 == every local recording is backed
     /// up). Surfaced under the "audio-upload" label in the panel; never merged with the
@@ -2854,6 +2860,13 @@ struct DrainProgress {
     /// R12: changesets still to pull to reach the last-known relay tip (0 when caught up or
     /// the tip is not yet known). Counts CHANGESETS (commit-ordered seqs), not cells.
     pull_behind: u64,
+    /// Item 1: DURABLE count of changesets held in the crypto-quarantine — peer writes this
+    /// device pulled but could not decrypt/decode (corruption, tampering, or a not-yet-arrived
+    /// key epoch). Read from `_yapstack_crypto_quarantine` each cycle. A NON-ZERO value is a
+    /// persistent, non-dismissable warning (a potential tamper signal), shown INDEPENDENTLY of
+    /// the up-to-date state: a device is honestly caught up (watermark at the tip) yet still
+    /// flags "N unreadable". Cleared only when a manual retry recovers every changeset.
+    crypto_quarantined: u64,
 }
 
 fn drain_progress_cell() -> &'static RwLock<DrainProgress> {
@@ -3382,6 +3395,7 @@ fn spawn_drain(
                         last_success: None,
                         catching_up: p.entries == 0 && initial_behind > 0,
                         pull_behind: initial_behind,
+                        crypto_quarantined: outbox::crypto_quarantine_pending(conn).unwrap_or(0),
                     });
                     p.entries > 0
                 }
@@ -3631,16 +3645,19 @@ fn spawn_drain(
                         //   2. the PULL watermark has reached the last-known relay tip
                         //      (`pull_behind == 0`) — the fix: an empty outbox is NOT up to
                         //      date while a peer's changesets remain un-merged;
-                        //   3. no transport error AND no crypto skip this cycle (`clean`) —
-                        //      else we'd claim success mid-failure, or over a peer write we
-                        //      could not decrypt (R5). A crypto failure already rides on
-                        //      `pull_error`, so (3)'s crypto clause is belt-and-suspenders.
+                        //   3. no transport error this cycle (`clean`) — else we'd claim success
+                        //      mid-failure.
+                        // Item 1: a crypto-quarantined changeset does NOT block "up to date". The
+                        // pull ADVANCED past it (watermark at the tip), so the device IS caught up
+                        // — honestly, WITH a standing "N unreadable" warning surfaced separately
+                        // via `crypto_quarantined`. This is the deliberate change from the old R5
+                        // halt (which kept the device perpetually "catching up"): caught-up and
+                        // a durable warning now coexist.
                         // While (2) fails we publish a DISTINCT `catching_up` state carrying the
                         // honest `pull_behind` count; connectivity/auth health (Unreachable /
                         // Failing / AuthExpired) already takes precedence over both in
                         // `build_status_dto` (unreachable/failing > catching-up > up-to-date).
-                        let clean = report.first_transport_error().is_none()
-                            && report.crypto_skipped == 0;
+                        let clean = report.first_transport_error().is_none();
                         let caught_up = p.entries == 0 && pull_behind == 0 && clean;
                         let last_success = if caught_up {
                             if had_backlog || announced_catch_up {
@@ -3663,6 +3680,10 @@ fn spawn_drain(
                             // outbox is empty but the pull is still behind.
                             catching_up: p.entries == 0 && pull_behind > 0,
                             pull_behind,
+                            // Item 1: the durable crypto-quarantine total drives the persistent
+                            // "N unreadable" warning, refreshed every cycle from the table.
+                            crypto_quarantined: outbox::crypto_quarantine_pending(conn)
+                                .unwrap_or(0),
                         });
                     }
                     Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
@@ -4207,6 +4228,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         acked_this_session: progress.acked_this_session,
         last_success: progress.last_success,
         pull_behind: progress.pull_behind,
+        crypto_quarantined: progress.crypto_quarantined,
         audio_upload_outstanding: audio.outstanding,
         audio_backfill_outstanding: audio.backfill_outstanding,
         audio_upload_failed: audio.failed,
@@ -4457,6 +4479,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             acked_this_session: 0,
             last_success: None,
             pull_behind: 0,
+            crypto_quarantined: 0,
             audio_upload_outstanding: 0,
             audio_backfill_outstanding: 0,
             audio_upload_failed: 0,
@@ -4608,6 +4631,50 @@ pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> 
     Ok(n as u32)
 }
 
+/// Item 1 manual retry seam for the Sync panel's crypto-quarantine warning row. Re-attempts
+/// decryption of EVERY quarantined changeset under the CURRENT vault key + epoch — the
+/// key-epoch recovery path: a device that pulled peer writes before its key was reconciled can
+/// drain the "unreadable" backlog once the right key arrives. Recovered changesets merge (their
+/// original clock intact, so cr-sqlite LWW converges) and leave the quarantine; genuinely
+/// corrupt/tampered ones stay flagged as a durable tamper signal, never dropped. Opens the LIVE
+/// CRR DB (same DB the drain quarantines into) with the CRR engine registered so the recovered
+/// merges apply. Returns the number recovered. No-op when sync is disabled.
+#[tauri::command]
+#[specta::specta]
+pub fn sync_retry_crypto_quarantine(app: tauri::AppHandle) -> Result<u32, String> {
+    let session = match load_session()? {
+        Some(s) if s.sync_enabled => s,
+        _ => return Ok(0),
+    };
+    let vault_key = session.vault_key()?;
+    let db_path = app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone();
+    // CrsqlDb::open registers the pinned CRR engine + sync pragmas (busy_timeout/WAL), so this
+    // second connection merges recovered changesets safely alongside the running drain.
+    let db = CrsqlDb::open(&db_path).map_err(|e| e.to_string())?;
+    let cipher = ChangesetCipher::new(
+        vault_key,
+        session.epoch,
+        session.tenant_id,
+        SYNC_SCHEMA_VERSION,
+        CRSQLITE_ENGINE_VERSION,
+    );
+    let report = outbox::retry_crypto_quarantine(db.conn(), &cipher).map_err(|e| e.to_string())?;
+    if report.recovered > 0 {
+        // Recovered changesets changed visible rows: nudge the UI to refresh and wake the drain
+        // so the status DTO re-publishes the now-lower quarantine count promptly.
+        if let Err(e) = app.emit(SYNC_APPLIED_EVENT, ()) {
+            tracing::warn!("sync_retry_crypto_quarantine: emit {SYNC_APPLIED_EVENT} failed: {e}");
+        }
+        drain_wake().notify_one();
+    }
+    Ok(report.recovered as u32)
+}
+
 /// S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
 /// queue (NORMAL priority). Dictation audio has no `session_audio_parts` row; the part
 /// identity IS the `dictation_history.id` (self-referential AAD `session_id`, matching the
@@ -4695,8 +4762,15 @@ pub enum AudioPreparePartDto {
     NoSpace { needed: u64 },
     /// Can't reach the sync server (relay unreachable).
     Unreachable,
+    /// The relay rejected the bearer (HTTP 401) mid-fetch. Distinct from a generic error:
+    /// the drain refreshes the token on its own cycle, so the player shows "Sync session
+    /// expired — reconnecting…" and simply re-probes; the slot is cleared so the re-probe
+    /// re-attempts with the freshly-persisted bearer (self-healing, no user action).
+    AuthExpired,
     /// The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
-    /// fetch worker). Distinct copy: "audio failed verification".
+    /// fetch worker). Distinct copy: "audio failed verification". Sticky until the user
+    /// explicitly retries (the bar's Retry clears the slot via `audio_cancel_part`) — a
+    /// tamper signal must never auto-retry.
     VerificationFailed,
     /// Any other fetch/IO fault, surfaced verbatim (never auto-routed).
     Error { message: String },
@@ -4742,10 +4816,13 @@ fn resolve_part_identity(conn: &rusqlite::Connection, part_id: &str) -> Option<(
 }
 
 /// Build the player-facing DTO from a slot's live progress + terminal outcome. On a retryable
-/// terminal (unreachable / not-on-server / no-space / other error) the slot is cleared so the
-/// NEXT poll (a user retry, or the player's automatic 30s re-probe for not-on-server) starts
-/// fresh; `Ready` and `VerificationFailed` are the only stable terminals (a re-download of a
-/// tampered blob would fail identically).
+/// terminal (unreachable / auth-expired / not-on-server / no-space / other error) the slot is
+/// cleared so the NEXT poll (a user retry, or the player's automatic 30s re-probe for
+/// not-on-server and auth-expired) starts fresh; `Ready` and `VerificationFailed` are the only
+/// stable terminals here — `VerificationFailed` because a re-download of a tampered blob would
+/// fail identically (recoverable ONLY via the bar's explicit Retry → `audio_cancel_part`),
+/// and `Fetched` slots are cleaned up by the WORKER at finish (see the worker in
+/// `audio_prepare_part`), so this arm only serves the brief window before that removal.
 fn slot_to_dto(
     part_id: &str,
     slot: &yapstack_sync::audio::FetchSlot,
@@ -4781,6 +4858,7 @@ fn slot_to_dto(
         Some(Err(code)) => {
             let dto = match code.as_str() {
                 "unreachable" => AudioPreparePartDto::Unreachable,
+                "auth_expired" => AudioPreparePartDto::AuthExpired,
                 "verification" => AudioPreparePartDto::VerificationFailed,
                 other => AudioPreparePartDto::Error {
                     message: other.strip_prefix("error:").unwrap_or(other).to_string(),
@@ -4848,12 +4926,18 @@ fn volume_free_space(path: &Path) -> Option<u64> {
 
 /// S3 fetch-on-demand entry point (polled per missing part). Resolves D2 order, joins the
 /// single in-flight fetch (starting it on the first call), and returns the current state.
+/// `high_priority` (default false) puts the part in the queue's HIGH class — the session
+/// view the user is looking at passes true so its ordered parts start ahead of queued
+/// background dictation prefetches; a poll of an already-QUEUED normal part with
+/// `high_priority` promotes it in place (FETCH POLISH item 5).
 #[tauri::command]
 #[specta::specta]
 pub fn audio_prepare_part(
     app: tauri::AppHandle,
     part_id: String,
+    high_priority: Option<bool>,
 ) -> Result<AudioPreparePartDto, String> {
+    let high = high_priority.unwrap_or(false);
     let session = match load_session()? {
         Some(s) if s.sync_enabled => s,
         // No server to fetch from → stays the honest on-device state.
@@ -4885,7 +4969,13 @@ pub fn audio_prepare_part(
     }
 
     // Coalesce onto an existing slot (queued or in flight) without re-reading the keychain.
+    // A high-priority poll of a part that is still admission-queued in the NORMAL class
+    // promotes it (e.g. the user opens a session whose dictation-prefetched parts queued
+    // earlier) — a no-op for running/terminal/already-high slots.
     if let Some(slot) = fetch_registry().get(&part_id) {
+        if high {
+            fetch_registry().promote(&part_id);
+        }
         return Ok(slot_to_dto(&part_id, &slot, &cache_path));
     }
 
@@ -4946,6 +5036,11 @@ pub fn audio_prepare_part(
                 let terminal = match result {
                     Ok(r) => Ok(r),
                     Err(e) if e.is_network() => Err("unreachable".to_string()),
+                    // 401 mid-fetch: the bearer expired. Its own terminal (not a generic
+                    // error) so the player can show "reconnecting…" and re-probe — the
+                    // drain refreshes the token; the cleared slot makes the next probe a
+                    // real re-attempt with the reloaded bearer (self-healing).
+                    Err(yapstack_sync::SyncError::Unauthorized) => Err("auth_expired".to_string()),
                     Err(yapstack_sync::SyncError::Crypto(_)) => {
                         tracing::warn!(
                             "audio fetch: decrypt/verification failed for part {part_for_worker} \
@@ -4955,10 +5050,24 @@ pub fn audio_prepare_part(
                     }
                     Err(e) => Err(format!("error:{e}")),
                 };
-                if matches!(terminal, Ok(yapstack_sync::audio::FetchResult::Fetched)) {
+                let fetched = matches!(terminal, Ok(yapstack_sync::audio::FetchResult::Fetched));
+                if fetched {
                     crate::register_trusted_audio_dir(&app_for_worker, &cache_dir_for_worker);
                 }
                 slot_for_worker.finish(terminal);
+                if fetched {
+                    // Fetched-slot cleanup (bounded-leak fix): the cache file is fully
+                    // persisted BEFORE `Fetched` is returned, so once the slot is gone every
+                    // later prepare short-circuits on the cache hit (no re-download) and a
+                    // still-held Arc keeps serving Ready from its outcome. Removing here —
+                    // after finish, before task_finished — is the race-free point: the slot
+                    // stays `is_active` through the whole download+decrypt window (so
+                    // cache_clear can never touch a partial), and the permit accounting is
+                    // untouched (task_finished still runs exactly once below). A concurrent
+                    // cache_clear after this removal deletes only the COMPLETE file — a
+                    // legitimate clear outcome, never corruption.
+                    fetch_registry().remove(&part_for_worker);
+                }
                 fetch_registry().task_finished();
             });
         if let Err(e) = spawn {
@@ -4970,7 +5079,7 @@ pub fn audio_prepare_part(
             fetch_registry().task_finished();
         }
     });
-    let slot = fetch_registry().submit(&part_id, starter);
+    let slot = fetch_registry().submit_with_priority(&part_id, starter, high);
     Ok(slot_to_dto(&part_id, &slot, &cache_path))
 }
 

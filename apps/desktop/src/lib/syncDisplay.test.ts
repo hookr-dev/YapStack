@@ -25,6 +25,7 @@ function status(partial: Partial<SyncStatus> = {}): SyncStatus {
     ackedThisSession: 0,
     lastSuccess: null,
     pullBehind: 0,
+    cryptoQuarantined: 0,
     audioUploadOutstanding: 0,
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,
@@ -282,6 +283,110 @@ describe("deriveSyncDisplay — catching up (R12, pull behind)", () => {
       status: status({ phase: "connected", pendingEntries: 0, pullBehind: 0 }),
     });
     expect(d.state).toBe("caught-up");
+  });
+});
+
+describe("deriveSyncDisplay — crypto-quarantine honesty (§11.3, the FINDING)", () => {
+  it("caught-up with unreadable changesets is amber 'Synced — N unreadable', NEVER plain green", () => {
+    // The exact FINDING: outbox drained, pull caught up, no error — the OLD code showed the
+    // green "Up to date" while peer changesets were undecryptable. A nonzero quarantine count
+    // must replace the green with an amber attention state.
+    const d = derive({
+      status: status({
+        phase: "connected",
+        pendingEntries: 0,
+        pullBehind: 0,
+        lastError: null,
+        cryptoQuarantined: 3,
+      }),
+    });
+    expect(d.state).toBe("quarantined");
+    expect(d.tone).toBe("amber");
+    expect(d.icon).toBe("cloud-alert");
+    expect(d.motion).toBe(false);
+    expect(d.label).toBe("Synced — 3 changesets unreadable");
+    expect(d.tooltip).toBe("Synced — 3 changesets unreadable");
+    // Belt-and-suspenders: it is categorically not the green caught-up.
+    expect(d.state).not.toBe("caught-up");
+    expect(d.icon).not.toBe("cloud-check");
+  });
+
+  it("singular copy for a single unreadable changeset", () => {
+    const d = derive({
+      status: status({ phase: "connected", pendingEntries: 0, cryptoQuarantined: 1 }),
+    });
+    expect(d.label).toBe("Synced — 1 changeset unreadable");
+  });
+
+  it("a zero count is still plain-green caught-up (no false warning)", () => {
+    const d = derive({
+      status: status({ phase: "connected", pendingEntries: 0, cryptoQuarantined: 0 }),
+    });
+    expect(d.state).toBe("caught-up");
+    expect(d.icon).toBe("cloud-check");
+    expect(d.tone).toBe("muted");
+  });
+
+  it("connectivity health (unreachable) outranks the quarantine warning", () => {
+    const d = derive({
+      conn: { kind: "unreachable", raw: "refused" },
+      status: status({ cryptoQuarantined: 5 }),
+    });
+    expect(d.state).toBe("unreachable");
+  });
+
+  it("auth-expired outranks the quarantine warning", () => {
+    const d = derive({
+      status: status({ phase: "auth_expired", cryptoQuarantined: 5 }),
+    });
+    expect(d.state).toBe("auth-expired");
+  });
+
+  it("a set lastError (error) outranks the quarantine warning", () => {
+    const d = derive({
+      status: status({ phase: "connected", cryptoQuarantined: 5, lastError: "boom" }),
+    });
+    expect(d.state).toBe("error");
+  });
+
+  it("an active push (syncing) outranks the quarantine warning (transient spinner, still honest)", () => {
+    const d = derive({
+      status: status({ phase: "syncing", pendingEntries: 5, cryptoQuarantined: 5 }),
+    });
+    expect(d.state).toBe("syncing");
+  });
+
+  it("R12 coexistence: an active pull (catching-up) outranks the quarantine warning", () => {
+    // Quarantine + a still-behind pull: the active catch-up spinner wins; once the pull
+    // settles (pullBehind 0) the very next derivation surfaces the amber warning instead of
+    // green — the count is durable, so nothing is lost by deferring behind the active pull.
+    const d = derive({
+      status: status({ phase: "catching_up", pullBehind: 900, cryptoQuarantined: 5 }),
+    });
+    expect(d.state).toBe("catching-up");
+  });
+
+  it("a push backlog (pending) outranks the quarantine warning (distinct non-green idle state)", () => {
+    // pending is not green either, and it resolves; once the outbox drains the amber warning
+    // surfaces. The invariant we protect is only 'never plain green while count > 0'.
+    const d = derive({
+      status: status({ phase: "connected", pendingEntries: 4, cryptoQuarantined: 5 }),
+    });
+    expect(d.state).toBe("pending");
+  });
+
+  it("R12 coexistence, settled: quarantine + caught-up pull (pullBehind 0) → amber, not green", () => {
+    const d = derive({
+      status: status({
+        phase: "connected",
+        pendingEntries: 0,
+        pullBehind: 0,
+        cryptoQuarantined: 2,
+      }),
+    });
+    expect(d.state).toBe("quarantined");
+    expect(d.tone).toBe("amber");
+    expect(d.label).toBe("Synced — 2 changesets unreadable");
   });
 });
 

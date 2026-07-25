@@ -657,6 +657,20 @@ async audioRetryFailedUploads() : Promise<Result<number, string>> {
 }
 },
 /**
+ * Item 1 manual retry seam for the Sync panel's crypto-quarantine warning row. Re-attempts
+ * decryption of EVERY quarantined changeset under the CURRENT vault key + epoch (key-epoch
+ * recovery). Recovered changesets merge and leave the quarantine; corrupt/tampered ones stay
+ * flagged. Returns the number recovered. No-op when sync is disabled.
+ */
+async syncRetryCryptoQuarantine() : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_retry_crypto_quarantine") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
  * queue (NORMAL priority). Dictation audio has no `session_audio_parts` row; the part
  * identity IS the `dictation_history.id` (self-referential AAD `session_id`, matching the
@@ -1109,6 +1123,14 @@ lastSuccess: string | null;
  * device is honestly "up to date" only when this is 0 AND the outbox is empty.
  */
 pullBehind: number;
+/**
+ * Item 1: DURABLE count of crypto-quarantined changesets (peer writes pulled but not
+ * decryptable). Non-zero => the sync panel shows a persistent, non-dismissable warning
+ * row ("N unreadable changeset(s)") with a Retry affordance. Shown INDEPENDENTLY of the
+ * up-to-date state: a caught-up device can still carry unreadable changesets. A potential
+ * tamper/corruption signal — never auto-dismissed.
+ */
+cryptoQuarantined: number;
 /**
  * S2 — audio upload lane (DISTINCT from changeset sync). Blobs (recordings) still to
  * seal+upload to the relay across both priorities (0 == every local recording is backed

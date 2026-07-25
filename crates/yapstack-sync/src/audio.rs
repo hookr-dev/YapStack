@@ -960,13 +960,32 @@ pub struct FetchRegistry {
     inner: Mutex<RegistryInner>,
 }
 
+/// One admitted-but-not-started fetch waiting for a permit. `high` is the priority CLASS
+/// (mechanism only — the caller decides policy): the queue keeps every high entry as a
+/// contiguous FRONT segment, FIFO within each class, so e.g. the session the user is
+/// looking at starts before background dictation prefetches without ever reordering the
+/// session's own part sequence.
+struct QueuedFetch {
+    part_id: String,
+    starter: FetchStarter,
+    high: bool,
+}
+
 #[derive(Default)]
 struct RegistryInner {
     slots: HashMap<String, Arc<FetchSlot>>,
     /// FIFO of parts admitted but not yet started (cap reached), with their starters.
-    queue: VecDeque<(String, FetchStarter)>,
+    /// Invariant: all `high` entries form a contiguous prefix (see [`QueuedFetch`]).
+    queue: VecDeque<QueuedFetch>,
     /// Started-and-not-yet-finished count (each started task calls `task_finished` once).
     running: usize,
+}
+
+impl RegistryInner {
+    /// The insertion index for a high-class entry: the end of the contiguous high prefix.
+    fn high_segment_end(&self) -> usize {
+        self.queue.iter().take_while(|q| q.high).count()
+    }
 }
 
 impl Default for FetchRegistry {
@@ -990,12 +1009,26 @@ impl FetchRegistry {
         }
     }
 
+    /// Submit a fetch for `part_id` in the NORMAL class (background prefetches). See
+    /// [`submit_with_priority`](Self::submit_with_priority) for the semantics.
+    pub fn submit(&self, part_id: &str, starter: FetchStarter) -> Arc<FetchSlot> {
+        self.submit_with_priority(part_id, starter, false)
+    }
+
     /// Submit a fetch for `part_id`. If a slot already exists the starter is DROPPED and the
     /// existing slot returned (single-flight coalescing). Otherwise the slot is created and
-    /// the starter either runs immediately (a permit was free) or queues FIFO — the slot
-    /// reads [`FetchSlot::is_queued`] until promoted. Every started starter's task MUST
-    /// eventually call [`task_finished`](Self::task_finished) exactly once.
-    pub fn submit(&self, part_id: &str, starter: FetchStarter) -> Arc<FetchSlot> {
+    /// the starter either runs immediately (a permit was free) or queues — `high` entries
+    /// join the END of the queue's high prefix (ahead of every normal entry, behind earlier
+    /// high ones, so a caller's own submission order is preserved); normal entries join the
+    /// back. The slot reads [`FetchSlot::is_queued`] until promoted to running. Every
+    /// started starter's task MUST eventually call
+    /// [`task_finished`](Self::task_finished) exactly once.
+    pub fn submit_with_priority(
+        &self,
+        part_id: &str,
+        starter: FetchStarter,
+        high: bool,
+    ) -> Arc<FetchSlot> {
         let (slot, run_now) = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = g.slots.get(part_id) {
@@ -1008,7 +1041,17 @@ impl FetchRegistry {
                 (s, Some(starter))
             } else {
                 s.set_queued(true);
-                g.queue.push_back((part_id.to_string(), starter));
+                let entry = QueuedFetch {
+                    part_id: part_id.to_string(),
+                    starter,
+                    high,
+                };
+                if high {
+                    let at = g.high_segment_end();
+                    g.queue.insert(at, entry);
+                } else {
+                    g.queue.push_back(entry);
+                }
                 (s, None)
             }
         };
@@ -1018,19 +1061,42 @@ impl FetchRegistry {
         slot
     }
 
+    /// Promote a QUEUED entry into the high class: it moves to the end of the queue's high
+    /// prefix (ahead of every normal entry, behind earlier high ones — relative order among
+    /// promoted entries is their promotion order, so a view promoting its parts in
+    /// part_index order keeps them in that order). Returns `true` only when an entry
+    /// actually moved; running/terminal/absent/already-high parts are untouched (`false`).
+    pub fn promote(&self, part_id: &str) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pos) = g.queue.iter().position(|q| q.part_id == part_id) else {
+            return false;
+        };
+        if g.queue[pos].high {
+            return false;
+        }
+        let Some(mut entry) = g.queue.remove(pos) else {
+            return false;
+        };
+        entry.high = true;
+        let at = g.high_segment_end();
+        g.queue.insert(at, entry);
+        true
+    }
+
     /// A started task finished (any terminal, including cancel): release its permit and
-    /// start the next queued fetch, if any. Called exactly once per started starter.
+    /// start the next queued fetch, if any (the high prefix drains first by construction).
+    /// Called exactly once per started starter.
     pub fn task_finished(&self) {
         let next = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.running = g.running.saturating_sub(1);
             match g.queue.pop_front() {
-                Some((id, starter)) => {
+                Some(q) => {
                     g.running += 1;
-                    if let Some(s) = g.slots.get(&id) {
+                    if let Some(s) = g.slots.get(&q.part_id) {
                         s.set_queued(false);
                     }
-                    Some(starter)
+                    Some(q.starter)
                 }
                 None => None,
             }
@@ -1046,7 +1112,7 @@ impl FetchRegistry {
     pub fn cancel_if_queued(&self, part_id: &str) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = g.queue.len();
-        g.queue.retain(|(id, _)| id != part_id);
+        g.queue.retain(|q| q.part_id != part_id);
         if g.queue.len() == before {
             return false;
         }
@@ -1084,7 +1150,7 @@ impl FetchRegistry {
     pub fn remove(&self, part_id: &str) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.slots.remove(part_id);
-        g.queue.retain(|(id, _)| id != part_id);
+        g.queue.retain(|q| q.part_id != part_id);
     }
 }
 

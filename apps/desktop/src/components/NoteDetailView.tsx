@@ -25,6 +25,7 @@ import {
   formatNoSpace,
   nextPollDelayMs,
   syncCommands,
+  AUTH_EXPIRED_FETCH_COPY,
   type AudioPartPrepare,
   type TrackFetch,
 } from "@/lib/sync";
@@ -313,11 +314,28 @@ function AudioFetchBar({
     );
   }
 
-  if (track.kind === "verification_failed") {
+  if (track.kind === "auth_expired") {
+    // Self-healing: the drain refreshes the bearer and the poll re-probes on the slow
+    // cadence — no user action, so no Retry affordance.
     return (
       <div className={barCls}>
         <AlertTriangle className="h-4 w-4 text-amber-500" />
-        <span className="text-xs">Audio failed verification</span>
+        <span className="text-xs">{AUTH_EXPIRED_FETCH_COPY}</span>
+      </div>
+    );
+  }
+
+  if (track.kind === "verification_failed") {
+    // Sticky tamper signal — never auto-retried — but a transient epoch divergence (e.g.
+    // a vault-key rotation racing the fetch) deserves an in-session escape hatch: Retry
+    // clears the slot (cancel) and re-prepares a fresh download.
+    return (
+      <div className={barCls}>
+        <AlertTriangle className="h-4 w-4 text-amber-500" />
+        <span className="min-w-0 flex-1 truncate text-xs">Audio failed verification</span>
+        <Button variant="ghost" size="icon-xs" onClick={onRetry} aria-label="Retry fetch" title="Retry">
+          <RefreshCw className="h-4 w-4" />
+        </Button>
       </div>
     );
   }
@@ -570,7 +588,9 @@ export function NoteDetailView() {
       // Sequential, ordered submission: part_index order = FIFO admission order in Rust.
       for (const id of ids) {
         try {
-          const st = await syncCommands.prepareAudioPart(id);
+          // highPriority: the session the user is LOOKING AT outranks background
+          // dictation prefetches in the global fetch queue (promotes if already queued).
+          const st = await syncCommands.prepareAudioPart(id, { highPriority: true });
           // IPC boundary: never trust the shape blindly (an older backend or a bad
           // serialization must degrade to an honest error, not a render crash).
           next[id] =

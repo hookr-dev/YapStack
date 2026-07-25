@@ -1,5 +1,5 @@
 import { renderHook, waitFor } from "@testing-library/react";
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   tauriCoreMock,
   tauriEventMock,
@@ -46,6 +46,7 @@ const prepareCalls = () =>
     .map(([, args]) => (args as Record<string, unknown>)?.partId);
 
 beforeEach(() => vi.clearAllMocks());
+afterEach(() => vi.useRealTimers());
 
 describe("useDictationEntry auto-fetch (S3.5 mount trigger)", () => {
   it("starts fetching on MOUNT when the WAV is not on this device (no play click)", async () => {
@@ -97,6 +98,32 @@ describe("useDictationEntry auto-fetch (S3.5 mount trigger)", () => {
       expect(result.current.fetchState).toEqual({ kind: "error", message: "boom" }),
     );
     expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it("quiet not-on-server re-probes on the 30s cadence (parity with sessions)", async () => {
+    vi.useFakeTimers();
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_prepare_part") return { state: "not_on_server" };
+      return null;
+    });
+    const { unmount } = renderHook(() => useDictationEntry(makeEntry()));
+    // Flush the mount probe + first prepare (microtasks under fake timers).
+    await vi.advanceTimersByTimeAsync(0);
+    expect(prepareCalls()).toHaveLength(1);
+    // Dictation prefetch stays in the NORMAL class (sessions outrank it).
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("audio_prepare_part", {
+      partId: "dict-1",
+      highPriority: false,
+    });
+    // Still waiting just before the cadence…
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(prepareCalls()).toHaveLength(1);
+    // …and a real re-attempt lands at 30s (quiet: no toast either way).
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(prepareCalls()).toHaveLength(2);
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    unmount();
   });
 
   it("unmount releases a still-queued fetch (cancel-if-queued, leave-in-flight)", async () => {

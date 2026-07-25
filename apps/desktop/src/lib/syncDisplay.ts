@@ -27,10 +27,12 @@ export const SMALL_N = 3;
 /** Continuous-syncing window (ms) that also unlocks motion, independent of N. */
 export const SYNC_MOTION_MS = 2000;
 
-/** The mutually-exclusive display states (plan §3 table; `catching-up` added R12). */
+/** The mutually-exclusive display states (plan §3 table; `catching-up` added R12;
+ *  `quarantined` added for the §11.3 crypto-quarantine honesty fix). */
 export type SyncDisplayState =
   | "off"
   | "caught-up"
+  | "quarantined"
   | "syncing"
   | "catching-up"
   | "pending"
@@ -87,10 +89,17 @@ function hostOf(url: string): string {
 
 /**
  * Derive the one display object every sync surface renders. Precedence (binding,
- * plan §1b + R12): off → unreachable → auth-expired → error → syncing (push) →
- * catching-up (pull behind) → pending → caught-up. Connection failure short-circuits
- * BEFORE any sync phase, and "catching up" outranks "up to date" so a pull backlog can
- * never masquerade as green.
+ * plan §1b + R12 + §11.3 crypto-quarantine): off → unreachable → auth-expired → error →
+ * syncing (push) → catching-up (pull behind) → pending → { caught-up | quarantined }.
+ * Connection failure short-circuits BEFORE any sync phase, "catching up" outranks "up to
+ * date" so a pull backlog can never masquerade as green, and — at the caught-up slot only —
+ * a nonzero crypto-quarantine count turns the ONLY green state into an amber "Synced — N
+ * unreadable" warning, so an unreadable/tampered peer changeset can never hide behind plain
+ * green. It sits at the caught-up slot (not higher) deliberately: unreachable/auth/error are
+ * more urgent and actionable; syncing/catching-up are active transitions whose spinner is
+ * honest and settle back to THIS amber when they finish; pending is a distinct non-green idle
+ * state that resolves and then reveals the warning. The count is durable, so deferring it
+ * behind those transient/idle states never loses it — it only ever replaces the green.
  */
 export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   const { conn, status, signedIn, syncEnabled, syncingSince } = input;
@@ -113,6 +122,7 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   const pendingEntries = status?.pendingEntries ?? 0;
   const pendingBytes = status?.pendingBytes ?? 0;
   const pullBehind = status?.pullBehind ?? 0;
+  const cryptoQuarantined = status?.cryptoQuarantined ?? 0;
   const lastError = status?.lastError ?? null;
   const lastSuccess = status?.lastSuccess ?? null;
   const hasError = lastError != null && lastError !== "";
@@ -211,9 +221,29 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
     };
   }
 
-  // 8. Fully drained, reachable, no error, AND caught up on the pull → up to date.
-  //    (Strictly gated: we can only reach here with pendingEntries == 0 AND !hasError
-  //    AND pullBehind == 0.)
+  // 8. Fully drained, reachable, no error, no push backlog, caught up on the pull — but one
+  //    or more PEER changesets are cryptographically UNREADABLE (§11.3 crypto-quarantine: a
+  //    decrypt/decode failure this device stored durably and ADVANCED past, so the watermark
+  //    still reached the tip). We are honestly caught up AND carrying a standing warning, so we
+  //    render amber "Synced — N unreadable" (the cloud-alert idiom) instead of the plain-green
+  //    "Up to date". This is the FINDING fix: the count must never read as green. It replaces
+  //    ONLY the green caught-up state (see the precedence note above), never a busier state.
+  if (cryptoQuarantined > 0) {
+    const noun = cryptoQuarantined === 1 ? "changeset" : "changesets";
+    const label = `Synced — ${cryptoQuarantined} ${noun} unreadable`;
+    return {
+      state: "quarantined",
+      label,
+      tone: "amber",
+      icon: "cloud-alert",
+      motion: false,
+      tooltip: label,
+    };
+  }
+
+  // 9. Fully drained, reachable, no error, no unreadable changesets, AND caught up on the pull
+  //    → up to date. (Strictly gated: we can only reach here with pendingEntries == 0 AND
+  //    !hasError AND pullBehind == 0 AND cryptoQuarantined == 0.)
   const rel = formatLastSynced(lastSuccess, now.getTime());
   return {
     state: "caught-up",

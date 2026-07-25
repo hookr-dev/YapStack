@@ -447,6 +447,92 @@ fn remove_purges_a_queued_entry_too() {
     assert!(reg.get("part-b").is_none());
 }
 
+/// FETCH POLISH item 5: high-class submissions join the FRONT segment of the admission
+/// queue (FIFO within the class), so the session the user is looking at starts before
+/// background dictation prefetches that queued earlier — without reordering the session's
+/// own part sequence.
+#[test]
+fn high_priority_submissions_jump_queued_normal_prefetches() {
+    let reg = FetchRegistry::with_cap(1);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    reg.submit("running-x", recording_starter(&started, "x")); // occupies the one permit
+    reg.submit("dict-a", recording_starter(&started, "dA")); // normal prefetches queue first
+    reg.submit("dict-b", recording_starter(&started, "dB"));
+    // The session view submits its parts high, in part_index order.
+    reg.submit_with_priority("sess-p0", recording_starter(&started, "p0"), true);
+    reg.submit_with_priority("sess-p1", recording_starter(&started, "p1"), true);
+    for _ in 0..4 {
+        reg.task_finished();
+    }
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["x", "p0", "p1", "dA", "dB"],
+        "session parts start ahead of earlier-queued prefetches, in their own order"
+    );
+}
+
+/// `promote` moves an already-QUEUED normal entry into the high class in place; running,
+/// absent, and already-high entries are untouched.
+#[test]
+fn promote_moves_queued_entry_ahead_but_never_touches_running() {
+    let reg = FetchRegistry::with_cap(1);
+    let started = Arc::new(Mutex::new(Vec::new()));
+    reg.submit("running-x", recording_starter(&started, "x"));
+    reg.submit("dict-a", recording_starter(&started, "dA"));
+    reg.submit("sess-p0", recording_starter(&started, "p0")); // queued NORMAL first…
+
+    assert!(!reg.promote("running-x"), "running → untouched");
+    assert!(!reg.promote("ghost"), "absent → untouched");
+    assert!(reg.promote("sess-p0"), "queued normal → promoted");
+    assert!(!reg.promote("sess-p0"), "already high → no-op");
+
+    reg.task_finished();
+    reg.task_finished();
+    assert_eq!(
+        *started.lock().unwrap(),
+        vec!["x", "p0", "dA"],
+        "the promoted part starts ahead of the earlier-queued normal one"
+    );
+    // Promotion order is preserved among promoted entries.
+    let reg2 = FetchRegistry::with_cap(1);
+    let started2 = Arc::new(Mutex::new(Vec::new()));
+    reg2.submit("running-x", recording_starter(&started2, "x"));
+    reg2.submit("q1", recording_starter(&started2, "q1"));
+    reg2.submit("q2", recording_starter(&started2, "q2"));
+    assert!(reg2.promote("q1"));
+    assert!(reg2.promote("q2")); // joins BEHIND q1 in the high segment
+    reg2.task_finished();
+    reg2.task_finished();
+    assert_eq!(*started2.lock().unwrap(), vec!["x", "q1", "q2"]);
+}
+
+/// FETCH POLISH item 4 (fetched-slot cleanup): the worker removes a `Fetched` slot right
+/// after `finish` — once inactive, `cache_clear` can finally reclaim that file (previously
+/// a lingering Fetched slot made the clear skip it forever), and a fresh submit after
+/// removal is a genuinely new attempt.
+#[test]
+fn fetched_slot_removal_lets_cache_clear_reclaim_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("done-part.wav"), vec![0u8; 40]).unwrap();
+
+    let reg = FetchRegistry::with_cap(2);
+    let slot = reg.submit("done-part", Box::new(|| {}));
+    slot.finish(Ok(FetchResult::Fetched));
+    // Slot still live (terminal unobserved) → the clear must skip the file.
+    let removed = audio::cache_clear(&cache, |p| reg.is_active(p));
+    assert_eq!(removed.files, 0, "live Fetched slot protects the file");
+
+    // The worker's cleanup convention: remove after finish, then release the permit.
+    reg.remove("done-part");
+    reg.task_finished();
+    assert!(!reg.is_active("done-part"));
+    let removed = audio::cache_clear(&cache, |p| reg.is_active(p));
+    assert_eq!(removed.files, 1, "inactive part is reclaimable");
+    assert!(!cache.join("done-part.wav").exists());
+}
+
 /// The still-uploading re-probe seam: after a NotOnServer terminal the desktop CLEARS the
 /// slot (it is no longer a stable terminal), so a later re-probe submit starts a genuinely
 /// fresh attempt — this is what lets the fetch begin automatically once the source device's

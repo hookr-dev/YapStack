@@ -332,6 +332,25 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
     ).toEqual({ kind: "unreachable" });
   });
 
+  it("ranks auth_expired below unreachable and above no_space/error/fetching", () => {
+    // Connectivity outranks a stale credential…
+    expect(
+      deriveTrackFetch([{ state: "auth_expired" }, { state: "unreachable" }]),
+    ).toEqual({ kind: "unreachable" });
+    // …but the expired bearer outranks everything that needs a user action or is in
+    // flight (its self-healing copy is the honest headline).
+    expect(
+      deriveTrackFetch([
+        { state: "auth_expired" },
+        { state: "no_space", needed: 1 },
+        { state: "error", message: "x" },
+        fetching(1, 2),
+        { state: "queued" },
+        { state: "not_on_server" },
+      ]),
+    ).toEqual({ kind: "auth_expired" });
+  });
+
   it("surfaces verification failure with highest precedence (tamper signal)", () => {
     expect(
       deriveTrackFetch([
@@ -401,6 +420,9 @@ describe("nextPollDelayMs (auto-fetch cadence)", () => {
     expect(nextPollDelayMs({ kind: "on_device" })).toBe(30_000);
     expect(ON_DEVICE_REPROBE_MS).toBe(30_000);
   });
+  it("re-probes on the slow cadence while the bearer is expired (self-healing)", () => {
+    expect(nextPollDelayMs({ kind: "auth_expired" })).toBe(30_000);
+  });
   it("stops on ready and on the terminals that need a user action", () => {
     expect(nextPollDelayMs({ kind: "ready" })).toBeNull();
     expect(nextPollDelayMs({ kind: "unreachable" })).toBeNull();
@@ -413,12 +435,25 @@ describe("nextPollDelayMs (auto-fetch cadence)", () => {
 describe("prepareAudioPart / cancelAudioPart / enqueueAudioForDictation IPC", () => {
   beforeEach(() => invokeMock.mockReset());
 
-  it("prepareAudioPart invokes with the part id and returns the DTO", async () => {
+  it("prepareAudioPart invokes with the part id (normal class) and returns the DTO", async () => {
     const { syncCommands } = await import("./sync");
     invokeMock.mockResolvedValue({ state: "fetching", received: 1, total: 2 });
     const r = await syncCommands.prepareAudioPart("part-9");
-    expect(invokeMock).toHaveBeenCalledWith("audio_prepare_part", { partId: "part-9" });
+    expect(invokeMock).toHaveBeenCalledWith("audio_prepare_part", {
+      partId: "part-9",
+      highPriority: false,
+    });
     expect(r).toEqual({ state: "fetching", received: 1, total: 2 });
+  });
+
+  it("prepareAudioPart forwards the high-priority class (session-view promotion)", async () => {
+    const { syncCommands } = await import("./sync");
+    invokeMock.mockResolvedValue({ state: "queued" });
+    await syncCommands.prepareAudioPart("part-9", { highPriority: true });
+    expect(invokeMock).toHaveBeenCalledWith("audio_prepare_part", {
+      partId: "part-9",
+      highPriority: true,
+    });
   });
 
   it("cancelAudioPart invokes with the part id", async () => {

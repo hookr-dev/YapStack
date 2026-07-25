@@ -1841,13 +1841,21 @@ mod tests {
         // Call start_capture with a source that will fail with a non-AlreadyRunning error
         // and verify state becomes Error, then verify AlreadyRunning doesn't.
 
-        // First: verify non-AlreadyRunning errors DO set Error state
-        let result = manager.start_capture(CaptureSource::SystemOnly, None);
-        if result.is_err() {
-            // On CI without system audio, this fails with a real error
-            let status = manager.status();
-            assert_eq!(status.state, CaptureState::Error);
-            assert!(status.error_message.is_some());
+        // First: verify non-AlreadyRunning errors DO set Error state. This is the ONLY step
+        // that opens a live audio subsystem — on a truly headless host (no CoreAudio/ALSA
+        // backend) `start_capture(SystemOnly)` can BLOCK inside cpal instead of returning, the
+        // documented S1-S3 hang. Gate JUST this probe behind YAPSTACK_AUDIO_DEVICE_TESTS so a
+        // headless `cargo test --all` never touches a device, while the pure state-machine
+        // assertions below (the real subject of this test) always run. Set the env to 1 to
+        // exercise the live-device error path on a machine with audio hardware.
+        if std::env::var_os("YAPSTACK_AUDIO_DEVICE_TESTS").is_some() {
+            let result = manager.start_capture(CaptureSource::SystemOnly, None);
+            if result.is_err() {
+                // On a host without system audio this fails with a real error.
+                let status = manager.status();
+                assert_eq!(status.state, CaptureState::Error);
+                assert!(status.error_message.is_some());
+            }
         }
 
         // Reset to Capturing state to test AlreadyRunning guard
@@ -1875,7 +1883,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "windows", ignore)] // WASAPI COM cleanup crashes on CI
+    #[ignore] // Opens a live audio subsystem: gate behind `--ignored` (or
+              // YAPSTACK_AUDIO_DEVICE_TESTS) so a headless `cargo test --all` never blocks
+              // inside cpal on a host with no CoreAudio/ALSA backend (the S1-S3 hang).
     fn test_start_capture_failure_sets_error_state() {
         // On macOS CI, SystemOnly will fail because there's no output device.
         // This verifies end-to-end that start_capture sets error state.

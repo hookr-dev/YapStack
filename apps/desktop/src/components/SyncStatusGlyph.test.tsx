@@ -43,6 +43,7 @@ function baseStatus(over: Partial<SyncStatus> = {}): SyncStatus {
     ackedThisSession: 0,
     lastSuccess: null,
     pullBehind: 0,
+    cryptoQuarantined: 0,
     audioUploadOutstanding: 0,
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,
@@ -180,6 +181,19 @@ describe("SyncStatusGlyph — icon + tone per state", () => {
     const icon = container.querySelector(".lucide-cloud-off");
     expect(icon).toBeTruthy();
     expect(icon).toHaveClass("text-amber-600");
+  });
+
+  it("caught-up WITH unreadable changesets → CloudAlert, amber, never animates (the FINDING)", async () => {
+    // §11.3 crypto-quarantine honesty: a caught-up device with undecryptable peer changesets
+    // must render the amber cloud-alert warning, NEVER the plain-green CloudCheck.
+    seed({ status: baseStatus({ phase: "connected", pendingEntries: 0, cryptoQuarantined: 2 }) });
+    const { container } = await renderSettled();
+    const icon = container.querySelector(".lucide-cloud-alert");
+    expect(icon).toBeTruthy();
+    expect(icon).toHaveClass("text-amber-600");
+    expect(icon).not.toHaveClass("animate-spin");
+    // Categorically not the green up-to-date glyph.
+    expect(container.querySelector(".lucide-cloud-check")).toBeNull();
   });
 
   it("error → CloudAlert, destructive, never animates", async () => {

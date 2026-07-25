@@ -1007,6 +1007,25 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN recording_device_id TEXT;
         "#,
         },
+        Migration {
+            version: 17,
+            description: "chat_context_settings table (per-chat-context Profile override)",
+            // Folds the former frontend-only runtime CREATE (lib/db.ts) into the
+            // migration list so a fresh DB gets the table from the ordered migrations
+            // rather than the idempotent getDb() bootstrap. `profile_id` NULL means
+            // "use the live default Chat Assignment"; a non-null row is an explicit
+            // per-context override. CREATE TABLE IF NOT EXISTS keeps it idempotent and
+            // harmless on any DB that already has the table (dev DBs whose
+            // `_sqlx_migrations` history is misaligned still carry the db.ts copy — the
+            // db.ts CREATE stays as a belt-and-suspenders no-op for exactly that case).
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS chat_context_settings (
+                context_key TEXT PRIMARY KEY,
+                profile_id  TEXT NULL,
+                updated_at  TEXT NOT NULL
+            );
+        "#,
+        },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
         // local dev DBs picked up a "ghost" v11 entry from another branch
@@ -1028,7 +1047,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=16).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=17).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1088,8 +1107,8 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            16,
-            "v1-v16; segments.speaker_id is patched at runtime by the frontend's getDb()"
+            17,
+            "v1-v17; segments.speaker_id is patched at runtime by the frontend's getDb()"
         );
     }
 
@@ -1135,6 +1154,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(owner, None, "new column defaults NULL (pre-attribution)");
+    }
+
+    #[test]
+    fn test_migration_v17_creates_chat_context_settings() {
+        let m = migrations();
+        let v17 = &m[16];
+        assert_eq!(v17.version, 17);
+        assert!(v17
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS chat_context_settings"));
+        // Apply the whole chain and confirm the table materializes with the right shape.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        conn.execute(
+            "INSERT INTO chat_context_settings (context_key, profile_id, updated_at) \
+             VALUES ('ctx-a', NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let pid: Option<String> = conn
+            .query_row(
+                "SELECT profile_id FROM chat_context_settings WHERE context_key = 'ctx-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid, None, "NULL profile_id means 'use the live default'");
+        // Idempotent: re-running the v17 CREATE IF NOT EXISTS is a clean no-op.
+        conn.execute_batch(v17.sql).unwrap();
     }
 
     #[test]

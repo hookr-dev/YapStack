@@ -238,6 +238,16 @@ export function SyncTab() {
         <SyncStatusLine status={syncStatus} display={display} />
       )}
 
+      {/* Item 1 — persistent crypto-quarantine warning. Peer writes this device pulled but
+          could not decrypt; NON-dismissable (a potential tamper signal), with a Retry that
+          re-attempts once the key epoch is reconciled. Hidden while the count is 0. */}
+      {signedIn && syncEnabled && syncStatus && (
+        <CryptoQuarantineWarning
+          status={syncStatus}
+          onRetried={() => void refreshSyncStatus()}
+        />
+      )}
+
       {/* Audio backup lane — DISTINCT from changeset sync (S2). Only shown once
           enabled and when there is something to report. */}
       {signedIn && syncEnabled && syncStatus && (
@@ -498,7 +508,9 @@ function SyncStatusLine({
       <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
     ) : display.state === "error" ? (
       <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
-    ) : display.state === "auth-expired" || display.state === "unreachable" ? (
+    ) : display.state === "auth-expired" ||
+      display.state === "unreachable" ||
+      display.state === "quarantined" ? (
       <ShieldAlert className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
     ) : (
       <ShieldCheck className="h-3.5 w-3.5 text-primary" />
@@ -604,6 +616,77 @@ function AudioBackupCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Item 1 — persistent crypto-quarantine warning row. Surfaces `cryptoQuarantined` (peer
+ * changesets this device pulled but could not decrypt/decode). NON-dismissable: it stays until
+ * every quarantined changeset is recovered, because a non-zero count is a potential
+ * tamper/corruption signal that must never be silently hidden or auto-dismissed. Retry
+ * re-attempts decryption under the CURRENT key epoch (the key-epoch recovery seam). Shown
+ * independently of "up to date" — a caught-up device can still carry unreadable changesets.
+ * Hidden only when the count is 0.
+ */
+function CryptoQuarantineWarning({
+  status,
+  onRetried,
+}: {
+  status: SyncStatus;
+  onRetried: () => void;
+}) {
+  const [retrying, setRetrying] = useState(false);
+  const n = Math.max(0, status.cryptoQuarantined ?? 0);
+  if (n === 0) return null;
+
+  const handleRetry = async () => {
+    setRetrying(true);
+    try {
+      const recovered = await syncCommands.retryCryptoQuarantine();
+      toast.success(
+        recovered > 0
+          ? `Recovered ${recovered} changeset${recovered === 1 ? "" : "s"}.`
+          : "Still unreadable — the key for these changes has not arrived yet.",
+      );
+      onRetried();
+    } catch (e) {
+      // Surface verbatim — never auto-route.
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const noun = n === 1 ? "changeset" : "changesets";
+  return (
+    <Alert variant="destructive">
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>
+        {n} unreadable {noun}
+      </AlertTitle>
+      <AlertDescription className="space-y-2">
+        <p>
+          {n === 1 ? "A change" : `${n} changes`} synced from your other devices
+          could not be decrypted on this device. This can happen when a device's
+          key has not been reconciled yet — or, rarely, if data was tampered with
+          in transit. It is kept safely and never dropped. Retry once every device
+          is approved.
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={handleRetry}
+          disabled={retrying}
+        >
+          {retrying ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" />
+          )}
+          Retry
+        </Button>
+      </AlertDescription>
+    </Alert>
   );
 }
 

@@ -141,6 +141,14 @@ export interface SyncStatus {
    *  up or the tip is unknown). Drives the "catching up (N to go)" copy. A device is
    *  "up to date" only when this is 0 AND `pendingEntries` is 0. */
   pullBehind: number;
+  /** Item 1: DURABLE count of crypto-quarantined changesets — peer writes this device
+   *  pulled but could not decrypt/decode (corruption, tampering, or a not-yet-arrived key
+   *  epoch). Non-zero drives a persistent, non-dismissable warning row with a Retry
+   *  affordance, shown INDEPENDENTLY of "up to date" (a caught-up device can still carry
+   *  unreadable changesets). A potential tamper signal — never auto-dismissed. Optional so a
+   *  legacy status snapshot (or a synthesized error-fallback state) reads as 0 via `?? 0`
+   *  rather than forcing every SyncStatus producer to set it. */
+  cryptoQuarantined?: number;
   /** S2 — audio-upload lane, DISTINCT from changeset sync. Recordings still to
    *  seal+upload across both priorities (0 == every local recording is backed up). */
   audioUploadOutstanding: number;
@@ -230,12 +238,27 @@ export const syncCommands = {
   retryFailedAudioUploads: (): Promise<number> =>
     invoke("audio_retry_failed_uploads"),
 
+  /** Item 1 manual-retry for the crypto-quarantine warning: re-attempt decryption of every
+   *  quarantined changeset under the current vault key + epoch (key-epoch recovery). Recovered
+   *  changesets merge and leave the quarantine; corrupt/tampered ones stay flagged. Resolves
+   *  with the number recovered. */
+  retryCryptoQuarantine: (): Promise<number> =>
+    invoke("sync_retry_crypto_quarantine"),
+
   /** S3 fetch-on-demand: resolve a missing part in D2 order (cache → fetch), joining the
    *  single in-flight download (one per part; concurrent views coalesce). Poll this while a
    *  track is fetching; it returns progress or a terminal state. `NotOnServer` stays the
-   *  honest "audio is on <device>" case. */
-  prepareAudioPart: (partId: string): Promise<AudioPartPrepare> =>
-    invoke("audio_prepare_part", { partId }),
+   *  honest "audio is on <device>" case. `highPriority` (session view = true) puts the part
+   *  in the queue's HIGH class ahead of background dictation prefetches, and promotes an
+   *  already-queued normal part in place. */
+  prepareAudioPart: (
+    partId: string,
+    opts?: { highPriority?: boolean },
+  ): Promise<AudioPartPrepare> =>
+    invoke("audio_prepare_part", {
+      partId,
+      highPriority: opts?.highPriority ?? false,
+    }),
 
   /** S3: cancel an in-flight fetch AND reset the part's slot (also the retry seam — a
    *  subsequent `prepareAudioPart` starts a fresh download). */
@@ -284,6 +307,9 @@ export type AudioPartPrepare =
   | { state: "queued" }
   | { state: "not_on_server" }
   | { state: "unreachable" }
+  // The relay rejected the bearer mid-fetch (401). Self-healing: the drain refreshes the
+  // token and the cleared slot makes the next re-probe a real re-attempt.
+  | { state: "auth_expired" }
   // The cache volume positively reported insufficient space; `needed` = clean-disk budget.
   | { state: "no_space"; needed: number }
   | { state: "verification_failed" }
@@ -310,6 +336,7 @@ export type TrackFetch =
   | { kind: "queued" } // admitted, no part started yet (global cap busy)
   | { kind: "on_device" } // at least one part has no server copy — can't assemble YET (auto re-probed)
   | { kind: "unreachable" } // can't reach the sync server
+  | { kind: "auth_expired" } // bearer rejected mid-fetch; re-probed until the drain refreshes it
   | { kind: "no_space"; needed: number } // disk precheck: not enough space on the cache volume
   | { kind: "verification_failed" } // a part failed to decrypt/verify (tamper signal)
   | { kind: "error"; message: string };
@@ -317,13 +344,15 @@ export type TrackFetch =
 /**
  * Reduce the per-part prepare states (of the MISSING parts only, in part_index order —
  * locally-present parts are excluded by the caller) into one track state. Precedence puts
- * the states that BLOCK assembly first: verification failure → unreachable → no_space →
- * generic error → still fetching → queued → any part with no server copy (`on_device`).
- * `on_device` ranks BELOW fetching/queued (auto-fetch S3.5): a part the server lacks is
- * re-probed on a slow cadence while the rest keep downloading, and the fetch self-starts
- * when the source device's upload lands — so mid-download progress stays the honest
- * headline. An empty input means nothing is missing, i.e. `ready`. Pure so the player and
- * its tests share one source of truth.
+ * the states that BLOCK assembly first: verification failure → unreachable → auth_expired →
+ * no_space → generic error → still fetching → queued → any part with no server copy
+ * (`on_device`). `auth_expired` sits below unreachable (connectivity outranks a stale
+ * credential) and above the generic error (it has its own self-healing copy). `on_device`
+ * ranks BELOW fetching/queued (auto-fetch S3.5): a part the server lacks is re-probed on a
+ * slow cadence while the rest keep downloading, and the fetch self-starts when the source
+ * device's upload lands — so mid-download progress stays the honest headline. An empty
+ * input means nothing is missing, i.e. `ready`. Pure so the player and its tests share one
+ * source of truth.
  */
 export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
   if (parts.length === 0) return { kind: "ready" };
@@ -331,6 +360,7 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
     return { kind: "verification_failed" };
   }
   if (parts.some((p) => p.state === "unreachable")) return { kind: "unreachable" };
+  if (parts.some((p) => p.state === "auth_expired")) return { kind: "auth_expired" };
   const noSpace = parts.find((p) => p.state === "no_space");
   if (noSpace && noSpace.state === "no_space") {
     return { kind: "no_space", needed: noSpace.needed };
@@ -398,14 +428,20 @@ export function formatNoSpace(needed: number): string {
   return `Not enough disk space (need ~${formatBytes(needed)})`;
 }
 
-/** Slow cadence for re-probing a track the server doesn't (fully) hold yet. */
+/** Slow cadence for re-probing a track the server doesn't (fully) hold yet — also the
+ *  auth-expired "reconnecting" cadence (the drain refreshes the bearer on its own). */
 export const ON_DEVICE_REPROBE_MS = 30_000;
+
+/** The auth-expired bar/toast copy — self-healing, no user action required. */
+export const AUTH_EXPIRED_FETCH_COPY = "Sync session expired — reconnecting…";
 
 /**
  * Poll scheduling for the auto-fetch effect: fast (600ms) while anything is downloading or
  * waiting for a permit, slow (30s) while the server lacks a blob (still-uploading re-probe —
- * the fetch self-starts when the upload lands), and stop (`null`) on ready + the terminals
- * that need a user action (retry / free space). Pure so the cadence is unit-testable.
+ * the fetch self-starts when the upload lands) or while the bearer is expired (each re-probe
+ * re-attempts with the freshly-persisted token once the drain refreshes it), and stop
+ * (`null`) on ready + the terminals that need a user action (retry / free space /
+ * verification). Pure so the cadence is unit-testable.
  */
 export function nextPollDelayMs(track: TrackFetch): number | null {
   switch (track.kind) {
@@ -413,6 +449,7 @@ export function nextPollDelayMs(track: TrackFetch): number | null {
     case "queued":
       return 600;
     case "on_device":
+    case "auth_expired":
       return ON_DEVICE_REPROBE_MS;
     default:
       return null;

@@ -42,6 +42,7 @@ function disconnectedStatus(): SyncStatus {
     ackedThisSession: 0,
     lastSuccess: null,
     pullBehind: 0,
+    cryptoQuarantined: 0,
     audioUploadOutstanding: 0,
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,

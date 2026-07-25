@@ -11,7 +11,13 @@ import {
   type DbDictationHistory,
 } from "@/lib/db";
 import { markdownToBasicHtml } from "@/lib/ai";
-import { deriveTrackFetch, syncCommands, type TrackFetch } from "@/lib/sync";
+import {
+  deriveTrackFetch,
+  syncCommands,
+  AUTH_EXPIRED_FETCH_COPY,
+  ON_DEVICE_REPROBE_MS,
+  type TrackFetch,
+} from "@/lib/sync";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -126,6 +132,20 @@ export function useDictationEntry(entry: DbDictationHistory) {
           await sleep(600);
           continue;
         }
+        // Quiet-mode 30s re-probe (parity with the session view): while the entry stays
+        // open and the server lacks the blob (or the bearer is expired — the drain
+        // refreshes it on its own), keep re-probing on the slow cadence so the fetch
+        // self-starts once the upload/refresh lands. Toasts stay suppressed; the wait is
+        // stateless (fetchState null) and the abort flag at the loop top ends it on
+        // unmount/cancel.
+        if (
+          opts.quiet &&
+          (track.kind === "on_device" || track.kind === "auth_expired")
+        ) {
+          setFetchState(null);
+          await sleep(ON_DEVICE_REPROBE_MS);
+          continue;
+        }
         // Terminal, non-ready: honest toast (explicit path), never silent — the quiet
         // auto-prefetch leaves the terminal on fetchState instead.
         if (!opts.quiet) {
@@ -134,14 +154,15 @@ export function useDictationEntry(entry: DbDictationHistory) {
               ? "Audio isn't backed up to sync yet"
               : track.kind === "unreachable"
                 ? "Can't reach sync server"
-                : track.kind === "verification_failed"
-                  ? "Audio failed verification"
-                  : track.kind === "no_space"
-                    ? "Not enough disk space to fetch audio"
-                    : "Couldn't fetch audio from sync",
+                : track.kind === "auth_expired"
+                  ? AUTH_EXPIRED_FETCH_COPY
+                  : track.kind === "verification_failed"
+                    ? "Audio failed verification"
+                    : track.kind === "no_space"
+                      ? "Not enough disk space to fetch audio"
+                      : "Couldn't fetch audio from sync",
           );
         }
-        if (opts.quiet && track.kind === "on_device") setFetchState(null);
         return;
       }
     },
