@@ -33,7 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hound = { workspace = true }
 whisper-rs = { version = "0.15", optional = true }
-parakeet-rs = { version = "=0.3.5", optional = true, features = ["sortformer"] }
+parakeet-rs = { version = "=0.3.6", optional = true, features = ["sortformer"] }
 # Must stay version-pinned to what parakeet-rs pins, or the SessionBuilder
 # types passed through with_custom_configure won't unify. Feature-light on
 # purpose: the ort features we need (webgpu) arrive via feature unification
