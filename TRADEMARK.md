@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # YapStack Trademark Policy
 
-> **STATUS: DRAFT — PENDING HUMAN LEGAL READ.** This policy MUST be reviewed by
-> counsel before the pull request that introduces it is merged, and trademark
-> registration for "YapStack" (and defensively "YapStack Cloud") is filed in parallel
-> (ENTITLEMENTS_SEAM.md decision 10 / open items). This text is not legal advice.
+> **STATUS: RATIFIED.** Ratified by the project owner (2026-07-27) as the project's
+> intended policy (ENTITLEMENTS_SEAM.md decision 10). This text is not legal advice;
+> independent counsel review is recommended — and trademark registration for
+> "YapStack" (and defensively "YapStack Cloud") should be filed — before launching a
+> commercial hosted service.
 
 The YapStack **source code** is free software under [`AGPL-3.0-only`](LICENSE). The
 **"YapStack" name, logo, and associated marks** are a separate matter: the code is

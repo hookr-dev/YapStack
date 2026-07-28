@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # YapStack Licensing & Covenant
 
-> **STATUS: DRAFT — PENDING HUMAN LEGAL READ.** This covenant and the accompanying
-> `TRADEMARK.md` and `DCO` MUST be reviewed by counsel before the pull request that
-> introduces them is merged (ENTITLEMENTS_SEAM.md decision 10 / open items). The text
-> below states intended policy; it is not legal advice and is not yet ratified.
+> **STATUS: RATIFIED.** Ratified by the project owner (2026-07-27) as the project's
+> intended policy, together with the accompanying `TRADEMARK.md` and `DCO`
+> (ENTITLEMENTS_SEAM.md decision 10). This document is not legal advice; independent
+> counsel review is recommended before launching a commercial hosted service or
+> filing trademark registration.
 
 YapStack is **free and open-source software licensed under
 [`AGPL-3.0-only`](LICENSE)**. Every crate and package in this repository inherits that
