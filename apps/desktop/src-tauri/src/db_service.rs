@@ -694,6 +694,38 @@ pub fn open_managed(path: &Path) -> rusqlite::Result<ManagedConn> {
     ManagedConn::open(path)
 }
 
+/// How many characters of statement text a failure log line carries.
+/// Enough for the verb + target table (`UPDATE segments SET deleted_at = …`),
+/// which is all a bug hunt needs to identify the failing call site.
+const SQL_LOG_PREVIEW_CHARS: usize = 40;
+
+/// Whitespace-collapsed leading slice of a statement, for failure logs.
+///
+/// **SQL TEXT ONLY.** Bound parameter values are NEVER logged: they carry user
+/// content (transcript text, note titles, folder names) and the subscriber's PII
+/// contract forbids it (see `logging.rs`). Every statement this backend serves is
+/// a literal in `db.ts` with `$N` placeholders, so the text itself is static.
+fn sql_preview(sql: &str) -> String {
+    // Collapse runs of whitespace, stopping one word PAST the budget so the
+    // truncation marker below is only added when there really was more. Bounded
+    // by the budget, so this stays O(budget) rather than O(statement).
+    let mut collapsed = String::with_capacity(SQL_LOG_PREVIEW_CHARS + 8);
+    for word in sql.split_whitespace() {
+        if collapsed.chars().count() > SQL_LOG_PREVIEW_CHARS {
+            break;
+        }
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+    if let Some((cut, _)) = collapsed.char_indices().nth(SQL_LOG_PREVIEW_CHARS) {
+        collapsed.truncate(cut);
+        collapsed.push('…');
+    }
+    collapsed
+}
+
 /// `db.execute(sql, params)` — write path. Rejects on SQL error so the
 /// frontend's `.catch()` on idempotent runtime patches keeps working.
 #[tauri::command]
@@ -703,11 +735,25 @@ pub async fn db_execute(
     query: String,
     values: Vec<JsonValue>,
 ) -> Result<DbExecuteResult, String> {
+    // Computed before `query` moves into the blocking closure. Cheap (bounded to
+    // ~40 chars) and unconditional so a failure is never silent.
+    let preview = sql_preview(&query);
     let svc = service.inner().clone();
     let result = tokio::task::spawn_blocking(move || svc.execute(&query, &values))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string());
+    // Honest errors: the command's `Err` string used to be the ONLY record of a
+    // failed write — the frontend swallowed it into a generic toast and nothing
+    // reached the rolling log. Log it here, at the layer that still has the
+    // statement and the connection role.
+    if let Err(ref message) = result {
+        tracing::warn!(
+            role = "writer",
+            sql = %preview,
+            "db_execute failed: {message}"
+        );
+    }
     // Local-write kick (SSE-latency deliverable 2): a committed local write nudges the sync
     // drain to run a push-capturing cycle promptly (debounced). No-op when sync is off or no
     // drain is running; never affects the command's result.
@@ -726,11 +772,20 @@ pub async fn db_select(
     query: String,
     values: Vec<JsonValue>,
 ) -> Result<Vec<DbRow>, String> {
+    let preview = sql_preview(&query);
     let svc = service.inner().clone();
-    tokio::task::spawn_blocking(move || svc.select(&query, &values))
+    let result = tokio::task::spawn_blocking(move || svc.select(&query, &values))
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if let Err(ref message) = result {
+        tracing::warn!(
+            role = "reader",
+            sql = %preview,
+            "db_select failed: {message}"
+        );
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1197,5 +1252,48 @@ mod tests {
         svc.reopen().unwrap();
         let rows = svc.select("SELECT id FROM sessions", &[]).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// The failure-log preview keeps the leading verb + target table, collapses the
+    /// multi-line formatting `db.ts` writes its statements in, and truncates.
+    #[test]
+    fn sql_preview_keeps_verb_and_target_and_truncates() {
+        let sql = "UPDATE segments\n     SET original_text = CASE WHEN original_text IS NULL \
+                   THEN text ELSE original_text END,\n         text = $1\n     WHERE id = $2";
+        let preview = sql_preview(sql);
+        assert!(
+            preview.starts_with("UPDATE segments SET original_text"),
+            "verb + target must survive: {preview}"
+        );
+        assert!(
+            preview.ends_with('…'),
+            "long statement must be marked truncated"
+        );
+        assert_eq!(
+            preview.chars().count(),
+            SQL_LOG_PREVIEW_CHARS + 1,
+            "budget + the ellipsis marker"
+        );
+    }
+
+    /// A short statement is logged whole, with no truncation marker.
+    #[test]
+    fn sql_preview_passes_short_statements_through() {
+        assert_eq!(sql_preview("SELECT 1"), "SELECT 1");
+        assert_eq!(sql_preview("  DELETE FROM   tags\n"), "DELETE FROM tags");
+        assert_eq!(sql_preview(""), "");
+    }
+
+    /// PII guard: the preview is derived from statement TEXT only. Bound values are
+    /// never passed to it, and a `$N` placeholder is all that ever reaches the log —
+    /// this pins the property that user content cannot leak through this seam.
+    #[test]
+    fn sql_preview_carries_placeholders_not_values() {
+        let preview = sql_preview("UPDATE segments SET text = $1 WHERE id = $2");
+        assert!(preview.contains("$1"), "placeholder is kept: {preview}");
+        assert!(
+            !preview.contains("secret"),
+            "nothing but the statement text is in scope"
+        );
     }
 }

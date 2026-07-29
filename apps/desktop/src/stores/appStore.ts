@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import { listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/tauri";
 import { commandErrorMessage } from "@/lib/command-error";
+import { log } from "@/lib/logger";
 
 /** Backend event fired by the sync drain after it merges peer changes (R6 item 2). */
 const SYNC_APPLIED_EVENT = "sync://applied";
@@ -696,6 +697,54 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
 }
 
 /**
+ * How much of the underlying error we put in a toast. Long enough for a real
+ * SQLite message ("UNIQUE constraint failed: segments.id", "database is
+ * locked", "no such column: hidden") without turning the toast into a wall.
+ */
+const DB_ERROR_TOAST_DETAIL_MAX = 120;
+
+/**
+ * Record a failed DB operation and hand back its message.
+ *
+ * Every store action that touches the DB used to end in
+ * `console.error(...) + toast.error("Failed to …")`, which threw away the one
+ * thing a support session needs: WHY. Two seams, deliberately both:
+ *   - `console.error` keeps the raw value (stack, cause) in devtools;
+ *   - `log.error(..., "db")` forwards a scoped line to the Rust `tracing`
+ *     subscriber, so it lands in the rolling daily log file and the LogsPanel
+ *     even when devtools was never opened — which is the case on a user's
+ *     machine. Same seam `db.ts`'s runtime-schema patcher already uses.
+ *
+ * PII contract: log the operation name and the error only. Never the row
+ * content being written (transcript text, note titles).
+ */
+function logDbFailure(op: string, error: unknown): string {
+  const detail = commandErrorMessage(error);
+  console.error(`${op} failed:`, error);
+  log.error(`${op} failed: ${detail}`, "db");
+  return detail;
+}
+
+/**
+ * [`logDbFailure`] plus an honest toast: the user-facing sentence with the
+ * underlying error appended, so a screenshot alone is diagnosable.
+ * `options` passes through to sonner (e.g. a dedupe `id` on hot paths).
+ */
+function reportDbFailure(
+  op: string,
+  userMessage: string,
+  error: unknown,
+  options?: { id: string },
+): void {
+  const detail = logDbFailure(op, error);
+  const shown =
+    detail.length > DB_ERROR_TOAST_DETAIL_MAX
+      ? `${detail.slice(0, DB_ERROR_TOAST_DETAIL_MAX - 1)}…`
+      : detail;
+  toast.error(shown ? `${userMessage}: ${shown}` : userMessage, options);
+}
+
+/**
  * Cleans up audio files given a pre-fetched list of part paths. Caller
  * must read the paths *before* dropping the session row, since the
  * cascade on `sessions` delete also nukes `session_audio_parts`. Falls
@@ -1086,8 +1135,12 @@ function createAppStore() {
               );
               return;
             }
-            console.error("Failed to persist live segment:", e);
-            toast.error("Failed to save transcript segment", { id: "segment-write-error" });
+            reportDbFailure(
+              "onLiveSegment/persist",
+              "Failed to save transcript segment",
+              e,
+              { id: "segment-write-error" },
+            );
           }
         });
       },
@@ -1412,7 +1465,13 @@ function createAppStore() {
           return;
         }
 
-        const session = await getSession(sessionId).catch(() => null);
+        // A null here has two very different causes — no such row (legitimate)
+        // vs. the read itself failing. Log the failing case so the generic
+        // "Could not load session." below is diagnosable.
+        const session = await getSession(sessionId).catch((e) => {
+          logDbFailure("resumeSession/getSession", e);
+          return null;
+        });
         if (!session) {
           toast.error("Could not load session.");
           return;
@@ -1575,8 +1634,7 @@ function createAppStore() {
             viewSessionParts: parts,
           });
         } catch (e) {
-          console.error("Failed to open session:", e);
-          toast.error("Failed to open session");
+          reportDbFailure("openSession", "Failed to open session", e);
         }
       },
 
@@ -1624,8 +1682,7 @@ function createAppStore() {
             set({ sessions, sessionFolderMap: restMap, sessionTagMap: restTagMap });
           }
         } catch (e) {
-          console.error("Failed to delete session:", e);
-          toast.error("Failed to delete session");
+          reportDbFailure("deleteSession", "Failed to delete session", e);
         }
       },
 
@@ -1644,8 +1701,11 @@ function createAppStore() {
             if (row) set({ viewSession: row });
           }
         } catch (e) {
-          console.error("Failed to mark session completed:", e);
-          toast.error("Failed to mark session completed");
+          reportDbFailure(
+            "markSessionCompleted",
+            "Failed to mark session completed",
+            e,
+          );
         }
       },
 
@@ -2466,8 +2526,7 @@ function createAppStore() {
             viewSessionSegments: [],
           });
         } catch (e) {
-          console.error("Failed to clear all sessions:", e);
-          toast.error("Failed to clear sessions");
+          reportDbFailure("clearAllSessions", "Failed to clear sessions", e);
         }
       },
 
@@ -2480,8 +2539,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to create folder:", e);
-          toast.error("Failed to create folder");
+          reportDbFailure("createFolder", "Failed to create folder", e);
         }
       },
 
@@ -2491,8 +2549,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to update folder:", e);
-          toast.error("Failed to update folder");
+          reportDbFailure("updateFolder", "Failed to update folder", e);
         }
       },
 
@@ -2508,8 +2565,7 @@ function createAppStore() {
           set({ folders, listFilter: newFilter, ...deriveFolderState(folders) });
           await get().loadSessionFolders();
         } catch (e) {
-          console.error("Failed to delete folder:", e);
-          toast.error("Failed to delete folder");
+          reportDbFailure("deleteFolder", "Failed to delete folder", e);
         }
       },
 
@@ -2519,8 +2575,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to move folder:", e);
-          toast.error("Failed to move folder");
+          reportDbFailure("moveFolder", "Failed to move folder", e);
         }
       },
 
@@ -2550,8 +2605,7 @@ function createAppStore() {
           const freshFolders = await listFolders();
           set({ folders: freshFolders, ...deriveFolderState(freshFolders) });
         } catch (e) {
-          console.error("Failed to reorder folders:", e);
-          toast.error("Failed to reorder folders");
+          reportDbFailure("reorderFolders", "Failed to reorder folders", e);
         }
       },
 
@@ -2564,8 +2618,7 @@ function createAppStore() {
           const sessions = await listSessions();
           set({ sessions });
         } catch (e) {
-          console.error("Failed to toggle pin:", e);
-          toast.error("Failed to toggle pin");
+          reportDbFailure("togglePin", "Failed to toggle pin", e);
         }
       },
 
@@ -2585,8 +2638,7 @@ function createAppStore() {
           const name = get().folders.find(f => f.id === folderId)?.name ?? "folder";
           toast.success(isRemoving ? `Removed from ${name}` : `Added to ${name}`);
         } catch (e) {
-          console.error("Failed to toggle session folder:", e);
-          toast.error("Failed to update folder");
+          reportDbFailure("toggleSessionFolder", "Failed to update folder", e);
         }
       },
 
@@ -2600,8 +2652,7 @@ function createAppStore() {
           const name = get().folders.find(f => f.id === folderId)?.name ?? "folder";
           toast.success(`Added to ${name}`);
         } catch (e) {
-          console.error("Failed to add session to folder:", e);
-          toast.error("Failed to add to folder");
+          reportDbFailure("addSessionToFolder", "Failed to add to folder", e);
         }
       },
 
@@ -2612,8 +2663,11 @@ function createAppStore() {
           set({ sessionFolderMap: restMap });
           toast.success("Removed from all folders");
         } catch (e) {
-          console.error("Failed to remove from folders:", e);
-          toast.error("Failed to remove from folders");
+          reportDbFailure(
+            "removeSessionFromAllFolders",
+            "Failed to remove from folders",
+            e,
+          );
         }
       },
 
@@ -2626,8 +2680,7 @@ function createAppStore() {
           await dbUpdateSegmentText(segmentId, newText);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to edit segment:", e);
-          toast.error("Failed to edit segment");
+          reportDbFailure("editSegmentText", "Failed to edit segment", e);
         } finally {
           if (get().editingSegmentId === segmentId) {
             set({ editingSegmentId: null });
@@ -2640,8 +2693,7 @@ function createAppStore() {
           await dbSoftDeleteSegment(segmentId);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to delete segment:", e);
-          toast.error("Failed to delete segment");
+          reportDbFailure("deleteSegment", "Failed to delete segment", e);
         }
       },
 
@@ -2650,8 +2702,11 @@ function createAppStore() {
           await dbToggleSegmentHidden(segmentId);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to toggle segment visibility:", e);
-          toast.error("Failed to toggle segment visibility");
+          reportDbFailure(
+            "toggleSegmentHidden",
+            "Failed to toggle segment visibility",
+            e,
+          );
         }
       },
 
@@ -2736,8 +2791,7 @@ function createAppStore() {
           });
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to delete segments:", e);
-          toast.error("Failed to delete segments");
+          reportDbFailure("deleteSegments", "Failed to delete segments", e);
         }
       },
 
@@ -2747,8 +2801,11 @@ function createAppStore() {
           await dbSetSegmentsHidden(ids, hidden);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to update segment visibility:", e);
-          toast.error("Failed to update segment visibility");
+          reportDbFailure(
+            "setSegmentsHidden",
+            "Failed to update segment visibility",
+            e,
+          );
         }
       },
 
@@ -2770,7 +2827,11 @@ function createAppStore() {
             set({ viewSessionSegments: segments });
           }
         } catch (e) {
-          console.error("Failed to refresh segments:", e);
+          // Log-only by design: this runs after a successful write, so the row
+          // IS updated and a second toast would be misleading. It still must
+          // reach the file log — a silent failure here looks exactly like "the
+          // edit did nothing" to the user.
+          logDbFailure("refreshViewSessionSegments", e);
         }
       },
 
@@ -2859,8 +2920,11 @@ function createAppStore() {
           await dbDeleteDictationHistoryEntry(id);
           set({ dictationHistory: get().dictationHistory.filter((h) => h.id !== id) });
         } catch (e) {
-          console.error("Failed to delete dictation history entry:", e);
-          toast.error("Failed to delete entry");
+          reportDbFailure(
+            "deleteDictationHistoryEntry",
+            "Failed to delete entry",
+            e,
+          );
         }
       },
 
@@ -2887,8 +2951,7 @@ function createAppStore() {
           await dbClearDictationHistory();
           set({ dictationHistory: [] });
         } catch (e) {
-          console.error("Failed to clear dictation history:", e);
-          toast.error("Failed to clear history");
+          reportDbFailure("clearDictationHistory", "Failed to clear history", e);
         }
       },
 
@@ -2946,8 +3009,7 @@ function createAppStore() {
             viewSessionSegments: [],
           });
         } catch (e) {
-          console.error("Failed to create manual note:", e);
-          toast.error("Failed to create note");
+          reportDbFailure("createManualNote", "Failed to create note", e);
         }
       },
     }),
