@@ -1641,10 +1641,36 @@ fn prepare_library_for_sync(live_db: &Path) -> Result<PathBuf, String> {
     // CRR-tracked (not absent), so a peer joining via snapshot never quarantines
     // speaker_id / chat_messages column changes. Idempotent (schema.rs:329,332).
     schema::apply_out_of_band_alters(conn).map_err(|e| format!("apply_out_of_band_alters: {e}"))?;
+    // Trigger-arity self-heal (see the drain seam for the full rationale). A snapshot
+    // freshly CRRified above cannot be stale, so this is defence in depth only — it
+    // costs one sqlite_master read + one pragma per table when everything is healthy.
+    heal_crr_trigger_arity(conn);
     cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
     uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
     mark_prepared(conn).map_err(|e| e.to_string())?;
     Ok(sync_db)
+}
+
+/// Repair any CRR table whose cr-sqlite triggers drifted out of arity with its column
+/// list, logging the outcome. Detect-then-heal: on a healthy DB this is a couple of
+/// catalog reads per table and heals nothing.
+///
+/// NON-FATAL by construction. A failure here leaves exactly the pre-existing behaviour
+/// (direct UPDATEs on the affected table keep failing) rather than blocking sync
+/// startup or aborting a cutover — but it is logged at `error` so it is never silent.
+/// Every caller passes a connection with the crsql extension loaded and holding no
+/// other open transaction, which is what the begin/commit_alter dance requires.
+fn heal_crr_trigger_arity(conn: &Connection) {
+    match schema::heal_stale_crr_triggers(conn) {
+        Ok(healed) if healed.is_empty() => {}
+        Ok(healed) => tracing::warn!(
+            "sync: rebuilt stale cr-sqlite trigger machinery for {} table(s): {} \
+             (direct UPDATEs on them were failing with an arity error)",
+            healed.len(),
+            healed.join(", ")
+        ),
+        Err(e) => tracing::error!("sync: crsql trigger-arity self-heal failed: {e}"),
+    }
 }
 
 fn ensure_prep_table(conn: &Connection) -> rusqlite::Result<()> {
@@ -2209,6 +2235,10 @@ fn cutover_with_fault(
         // long-lived DB that already carries the columns is skipped (schema.rs:329,332).
         schema::apply_out_of_band_alters(conn)
             .map_err(|e| format!("apply_out_of_band_alters: {e}"))?;
+        // Trigger-arity self-heal (see the drain seam for the full rationale). The
+        // staging copy was just CRRified at its current shape so nothing should be
+        // stale here; run it anyway so the cutover can never HAND OFF a broken table.
+        heal_crr_trigger_arity(conn);
         cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
         uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
         mark_prepared(conn).map_err(|e| e.to_string())?;
@@ -3297,6 +3327,18 @@ fn spawn_drain(
                 // rather than aborting the drain. Log loudly so it is not silent.
                 tracing::error!("sync drain: out-of-band alter self-heal failed: {e}");
             }
+            // Boot-time TRIGGER-ARITY self-heal, immediately after the column self-heal
+            // above and for the same reason: a device CRR-prepared by an older build can
+            // carry a column that was added by a BARE `ALTER TABLE ... ADD COLUMN` (the
+            // frontend did that before the db.ts CRR gate landed) instead of through the
+            // crsql alter dance. cr-sqlite accepts the bare ALTER but does not regenerate
+            // the AFTER UPDATE trigger, so the trigger keeps passing the OLD column list
+            // while `crsql_after_update` expects the NEW one — every direct UPDATE then
+            // dies with "expected N values, got M" (the owner's segment edit / soft-delete
+            // / hide failure). `apply_out_of_band_alters` cannot fix it: it skips columns
+            // that already exist. This pass detects the drift and rebuilds the machinery
+            // for the CURRENT shape, with no schema change and no sync-state reset.
+            heal_crr_trigger_arity(conn);
             let cipher = ChangesetCipher::new(
                 vault_key,
                 epoch,
@@ -6209,6 +6251,151 @@ mod tests {
             n > 0,
             "post-cutover write must be captured by crsql_changes"
         );
+    }
+
+    /// LIVE BUG (owner, Windows): `Failed to delete segment: expected 29 values got 27`.
+    /// End-to-end at the seam that actually failed — the app's OWN db_service pool, not a
+    /// synthetic connection. A device that cut over at the 13-column `segments` shape and
+    /// then took a BARE `ALTER TABLE segments ADD COLUMN speaker_id` (what the frontend did
+    /// before the db.ts CRR gate landed) has a frozen 13-column AFTER UPDATE trigger while
+    /// `crsql_after_update` expects the 14-column arity: every segment edit / soft-delete /
+    /// hide dies, while INSERT and sync keep working. `apply_out_of_band_alters` cannot fix
+    /// it — the column already exists, so it is skipped. `heal_crr_trigger_arity` — the pass
+    /// the drain runs at every boot — must repair it with zero manual steps.
+    #[test]
+    fn boot_heal_repairs_stale_trigger_arity_from_a_bare_alter() {
+        let (_dir, path, svc) = migration_chain_fixture(true);
+        perform_cutover(&path, &svc).expect("cutover");
+        // Reconstruct the OLD-BUILD state: `segments` CRRified at the 13-column shape with
+        // a matching 13-column trigger. We get there by rolling `speaker_id` back THROUGH
+        // the dance (so the machinery stays self-consistent, exactly as it was on that
+        // build) rather than hand-writing a trigger.
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            schema::crsql_alter(
+                db.conn(),
+                "segments",
+                "ALTER TABLE segments DROP COLUMN speaker_id",
+            )
+            .expect("roll the column back through the dance");
+            assert!(!schema::crr_triggers_are_stale(db.conn(), "segments").unwrap());
+            let cols: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('segments')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cols, 13, "old-build shape: 13-column segments");
+        }
+        // Let the pool's WRITER connection observe the rolled-back shape before we bare-ALTER
+        // through it. SQLite caches the schema per connection and only reloads on a
+        // SQLITE_SCHEMA re-prepare; a `duplicate column name` parse error is raised against
+        // the STALE cache and does not trigger that reload, so without this the ALTER below
+        // would spuriously fail in the test. (Not a production concern: this window only
+        // exists because the test mutates the schema behind the live pool's back.)
+        svc.execute("UPDATE segments SET text = text WHERE id = 'g1'", &[])
+            .expect("the rolled-back 13-column shape is self-consistent");
+
+        // The pre-gate frontend ALTER: lands the column OUTSIDE the crsql alter dance.
+        svc.execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER", &[])
+            .unwrap();
+
+        // The owner's symptom, through the app's own connection.
+        let err = svc
+            .execute("UPDATE segments SET text = 'edited' WHERE id = 'g1'", &[])
+            .expect_err("segment edit must fail on the stale-arity trigger");
+        assert!(
+            err.to_string().contains("expected 29 values, got 27"),
+            "expected the owner's verbatim arity error, got: {err}"
+        );
+        // ...while inserts still work (their trigger passes PK values only).
+        svc.execute(
+            "INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+             VALUES ('g5','s1','Mic','still inserting',2,1)",
+            &[],
+        )
+        .expect("INSERT is unaffected");
+
+        // The boot self-heal, exactly as the drain runs it on its own CRR connection.
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            let conn = db.conn();
+            schema::apply_out_of_band_alters(conn).expect("column self-heal (skips speaker_id)");
+            assert!(
+                schema::crr_triggers_are_stale(conn, "segments").unwrap(),
+                "the column pass alone cannot repair the trigger"
+            );
+            heal_crr_trigger_arity(conn);
+            assert!(!schema::crr_triggers_are_stale(conn, "segments").unwrap());
+        }
+
+        // All three right-click actions work again through the app's pool, and the writes
+        // are captured as local changes for the drain to push.
+        svc.execute("UPDATE segments SET text = 'edited' WHERE id = 'g1'", &[])
+            .expect("edit");
+        svc.execute(
+            "UPDATE segments SET deleted_at = datetime('now') WHERE id = 'g1'",
+            &[],
+        )
+        .expect("soft-delete");
+        svc.execute("UPDATE segments SET hidden = 1 WHERE id = 'g5'", &[])
+            .expect("hide");
+        let rows = svc
+            .select("SELECT text FROM segments WHERE id = 'g1'", &[])
+            .unwrap();
+        assert_eq!(rows[0]["text"], serde_json::json!("edited"));
+
+        let db = CrsqlDb::open(&path).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\"='segments' AND cid='hidden'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n > 0, "post-heal UPDATEs must be captured by crsql_changes");
+    }
+
+    /// The same pass on a HEALTHY device (Mac-shaped: cut over at the full 14-column
+    /// shape) heals nothing and leaves sync state — site id, db_version, watermarks —
+    /// untouched, so it can run unconditionally at every boot.
+    #[test]
+    fn boot_heal_is_inert_on_a_healthy_device() {
+        let (_dir, path, svc) = migration_chain_fixture(true);
+        perform_cutover(&path, &svc).expect("cutover at the 14-column shape");
+
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        let site: Vec<u8> = conn
+            .query_row("SELECT crsql_site_id()", [], |r| r.get(0))
+            .unwrap();
+        let version: i64 = conn
+            .query_row("SELECT crsql_db_version()", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(
+            schema::heal_stale_crr_triggers(conn).unwrap().is_empty(),
+            "a healthy device must have nothing to heal"
+        );
+        heal_crr_trigger_arity(conn);
+
+        assert_eq!(
+            conn.query_row("SELECT crsql_site_id()", [], |r| r.get::<_, Vec<u8>>(0))
+                .unwrap(),
+            site
+        );
+        assert_eq!(
+            conn.query_row("SELECT crsql_db_version()", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(state::push_watermark(conn).unwrap(), 0);
+        drop(db);
+        svc.execute("UPDATE segments SET text = 'fine' WHERE id = 'g1'", &[])
+            .expect("edits keep working on a healthy device");
     }
 
     #[test]

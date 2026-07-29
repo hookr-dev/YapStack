@@ -658,9 +658,13 @@ async audioRetryFailedUploads() : Promise<Result<number, string>> {
 },
 /**
  * Item 1 manual retry seam for the Sync panel's crypto-quarantine warning row. Re-attempts
- * decryption of EVERY quarantined changeset under the CURRENT vault key + epoch (key-epoch
- * recovery). Recovered changesets merge and leave the quarantine; corrupt/tampered ones stay
- * flagged. Returns the number recovered. No-op when sync is disabled.
+ * decryption of EVERY quarantined changeset under the CURRENT vault key + epoch — the
+ * key-epoch recovery path: a device that pulled peer writes before its key was reconciled can
+ * drain the "unreadable" backlog once the right key arrives. Recovered changesets merge (their
+ * original clock intact, so cr-sqlite LWW converges) and leave the quarantine; genuinely
+ * corrupt/tampered ones stay flagged as a durable tamper signal, never dropped. Opens the LIVE
+ * CRR DB (same DB the drain quarantines into) with the CRR engine registered so the recovered
+ * merges apply. Returns the number recovered. No-op when sync is disabled.
  */
 async syncRetryCryptoQuarantine() : Promise<Result<number, string>> {
     try {
@@ -688,10 +692,14 @@ async audioEnqueueDictation(dictationId: string) : Promise<Result<number, string
 /**
  * S3 fetch-on-demand entry point (polled per missing part). Resolves D2 order, joins the
  * single in-flight fetch (starting it on the first call), and returns the current state.
+ * `high_priority` (default false) puts the part in the queue's HIGH class — the session
+ * view the user is looking at passes true so its ordered parts start ahead of queued
+ * background dictation prefetches; a poll of an already-QUEUED normal part with
+ * `high_priority` promotes it in place (FETCH POLISH item 5).
  */
-async audioPreparePart(partId: string) : Promise<Result<AudioPreparePartDto, string>> {
+async audioPreparePart(partId: string, highPriority: boolean | null) : Promise<Result<AudioPreparePartDto, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("audio_prepare_part", { partId }) };
+    return { status: "ok", data: await TAURI_INVOKE("audio_prepare_part", { partId, highPriority }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -830,8 +838,17 @@ export type AudioPreparePartDto =
  */
 { state: "unreachable" } |
 /**
+ * The relay rejected the bearer (HTTP 401) mid-fetch. Distinct from a generic error:
+ * the drain refreshes the token on its own cycle, so the player shows "Sync session
+ * expired — reconnecting…" and simply re-probes; the slot is cleared so the re-probe
+ * re-attempts with the freshly-persisted bearer (self-healing, no user action).
+ */
+{ state: "auth_expired" } |
+/**
  * The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
- * fetch worker). Distinct copy: "audio failed verification".
+ * fetch worker). Distinct copy: "audio failed verification". Sticky until the user
+ * explicitly retries (the bar's Retry clears the slot via `audio_cancel_part`) — a
+ * tamper signal must never auto-retry.
  */
 { state: "verification_failed" } |
 /**

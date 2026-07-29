@@ -39,6 +39,40 @@ APIs newer than the pinned nightly toolchain.
   pass that pointer across the FFI boundary. Interior-NUL names (impossible for
   real SQL identifiers) are rejected with a clear error instead of truncating.
 
+## Investigated — NO patch needed
+
+### `crsql_commit_alter` DOES regenerate the update trigger (2026-07-29)
+
+Investigated while root-causing the live `expected 29 values, got 27` failure on
+every direct `UPDATE segments` (owner's Windows device). Suspicion was that
+`crsql_commit_alter` had failed to recreate `segments__crsql_utrig` at the new
+column arity. It does not fail. Verified end-to-end by
+`crates/yapstack-sync/tests/trigger_arity.rs::wrapped_alter_leaves_triggers_consistent`,
+and traceable in this tree:
+
+- `core/rs/core/src/lib.rs:645` — `crsql_begin_alter` drops the three crsql
+  triggers (`teardown.rs:21-55`), so `is_crr` (`is_crr.rs:10-26`, which probes
+  `<table>__crsql_itrig`) reports **false** inside the dance.
+- `core/rs/core/src/lib.rs:689-707` — `crsql_commit_alter` then runs
+  `crsql_compact_post_alter` and `crsql_create_crr`.
+- `core/rs/core/src/create_crr.rs:25-37` — because `is_crr` is false, the early
+  return is skipped; `pull_table_info` re-reads the CURRENT shape and
+  `create_triggers` (`triggers.rs:12-20`) re-emits all three triggers. The
+  `CREATE TRIGGER IF NOT EXISTS` in `triggers.rs` is safe precisely because
+  `begin_alter` dropped them first.
+
+The real fault was OUR side: a bare `ALTER TABLE … ADD COLUMN` outside the dance
+(cr-sqlite accepts it) changes the live shape without regenerating the trigger,
+while `x_crsql_after_update` (`local_writes/after_update.rs:43-56`) re-derives the
+expected arity from the live shape at call time. Repaired in
+`yapstack_sync::schema::heal_stale_crr_triggers`, which re-runs the dance with no
+schema change. Two vendor facts make that repair state-preserving and are pinned
+by tests: the clock/pks tables are `CREATE TABLE IF NOT EXISTS`
+(`bootstrap.rs:195-235`) and are only dropped when the PK set changed
+(`alter.rs:65-71`); and the post-alter backfill stamps new clock rows with
+`crsql_db_version()`, not `crsql_next_db_version()` (`backfill.rs:107-117`), so it
+never bumps `db_version`.
+
 ## Regression coverage
 
 The R7-branch tests
