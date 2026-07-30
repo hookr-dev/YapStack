@@ -138,6 +138,7 @@ import {
   trackEngineError,
   trackSettingChanged,
   trackSessionMovedToFolder,
+  setAnalyticsEnabled,
 } from "@/lib/analytics";
 
 export type ThemeMode = "light" | "dark" | "system";
@@ -342,6 +343,10 @@ export interface Settings {
   /** Live insights — overlay-driven LLM extractions on a cadence trigger. */
   insights: InsightsSettings;
   showRecordingIndicator: boolean;
+  /// Opt out of anonymous usage analytics. Default true (ON), matching the
+  /// behavior before the toggle existed. Device-local by design: consent is
+  /// per-machine and must never travel over sync (sync-policy.ts).
+  analyticsEnabled: boolean;
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
   /// Restored as soon as recording ends. Only ever lowers — never raises.
@@ -802,6 +807,7 @@ const defaultSettings: Settings = {
   dictation: DEFAULT_DICTATION_SETTINGS,
   insights: DEFAULT_INSIGHTS_SETTINGS,
   showRecordingIndicator: true,
+  analyticsEnabled: true,
   dictationDuckEnabled: false,
   dictationDuckAmount: 0.8,
   onboarding: { completedFlows: {} },
@@ -2436,6 +2442,14 @@ function createAppStore() {
           settings: { ...state.settings, ...partial },
         }));
 
+        // Apply the analytics gate BEFORE the tracked-key loop below: switching the
+        // toggle OFF must not itself emit a `setting_changed` event on its way out.
+        // (`analyticsEnabled` is deliberately absent from `trackedKeys` — YapStack
+        // sends no telemetry about the telemetry preference in either direction.)
+        if (partial.analyticsEnabled !== undefined) {
+          setAnalyticsEnabled(partial.analyticsEnabled);
+        }
+
         const trackedKeys = [
           "captureSource", "theme", "language", "silenceDurationMs",
           "maxChunkSeconds", "promptContextChars",
@@ -3060,6 +3074,15 @@ function createAppStore() {
             ...(p.syncConfig ?? {}),
           },
         };
+      },
+      // Push the persisted analytics choice into the emit gate the moment settings
+      // are back. Storage is the default (synchronous) localStorage, so this runs
+      // during store creation at import time — long before `useAutoSetup` can fire
+      // `app_launched`, which is the earliest event in the app. No `analyticsEnabled`
+      // key in persisted state (upgrade from before the toggle) deep-merges to the
+      // default `true`, i.e. behavior is unchanged for existing users.
+      onRehydrateStorage: () => (state) => {
+        setAnalyticsEnabled(state?.settings.analyticsEnabled ?? true);
       },
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as { settings?: Record<string, unknown> };

@@ -7,6 +7,7 @@ import {
   formatFingerprint,
   isValidRecoveryCode,
   isValidServerUrl,
+  isCommandNotFound,
   formatSyncProgress,
   formatCatchingUp,
   formatBytes,
@@ -120,6 +121,43 @@ describe("formatCatchingUp", () => {
   it("falls back to plain phrasing for a non-positive count", () => {
     expect(formatCatchingUp(0)).toBe("Syncing — catching up");
     expect(formatCatchingUp(-5)).toBe("Syncing — catching up");
+  });
+});
+
+describe("isCommandNotFound", () => {
+  it("matches Tauri's exact unregistered-command rejection for that command", () => {
+    // The literal shape tauri 2.11 rejects with (src/webview/mod.rs) when no
+    // invoke handler claims the message: a plain string, not an Error.
+    expect(isCommandNotFound("Command sync_status not found", "sync_status")).toBe(true);
+    // Tolerates an Error wrapper without loosening the message test.
+    expect(
+      isCommandNotFound(new Error("Command sync_status not found"), "sync_status"),
+    ).toBe(true);
+  });
+
+  it("does not match a different command's absence", () => {
+    expect(isCommandNotFound("Command sync_probe not found", "sync_status")).toBe(false);
+  });
+
+  it("does not match real errors raised by a registered command", () => {
+    for (const real of [
+      "relay unreachable: connection refused",
+      "sync_status failed: keychain entry not found",
+      "Command failed: not found",
+      "not found",
+      "Command sync_status not found (device offline)",
+      "",
+    ]) {
+      expect(isCommandNotFound(real, "sync_status")).toBe(false);
+    }
+  });
+
+  it("returns false for non-string, non-Error values", () => {
+    expect(isCommandNotFound(null, "sync_status")).toBe(false);
+    expect(isCommandNotFound(undefined, "sync_status")).toBe(false);
+    expect(isCommandNotFound({ message: "Command sync_status not found" }, "sync_status")).toBe(
+      false,
+    );
   });
 });
 

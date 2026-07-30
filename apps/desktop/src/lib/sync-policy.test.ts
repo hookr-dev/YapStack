@@ -37,6 +37,12 @@ describe("SETTINGS_SYNC_POLICY", () => {
     expect(classifySettingField("theme")).toBe("device-local");
     expect(classifySettingField("selectedEngine")).toBe("device-local");
   });
+  it("classifies analytics consent as device-local — consent never travels", () => {
+    // One device opting out must not opt the other one out (or back in) via sync.
+    expect(classifySettingField("analyticsEnabled")).toBe("device-local");
+    expect(isSyncableField("analyticsEnabled")).toBe(false);
+  });
+
   it("classifies user prefs as synced", () => {
     expect(classifySettingField("speakerNames")).toBe("synced");
     expect(classifySettingField("language")).toBe("synced");

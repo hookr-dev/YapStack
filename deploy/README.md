@@ -8,8 +8,9 @@ proxy/TLS, two-device onboarding); read that first. This file covers the day-two
 operational notes: **keeping the host awake**, the **port/env knobs**, and a **one-glance
 backup note**.
 
-The relay is a **blind store** — ciphertext + opaque metadata only, no CRDT engine, zero
-outbound calls, no admin key. Self-host always resolves to the maximum tier (`AllowAll`).
+The relay is a **blind store** — ciphertext + opaque metadata only, no CRDT engine, no
+outbound calls except to your own storage/database, no admin key. Self-host always
+resolves to the maximum tier (`AllowAll`).
 
 ## Start / stop / status
 
@@ -69,7 +70,10 @@ deliberately **no `[limits]` section and no admin key**.
 | `MINIO_PUBLIC_ENDPOINT` | `http://localhost:9000` | Public URL baked into presigned audio/snapshot URLs — set to your TLS storage hostname behind a proxy. |
 | `MINIO_ENDPOINT` | `http://minio:9000` | In-network endpoint the server signs against. |
 | `MINIO_BUCKET` | `yapstack` | Bucket holding encrypted audio + bootstrap snapshots. |
-| `DATABASE_URL` | owner DSN | Postgres connection; point at the non-owner `yapstack_app` role to harden (see self-hosting doc). |
+| `DATABASE_URL` | owner DSN | Postgres connection. Unset = the owner DSN compose builds from `POSTGRES_*`; set it in `.env` to serve as the non-owner `yapstack_app` role (see self-hosting doc). |
+| `YAPSTACK_GC_ENABLED` | `true` | Audio-blob GC master switch (`1`/`true`/`on` vs `0`/`false`/`off`). |
+| `YAPSTACK_GC_INTERVAL_SECS` | `86400` | Seconds between GC sweeps (one also runs shortly after boot). |
+| `YAPSTACK_GC_GRACE_SECS` | `604800` | How long a blob must be unreferenced before GC may delete it. |
 | `JWT_SECRET` | *required* | Signs session tokens. `openssl rand -hex 32`. |
 | `SERVER_PEPPER` | *required* | Auth-verifier pepper. `openssl rand -hex 32`. |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | *required* | Postgres owner credentials + database name. |

@@ -40,6 +40,9 @@ export const SETTINGS_SYNC_POLICY: Record<keyof Settings, FieldSyncClass> = {
   sidebarCollapsed: "device-local",
   theme: "device-local",
   showRecordingIndicator: "device-local",
+  // Analytics consent is per-machine: one device opting out must never silently
+  // opt the other one out (or in) via sync.
+  analyticsEnabled: "device-local",
   dictationDuckEnabled: "device-local",
   dictationDuckAmount: "device-local",
   audioSaveLocation: "device-local",

@@ -80,9 +80,10 @@ services:
       # The entrypoint renders yapstack-relay.toml from these before exec'ing the server.
       YAPSTACK_BIND_ADDR: ${YAPSTACK_BIND_ADDR:-0.0.0.0:8080}
       # Default: connect as the DB owner (FORCE RLS still isolates it). To harden, run
-      # migrations once as the owner then point this at the non-owner yapstack_app role
-      # (docs/self-hosting.md).
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # migrations once as the owner then set DATABASE_URL in .env to the non-owner
+      # yapstack_app DSN (docs/self-hosting.md) — overridable here so that hardening is
+      # a .env edit, never a compose edit.
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       SERVER_PEPPER: ${SERVER_PEPPER:?set SERVER_PEPPER in .env}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
@@ -91,6 +92,13 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-yapstack}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Audio-blob GC. Read straight from the process environment by
+      # GcConfig::resolved (crates/yapstack-server/src/config.rs) — the entrypoint
+      # writes no [gc] TOML section, so these ARE the knobs. Defaults below mirror
+      # the Rust defaults exactly; a malformed value is ignored (default stands).
+      YAPSTACK_GC_ENABLED: ${YAPSTACK_GC_ENABLED:-true}
+      YAPSTACK_GC_INTERVAL_SECS: ${YAPSTACK_GC_INTERVAL_SECS:-86400}
+      YAPSTACK_GC_GRACE_SECS: ${YAPSTACK_GC_GRACE_SECS:-604800}
     ports:
       - "${YAPSTACK_HTTP_PORT:-8080}:8080"
     healthcheck:

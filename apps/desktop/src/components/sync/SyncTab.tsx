@@ -42,6 +42,7 @@ import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   syncCommands,
+  isCommandNotFound,
   shouldShowUpgrade,
   formatFingerprint,
   formatBytes,
@@ -150,6 +151,50 @@ export function SyncTab() {
   const pendingDevices = (syncStatus?.roster ?? []).filter(
     (d) => d.pending && !d.isSelf,
   );
+
+  // A build compiled WITHOUT the `sync` cargo feature registers none of the
+  // `sync_*` commands, so the mount status call above rejects with Tauri's exact
+  // "Command sync_status not found" (which `refreshSyncStatus` parks in
+  // `lastError`). Every control below would be a dead end, so say so plainly
+  // instead. Official releases DO ship sync; this is the custom-build case.
+  const syncFeatureMissing =
+    syncStatus?.phase === "error" &&
+    isCommandNotFound(syncStatus.lastError, "sync_status");
+
+  if (syncFeatureMissing) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <CloudOff className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold">YapStack Sync</h3>
+          <Badge variant="outline" className="text-[10px]">
+            Not in this build
+          </Badge>
+        </div>
+        <Card className={CARD}>
+          <CardHeader className={HEAD}>
+            <CardTitle className="text-sm">
+              Sync isn’t included in this build
+            </CardTitle>
+            <CardDescription className="text-xs">
+              This copy of YapStack was compiled without the optional sync
+              feature, so there is nothing to set up here — everything you
+              record stays on this device. Official releases include sync. To
+              build it yourself, compile with{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[10px]">
+                --features sync
+              </code>{" "}
+              and point it at your own relay: see{" "}
+              <span className="font-medium text-foreground">
+                docs/self-hosting.md
+              </span>
+              .
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">

@@ -30,7 +30,7 @@ Honesty first — the exact list:
 
 | When | What goes where |
 |---|---|
-| **Normal use** | Nothing content-related, ever. Audio, transcripts, and notes are processed and stored locally. Official builds send anonymous usage analytics ([Aptabase](https://aptabase.com): feature-usage counts, app version, OS, locale — never audio, transcripts, notes, or user identifiers; there is currently no in-app toggle, and builds compiled without the analytics key send none). The app also checks the release feed for updates and downloads transcription models from Hugging Face on first use. |
+| **Normal use** | Nothing content-related, ever. Audio, transcripts, and notes are processed and stored locally. Official builds send anonymous usage analytics ([Aptabase](https://aptabase.com): feature-usage counts, app version, OS, locale — never audio, transcripts, notes, or user identifiers; can be disabled in Settings → General, and builds compiled without the analytics key send none). The app also checks the release feed for updates and downloads transcription models from Hugging Face on first use. |
 | **AI features (optional)** | If you connect a cloud AI provider, the text you send it goes to that provider. Point it at a local model ([llama.cpp, LM Studio, Ollama](docs/LOCAL_LLM.md)) and nothing leaves. |
 | **Sync (optional, off by default)** | Encrypted changesets and encrypted audio go to the relay **you** run. See the table below for exactly what that relay can and cannot see. |
 
@@ -75,7 +75,7 @@ Sync is **off by default** — at build time (a compile feature) *and* at runtim
 
 New devices join via an explicit fingerprint-verification ceremony approved from an already-trusted device. Audio syncs as encrypted blobs and is fetched on demand. Losing both your password **and** your recovery code makes your synced data unrecoverable — by design; there is no server-side reset.
 
-> **Status**: sync is not yet included in official release builds — it currently requires building with the `sync` feature. See [`docs/self-hosting.md`](docs/self-hosting.md) to run the relay and [`docs/CRYPTO_SPEC.md`](docs/CRYPTO_SPEC.md) for the full cryptographic design.
+> **Status**: official releases include sync going forward; releases published before this documentation landed were built without it (build from source with `--features sync` if you're on one). See [`docs/self-hosting.md`](docs/self-hosting.md) to run the relay and [`docs/CRYPTO_SPEC.md`](docs/CRYPTO_SPEC.md) for the full cryptographic design.
 
 ## The covenant
 

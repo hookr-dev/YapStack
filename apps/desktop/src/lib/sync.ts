@@ -185,6 +185,28 @@ export interface LoginBeginResult {
 
 // ----- IPC boundary (implemented by the Rust `sync` feature) -----
 
+/**
+ * True when `err` is Tauri's rejection for an IPC command that is NOT REGISTERED in
+ * this build — i.e. the whole `sync` cargo feature was compiled out, so none of the
+ * `sync_*` commands exist.
+ *
+ * Error shape (verified against tauri 2.11, `src/webview/mod.rs`): when no invoke
+ * handler claims the message, Tauri rejects the promise with the plain STRING
+ * `Command <name> not found` — not an Error subclass, no code, no structured payload.
+ * (The generated `generate_handler!` match returns `false` for an unknown command and
+ * that fallback formats the message.)
+ *
+ * Matching is FULL EQUALITY against the specific command name, deliberately: a real
+ * failure raised *by* a registered command can never be mistaken for "feature absent",
+ * which is what a substring or /not found/ test would risk. `err` may arrive already
+ * stringified (the store keeps `lastError` as a string), hence `unknown`.
+ */
+export function isCommandNotFound(err: unknown, command: string): boolean {
+  const msg =
+    typeof err === "string" ? err : err instanceof Error ? err.message : "";
+  return msg === `Command ${command} not found`;
+}
+
 export const syncCommands = {
   /** Typed relay probe (T025): reachability / TLS / not-a-relay are distinct classes and a
    *  version gap is advisory metadata on success. Normalizes the URL, enforces a 5s budget,

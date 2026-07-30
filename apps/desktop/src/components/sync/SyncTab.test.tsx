@@ -94,6 +94,56 @@ function setup({
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
 
+describe("SyncTab — build without the sync feature", () => {
+  /** What `refreshSyncStatus` parks in the store when `sync_status` is not a
+   *  registered command: phase "error" + Tauri's verbatim rejection string. */
+  const missing = () =>
+    makeStatus({
+      phase: "error",
+      email: null,
+      syncEnabled: false,
+      roster: [],
+      lastError: "Command sync_status not found",
+    });
+
+  it("renders the not-in-this-build placeholder instead of the dead controls", () => {
+    setup({ status: missing() });
+    render(<SyncTab />);
+    expect(screen.getByText("Sync isn’t included in this build")).toBeInTheDocument();
+    expect(screen.getByText("docs/self-hosting.md")).toBeInTheDocument();
+    expect(screen.getByText("--features sync")).toBeInTheDocument();
+    // None of the sync controls (all of which would fail) are rendered.
+    expect(screen.queryByText("Relay server")).not.toBeInTheDocument();
+    expect(screen.queryByText("Account")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
+    // Not surfaced as a "Connection problem" — the relay is not the issue.
+    expect(screen.queryByText("Connection problem")).not.toBeInTheDocument();
+  });
+
+  it("keeps the real UI (and the verbatim error) for an actual status failure", () => {
+    setup({
+      status: makeStatus({
+        phase: "error",
+        email: null,
+        syncEnabled: false,
+        roster: [],
+        lastError: "relay unreachable: connection refused",
+      }),
+    });
+    render(<SyncTab />);
+    expect(
+      screen.queryByText("Sync isn’t included in this build"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Relay server")).toBeInTheDocument();
+    expect(screen.getByText("Connection problem")).toBeInTheDocument();
+    expect(
+      screen.getByText("relay unreachable: connection refused"),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("SyncTab", () => {
   it("signed-out shows only the Relay + Account cards", () => {
     setup();
