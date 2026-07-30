@@ -46,10 +46,11 @@ plan name, or price is hardcoded in this repository.
 
 ## 4. Zero phone-home
 
-A self-hosted relay makes **zero outbound network calls**. It does not check in, does
-not fetch entitlements, does not report telemetry, and cannot be remotely disabled.
-Limits are **pushed in** to the relay's own database by the operator's control plane;
-the relay never reaches out.
+A self-hosted relay makes **no outbound network calls except to the object storage
+and database the operator configures** (its own infrastructure). It does not check
+in, does not fetch entitlements, does not report telemetry, and cannot be remotely
+disabled. Limits are **pushed in** to the relay's own database by the operator's
+control plane; the relay never reaches out.
 
 ## 5. No removal of shipped open-source surface
 

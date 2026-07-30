@@ -1,14 +1,16 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Self-hosting the YapStack sync relay
 
-YapStack sync is **end-to-end encrypted** (architecture "World B"). The relay is a
-**blind store**: it holds only ciphertext and opaque metadata, runs no CRDT engine,
-decrypts nothing, and makes **zero outbound calls**. There is **no admin key** and **no
-feature gating** in a self-host deployment — self-host is always the maximum tier
-(entitlements resolve to `AllowAll`). This is licensed **AGPL-3.0-only**; a fork of the
-server (or any crate) must share back under AGPL.
+YapStack sync is **end-to-end encrypted**. The relay is a **blind store**: it holds
+only ciphertext and opaque metadata, runs no CRDT engine, decrypts nothing, and its
+only outbound calls are to the object storage and database **you** configure (one
+metadata-only HEAD per upload check; no telemetry, no check-ins, no kill switch).
+There is **no admin key** and **no feature gating** in a self-host deployment —
+self-host is always the maximum tier (entitlements resolve to `AllowAll`). This is
+licensed **AGPL-3.0-only**; a fork of the server (or any crate) must share back under
+AGPL.
 
-The stack is three containers wired by one `.env`:
+The stack is four containers (one is a one-shot bucket initializer) wired by one `.env`:
 
 | Service | Role |
 |---|---|
@@ -119,18 +121,19 @@ matching MinIO objects (or vice-versa) is inconsistent.
 All backups are **already encrypted** at the content layer, but still store them
 securely: they contain the wrapped vault keys and auth verifiers.
 
-## Two-device onboarding (owner's real path)
+## Two-device onboarding
 
-When two devices already hold independently-populated libraries, do **not** let both
-CRRify-and-merge — that is silently lossy. Pick one device to **seed** (the one with the
-primary/largest DB) and let the other **join**:
+Enabling sync on each device is the same single flow: **Settings → Sync → enable**.
+Every device captures its local library and merges what the relay holds. Because all
+synced records use random unique IDs, two **independently-grown** libraries merge as a
+lossless union — nothing is overwritten.
 
-1. **Seed** publishes an encrypted DB **snapshot** (R2) — one compact artifact instead of
-   replaying hundreds of thousands of per-cell changes.
-2. **Join** re-bootstraps from that snapshot into a fresh base, then **reconciles** its
-   own local-only rows into it with app-level dedup. Rows unique to the joining device
-   are preserved; genuinely ambiguous collisions are **surfaced for review**, never
-   silently dropped.
+**One rule: never copy a YapStack library between machines by hand** (e.g. copying the
+database file to a second computer) and then sync both. Two copies of the *same*
+library edited on both sides share record IDs, and the merge resolves each conflicting
+field to one winner — the loser's edit is dropped silently. Sign the second machine in
+and let sync populate it instead.
 
-The desktop app drives this from **Settings → Sync** (seed vs join). Review any surfaced
-collisions after a join before deleting the old local database.
+A snapshot-based **seed/join** flow (compact bootstrap for very large libraries, with
+surfaced conflict review) is designed and partially built but **not yet available in
+the app** — current builds always use the capture-and-merge path above.

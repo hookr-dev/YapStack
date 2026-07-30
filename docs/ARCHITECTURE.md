@@ -2,7 +2,7 @@
 
 ## Overview
 
-YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a sidecar process that supports two engines as first-class peers: **Whisper** (whisper-rs, 99 languages) and **NVIDIA Parakeet TDT v3** (parakeet-rs + ONNX Runtime, 25 European languages, optional Sortformer speaker diarization). The user picks the engine in Settings; the sidecar is spawned with `--engine whisper|parakeet` and dispatches IPC requests through a `TranscriptionBackend` trait so adding a third engine is one feature flag plus one impl. Sessions and segments are persisted to SQLite via `tauri-plugin-sql`.
+YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a sidecar process that supports two engines as first-class peers: **Whisper** (whisper-rs, 99 languages) and **NVIDIA Parakeet TDT v3** (parakeet-rs + ONNX Runtime, 25 European languages, optional Sortformer speaker diarization). The user picks the engine in Settings; the sidecar is spawned with `--engine whisper|parakeet` and dispatches IPC requests through a `TranscriptionBackend` trait so adding a third engine is one feature flag plus one impl. Sessions and segments are persisted to SQLite through a repo-owned command layer (`db_service`, single writer + reader pool); when the optional `sync` feature is enabled the same database is CRDT-tracked (cr-sqlite) and synchronized end-to-end-encrypted through a self-hosted blind relay — see `CRYPTO_SPEC.md` for the cryptographic design and `self-hosting.md` for running the relay.
 
 ## Workspace Layout
 
@@ -13,7 +13,11 @@ yapstack/
 │   ├── yapstack-common/           # Shared types, config, IPC protocol
 │   ├── yapstack-audio/            # Audio capture, ring buffers, mixing, WAV export
 │   ├── yapstack-transcription/    # Model management, sidecar client
-│   └── yapstack-transcription-sidecar/          # Standalone binary for Whisper transcription
+│   ├── yapstack-transcription-sidecar/  # Standalone Whisper/Parakeet inference binary
+│   ├── yapstack-crypto/           # E2E primitives: AEAD envelopes, KDFs, roster signing, KATs
+│   ├── yapstack-sync/             # Sync engine: CRDT capture/merge, outbox, audio blobs, transport
+│   ├── yapstack-server/           # Self-hostable blind relay (axum + Postgres + MinIO)
+│   └── yapstack-entitlements/     # Typed quantitative limits (Limit::Unlimited | Max) + admin contract
 ├── apps/
 │   └── desktop/
 │       ├── src/                # React frontend

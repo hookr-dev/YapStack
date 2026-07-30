@@ -22,14 +22,14 @@ docker compose logs -f server
 curl -s http://localhost:8080/health   # {"status":"ok"}
 ```
 
-## Keep the host awake (the July-17 incident)
+## Keep the host awake
 
 The relay is only reachable while its host machine is **actually running**. On a Mac
 serving as an always-on relay this bites in a specific way: closing the lid
 (**clamshell**) or letting the machine idle into sleep **suspends Docker and drops every
 in-flight connection** — clients then show "relay unreachable" even though nothing is
-misconfigured. This is exactly what took the relay down on **July 17**: the host went to
-sleep on lid-close overnight and sync silently stalled until morning.
+misconfigured. A host that sleeps on lid-close will silently stall sync for every
+device until it wakes.
 
 A relay host must be configured to **never sleep**:
 

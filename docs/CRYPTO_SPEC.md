@@ -1,21 +1,21 @@
-# YapStack Cryptography Specification (World B, v1)
+# YapStack Cryptography Specification (v1)
 
 > **Status:** Normative. This is the single source of truth for all cryptographic
 > primitives, parameters, byte layouts, and known-answer test (KAT) vectors used
-> by YapStack sync. **Gate 2 of `sync-backend-v1`: no server, sync-runtime, or
-> share-viewer code may be written before this document exists.**
+> by YapStack sync. No server, sync-runtime, or share-viewer code may be written
+> against constructions not specified here.
 >
 > **Scope:** One spec, two stacks. The Rust desktop client (`crates/yapstack-sync`,
-> `apps/desktop/src-tauri`) and the JS/WASM share-viewer (`apps/share-viewer`)
-> **MUST** implement byte-for-byte identical constructions and **MUST** pass the
-> KAT vectors in §13 in CI. Divergence = shares/audio/changesets that do not
-> decrypt cross-platform, which is a release blocker.
+> `apps/desktop/src-tauri`) implements this today and **MUST** pass the KAT vectors
+> in §13 in CI. The JS/WASM share-viewer (planned; not yet in-tree) **MUST**
+> implement byte-for-byte identical constructions and reproduce the same vectors
+> before it ships — divergence means shares/audio/changesets that do not decrypt
+> cross-platform, which is a release blocker.
 >
-> **Authority:** Implements `YAPSTACK_SYNC_ARCHITECTURE.md` §4 (key management),
-> §7a (changeset exchange), §8 (shares), §9 (audio). Enforces the locked security
-> defaults in `docs/goals/sync-backend-v1/goal.md`. All choices below were fixed by
-> prior adversarial review; they are normative and **MUST NOT** be relitigated in
-> implementation without a new review round.
+> **Authority:** All choices below were fixed by prior adversarial review; they are
+> normative and **MUST NOT** be relitigated in implementation without a new review
+> round. Sections marked LOCKED additionally require a spec amendment (with its own
+> review) before any change.
 >
 > **Keywords** MUST / MUST NOT / SHOULD / MAY are RFC 2119.
 
@@ -1020,13 +1020,15 @@ open: recompute okm from K_root+nonce, constant-time check commitment, AEAD-open
 > `okm`/`commitment`/`k_aead` depend only on `(K_root, nonce)`, so C1 does not move
 > them; only `ct||tag` changes because the AAD now leads with the version byte.
 
-### 13.6 Ed25519 device-list signature — TO BE GENERATED in CI bring-up (T007)
+### 13.6 Ed25519 device-list signature — Rust roundtrip in CI; pinned vector deferred
 
-> Not fabricated. The signing seed derivation (§7.2), canonical roster encoding
-> (§7.3), and Ed25519 sign/verify KAT (seed → pubkey, message → signature) **MUST**
-> be added as a fixed-input vector during T007 CI bring-up, cross-checked between
-> `ed25519-dalek` (Rust) and `@noble/curves` (JS). Deterministic Ed25519 (RFC 8032)
-> makes this a stable KAT.
+> The signing seed derivation (§7.2), canonical roster encoding (§7.3), and an
+> Ed25519 sign/verify roundtrip run in CI today
+> (`crates/yapstack-crypto/tests/kat.rs::kat_13_6_ed25519_roster_signature`,
+> fixed message, tamper rejection asserted). A pinned fixed-input hex vector
+> cross-checked against `@noble/curves` (JS) is deferred to the share-viewer
+> tranche, alongside the JS stack itself. Deterministic Ed25519 (RFC 8032) makes
+> this a stable KAT when generated.
 
 ### 13.7 Recovery split — `recovery_key` / `recovery_auth_key` (§6.2)
 

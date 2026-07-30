@@ -10,13 +10,18 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 - [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) — Contributor Covenant 2.1.
 - [`SECURITY.md`](../SECURITY.md) — vulnerability disclosure policy.
 - [`CHANGELOG.md`](../CHANGELOG.md) — release notes (Keep a Changelog format).
+- [`LICENSING.md`](../LICENSING.md) — the licensing covenant: AGPL-3.0-only, no CLA, limits-not-features, self-host is the max tier, zero phone-home.
+- [`TRADEMARK.md`](../TRADEMARK.md) — name/marks policy (code freedom absolute; brand confusion restricted).
+- [`DCO`](../DCO) — Developer Certificate of Origin 1.1 (contribution terms; no CLA).
 
 ## Architecture & API
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — data flow between crates, ring buffer, sidecar IPC, live transcription pipeline, AI chat tool calling, frontend component tree, analytics.
 - [`API_REFERENCE.md`](API_REFERENCE.md) — exact function signatures, struct fields, error variants, Tauri command shapes. Read before adding or modifying public APIs.
 - [`GLOSSARY.md`](GLOSSARY.md) — domain terms (session, segment, part, dictation, diarization, etc.).
-- [`SYNC_ARCHITECTURE.md`](SYNC_ARCHITECTURE.md) — decision report for the E2E sync backend: cr-sqlite on-device merge, blind encrypted relay, key management, schema-migration desync, private-link sharing. Read before any sync/backend work.
+- [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md) — normative cryptographic design for E2E sync: envelopes, AAD discipline, key hierarchy, device roster, KAT vectors. Read before any sync/crypto work.
+- [`self-hosting.md`](self-hosting.md) — run the sync relay yourself: install, hardening, TLS, backups.
+- [`../deploy/README.md`](../deploy/README.md) — relay day-two operations quick reference (start/stop, env knobs, keep-host-awake, backup).
 
 ## Development
 

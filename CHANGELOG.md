@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ## [Unreleased]
 
 ### Added
+- **Optional end-to-end-encrypted multi-device sync** (off by default; not yet included in official release builds — requires building with the `sync` feature). Devices sync through a self-hosted blind relay (`deploy/` Docker stack: server + Postgres + MinIO) that stores only ciphertext: notes, sessions, transcripts, and dictations converge via on-device CRDT merge; audio syncs as encrypted blobs with on-demand fetch and a one-time library backfill; new devices join via a fingerprint-approval ceremony; live sessions render as read-only follow-along on other devices; sync status is honest end-to-end (catching-up counts, unreadable-changeset quarantine warnings, distinct unreachable/expired states). See `docs/self-hosting.md` and `docs/CRYPTO_SPEC.md`.
+- **Segment context-menu reliability on upgraded databases.** Editing, hiding, and deleting transcript segments failed on databases whose sync schema was upgraded across builds; the app now detects and repairs stale change-tracking triggers automatically at startup, and database errors surface their real cause in toasts and logs instead of a generic failure.
 - **Transcript copy & export.** The session actions (⋮) menu gains **Copy transcript** (to the clipboard) and **Export transcript** (save as Markdown/text), each offering the full transcript, just your side, or just the other speaker's side. Copy and Export are grouped with "Show audio file" as a distinct content-export section of the menu.
 - **Paginated logs.** The Logs panel loads more recent entries on open and adds a "Load older entries" control to page further back through the in-memory buffer.
 
