@@ -34,6 +34,7 @@ import { segmentsToAttributedMarkdown, segmentsForSpeaker } from "@/lib/export";
 import { exportTranscriptToFile } from "@/lib/transcript-export";
 import { trackTranscriptExported } from "@/lib/analytics";
 import { formatDuration, formatElapsed } from "@/lib/utils";
+import { log } from "@/lib/logger";
 import { ICON_MAP } from "@/lib/folder-constants";
 import type { FolderTreeNode } from "@/lib/folder-tree";
 import { revealAudioFile } from "@/lib/reveal-file";
@@ -235,13 +236,21 @@ export function SessionHeader({
     }
   };
 
-  // Sync local titleText when session prop changes (e.g. after AI tool updates title)
+  // Sync local titleText when the session prop changes (AI tool renamed it, or a
+  // remote rename merged in). A3: while the title input is focused this must NOT
+  // run — and, critically, `prevTitleRef` must NOT advance either. Advancing it
+  // mid-edit is what made a remote rename invisible: the reset was skipped, the
+  // ref moved on, and the subsequent blur-save compared against the REMOTE title
+  // and overwrote it with no trace. Leaving the ref behind means the next render
+  // after blur adopts the remote title (when the user typed nothing), and
+  // `handleSaveTitle` can tell that the row moved under the edit.
   const prevTitleRef = useRef(session.title);
-  if (session.title !== prevTitleRef.current) {
+  // The title as it stood when this edit began — the reference point for "did
+  // the user actually change anything?" and "did the row move under the edit?".
+  const titleEditBaseRef = useRef(session.title);
+  if (!isEditingTitle && session.title !== prevTitleRef.current) {
     prevTitleRef.current = session.title;
-    if (!isEditingTitle) {
-      setTitleText(session.title);
-    }
+    setTitleText(session.title);
   }
 
   // Listen for keyboard shortcut delete trigger
@@ -255,8 +264,28 @@ export function SessionHeader({
 
   const handleSaveTitle = async () => {
     const trimmed = titleText.trim();
-    if (trimmed && trimmed !== session.title) {
+    const base = titleEditBaseRef.current;
+    // No local change (or an empty title): never write. Adopt whatever the row
+    // says now — which may be a rename that merged in while the input was open.
+    if (!trimmed || trimmed === base) {
+      setTitleText(session.title);
+      prevTitleRef.current = session.title;
+      setIsEditingTitle(false);
+      return;
+    }
+    if (trimmed !== session.title) {
+      // `sessions.title` is one last-writer-wins cell: this write supersedes a
+      // remote rename that landed during the edit. Same posture as the note
+      // editor — LWW proceeds, but visibly (A3 / A1d).
+      if (session.title !== base) {
+        log.warn(
+          `session ${session.id}: remote rename landed during title edit; local version wins (LWW)`,
+          "session-header",
+        );
+        toast.info("Title updated on another device — your version was saved");
+      }
       await updateSessionTitle(session.id, trimmed);
+      prevTitleRef.current = trimmed;
       await loadSessions();
       // Refresh viewSession so the header re-renders with the new title
       const updated = await getSession(session.id);
@@ -286,7 +315,13 @@ export function SessionHeader({
             onBlur={handleSaveTitle}
             onKeyDown={(e) => {
               if (e.key === "Enter") handleSaveTitle();
-              if (e.key === "Escape") setIsEditingTitle(false);
+              if (e.key === "Escape") {
+                // Discard the draft and adopt the current row (which may have
+                // been renamed remotely during the edit).
+                setTitleText(session.title);
+                prevTitleRef.current = session.title;
+                setIsEditingTitle(false);
+              }
             }}
             className="h-7 text-sm font-medium"
             autoFocus
@@ -297,6 +332,7 @@ export function SessionHeader({
             onDoubleClick={() => {
               if (!isRecording) {
                 setTitleText(session.title);
+                titleEditBaseRef.current = session.title;
                 setIsEditingTitle(true);
               }
             }}

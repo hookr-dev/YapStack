@@ -19,6 +19,7 @@ vi.mock("sonner", () => ({
 import { commands } from "@/lib/tauri";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
+import { ON_DEVICE_REPROBE_MS } from "@/lib/sync";
 import { useDictationEntry } from "./useDictationEntry";
 
 function makeEntry(over: Partial<DbDictationHistory> = {}): DbDictationHistory {
@@ -123,6 +124,62 @@ describe("useDictationEntry auto-fetch (S3.5 mount trigger)", () => {
     await vi.advanceTimersByTimeAsync(1_500);
     expect(prepareCalls()).toHaveLength(2);
     expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("publishes NO fetch state before the first probe resolves", async () => {
+    // The optimistic 0% opening frame made every entry blink "fetching" on mount,
+    // including the ones whose audio is cached or simply not on the server.
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    let resolvePrepare: ((v: unknown) => void) | undefined;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_prepare_part") {
+        return new Promise((r) => {
+          resolvePrepare = r;
+        });
+      }
+      return null;
+    });
+
+    const { result } = renderHook(() => useDictationEntry(makeEntry()));
+    await waitFor(() => expect(prepareCalls()).toContain("dict-1"));
+    // In flight, nothing resolved: the hook makes no claim.
+    expect(result.current.fetchState).toBeNull();
+
+    resolvePrepare?.({ state: "fetching", received: 30, total: 100 });
+    await waitFor(() =>
+      expect(result.current.fetchState).toMatchObject({ kind: "fetching", percent: 30 }),
+    );
+  });
+
+  it("stays silent (no state) for a cache hit — no fetch frame at all", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_prepare_part") return { state: "ready", path: "/c/d.wav" };
+      return null;
+    });
+    const { result } = renderHook(() => useDictationEntry(makeEntry()));
+    await waitFor(() => expect(prepareCalls()).toContain("dict-1"));
+    expect(result.current.fetchState).toBeNull();
+  });
+
+  it("keeps the quiet 30s re-probe STATELESS (no strobe on the play control)", async () => {
+    vi.useFakeTimers();
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_prepare_part") return { state: "not_on_server" };
+      return null;
+    });
+    const { result, unmount } = renderHook(() => useDictationEntry(makeEntry()));
+    // Across three full re-probe cycles the state never becomes non-null, so the
+    // surfaces that render it never flicker.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(result.current.fetchState).toBeNull();
+      await vi.advanceTimersByTimeAsync(ON_DEVICE_REPROBE_MS);
+      expect(result.current.fetchState).toBeNull();
+    }
+    expect(prepareCalls().length).toBeGreaterThan(1);
     unmount();
   });
 

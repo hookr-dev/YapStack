@@ -311,3 +311,168 @@ fn uuid16(s: &str) -> [u8; 16] {
     out.copy_from_slice(&raw);
     out
 }
+
+// ----- Boot-time lock contention (background-lane hardening) --------------------------------
+//
+// The audio lane starts at the most contended moment there is: alongside the changeset
+// drain's catch-up merge and capture, the CRR self-heal, and the app's own first writes. On
+// the owner's boot log the walk's enqueue lost that race and returned "database is locked" —
+// which, with a bare `?`, abandoned the ENTIRE walk for the session (it could only re-run at
+// the next app start). A transient lock must never be a user-visible failure, so every
+// background-lane write is retried, and a part that still cannot be queued is stepped over
+// while the pass stays honestly incomplete.
+
+/// An on-disk DB (in-memory DBs cannot be contended from a second connection) with the
+/// app-side tables the walk reads, plus a second connection standing in for the sync drain.
+fn contended_db(dir: &std::path::Path) -> (Connection, Connection) {
+    let path = dir.join("contend.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; \
+         CREATE TABLE session_audio_parts (\
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, part_index INTEGER, \
+            file_path TEXT, format TEXT);",
+    )
+    .unwrap();
+    audio::ensure_queue_table(&conn).unwrap();
+    // Short patience on the walk's own connection so the SQLite busy handler gives up fast and
+    // the engine-level retry is what has to carry it.
+    conn.busy_timeout(std::time::Duration::from_millis(20))
+        .unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .busy_timeout(std::time::Duration::from_millis(20))
+        .unwrap();
+    (conn, writer)
+}
+
+#[test]
+fn busy_retry_rides_out_transient_contention_and_gives_up_on_real_errors() {
+    // The retry is CLASS-SCOPED: only SQLite's busy/locked errors are retried, because only
+    // they mean "try again in a moment". A malformed statement must fail on the first attempt,
+    // undelayed, exactly as before.
+    let busy = || {
+        yapstack_sync::SyncError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked".into()),
+        ))
+    };
+    assert!(audio::is_busy_error(&busy()));
+    assert!(!audio::is_busy_error(&yapstack_sync::SyncError::Codec(
+        "nope".into()
+    )));
+
+    // Fails twice with BUSY, then succeeds → the caller never sees an error.
+    let mut attempts = 0;
+    let out = audio::with_busy_retry("test-op", || {
+        attempts += 1;
+        if attempts < 3 {
+            Err(busy())
+        } else {
+            Ok(attempts)
+        }
+    })
+    .unwrap();
+    assert_eq!(out, 3, "succeeded on the third attempt");
+
+    // A non-busy error is returned immediately — no retries, no sleeping.
+    let mut calls = 0;
+    let err = audio::with_busy_retry("test-op", || -> Result<(), yapstack_sync::SyncError> {
+        calls += 1;
+        Err(yapstack_sync::SyncError::Codec("bad".into()))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1, "a real error is not retried");
+    assert!(matches!(err, yapstack_sync::SyncError::Codec(_)));
+}
+
+#[test]
+fn backfill_walk_completes_once_contention_clears() {
+    // The owner's exact scenario: the walk starts while another writer holds the lock. It must
+    // wait it out and finish the pass — not surface a failure, not abandon the library.
+    let dir = tempfile::tempdir().unwrap();
+    let (conn, writer) = contended_db(dir.path());
+    let p1 = write_part_file(dir.path(), "h1.wav", b"one".repeat(50).as_slice());
+    let p2 = write_part_file(dir.path(), "h2.wav", b"two".repeat(50).as_slice());
+    insert_part(&conn, PART_1, SESSION_A, &p1);
+    insert_part(&conn, PART_2, SESSION_A, &p2);
+
+    // A competing writer holds the write lock for longer than the walk connection's own
+    // busy_timeout, then releases it.
+    let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let release = holding.clone();
+    let holder = std::thread::spawn(move || {
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        writer
+            .execute(
+                "INSERT INTO session_audio_parts(id, session_id) VALUES('z','z')",
+                [],
+            )
+            .unwrap();
+        while release.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        writer.execute_batch("COMMIT;").unwrap();
+    });
+    // Let the holder actually take the lock, then release it while the walk is retrying.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let releaser = holding.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        releaser.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let report = audio::backfill_walk(&conn, |p| std::path::Path::new(p).exists()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(report.skipped, 0, "contention alone never skips a part");
+    assert_eq!(
+        report.enqueued, 2,
+        "both parts queued once the lock cleared"
+    );
+    assert!(report.is_complete());
+    assert!(
+        audio::backfill_walk_completed(&conn).unwrap(),
+        "a fully-covered pass is marked complete"
+    );
+}
+
+#[test]
+fn backfill_walk_skips_an_unqueueable_part_and_stays_incomplete() {
+    // Whatever the per-part failure is, ONE part must not abandon the pass: the rest of the
+    // library still gets queued, the pass is NOT marked complete, and the next start retries
+    // exactly the straggler. Modelled with a trigger that refuses one part_id — the same
+    // control flow a still-locked row takes after its retry budget is spent.
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db();
+    let p1 = write_part_file(dir.path(), "h1.wav", b"one".repeat(50).as_slice());
+    let p2 = write_part_file(dir.path(), "h2.wav", b"two".repeat(50).as_slice());
+    insert_part(&conn, PART_1, SESSION_A, &p1);
+    insert_part(&conn, PART_2, SESSION_A, &p2);
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER refuse_one BEFORE INSERT ON _yapstack_audio_upload_queue \
+         WHEN NEW.part_id = '{PART_2}' \
+         BEGIN SELECT RAISE(ABORT, 'simulated per-part failure'); END;"
+    ))
+    .unwrap();
+
+    let report = audio::backfill_walk(&conn, |p| std::path::Path::new(p).exists()).unwrap();
+    assert_eq!(report.examined, 2);
+    assert_eq!(report.enqueued, 1, "the healthy part is still queued");
+    assert_eq!(
+        report.skipped, 1,
+        "the failing part is stepped over, counted"
+    );
+    assert!(!report.is_complete());
+    assert!(
+        !audio::backfill_walk_completed(&conn).unwrap(),
+        "a pass that skipped work must NOT claim completion — the next start retries it"
+    );
+
+    // Next start: the obstruction is gone, the straggler is picked up, and the pass completes.
+    conn.execute_batch("DROP TRIGGER refuse_one;").unwrap();
+    let again = audio::backfill_walk(&conn, |p| std::path::Path::new(p).exists()).unwrap();
+    assert_eq!(again.enqueued, 1, "only the straggler was left to queue");
+    assert_eq!(again.skipped, 0);
+    assert!(audio::backfill_walk_completed(&conn).unwrap());
+    assert_eq!(audio::lane_status(&conn).unwrap().pending, 2);
+}

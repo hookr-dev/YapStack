@@ -38,11 +38,18 @@ const SWAP_MAX_RETRIES = 10;
 /**
  * Transient SQLite write-lock contention. Post-cutover (Option A′) the sync drain's
  * CrsqlDb writer and db_service's writer share one WAL file, so while the drain is
- * merging a large pulled backlog a frontend `db_select`/`db_execute` can lose the race
+ * working through a large backlog a frontend `db_select`/`db_execute` can lose the race
  * for the write lock past the Rust `busy_timeout` and surface `SQLITE_BUSY` as
- * "database is locked". The drain now commits one changeset per batch and yields the
- * lock between batches, so the next attempt almost always wins — we retry with a bounded
- * capped backoff and only surface the lock error if it stays stuck (R6 item 1b).
+ * "database is locked".
+ *
+ * BOTH drain directions now hold the write lock only for ONE bounded unit at a time and
+ * release it at every commit: the pull merges one changeset per transaction (R6 item 1b),
+ * and the push CAPTURE commits one chunk per transaction, advancing its watermark inside
+ * that same transaction (before this, the first capture of a large library held a single
+ * transaction across the whole backlog and starved every other writer). So a losing
+ * attempt almost always wins the next one — we retry with a bounded capped backoff and
+ * only surface the lock error if it stays stuck. A retried-then-succeeded lock is logged
+ * at DEBUG in Rust (`db_service::log_db_failure`), never as a warning.
  */
 const LOCK_MAX_RETRIES = 8;
 const LOCK_RETRY_BASE_MS = 60;

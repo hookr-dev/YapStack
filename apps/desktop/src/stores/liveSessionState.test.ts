@@ -22,9 +22,16 @@ const { listenHandlers, listenMock } = vi.hoisted(() => {
 
 // Controllable db reads. Everything else in @/lib/db stays real (pure helpers such as
 // isRecordingStale run for the resume guard).
-const { getSessionMock, getSessionSegmentsMock } = vi.hoisted(() => ({
+const {
+  getSessionMock,
+  getSessionSegmentsMock,
+  listSessionAudioPartsMock,
+  getNoteMock,
+} = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getSessionSegmentsMock: vi.fn(),
+  listSessionAudioPartsMock: vi.fn(),
+  getNoteMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
@@ -43,9 +50,14 @@ vi.mock("@/lib/db", async () => {
     ...actual,
     getSession: getSessionMock,
     getSessionSegments: getSessionSegmentsMock,
-    listSessionAudioParts: vi.fn().mockResolvedValue([]),
+    listSessionAudioParts: listSessionAudioPartsMock,
+    getNote: getNoteMock,
+    listSessions: vi.fn().mockResolvedValue([]),
     listFolders: vi.fn().mockResolvedValue([]),
+    listAllSessionFolders: vi.fn().mockResolvedValue([]),
     listTags: vi.fn().mockResolvedValue([]),
+    listAllSessionTags: vi.fn().mockResolvedValue([]),
+    listDictationHistory: vi.fn().mockResolvedValue([]),
   };
 });
 
@@ -128,6 +140,16 @@ function syncStatus(over: Partial<SyncStatus> = {}): SyncStatus {
 beforeEach(() => {
   vi.clearAllMocks();
   listenHandlers.clear();
+  listSessionAudioPartsMock.mockResolvedValue([]);
+  getNoteMock.mockResolvedValue(null);
+  useAppStore.setState({
+    noteEditingSessionId: null,
+    editingSegmentId: null,
+    pendingViewRefresh: false,
+    remoteNoteUpdate: null,
+    viewSessionParts: [],
+    viewSessionSegments: [],
+  });
 });
 
 describe("refreshOpenViewSession (D4 live refresh, Gap 2)", () => {
@@ -186,11 +208,6 @@ describe("refreshOpenViewSession (D4 live refresh, Gap 2)", () => {
         selectedSessionId: "open",
         activeSessionId: null,
         editingSegmentId: null,
-        loadSessions: vi.fn().mockResolvedValue(undefined),
-        loadFolders: vi.fn().mockResolvedValue(undefined),
-        loadSessionFolders: vi.fn().mockResolvedValue(undefined),
-        loadTags: vi.fn().mockResolvedValue(undefined),
-        loadSessionTags: vi.fn().mockResolvedValue(undefined),
       });
       const unlisten = await useAppStore.getState().startSyncAppliedRefresh();
       listenHandlers.get("sync://applied")!({
@@ -202,6 +219,193 @@ describe("refreshOpenViewSession (D4 live refresh, Gap 2)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // B3
+  it("reloads the open session's audio parts so an appended remote part surfaces", async () => {
+    const parts = [
+      { id: "p1", session_id: "open", part_index: 0 } as never,
+      { id: "p2", session_id: "open", part_index: 1 } as never,
+    ];
+    getSessionMock.mockResolvedValue(makeSession());
+    getSessionSegmentsMock.mockResolvedValue([]);
+    listSessionAudioPartsMock.mockResolvedValue(parts);
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      viewSessionParts: [],
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+
+    expect(listSessionAudioPartsMock).toHaveBeenCalledWith("open");
+    expect(useAppStore.getState().viewSessionParts).toHaveLength(2);
+  });
+});
+
+// A2
+describe("remote delete of the OPEN session (sync-UX A2)", () => {
+  it("clears the open view, returns to the list and says why", async () => {
+    getSessionMock.mockResolvedValue(null); // row vanished in the merge
+    getSessionSegmentsMock.mockResolvedValue([]);
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      currentView: "note-detail",
+      viewSession: makeSession(),
+      viewSessionSegments: [makeSegment("g1")],
+      viewSessionParts: [{ id: "p1" } as never],
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+
+    const s = useAppStore.getState();
+    expect(s.currentView).toBe("note-list");
+    expect(s.selectedSessionId).toBeNull();
+    expect(s.viewSession).toBeNull();
+    expect(s.viewSessionSegments).toEqual([]);
+    expect(s.viewSessionParts).toEqual([]);
+    expect(toast.info).toHaveBeenCalledWith(
+      "Session was deleted on another device",
+    );
+  });
+
+  it("leaves a still-present session open (no false positive)", async () => {
+    getSessionMock.mockResolvedValue(makeSession());
+    getSessionSegmentsMock.mockResolvedValue([]);
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      currentView: "note-detail",
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+
+    expect(useAppStore.getState().currentView).toBe("note-detail");
+    expect(useAppStore.getState().selectedSessionId).toBe("open");
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+});
+
+// A1c + A1b (store side)
+describe("open note sync-down (sync-UX A1)", () => {
+  beforeEach(() => {
+    getSessionMock.mockResolvedValue(makeSession());
+    getSessionSegmentsMock.mockResolvedValue([]);
+  });
+
+  it("publishes the open session's note row when no note edit is in progress", async () => {
+    getNoteMock.mockResolvedValue({ content: "<p>from peer</p>" });
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      noteEditingSessionId: null,
+      noteRefreshCounter: 4,
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+
+    expect(useAppStore.getState().remoteNoteUpdate).toMatchObject({
+      sessionId: "open",
+      content: "<p>from peer</p>",
+    });
+    // Normative: sync never bumps the note refresh counter.
+    expect(useAppStore.getState().noteRefreshCounter).toBe(4);
+  });
+
+  it("does not re-publish identical content (no editor churn)", async () => {
+    getNoteMock.mockResolvedValue({ content: "<p>same</p>" });
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      noteEditingSessionId: null,
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+    const first = useAppStore.getState().remoteNoteUpdate;
+    await useAppStore.getState().refreshOpenViewSession();
+
+    expect(useAppStore.getState().remoteNoteUpdate).toBe(first);
+  });
+
+  it("does NOT read or publish note content while the note is being edited", async () => {
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      noteEditingSessionId: "open",
+      remoteNoteUpdate: null,
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+
+    expect(getNoteMock).not.toHaveBeenCalled();
+    expect(useAppStore.getState().remoteNoteUpdate).toBeNull();
+    // Transcript state still refreshed — only the note is held back.
+    expect(getSessionSegmentsMock).toHaveBeenCalledWith("open");
+    // …and the skipped note publication is remembered.
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+  });
+});
+
+// B5
+describe("skipped-refresh catch-up (sync-UX B5)", () => {
+  it("remembers a refresh skipped by the segment-edit guard and drains it on clear", async () => {
+    getSessionMock.mockResolvedValue(makeSession());
+    getSessionSegmentsMock.mockResolvedValue([makeSegment("g1")]);
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      editingSegmentId: "seg-under-edit",
+      viewSessionSegments: [],
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+    expect(getSessionSegmentsMock).not.toHaveBeenCalled();
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+
+    // Closing the edit window is the catch-up point.
+    useAppStore.getState().setEditingSegmentId(null);
+    await vi.waitFor(() =>
+      expect(useAppStore.getState().viewSessionSegments).toHaveLength(1),
+    );
+    expect(useAppStore.getState().pendingViewRefresh).toBe(false);
+  });
+
+  it("drains when the note-editing window closes (shared mechanism)", async () => {
+    getSessionMock.mockResolvedValue(makeSession());
+    getSessionSegmentsMock.mockResolvedValue([]);
+    getNoteMock.mockResolvedValue({ content: "<p>peer</p>" });
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      noteEditingSessionId: "open",
+      remoteNoteUpdate: null,
+    });
+
+    await useAppStore.getState().refreshOpenViewSession();
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+
+    useAppStore.getState().setNoteEditingSessionId(null);
+    await vi.waitFor(() =>
+      expect(useAppStore.getState().remoteNoteUpdate).toMatchObject({
+        content: "<p>peer</p>",
+      }),
+    );
+  });
+
+  it("does not drain while another guard is still open", async () => {
+    useAppStore.setState({
+      selectedSessionId: "open",
+      activeSessionId: null,
+      editingSegmentId: "seg",
+      noteEditingSessionId: "open",
+      pendingViewRefresh: true,
+    });
+
+    useAppStore.getState().setNoteEditingSessionId(null);
+
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+    expect(getSessionSegmentsMock).not.toHaveBeenCalled();
   });
 });
 

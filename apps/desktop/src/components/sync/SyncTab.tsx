@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -59,6 +59,11 @@ const CARD = "py-4 gap-3";
 const HEAD = "px-4";
 const BODY = "px-4";
 
+/** Idle refresh cadence for the panel's derived rows — matches the status poll below so
+ *  the whole page moves on one clock. */
+const IDLE_POLL_MS = 5000;
+const FETCHED_AUDIO_POLL_MS = IDLE_POLL_MS;
+
 /**
  * Settings → Sync. A single adaptive page composed as four stacked cards (plan
  * §2): Relay server, Account, Devices (signed-in), Enable sync (first-run). The
@@ -100,7 +105,7 @@ export function SyncTab() {
   useEffect(() => {
     if (!signedIn) return;
     const active = phase === "syncing" || phase === "catching_up";
-    const intervalMs = active ? 1500 : 5000;
+    const intervalMs = active ? 1500 : IDLE_POLL_MS;
     const id = window.setInterval(() => {
       void refreshSyncStatus();
     }, intervalMs);
@@ -595,7 +600,14 @@ function AudioBackupCard({
 }) {
   const [retrying, setRetrying] = useState(false);
   const audio = deriveAudioBackup(status);
-  if (audio.state === "hidden") return null;
+  // Unmounting this card whenever the counts fall back to zero yanked a whole card out of
+  // the middle of the stack and jumped every card below it — while the user was looking
+  // at them. Once the lane has reported anything in this panel session it keeps a
+  // one-line resting presence instead of disappearing.
+  const everReported = useRef(false);
+  if (audio.state !== "hidden") everReported.current = true;
+  const resting = audio.state === "hidden";
+  if (resting && !everReported.current) return null;
 
   const handleRetry = async () => {
     setRetrying(true);
@@ -613,17 +625,34 @@ function AudioBackupCard({
     }
   };
 
+  if (resting) {
+    return (
+      <Card className={`${CARD} view-enter`}>
+        <CardContent
+          className={`${BODY} flex items-center gap-1.5 text-xs text-muted-foreground`}
+        >
+          <ShieldCheck className="h-3.5 w-3.5 text-primary" />
+          Audio backup — nothing waiting
+        </CardContent>
+      </Card>
+    );
+  }
+
   const icon =
     audio.state === "uploading" ? (
       <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
     ) : audio.state === "failed" ? (
       <AlertTriangle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+    ) : audio.state === "incomplete" ? (
+      // Lighter than `failed`: nothing has gone wrong that the user must act on — the
+      // walk simply lost a race with the boot write-lock and retries by itself.
+      <ShieldAlert className="h-3.5 w-3.5 text-amber-600/80 dark:text-amber-400/80" />
     ) : (
       <ShieldCheck className="h-3.5 w-3.5 text-primary" />
     );
 
   return (
-    <Card className={CARD}>
+    <Card className={`${CARD} view-enter`}>
       <CardHeader className={HEAD}>
         <CardTitle className="text-sm">Audio backup</CardTitle>
         <CardDescription className="text-xs">
@@ -757,6 +786,12 @@ function FetchedAudioCard() {
   }, []);
   useEffect(() => {
     void refresh();
+    // The cache grows while the panel is open (auto-fetch runs in the background from any
+    // view). Refreshing only on mount meant the row appeared out of nowhere on the NEXT
+    // visit to Settings, shoving the cards under it. Same idle cadence the tab itself
+    // uses for status.
+    const id = window.setInterval(() => void refresh(), FETCHED_AUDIO_POLL_MS);
+    return () => window.clearInterval(id);
   }, [refresh]);
 
   if (!stats || stats.bytes <= 0) return null;
@@ -780,7 +815,9 @@ function FetchedAudioCard() {
   };
 
   return (
-    <Card className={CARD}>
+    // Fades/slides in rather than popping into the middle of the stack the moment the
+    // poll first sees bytes.
+    <Card className={`${CARD} view-enter`}>
       <CardContent className={`${BODY} flex items-center justify-between gap-3`}>
         <div className="space-y-0.5">
           <p className="text-xs font-medium">

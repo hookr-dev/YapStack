@@ -726,6 +726,42 @@ fn sql_preview(sql: &str) -> String {
     collapsed
 }
 
+/// True for SQLite's transient contention class — `SQLITE_BUSY` (incl. the
+/// `SQLITE_BUSY_SNAPSHOT` extended code) and `SQLITE_LOCKED`. These mean "another connection
+/// holds the write lock right now", never "your statement or data is wrong".
+fn is_busy_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Log a failed DB command at the honest level for its CLASS.
+///
+/// A busy/locked failure is a TRANSIENT contention event that the caller retries (the
+/// frontend's `invokeWithSwapRetry` in `db-backend.ts` makes up to 8 lock retries): warning
+/// once per attempt turned one self-healing boot-time blip into nine scary WARN lines in the
+/// owner's log for an operation that then SUCCEEDED. Rust cannot see the JS attempt number, so the honest
+/// smallest change is to log the busy class at DEBUG (still in the rolling log, still
+/// diagnosable) and keep WARN for every error the retry loop cannot fix. A final,
+/// retries-exhausted failure is still surfaced loudly — by the frontend, which is the only
+/// layer that knows it was the last attempt (T032 reporting).
+fn log_db_failure(role: &'static str, preview: &str, e: &rusqlite::Error) {
+    if is_busy_error(e) {
+        tracing::debug!(
+            role,
+            sql = %preview,
+            "db {role} busy/locked (transient, caller retries): {e}"
+        );
+    } else {
+        tracing::warn!(role, sql = %preview, "db {role} failed: {e}");
+    }
+}
+
 /// `db.execute(sql, params)` — write path. Rejects on SQL error so the
 /// frontend's `.catch()` on idempotent runtime patches keeps working.
 #[tauri::command]
@@ -739,21 +775,18 @@ pub async fn db_execute(
     // ~40 chars) and unconditional so a failure is never silent.
     let preview = sql_preview(&query);
     let svc = service.inner().clone();
-    let result = tokio::task::spawn_blocking(move || svc.execute(&query, &values))
+    let raw = tokio::task::spawn_blocking(move || svc.execute(&query, &values))
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())?;
     // Honest errors: the command's `Err` string used to be the ONLY record of a
     // failed write — the frontend swallowed it into a generic toast and nothing
     // reached the rolling log. Log it here, at the layer that still has the
-    // statement and the connection role.
-    if let Err(ref message) = result {
-        tracing::warn!(
-            role = "writer",
-            sql = %preview,
-            "db_execute failed: {message}"
-        );
+    // statement, the connection role, and — crucially — the TYPED error, so a
+    // transient lock is not shouted at the same volume as a broken statement.
+    if let Err(ref e) = raw {
+        log_db_failure("writer", &preview, e);
     }
+    let result = raw.map_err(|e| e.to_string());
     // Local-write kick (SSE-latency deliverable 2): a committed local write nudges the sync
     // drain to run a push-capturing cycle promptly (debounced). No-op when sync is off or no
     // drain is running; never affects the command's result.
@@ -774,18 +807,13 @@ pub async fn db_select(
 ) -> Result<Vec<DbRow>, String> {
     let preview = sql_preview(&query);
     let svc = service.inner().clone();
-    let result = tokio::task::spawn_blocking(move || svc.select(&query, &values))
+    let raw = tokio::task::spawn_blocking(move || svc.select(&query, &values))
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string());
-    if let Err(ref message) = result {
-        tracing::warn!(
-            role = "reader",
-            sql = %preview,
-            "db_select failed: {message}"
-        );
+        .map_err(|e| e.to_string())?;
+    if let Err(ref e) = raw {
+        log_db_failure("reader", &preview, e);
     }
-    result
+    raw.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1295,5 +1323,32 @@ mod tests {
             !preview.contains("secret"),
             "nothing but the statement text is in scope"
         );
+    }
+
+    #[test]
+    fn busy_classification_separates_contention_from_real_failures() {
+        // The log level for a failed DB command follows its CLASS. A busy/locked failure is
+        // transient and the frontend retries it (up to 8 lock retries in `db-backend.ts`), so
+        // shouting WARN on every attempt buried the owner's log in noise for operations that
+        // then succeeded. Everything the retry loop cannot fix keeps its WARN.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY — "database is locked"
+            Some("database is locked".into()),
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(6), // SQLITE_LOCKED — "database table is locked"
+            Some("database table is locked".into()),
+        );
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(19), // SQLITE_CONSTRAINT — a real, un-retryable failure
+            Some("UNIQUE constraint failed".into()),
+        );
+        assert!(is_busy_error(&busy));
+        assert!(is_busy_error(&locked));
+        assert!(!is_busy_error(&constraint));
+        assert!(!is_busy_error(&rusqlite::Error::QueryReturnedNoRows));
+        // Both classes still reach the rolling log — only the level differs.
+        log_db_failure("writer", "insert into t", &busy);
+        log_db_failure("writer", "insert into t", &constraint);
     }
 }

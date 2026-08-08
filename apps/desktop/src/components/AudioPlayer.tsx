@@ -4,10 +4,21 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Play, Pause, Circle } from "lucide-react";
-import { formatTime } from "@/lib/utils";
+import { cn, formatTime } from "@/lib/utils";
 import { trackAudioPlaybackStarted } from "@/lib/analytics";
 
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
+
+/**
+ * The shared shell for the single row that sits under a session header: the player
+ * itself, the fetch/unavailable bar, and the probing placeholder all render at exactly
+ * this height. Every one of those states can replace any other while the view is open
+ * (probe resolves, fetch completes, bearer expires), so they must be the same height or
+ * the whole transcript below jumps. `min-h-10` = 24px (`icon-xs` = `size-6`) of control
+ * plus the 8px `py-2` on each side — the tallest variant — so the text-only variants
+ * (16px of line box) stop collapsing to 32px.
+ */
+export const AUDIO_ROW_CLASS = "flex min-h-10 items-center gap-3 border-b px-4 py-2";
 
 export interface AudioPart {
   src: string;
@@ -32,6 +43,7 @@ export function AudioPlayer({
   onPlayStateChange,
   onDurationResolved,
   onResume,
+  className,
 }: {
   parts: AudioPart[];
   onTimeUpdate?: (time: number) => void;
@@ -39,6 +51,10 @@ export function AudioPlayer({
   onDurationResolved?: (d: number) => void;
   /** When provided, renders a Resume button to the left of Play. */
   onResume?: () => void;
+  /** Extra classes for the row shell. The caller decides whether this mount deserves a
+   *  transition — e.g. the player that replaces a finished fetch bar passes
+   *  `view-enter`, while a player that was there all along passes nothing. */
+  className?: string;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [partIndex, setPartIndex] = useState(0);
@@ -284,7 +300,7 @@ export function AudioPlayer({
   }, [seekToGlobal]);
 
   return (
-    <div className="flex items-center gap-3 border-b px-4 py-2">
+    <div className={cn(AUDIO_ROW_CLASS, className)}>
       <audio
         ref={audioRef}
         src={activePart?.src ?? ""}

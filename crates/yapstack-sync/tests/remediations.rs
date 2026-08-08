@@ -498,3 +498,70 @@ fn out_of_band_alter_lets_fresh_device_apply_recording_device_id_without_quarant
         .unwrap();
     assert_eq!(owner.as_deref(), Some("AAAABBBBCCCCDDDD"));
 }
+
+/// The pull-side merge and the app's own writer share one file. `merge_changeset` and
+/// `replay_pending` both READ the local schema before they WRITE, so a DEFERRED `BEGIN` has
+/// to upgrade read→write mid-transaction — and in WAL a lost upgrade race returns
+/// `SQLITE_BUSY_SNAPSHOT`, which SQLite's busy handler does NOT retry: the merge would fail
+/// outright no matter how generous `busy_timeout` is. Taking the write lock UP FRONT
+/// (`BEGIN IMMEDIATE`) makes the two writers serialize instead, so a merge that starts while
+/// the app is writing WAITS and then succeeds.
+#[test]
+fn merge_waits_out_a_concurrent_writer_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("merge-contend.db");
+
+    // Source device authors a change.
+    let src = CrsqlDb::open_in_memory().unwrap();
+    src.conn()
+        .execute_batch("CREATE TABLE kv(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT '');")
+        .unwrap();
+    src.conn()
+        .query_row("SELECT crsql_as_crr('kv')", [], |_| Ok(()))
+        .unwrap();
+    src.conn()
+        .execute("INSERT INTO kv(id,v) VALUES('k1','v1')", [])
+        .unwrap();
+    let cs = read_local_changes_since(src.conn(), 0).unwrap();
+
+    // Target on disk so a SECOND connection can hold its write lock.
+    let dst = CrsqlDb::open(&path).unwrap();
+    dst.conn()
+        .execute_batch("PRAGMA journal_mode=WAL;")
+        .unwrap();
+    dst.conn()
+        .execute_batch("CREATE TABLE kv(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT '');")
+        .unwrap();
+    dst.conn()
+        .query_row("SELECT crsql_as_crr('kv')", [], |_| Ok(()))
+        .unwrap();
+
+    // The app's writer holds the write lock for a beat, then commits.
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let w = Connection::open(&writer_path).unwrap();
+        w.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        w.execute_batch("CREATE TABLE app_t(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        w.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        w.execute("INSERT INTO app_t(id) VALUES(1)", []).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        w.execute_batch("COMMIT;").unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // The merge must WAIT for the writer and then apply — never fail on contention.
+    let (applied, quarantined) = merge_changeset(dst.conn(), &cs).unwrap();
+    writer.join().unwrap();
+    assert!(
+        applied > 0,
+        "the merge applied after waiting out the writer"
+    );
+    assert_eq!(quarantined, 0);
+    assert_eq!(count(dst.conn(), "SELECT count(*) FROM kv"), 1);
+    // Both writers' work survives: serialized, not lost.
+    assert_eq!(count(dst.conn(), "SELECT count(*) FROM app_t"), 1);
+
+    // The replay path takes the same lock discipline; with an empty queue it is a clean no-op.
+    assert_eq!(replay_pending(dst.conn()).unwrap(), 0);
+}

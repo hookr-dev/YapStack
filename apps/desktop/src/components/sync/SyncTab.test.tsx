@@ -1,4 +1,5 @@
 import {
+  act,
   render,
   screen,
   cleanup,
@@ -55,7 +56,9 @@ function makeStatus(overrides: Partial<SyncStatus> = {}): SyncStatus {
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,
     audioUploadedTotal: 0,
-    audioBackfillComplete: false,
+    // Healthy default: a backfill walk has covered this device's library at least once.
+    // Tests that care about the incomplete-walk caveat opt in explicitly.
+    audioBackfillComplete: true,
     ...overrides,
   };
 }
@@ -346,6 +349,49 @@ describe("SyncTab — audio backup card (S2)", () => {
     render(<SyncTab />);
     expect(screen.queryByText("Audio backup")).not.toBeInTheDocument();
   });
+
+  it("says so when the library walk never finished, instead of claiming all-backed-up", () => {
+    // The boot-contention case the owner hit: the walk stepped over parts that are
+    // therefore in NO queue and NO count. Nothing here is outstanding or failed.
+    setup({
+      status: makeStatus({
+        audioUploadedTotal: 42,
+        audioBackfillComplete: false,
+      }),
+    });
+    render(<SyncTab />);
+    expect(screen.queryByText("42 recordings backed up")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Some audio not yet backed up — retries next launch"),
+    ).toBeInTheDocument();
+    // No Retry: `audio_retry_failed_uploads` re-pends rows already IN the queue, and a
+    // skipped part has no row. Only the next launch's walk can pick it up.
+    expect(screen.queryByRole("button", { name: /Retry/ })).not.toBeInTheDocument();
+  });
+
+  it("collapses to a resting line — not an unmount — once the counts fall back to zero", () => {
+    // Unmounting a card from the MIDDLE of the stack jumps every card below it while
+    // the user is reading them.
+    setup({ status: makeStatus({ audioUploadOutstanding: 2 }) });
+    const { rerender } = render(<SyncTab />);
+    expect(screen.getByText("Backing up 2 recordings")).toBeInTheDocument();
+
+    act(() => {
+      useAppStore.setState({ syncStatus: makeStatus() });
+    });
+    rerender(<SyncTab />);
+
+    expect(screen.queryByText("Backing up 2 recordings")).not.toBeInTheDocument();
+    expect(screen.getByText("Audio backup — nothing waiting")).toBeInTheDocument();
+  });
+
+  it("animates in rather than popping into the stack", () => {
+    setup({ status: makeStatus({ audioUploadOutstanding: 1 }) });
+    const { container } = render(<SyncTab />);
+    const card = screen.getByText("Audio backup").closest("[data-slot='card']");
+    expect(card?.className).toContain("view-enter");
+    expect(container).toBeTruthy();
+  });
 });
 
 describe("SyncTab — fetched-audio cache row (S3.5)", () => {
@@ -396,5 +442,41 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     await waitFor(() =>
       expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument(),
     );
+  });
+
+  it("picks the cache up on the panel's idle poll, not only on mount", async () => {
+    // Auto-fetch fills this cache from any view. Refreshing only on mount meant the
+    // row materialised on the NEXT visit to Settings, shoving the cards below it.
+    let bytes = 0;
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "audio_cache_stats") return { bytes, files: bytes > 0 ? 1 : 0 };
+      return null;
+    });
+    setup({ email: "user@example.com", status: makeStatus() });
+    vi.useFakeTimers();
+    try {
+      render(<SyncTab />);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(invoke).toHaveBeenCalledWith("audio_cache_stats");
+      expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument();
+
+      // A background fetch lands while the panel sits open.
+      bytes = 2 * 1024 * 1024;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(screen.getByText("Fetched audio: 2.0 MB")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("animates in rather than popping into the stack", async () => {
+    await mockCache(5 * 1024 * 1024, 3);
+    setup({ email: "user@example.com", status: makeStatus() });
+    render(<SyncTab />);
+    const card = (await screen.findByText("Fetched audio: 5.0 MB")).closest(
+      "[data-slot='card']",
+    );
+    expect(card?.className).toContain("view-enter");
   });
 });

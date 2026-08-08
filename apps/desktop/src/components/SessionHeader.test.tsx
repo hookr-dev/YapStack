@@ -1,4 +1,4 @@
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -14,6 +14,7 @@ import {
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment, DbSession } from "@/lib/db";
 import { SessionHeader } from "./SessionHeader";
+import { toast } from "sonner";
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
 vi.mock("@tauri-apps/api/event", () => tauriEventMock());
@@ -29,6 +30,19 @@ vi.mock("@aptabase/tauri", () => ({
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }));
+
+const { updateSessionTitleMock, getSessionMock } = vi.hoisted(() => ({
+  updateSessionTitleMock: vi.fn(),
+  getSessionMock: vi.fn(),
+}));
+vi.mock("@/lib/db", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/db")>("@/lib/db");
+  return {
+    ...actual,
+    updateSessionTitle: updateSessionTitleMock,
+    getSession: getSessionMock,
+  };
+});
 
 function makeSession(overrides?: Partial<DbSession>): DbSession {
   return {
@@ -70,6 +84,8 @@ function seg(id: string, source: "Mic" | "System", hidden = 0): DbSegment {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  updateSessionTitleMock.mockResolvedValue(undefined);
+  getSessionMock.mockResolvedValue(null);
   // Radix menu items call scrollIntoView on open; jsdom lacks it.
   HTMLElement.prototype.scrollIntoView = vi.fn();
   useAppStore.setState({
@@ -134,5 +150,76 @@ describe("SessionHeader — Copy / Export transcript", () => {
     expect(await screen.findByText("Delete session")).toBeInTheDocument();
     expect(screen.queryByText("Copy transcript")).not.toBeInTheDocument();
     expect(screen.queryByText("Export transcript")).not.toBeInTheDocument();
+  });
+});
+
+// A3: the title input is an edit surface over ONE last-writer-wins cell, so a
+// sync-down must not reset it under the user's fingers — and a save that
+// supersedes a remote rename must say so instead of overwriting it silently.
+describe("SessionHeader — title edit vs. remote rename (sync-UX A3)", () => {
+  async function startEditing(title = "Old title") {
+    const view = render(<SessionHeader session={makeSession({ title })} />);
+    await userEvent.dblClick(screen.getByText(title));
+    return view;
+  }
+
+  it("keeps the typed title when a remote rename merges in mid-edit", async () => {
+    const { rerender } = await startEditing();
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My new title");
+
+    // A sync-applied refresh replaces viewSession with the peer's rename.
+    rerender(<SessionHeader session={makeSession({ title: "Peer title" })} />);
+
+    expect(screen.getByRole("textbox")).toHaveValue("My new title");
+  });
+
+  it("adopts the remote title on blur when the user changed nothing", async () => {
+    const { rerender } = await startEditing();
+    rerender(<SessionHeader session={makeSession({ title: "Peer title" })} />);
+
+    fireEvent.blur(screen.getByRole("textbox"));
+
+    await waitFor(() => expect(screen.getByText("Peer title")).toBeTruthy());
+    // No local change ⇒ no write ⇒ the peer's rename survives.
+    expect(updateSessionTitleMock).not.toHaveBeenCalled();
+  });
+
+  it("saves the local title but announces that it superseded a remote rename", async () => {
+    const { rerender } = await startEditing();
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My new title");
+    rerender(<SessionHeader session={makeSession({ title: "Peer title" })} />);
+
+    fireEvent.blur(screen.getByRole("textbox"));
+
+    await waitFor(() =>
+      expect(updateSessionTitleMock).toHaveBeenCalledWith(
+        "session-1",
+        "My new title",
+      ),
+    );
+    expect(toast.info).toHaveBeenCalledWith(
+      "Title updated on another device — your version was saved",
+    );
+  });
+
+  it("saves silently when no remote rename happened", async () => {
+    await startEditing();
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My new title");
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(updateSessionTitleMock).toHaveBeenCalledWith(
+        "session-1",
+        "My new title",
+      ),
+    );
+    expect(toast.info).not.toHaveBeenCalled();
   });
 });

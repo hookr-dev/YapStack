@@ -20,6 +20,8 @@ import {
 } from "@/components/ui/alert-dialog";
 import { commands } from "@/lib/tauri";
 import {
+  clampMonotonicPercent,
+  isFetchRestart,
   deriveTrackFetch,
   formatTrackFetchLabel,
   formatNoSpace,
@@ -34,7 +36,7 @@ import { ChatView } from "@/components/ChatView";
 import { NoteEditor } from "@/components/NoteEditor";
 import { FloatingChatBar } from "@/components/FloatingChatBar";
 import { AIContextProvider } from "@/components/AIContextProvider";
-import { AudioPlayer } from "@/components/AudioPlayer";
+import { AudioPlayer, AUDIO_ROW_CLASS } from "@/components/AudioPlayer";
 import {
   ResizablePanelGroup,
   ResizablePanel,
@@ -221,6 +223,107 @@ export function assembleTrack(
 }
 
 /**
+ * Lifecycle of the on-disk presence probe for ONE track's part files.
+ *
+ * The critical property is that `resolved` is STICKY: a re-probe (the window-focus
+ * re-check, which exists so copying a file over is noticed) leaves the held flags in
+ * place until a new RESULT arrives. Clearing them mid-probe used to unmount the player,
+ * empty `missingPartIds`, tear the poll effect down — which releases the queued parts —
+ * and restart progress at 0, all from a click into another app and back.
+ *
+ * `probing` therefore means only "first probe for this track, nothing held yet", and
+ * `unknown` means the probe cannot answer at all (older backend without the command), in
+ * which case we stay optimistic exactly as before and let playback surface the truth.
+ */
+export type PresenceProbe =
+  | { status: "probing" }
+  | { status: "resolved"; flags: boolean[] }
+  | { status: "unknown" };
+
+/** How long a fetch-bar state must survive before it may replace what is on screen. A
+ *  cache hit or an already-local part resolves well inside this, so its transient
+ *  "Fetching…" frame never reaches the user. */
+const FETCH_LABEL_DEBOUNCE_MS = 150;
+
+/**
+ * Display transform for the fetch bar — what the user SEES, as opposed to what the poll
+ * currently knows. Three jobs:
+ *
+ *  1. A `pending` track (probe or first prepare tick still in flight) holds the frame
+ *     already on screen rather than guessing.
+ *  2. A change of KIND waits `FETCH_LABEL_DEBOUNCE_MS` before it lands, so a state that
+ *     resolves faster than that never flashes. Same-kind updates (progress ticks) apply
+ *     immediately — live progress must stay live.
+ *  3. The rendered percent is ratcheted non-decreasing for the lifetime of one fetch
+ *     session (`sessionKey`); a new session resets the floor because a genuinely fresh
+ *     download does start over at 0.
+ */
+function useTrackFetchDisplay(
+  track: TrackFetch | null,
+  sessionKey: string,
+): TrackFetch | null {
+  const [shown, setShown] = useState<TrackFetch | null>(null);
+  const shownRef = useRef<TrackFetch | null>(null);
+  const peakRef = useRef(0);
+  const sessionRef = useRef(sessionKey);
+
+  useEffect(() => {
+    if (sessionRef.current !== sessionKey) {
+      sessionRef.current = sessionKey;
+      peakRef.current = 0;
+    }
+    if (track === null) {
+      shownRef.current = null;
+      setShown(null);
+      return;
+    }
+    if (track.kind === "pending") return; // hold the previous frame
+
+    const prev = shownRef.current;
+    let next = track;
+    if (track.kind === "fetching") {
+      // Release the ratchet on a genuine restart, so a re-queued part re-downloads
+      // behind a bar that moves rather than one frozen at its old high-water mark.
+      if (isFetchRestart(peakRef.current, track, prev?.kind === "fetching")) {
+        peakRef.current = 0;
+      }
+      const percent = clampMonotonicPercent(peakRef.current, track.percent);
+      peakRef.current = percent;
+      next = { ...track, percent };
+    }
+    if (prev && prev.kind === next.kind) {
+      shownRef.current = next;
+      setShown(next);
+      return;
+    }
+    const timer = setTimeout(() => {
+      shownRef.current = next;
+      setShown(next);
+    }, FETCH_LABEL_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [track, sessionKey]);
+
+  return shown;
+}
+
+/**
+ * The inert stand-in for the audio row: correct height, no affordance, no claim. Rendered
+ * while the presence probe for a freshly-opened track has not answered yet, and while the
+ * fetch bar is holding for a state to settle. Reserving the space is the whole point —
+ * rendering the player optimistically (and yanking it away a tick later) is what made the
+ * open of a synced session flicker.
+ */
+function AudioRowPlaceholder() {
+  return (
+    <div
+      className={`${AUDIO_ROW_CLASS} text-muted-foreground`}
+      data-audio-row="placeholder"
+      aria-hidden="true"
+    />
+  );
+}
+
+/**
  * The honest missing-audio bar for a synced session whose bytes are not on this device (S3).
  * With auto-fetch (S3.5) the happy path never needs a click: the bar shows queued/fetching
  * progress with a cancel X. Renders one of: the classic disabled "audio is on <device>"
@@ -247,8 +350,9 @@ function AudioFetchBar({
   onCancel: () => void;
   onRetry: () => void;
 }) {
-  const barCls =
-    "flex items-center gap-3 border-b px-4 py-2 text-muted-foreground";
+  // Same shell (and therefore the same height) as the player and the placeholder, so any
+  // of these states can replace any other without moving the transcript underneath.
+  const barCls = `${AUDIO_ROW_CLASS} text-muted-foreground`;
 
   // Sync off (or no relay): the audio can only be fetched via sync — stay honest & disabled.
   if (!syncEnabled) {
@@ -264,7 +368,7 @@ function AudioFetchBar({
 
   // Only reachable after an explicit user cancel (auto-fetch is otherwise always armed):
   // offer to start it again.
-  if (!active || !track) {
+  if (!active) {
     return (
       <div className={barCls}>
         <Button variant="ghost" size="icon-xs" onClick={onFetch} aria-label="Fetch and play audio" title="Fetch audio from sync">
@@ -275,11 +379,21 @@ function AudioFetchBar({
     );
   }
 
+  // Armed, but nothing has settled yet (`pending`, or a kind change still inside the
+  // display debounce). Hold the space; do NOT fall through to the click-to-fetch copy,
+  // which would tell the user the fetch had stopped when it is starting.
+  if (!track || track.kind === "pending") return <AudioRowPlaceholder />;
+
   if (track.kind === "queued") {
     return (
       <div className={barCls}>
-        <span className="text-xs">Waiting to fetch…</span>
-        <div className="h-1 flex-1 overflow-hidden rounded bg-muted" />
+        <span className="min-w-[14ch] whitespace-nowrap text-xs">Waiting to fetch…</span>
+        {/* Indeterminate: the wait is real work (a permit is held by another download),
+            so the track must not read as a dead grey rule. Same sweep primitive the
+            command palette uses for its own unknown-duration work. */}
+        <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
+          <div className="h-full w-1/3 animate-command-loading rounded-full bg-primary/40" />
+        </div>
         <Button variant="ghost" size="icon-xs" onClick={onCancel} aria-label="Cancel fetch" title="Cancel">
           <X className="h-4 w-4" />
         </Button>
@@ -290,7 +404,17 @@ function AudioFetchBar({
   if (track.kind === "fetching") {
     return (
       <div className={barCls}>
-        <span className="text-xs tabular-nums">{formatTrackFetchLabel(track)}</span>
+        {/* Reserve the label's widest form up front. The copy changes on every tick
+            ("Fetching…" → "… 7%" → "… 100%"), and a shrink-to-fit span shoves the
+            progress bar sideways each time. `tabular-nums` holds the digits steady;
+            the min-width holds the phrase steady. */}
+        <span
+          className={`whitespace-nowrap text-xs tabular-nums ${
+            track.totalParts > 1 ? "min-w-[27ch]" : "min-w-[14ch]"
+          }`}
+        >
+          {formatTrackFetchLabel(track)}
+        </span>
         <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
           <div className="h-full bg-primary transition-[width]" style={{ width: `${track.percent}%` }} />
         </div>
@@ -493,7 +617,7 @@ export function NoteDetailView() {
   // only metadata. Probe existence off the render path (resolves post-mount)
   // and re-check when the parts change (session switch / D4 reload replaces the
   // parts array) or the window regains focus (the user may have copied the
-  // file over). `partsExist` stays `null` (optimistic) until the probe lands.
+  // file over).
   const partPaths = useMemo(
     () =>
       (isActiveSession ? activeSessionParts : viewSessionParts).map(
@@ -501,34 +625,61 @@ export function NoteDetailView() {
       ),
     [isActiveSession, activeSessionParts, viewSessionParts],
   );
-  const [partsExist, setPartsExist] = useState<boolean[] | null>(null);
+  // Identity-independent key: the D4 live refresh replaces `viewSessionParts` with a NEW
+  // array of the SAME paths several times a minute. Keying the probe on array identity
+  // restarted it (and everything downstream of it) each time; keying on the paths
+  // themselves means only a genuinely different track restarts anything.
+  const partsKey = partPaths.join(" ");
+  const partPathsRef = useRef(partPaths);
+  partPathsRef.current = partPaths;
+  const [probe, setProbe] = useState<PresenceProbe>({ status: "probing" });
   useEffect(() => {
-    if (partPaths.length === 0) {
-      setPartsExist(null);
+    const paths = partPathsRef.current;
+    if (paths.length === 0) {
+      setProbe({ status: "unknown" });
       return;
     }
     let cancelled = false;
+    // New track: whatever we held describes DIFFERENT files, so it must go. Until the
+    // first result lands the row is the inert placeholder — not an optimistic player
+    // that gets yanked, and not a fetch bar for a fetch we do not know is needed.
+    setProbe({ status: "probing" });
     const check = () => {
+      // Deliberately does NOT flip back to `probing`: a re-probe holds the last result
+      // so the player stays mounted, `missingPartIds` stays stable, the poll effect is
+      // not torn down (which would release the queued parts), and progress is not reset.
       commands
-        .audioFilesExist(partPaths)
+        .audioFilesExist(paths)
         .then((res) => {
-          if (!cancelled) setPartsExist(res);
+          if (cancelled) return;
+          setProbe(
+            Array.isArray(res) && res.length === paths.length
+              ? { status: "resolved", flags: res }
+              : { status: "unknown" },
+          );
         })
         .catch(() => {
-          // Command unavailable (older backend) → stay optimistic; the
-          // player's own play-error toast still catches a genuinely missing
-          // file when the user hits play.
-          if (!cancelled) setPartsExist(null);
+          // Command unavailable (older backend) → stay optimistic; the player's own
+          // play-error toast still catches a genuinely missing file when the user hits
+          // play. A result we already hold outranks a failed re-probe.
+          if (!cancelled) {
+            setProbe((prev) => (prev.status === "resolved" ? prev : { status: "unknown" }));
+          }
         });
     };
-    setPartsExist(null); // reset to optimistic while re-checking
     check();
     window.addEventListener("focus", check);
     return () => {
       cancelled = true;
       window.removeEventListener("focus", check);
     };
-  }, [partPaths]);
+    // Keyed on the joined paths (via the ref above), not on `partPaths`' array identity.
+  }, [partsKey]);
+  /** Last RESOLVED presence result, or `null` when we have none (probing / unsupported). */
+  const partsExist: boolean[] | null =
+    probe.status === "resolved" ? probe.flags : null;
+  /** First probe for this track still in flight — nothing may be claimed about the audio. */
+  const presenceUnresolved = probe.status === "probing";
 
   // ---- S3.5 auto-fetch playback ----
   // When a synced session's audio is missing locally, fetching starts BY ITSELF the moment
@@ -640,6 +791,44 @@ export function NoteDetailView() {
     return out;
   }, [prepareStates]);
 
+  // D2-ordered assembly: local file_path for present parts, fetched cache path for the rest.
+  const assembled = assembleTrack(rawParts, partsExist, cacheByPart, audioStreamUrl);
+  const partsForPlayer: AudioPart[] = assembled.parts;
+  const hasAudio = rawParts.length > 0;
+  // Aggregate fetch state across the MISSING parts (all-or-nothing: the timeline seeks by
+  // global time, so every part must resolve before we render the player). Memoized so the
+  // display hook below sees a stable identity between polls.
+  const trackFetch: TrackFetch | null = useMemo(() => {
+    if (!fetchArmed || missingPartIds.length === 0) return null;
+    // A part we have not heard back about yet is UNKNOWN, not "fetching". Defaulting it
+    // to a synthetic fetching state announced "Fetching…" before the very first prepare
+    // call returned, so a cache hit or a 404 flashed a download that never happened —
+    // and it recurred on every re-start/retry, which clear `prepareStates`.
+    const states = missingPartIds.map((id) => prepareStates[id]);
+    if (states.some((st) => st === undefined)) return { kind: "pending" };
+    return deriveTrackFetch(states as AudioPartPrepare[]);
+  }, [fetchArmed, missingPartIds, prepareStates]);
+  // One fetch session = one missing-set + one (re)start. Its identity resets the
+  // monotonic progress floor; nothing else may.
+  const displayTrack = useTrackFetchDisplay(trackFetch, `${missingKey}#${fetchNonce}`);
+  // `audioPlayable` = every part has a resolved src (local or freshly fetched). When parts
+  // are missing and not (yet) fetched we render the honest fetch/unavailable bar and withhold
+  // every playback affordance (transcript-timestamp seeking included). An unresolved probe
+  // is not a licence to seek either — we do not yet know the bytes are here.
+  const audioPlayable = hasAudio && assembled.allPlayable && !presenceUnresolved;
+  const audioMissing =
+    hasAudio && !presenceUnresolved && missingPartIds.length > 0 && !assembled.allPlayable;
+  // Did this track ever show the fetch bar? If so, the player that eventually replaces it
+  // is an ARRIVAL and gets the standard view transition; a player that was there from the
+  // first paint gets nothing (it would double up with the view's own entrance).
+  const fetchBarShownRef = useRef(false);
+  useEffect(() => {
+    fetchBarShownRef.current = false;
+  }, [partsKey]);
+  useEffect(() => {
+    if (audioMissing) fetchBarShownRef.current = true;
+  }, [audioMissing]);
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -650,26 +839,6 @@ export function NoteDetailView() {
   const isEditable = isActiveSession || session.status === "completed";
   const isManual = session.session_type === "manual";
   const isTranscription = !isManual;
-  // D2-ordered assembly: local file_path for present parts, fetched cache path for the rest.
-  const assembled = assembleTrack(rawParts, partsExist, cacheByPart, audioStreamUrl);
-  const partsForPlayer: AudioPart[] = assembled.parts;
-  const hasAudio = rawParts.length > 0;
-  // Aggregate fetch state across the MISSING parts (all-or-nothing: the timeline seeks by
-  // global time, so every part must resolve before we render the player).
-  const trackFetch: TrackFetch | null =
-    fetchArmed && missingPartIds.length > 0
-      ? deriveTrackFetch(
-          missingPartIds.map(
-            (id) =>
-              prepareStates[id] ?? { state: "fetching", received: 0, total: 0 },
-          ),
-        )
-      : null;
-  // `audioPlayable` = every part has a resolved src (local or freshly fetched). When parts
-  // are missing and not (yet) fetched we render the honest fetch/unavailable bar and withhold
-  // every playback affordance (transcript-timestamp seeking included).
-  const audioPlayable = hasAudio && assembled.allPlayable;
-  const audioMissing = hasAudio && missingPartIds.length > 0 && !assembled.allPlayable;
   const audioDeviceLabel =
     syncStatus?.roster.find(
       (r) => r.fingerprint === session.recording_device_id,
@@ -747,14 +916,20 @@ export function NoteDetailView() {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} segments={segments} />
-        {audioMissing ? (
+        {hasAudio && presenceUnresolved ? (
+          // The presence probe for this track has not answered. Reserve the row rather
+          // than rendering the player (which would be yanked away a tick later if the
+          // bytes turn out to be on the other device) or the fetch bar (which would
+          // claim a fetch we do not know is needed).
+          <AudioRowPlaceholder />
+        ) : audioMissing ? (
           // Metadata synced from another device but the audio bytes did not. S3: offer
           // fetch-on-demand (progress + cancel) instead of a dead disabled control.
           <AudioFetchBar
             deviceLabel={audioDeviceLabel}
             syncEnabled={syncEnabled}
             active={fetchArmed}
-            track={trackFetch}
+            track={displayTrack}
             onFetch={startFetch}
             onCancel={cancelFetch}
             onRetry={retryFetch}
@@ -762,6 +937,7 @@ export function NoteDetailView() {
         ) : hasAudio ? (
           <AudioPlayer
             parts={partsForPlayer}
+            className={fetchBarShownRef.current ? "view-enter" : undefined}
             onTimeUpdate={setPlaybackTime}
             onPlayStateChange={setIsPlaying}
             onResume={

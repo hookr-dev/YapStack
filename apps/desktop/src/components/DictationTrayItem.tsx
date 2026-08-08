@@ -4,14 +4,24 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { Play, Pause, Copy, FileText, Trash2 } from "lucide-react";
+import { Play, Pause, Copy, FileText, Trash2, Loader2 } from "lucide-react";
 import { useDictationEntry } from "@/hooks/useDictationEntry";
+import { deriveFetchGlyph } from "@/lib/sync";
 import { formatRelativeTime } from "@/lib/utils";
 import type { DbDictationHistory } from "@/lib/db";
 
 export function DictationTrayItem({ entry }: { entry: DbDictationHistory }) {
-  const { playing, handleCopy, handlePlayAudio, handleMoveToNote, handleDelete } =
-    useDictationEntry(entry);
+  const {
+    playing,
+    fetchState,
+    handleCopy,
+    handlePlayAudio,
+    handleMoveToNote,
+    handleDelete,
+  } = useDictationEntry(entry);
+  // Same decision as the feed row: while a sync fetch is genuinely running the action is
+  // busy, not broken (it used to read as an inert "Play Audio" that did nothing).
+  const glyph = deriveFetchGlyph(fetchState);
 
   return (
     <ContextMenu>
@@ -35,13 +45,22 @@ export function DictationTrayItem({ entry }: { entry: DbDictationHistory }) {
           Copy Text
         </ContextMenuItem>
         {entry.wav_file_path && (
-          <ContextMenuItem onClick={handlePlayAudio}>
-            {playing ? (
+          <ContextMenuItem
+            onClick={handlePlayAudio}
+            disabled={glyph.kind === "busy"}
+          >
+            {glyph.kind === "busy" ? (
+              <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+            ) : playing ? (
               <Pause className="h-3.5 w-3.5 mr-2" />
             ) : (
               <Play className="h-3.5 w-3.5 mr-2" />
             )}
-            {playing ? "Pause Audio" : "Play Audio"}
+            {glyph.kind === "busy"
+              ? glyph.label
+              : playing
+                ? "Pause Audio"
+                : "Play Audio"}
           </ContextMenuItem>
         )}
         {!entry.session_id && (

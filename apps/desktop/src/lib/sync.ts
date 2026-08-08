@@ -344,9 +344,20 @@ export type AudioPartPrepare =
  */
 export type TrackFetch =
   | { kind: "ready" } // all (missing) parts are now local — build the player
+  // Nothing has RESOLVED yet for this track (the presence probe or the first prepare
+  // tick is still in flight). Never produced by `deriveTrackFetch` — it is the caller's
+  // sentinel for "I do not know yet", so the UI can hold whatever is already on screen
+  // instead of guessing "Fetching…" and flashing when the guess turns out wrong (D3).
+  | { kind: "pending" }
   | {
       kind: "fetching";
+      /** Track-level completion 0..100, weighted by PART (each missing part is one unit,
+       *  an already-landed part is a full unit) — deliberately NOT `received/total`,
+       *  which only covers the parts currently on the wire and therefore regresses at a
+       *  part boundary. Non-decreasing over the life of one fetch by construction. */
       percent: number;
+      /** Bytes received/expected across the parts currently DOWNLOADING (diagnostic;
+       *  the headline percent is part-weighted — see above). */
       received: number;
       total: number;
       /** 1-based ordinal (among the missing parts) of the first in-flight part — the K in
@@ -393,14 +404,29 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
   if (firstFetching >= 0) {
     let received = 0;
     let total = 0;
+    // Track-level completion measured over ALL the missing parts, not just the ones
+    // currently on the wire. Each part contributes at most one unit; a part that has
+    // already landed contributes its FULL unit. Summing bytes across only the in-flight
+    // parts (the old math) made the denominator shrink as parts completed, so the bar
+    // animated BACKWARDS at every part boundary — 90% of part 1, then 10% of part 2.
+    // Part-weighting cannot regress: a part's own fraction only grows, and a part that
+    // finishes converts its fraction into a full unit.
+    let completion = 0;
     for (const p of parts) {
       if (p.state === "fetching") {
-        received += Math.max(0, p.received);
-        total += Math.max(0, p.total);
+        const got = Math.max(0, p.received);
+        const want = Math.max(0, p.total);
+        received += got;
+        total += want;
+        completion += want > 0 ? Math.min(1, got / want) : 0;
+      } else if (p.state === "ready") {
+        completion += 1;
       }
     }
-    const percent =
-      total > 0 ? Math.min(100, Math.max(0, Math.round((received / total) * 100))) : 0;
+    const percent = Math.min(
+      100,
+      Math.max(0, Math.round((completion / parts.length) * 100)),
+    );
     return {
       kind: "fetching",
       percent,
@@ -445,6 +471,91 @@ export function formatTrackFetchLabel(track: {
   return pct ? `Fetching… ${pct}` : "Fetching…";
 }
 
+/**
+ * What a compact, single-glyph play affordance (a dictation feed row, a tray item) should
+ * show for a track's fetch state. These surfaces have no room for a progress bar, so the
+ * whole state collapses to three cases:
+ *   - `idle`     — nothing in flight; render the normal play control.
+ *   - `busy`     — a fetch is genuinely running; replace the glyph with a spinner and
+ *                  disable the control. `label` carries the honest detail for the
+ *                  tooltip/aria-label, since the glyph itself cannot.
+ *   - `blocked`  — a terminal that needs attention. The control stays LIVE (clicking it
+ *                  re-runs the fetch loudly and surfaces the reason as a toast) but the
+ *                  label explains it in place, so the button is never silently dead.
+ * Pure so every surface renders the same decision and the matrix is unit-testable.
+ */
+export type FetchGlyph =
+  | { kind: "idle" }
+  | { kind: "busy"; label: string }
+  | { kind: "blocked"; label: string };
+
+export function deriveFetchGlyph(track: TrackFetch | null): FetchGlyph {
+  if (track === null) return { kind: "idle" };
+  switch (track.kind) {
+    case "ready":
+      return { kind: "idle" };
+    case "pending":
+    case "queued":
+      return { kind: "busy", label: "Waiting to fetch…" };
+    case "fetching":
+      return { kind: "busy", label: formatTrackFetchLabel(track) };
+    case "on_device":
+      return { kind: "blocked", label: "Audio isn't backed up to sync yet" };
+    case "unreachable":
+      return { kind: "blocked", label: "Can't reach sync server" };
+    case "auth_expired":
+      return { kind: "blocked", label: AUTH_EXPIRED_FETCH_COPY };
+    case "no_space":
+      return { kind: "blocked", label: formatNoSpace(track.needed) };
+    case "verification_failed":
+      return { kind: "blocked", label: "Audio failed verification" };
+    case "error":
+      return { kind: "blocked", label: track.message };
+  }
+}
+
+/**
+ * Ratchet a rendered progress percent so it can only ever move forward within ONE fetch
+ * session. `deriveTrackFetch` is monotonic by construction, but the inputs are not
+ * guaranteed to be: a re-probe can report a smaller `total`, a part can be re-queued
+ * after a transient failure, and a stale poll response can land out of order. A progress
+ * bar that walks backwards reads as a bug even when the number is momentarily true, so
+ * the DISPLAY holds the high-water mark. Callers reset `peak` to 0 when a genuinely new
+ * fetch starts (cancel + re-start, retry, track change). Pure & unit-testable.
+ */
+export function clampMonotonicPercent(peak: number, next: number): number {
+  const bounded = Number.isFinite(next) ? Math.min(100, Math.max(0, next)) : 0;
+  return Math.max(Number.isFinite(peak) ? peak : 0, bounded);
+}
+
+/**
+ * Should the ratchet above be RELEASED — i.e. is this reading a genuine restart rather
+ * than noise? The ratchet exists to absorb a stale or out-of-order poll; it must not
+ * outlive the download it was guarding, or a part the backend re-queues (a transient
+ * failure, a lost permit) re-downloads from zero behind a bar frozen at its old
+ * high-water mark.
+ *
+ * Three signatures, each a real case the aggregate percent alone cannot express:
+ *   - `wasFetching` false — the track left the fetching state and came back, so whatever
+ *     returns is a fresh reading, not a continuation.
+ *   - a fall to exactly 0 from a non-zero peak — the single-part re-queue (its byte
+ *     counter restarts), which no proportional threshold can catch on a 1-part track.
+ *   - a fall of a whole part's share of the track — one of several parts was re-queued
+ *     while the others kept going. Byte jitter WITHIN a part is always smaller than this,
+ *     and a part boundary only ever moves completion up, so neither can false-positive.
+ *     The 1-point slack absorbs the rounding in `percent`.
+ */
+export function isFetchRestart(
+  peak: number,
+  next: { percent: number; totalParts: number },
+  wasFetching: boolean,
+): boolean {
+  if (!wasFetching) return true;
+  if (peak > 0 && next.percent === 0) return true;
+  const share = 100 / Math.max(1, next.totalParts);
+  return peak - next.percent >= share - 1;
+}
+
 /** "Not enough disk space (need ~X)" copy for the no_space terminal. */
 export function formatNoSpace(needed: number): string {
   return `Not enough disk space (need ~${formatBytes(needed)})`;
@@ -467,8 +578,11 @@ export const AUTH_EXPIRED_FETCH_COPY = "Sync session expired — reconnecting…
  */
 export function nextPollDelayMs(track: TrackFetch): number | null {
   switch (track.kind) {
+    // `pending` (nothing resolved yet) shares the fast cadence so the first real answer
+    // lands promptly — the UI is holding its previous frame meanwhile.
     case "fetching":
     case "queued":
+    case "pending":
       return 600;
     case "on_device":
     case "auth_expired":
@@ -618,7 +732,12 @@ export function formatLastSynced(iso: string | null, now: number = Date.now()): 
 
 // ----- S2 audio-upload lane display -----
 
-export type AudioBackupState = "hidden" | "uploading" | "failed" | "complete";
+export type AudioBackupState =
+  | "hidden"
+  | "uploading"
+  | "failed"
+  | "incomplete"
+  | "complete";
 
 export interface AudioBackupDisplay {
   /** `hidden` when there is nothing to show (nothing outstanding, failed, or ever
@@ -634,13 +753,28 @@ type AudioLaneFields = Pick<
   | "audioBackfillOutstanding"
   | "audioUploadFailed"
   | "audioUploadedTotal"
+  | "audioBackfillComplete"
 >;
 
 /**
  * Derive the audio-upload lane's steady-state line for the Sync panel. Precedence:
  * failures (needs attention) → in-flight uploads (with the library-backfill nuance) →
- * an "all backed up" resting state → hidden. Pure so the panel and its tests share one
- * source of truth. Distinct from the changeset `deriveSyncDisplay` — audio is its own lane.
+ * an INCOMPLETE library walk → an "all backed up" resting state → hidden. Pure so the
+ * panel and its tests share one source of truth. Distinct from the changeset
+ * `deriveSyncDisplay` — audio is its own lane.
+ *
+ * On `incomplete`: the backfill walk marks itself done only when a pass enqueued every
+ * local part. A part it stepped over (the DB was still write-locked after the busy-retry
+ * budget — the boot-contention case) is NOT in the upload queue at all, so it appears in
+ * none of the counts and the lane looks idle. The walk re-runs at next start and picks up
+ * exactly those stragglers; nothing else can. In particular `retry_failed_audio_uploads`
+ * cannot help — it re-pends rows that are already IN the queue, and a skipped part has no
+ * row — so this state deliberately carries no Retry affordance.
+ *
+ * KNOWN LIMIT: the status DTO carries no count of local parts, so an incomplete walk on a
+ * device that has never uploaded anything is indistinguishable from a device that has no
+ * audio at all. We therefore only downgrade a claim we would otherwise OVERSTATE (the
+ * "all backed up" line) and never manufacture a warning over `hidden`.
  */
 export function deriveAudioBackup(s: AudioLaneFields): AudioBackupDisplay {
   const out = Math.max(0, s.audioUploadOutstanding);
@@ -665,6 +799,14 @@ export function deriveAudioBackup(s: AudioLaneFields): AudioBackupDisplay {
       };
     }
     return { state: "uploading", label: base };
+  }
+  if (done > 0 && !s.audioBackfillComplete) {
+    // The lane is quiescent but the walk never covered the whole library, so "N backed
+    // up" would read as "everything is safe" when it is not.
+    return {
+      state: "incomplete",
+      label: "Some audio not yet backed up — retries next launch",
+    };
   }
   if (done > 0) {
     const noun = done === 1 ? "recording" : "recordings";

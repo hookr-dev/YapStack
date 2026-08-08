@@ -73,9 +73,17 @@ pub fn apply_or_quarantine(conn: &Connection, r: &ChangeRow) -> Result<bool, Syn
 
 /// Apply a whole changeset (pull path), quarantining any rows for unknown columns.
 /// Runs in one transaction. Returns (applied, quarantined) counts.
+///
+/// `BEGIN IMMEDIATE`, not a deferred `BEGIN`. The body READS (`is_unknown_column` inspects
+/// the local schema) before it WRITES, so a deferred transaction has to upgrade read→write;
+/// in WAL a lost upgrade race returns `SQLITE_BUSY_SNAPSHOT`, which the busy handler does
+/// NOT retry — it fails outright regardless of `busy_timeout` (same rationale as
+/// `schema::alter_dance` and `outbox::enqueue_local`). Taking the write lock up front lets
+/// `busy_timeout` serialize this merge against the app's writer instead of failing the whole
+/// changeset under boot-time contention.
 pub fn merge_changeset(conn: &Connection, cs: &Changeset) -> Result<(usize, usize), SyncError> {
     ensure_pending_table(conn)?;
-    conn.execute_batch("BEGIN;")?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
     let mut applied = 0usize;
     let mut quarantined = 0usize;
     let mut inner = || -> Result<(), SyncError> {
@@ -99,6 +107,10 @@ pub fn merge_changeset(conn: &Connection, cs: &Changeset) -> Result<(usize, usiz
 /// Replay every stashed change whose column now exists locally, deleting the ones
 /// that apply. Idempotent; safe to call after any schema migration. Returns the
 /// number of changes replayed.
+///
+/// `BEGIN IMMEDIATE` for the same reason as [`merge_changeset`]: the replay loop reads the
+/// local schema (`is_unknown_column`) before writing, and a deferred transaction's lost
+/// read→write upgrade surfaces as `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` cannot retry.
 pub fn replay_pending(conn: &Connection) -> Result<usize, SyncError> {
     ensure_pending_table(conn)?;
     let candidates: Vec<(i64, Vec<u8>)> = {
@@ -110,7 +122,7 @@ pub fn replay_pending(conn: &Connection) -> Result<usize, SyncError> {
         v
     };
 
-    conn.execute_batch("BEGIN;")?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
     let mut replayed = 0usize;
     let mut inner = || -> Result<(), SyncError> {
         for (id, blob) in &candidates {

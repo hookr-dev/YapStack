@@ -16,10 +16,14 @@ import {
   enqueueAudioForSession,
   enqueueAudioForDictation,
   deriveTrackFetch,
+  deriveFetchGlyph,
+  clampMonotonicPercent,
+  isFetchRestart,
   formatFetchProgress,
   formatTrackFetchLabel,
   formatNoSpace,
   nextPollDelayMs,
+  AUTH_EXPIRED_FETCH_COPY,
   ON_DEVICE_REPROBE_MS,
   type AudioPartPrepare,
 } from "./sync";
@@ -189,6 +193,8 @@ describe("deriveAudioBackup", () => {
     audioBackfillOutstanding: 0,
     audioUploadFailed: 0,
     audioUploadedTotal: 0,
+    // The steady state: a walk has covered the whole library at least once.
+    audioBackfillComplete: true,
   };
 
   it("is hidden when nothing is outstanding, failed, or ever uploaded", () => {
@@ -248,6 +254,80 @@ describe("deriveAudioBackup", () => {
       deriveAudioBackup({ ...base, audioUploadedTotal: 42 }).label,
     ).toBe("42 recordings backed up");
   });
+
+  it("refuses the all-backed-up line while the library walk is incomplete", () => {
+    // A part the walk stepped over (boot write-lock) is in NO count — the lane looks
+    // idle and "42 recordings backed up" would read as "everything is safe".
+    expect(
+      deriveAudioBackup({
+        ...base,
+        audioUploadedTotal: 42,
+        audioBackfillComplete: false,
+      }),
+    ).toEqual({
+      state: "incomplete",
+      label: "Some audio not yet backed up — retries next launch",
+    });
+  });
+
+  it("lets real work outrank the incomplete-walk caveat", () => {
+    // Something actionable (or visibly moving) is the better headline; the walk still
+    // re-runs next launch either way.
+    expect(
+      deriveAudioBackup({
+        ...base,
+        audioUploadedTotal: 5,
+        audioUploadFailed: 2,
+        audioBackfillComplete: false,
+      }).state,
+    ).toBe("failed");
+    expect(
+      deriveAudioBackup({
+        ...base,
+        audioUploadedTotal: 5,
+        audioUploadOutstanding: 3,
+        audioBackfillComplete: false,
+      }).state,
+    ).toBe("uploading");
+  });
+
+  it("stays hidden on an incomplete walk that has never uploaded anything", () => {
+    // Known limit: with no local-part count in the DTO this is indistinguishable from a
+    // device with no audio at all, so we downgrade an overstatement but never invent a
+    // warning.
+    expect(
+      deriveAudioBackup({ ...base, audioBackfillComplete: false }).state,
+    ).toBe("hidden");
+  });
+});
+
+describe("isFetchRestart (ratchet release)", () => {
+  const at = (percent: number, totalParts = 1) => ({ percent, totalParts });
+
+  it("treats a return from any non-fetching state as a fresh reading", () => {
+    expect(isFetchRestart(80, at(10), false)).toBe(true);
+    // …including the very first fetching frame, where there is nothing to continue.
+    expect(isFetchRestart(0, at(0), false)).toBe(true);
+  });
+
+  it("catches a single-part re-queue, whose counter restarts at zero", () => {
+    expect(isFetchRestart(80, at(0), true)).toBe(true);
+  });
+
+  it("catches one part of several being re-queued", () => {
+    // 4 parts: a whole part's share (25 points) disappears.
+    expect(isFetchRestart(70, at(45, 4), true)).toBe(true);
+  });
+
+  it("holds through byte jitter inside a part (the stale-poll case the ratchet is for)", () => {
+    expect(isFetchRestart(70, at(66, 4), true)).toBe(false);
+    expect(isFetchRestart(40, at(38), true)).toBe(false);
+  });
+
+  it("never fires on forward progress, including across a part boundary", () => {
+    expect(isFetchRestart(45, at(50, 2), true)).toBe(false);
+    expect(isFetchRestart(45, at(45, 2), true)).toBe(false);
+  });
 });
 
 describe("enqueueAudioForSession (fire-and-forget)", () => {
@@ -300,9 +380,12 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
   it("keeps fetching as the headline while another part has no server copy yet", () => {
     // Auto-fetch S3.5: a not-yet-uploaded part is re-probed on the slow cadence while the
     // rest keep downloading — mid-download progress stays the honest headline.
+    // The percent is TRACK-level: part 1 is 10% of the way through, part 2 has not
+    // started, so the track is 5% done — not 10%, which would be the (misleading)
+    // in-flight-only figure that has to fall back down once part 2 begins.
     expect(deriveTrackFetch([fetching(10, 100), { state: "not_on_server" }])).toEqual({
       kind: "fetching",
-      percent: 10,
+      percent: 5,
       received: 10,
       total: 100,
       currentPart: 1,
@@ -317,10 +400,12 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
   });
 
   it("aggregates progress across in-flight parts into a percent", () => {
+    // Part-weighted: part 1 is 50% done, part 2 is 16.7% done → (0.5 + 0.167) / 2 = 33%.
+    // `received`/`total` stay the raw byte tallies of the in-flight parts (diagnostic).
     const t = deriveTrackFetch([fetching(50, 100), fetching(50, 300)]);
     expect(t).toEqual({
       kind: "fetching",
-      percent: 25,
+      percent: 33,
       received: 100,
       total: 400,
       currentPart: 1,
@@ -404,6 +489,116 @@ describe("deriveTrackFetch (S3 player state machine)", () => {
       deriveTrackFetch([{ state: "error", message: "disk full" }, fetching(1, 2)]),
     ).toEqual({ kind: "error", message: "disk full" });
   });
+
+  it("counts a landed part at FULL weight so a part boundary cannot go backwards", () => {
+    // The exact frame the old math got wrong: part 1 is nearly done, then it lands and
+    // part 2 opens at zero. Summing only the in-flight parts reported 90% then 0%.
+    const beforeBoundary = deriveTrackFetch([fetching(90, 100), { state: "queued" }]);
+    const afterBoundary = deriveTrackFetch([ready(), fetching(0, 100)]);
+    expect(beforeBoundary).toMatchObject({ kind: "fetching", percent: 45 });
+    expect(afterBoundary).toMatchObject({ kind: "fetching", percent: 50 });
+    expect((afterBoundary as { percent: number }).percent).toBeGreaterThanOrEqual(
+      (beforeBoundary as { percent: number }).percent,
+    );
+  });
+
+  it("never regresses across a whole 3-part fetch", () => {
+    const timeline: AudioPartPrepare[][] = [
+      [fetching(0, 100), { state: "queued" }, { state: "queued" }],
+      [fetching(60, 100), { state: "queued" }, { state: "queued" }],
+      [ready(), fetching(20, 400), { state: "queued" }],
+      [ready(), ready(), fetching(10, 50)],
+      [ready(), ready(), fetching(50, 50)],
+    ];
+    const percents = timeline.map((parts) => {
+      const t = deriveTrackFetch(parts);
+      return t.kind === "fetching" ? t.percent : 100;
+    });
+    expect(percents).toEqual([0, 20, 35, 73, 100]);
+    for (let i = 1; i < percents.length; i++) {
+      expect(percents[i]).toBeGreaterThanOrEqual(percents[i - 1]);
+    }
+  });
+
+  it("ignores a part whose size the server has not declared yet (no divide-by-zero)", () => {
+    expect(deriveTrackFetch([ready(), fetching(0, 0)])).toMatchObject({
+      kind: "fetching",
+      percent: 50,
+    });
+  });
+});
+
+describe("clampMonotonicPercent (display ratchet)", () => {
+  it("moves forward with progress", () => {
+    expect(clampMonotonicPercent(10, 40)).toBe(40);
+  });
+  it("refuses to move backwards (a stale or re-queued poll must not rewind the bar)", () => {
+    expect(clampMonotonicPercent(90, 10)).toBe(90);
+  });
+  it("bounds the input to 0..100 and treats a non-finite reading as no progress", () => {
+    expect(clampMonotonicPercent(0, 140)).toBe(100);
+    expect(clampMonotonicPercent(0, -5)).toBe(0);
+    expect(clampMonotonicPercent(25, NaN)).toBe(25);
+    expect(clampMonotonicPercent(NaN, 25)).toBe(25);
+  });
+  it("starts from zero, so a caller that resets the peak gets a fresh ramp", () => {
+    expect(clampMonotonicPercent(0, 3)).toBe(3);
+  });
+});
+
+describe("deriveFetchGlyph (compact play affordances)", () => {
+  it("is idle with no fetch, and once the track is ready", () => {
+    expect(deriveFetchGlyph(null)).toEqual({ kind: "idle" });
+    expect(deriveFetchGlyph({ kind: "ready" })).toEqual({ kind: "idle" });
+  });
+
+  it("is busy — with honest detail — while the fetch is actually running", () => {
+    expect(deriveFetchGlyph({ kind: "pending" })).toEqual({
+      kind: "busy",
+      label: "Waiting to fetch…",
+    });
+    expect(deriveFetchGlyph({ kind: "queued" })).toEqual({
+      kind: "busy",
+      label: "Waiting to fetch…",
+    });
+    expect(
+      deriveFetchGlyph({
+        kind: "fetching",
+        percent: 42,
+        received: 42,
+        total: 100,
+        currentPart: 1,
+        totalParts: 1,
+      }),
+    ).toEqual({ kind: "busy", label: "Fetching… 42%" });
+  });
+
+  it("blocks (never silently) on every terminal, carrying the reason", () => {
+    expect(deriveFetchGlyph({ kind: "on_device" })).toEqual({
+      kind: "blocked",
+      label: "Audio isn't backed up to sync yet",
+    });
+    expect(deriveFetchGlyph({ kind: "unreachable" })).toEqual({
+      kind: "blocked",
+      label: "Can't reach sync server",
+    });
+    expect(deriveFetchGlyph({ kind: "auth_expired" })).toEqual({
+      kind: "blocked",
+      label: AUTH_EXPIRED_FETCH_COPY,
+    });
+    expect(deriveFetchGlyph({ kind: "verification_failed" })).toEqual({
+      kind: "blocked",
+      label: "Audio failed verification",
+    });
+    expect(deriveFetchGlyph({ kind: "no_space", needed: 1024 * 1024 })).toEqual({
+      kind: "blocked",
+      label: "Not enough disk space (need ~1.0 MB)",
+    });
+    expect(deriveFetchGlyph({ kind: "error", message: "boom" })).toEqual({
+      kind: "blocked",
+      label: "boom",
+    });
+  });
 });
 
 describe("formatFetchProgress", () => {
@@ -453,6 +648,8 @@ describe("nextPollDelayMs (auto-fetch cadence)", () => {
   it("polls fast while downloading or waiting for a permit", () => {
     expect(nextPollDelayMs(fetching())).toBe(600);
     expect(nextPollDelayMs({ kind: "queued" })).toBe(600);
+    // Nothing resolved yet — the fast cadence gets the first real answer on screen.
+    expect(nextPollDelayMs({ kind: "pending" })).toBe(600);
   });
   it("re-probes on the slow 30s cadence while the server lacks a blob", () => {
     expect(nextPollDelayMs({ kind: "on_device" })).toBe(30_000);

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
@@ -655,7 +655,8 @@ describe("NoteDetailView audio auto-fetch (S3.5, honest player rendering)", () =
     );
 
     // K = first in-flight part's ordinal among missing (p1 → 2), M = total missing (2).
-    expect(await screen.findByText("Fetching part 2 of 2 — 50%")).toBeInTheDocument();
+    // 75% = the landed part 1 (a full unit) plus half of part 2, over both parts.
+    expect(await screen.findByText("Fetching part 2 of 2 — 75%")).toBeInTheDocument();
     // Ordered submission: p0 was prepared before p1 on the first tick.
     const calls = prepareCalls();
     expect(calls.indexOf("p0")).toBeLessThan(calls.indexOf("p1"));
@@ -834,5 +835,251 @@ describe("NoteDetailView audio auto-fetch (S3.5, honest player rendering)", () =
     );
     expect(screen.queryByText(/Audio is on/)).not.toBeInTheDocument();
     expect(prepareCalls()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audio-row stability. Everything below is about what the row does BETWEEN the
+// honest states above: while the presence probe is unresolved, while a re-probe
+// runs under an in-flight fetch, and while progress crosses a part boundary.
+// ---------------------------------------------------------------------------
+
+const audioRow = () => document.querySelector("[data-audio-row='placeholder']");
+const playerEl = () => document.querySelector("audio[data-session-audio]");
+const releaseCalls = () =>
+  vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "audio_release_part")
+    .map(([, args]) => (args as Record<string, unknown>)?.partId);
+
+describe("NoteDetailView audio row — probe stability", () => {
+  it("holds an inert placeholder while the FIRST presence probe is unresolved", async () => {
+    // A probe that never answers: the mount tick must commit to nothing.
+    vi.mocked(commands.audioFilesExist).mockReturnValue(new Promise(() => {}));
+    mockSyncInvoke({ p0: { state: "fetching", received: 10, total: 100 } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() => expect(commands.audioFilesExist).toHaveBeenCalled());
+    // Not the player (it would be yanked away if the bytes are elsewhere)…
+    expect(playerEl()).toBeNull();
+    // …and not the fetch bar (no fetch is known to be needed yet).
+    expect(screen.queryByText(/Fetching/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/click to fetch/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Audio is on/)).not.toBeInTheDocument();
+    // The space is reserved instead, so nothing below it moves when it resolves.
+    expect(audioRow()).not.toBeNull();
+    expect(prepareCalls()).toHaveLength(0);
+  });
+
+  it("resolves the placeholder into the real player once the probe answers", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([true]);
+    mockSyncInvoke({});
+    openCompleted([makePart({ file_path: "/local/a.wav" })]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    await waitFor(() => expect(playerEl()).not.toBeNull());
+    expect(audioRow()).toBeNull();
+  });
+
+  it("a window-focus re-probe mid-fetch holds the bar and never releases the queued parts", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false, false]);
+    mockSyncInvoke({
+      p0: { state: "fetching", received: 40, total: 100 },
+      p1: { state: "queued" },
+    });
+    openCompleted([
+      makePart({ id: "p0" }),
+      makePart({ id: "p1", part_index: 1, file_path: "/peer/audio/s-remote.1.wav" }),
+    ]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    // (0.4 + 0) / 2 parts = 20%.
+    expect(await screen.findByText("Fetching part 1 of 2 — 20%")).toBeInTheDocument();
+    const probesBefore = vi.mocked(commands.audioFilesExist).mock.calls.length;
+    expect(releaseCalls()).toHaveLength(0);
+
+    // The user clicks into another app and back. This used to blank the presence
+    // result, which unmounted the bar, tore down the poll effect (releasing p1's
+    // queue slot) and restarted the progress at 0.
+    fireEvent(window, new Event("focus"));
+    await waitFor(() =>
+      expect(vi.mocked(commands.audioFilesExist).mock.calls.length).toBeGreaterThan(
+        probesBefore,
+      ),
+    );
+
+    // The bar is still the bar, at the same progress…
+    expect(screen.getByText("Fetching part 1 of 2 — 20%")).toBeInTheDocument();
+    expect(audioRow()).toBeNull();
+    expect(screen.queryByText(/click to fetch/)).not.toBeInTheDocument();
+    // …and p1 kept its place in the queue.
+    expect(releaseCalls()).toHaveLength(0);
+  });
+
+  it("does not restart the probe when a live refresh replaces the parts array in place", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "fetching", received: 30, total: 100 } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Fetching… 30%")).toBeInTheDocument();
+    const probesBefore = vi.mocked(commands.audioFilesExist).mock.calls.length;
+
+    // D4 live refresh: a NEW array holding the SAME part rows.
+    await act(async () => {
+      useAppStore.setState({ viewSessionParts: [makePart()] });
+    });
+
+    expect(screen.getByText("Fetching… 30%")).toBeInTheDocument();
+    expect(audioRow()).toBeNull();
+    expect(vi.mocked(commands.audioFilesExist).mock.calls.length).toBe(probesBefore);
+    expect(releaseCalls()).toHaveLength(0);
+  });
+});
+
+describe("NoteDetailView audio row — fetch-state presentation", () => {
+  it("never flashes 'Fetching…' when the part is already in the cache", async () => {
+    // The prepare resolves ready on the first tick. Anything the UI says about
+    // fetching in between is a lie it has to take back.
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "ready", path: "/cache/p0.wav" } });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() => expect(prepareCalls()).toContain("p0"));
+    expect(screen.queryByText(/Fetching/)).not.toBeInTheDocument();
+    // Give the label debounce more than its window to (not) fire.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(screen.queryByText(/Fetching/)).not.toBeInTheDocument();
+    // The cached part plays.
+    await waitFor(() => expect(playerEl()).not.toBeNull());
+  });
+
+  it("enters the player with the view transition when it replaces a fetch bar", async () => {
+    let ready = false;
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "audio_prepare_part") {
+        return ready
+          ? { state: "ready", path: "/cache/p0.wav" }
+          : { state: "fetching", received: 20, total: 100 };
+      }
+      return null;
+    });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("Fetching… 20%")).toBeInTheDocument();
+
+    ready = true;
+    await waitFor(() => expect(playerEl()).not.toBeNull(), { timeout: 3000 });
+    expect(playerEl()?.parentElement?.className).toContain("view-enter");
+  });
+
+  it("gives a local session's player no entrance transition (it was never absent)", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([true]);
+    mockSyncInvoke({});
+    openCompleted([makePart({ file_path: "/local/a.wav" })]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    await waitFor(() => expect(playerEl()).not.toBeNull());
+    expect(playerEl()?.parentElement?.className).not.toContain("view-enter");
+  });
+
+  it("keeps the rendered percent non-decreasing when a poll reports less", async () => {
+    // Two ticks: the second one reports LOWER progress (a re-probe that lost the
+    // byte count). The bar must hold, not rewind.
+    let tick = 0;
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "audio_prepare_part") {
+        tick += 1;
+        return tick <= 1
+          ? { state: "fetching", received: 80, total: 100 }
+          : { state: "fetching", received: 5, total: 100 };
+      }
+      return null;
+    });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    expect(await screen.findByText("Fetching… 80%")).toBeInTheDocument();
+    await waitFor(() => expect(tick).toBeGreaterThan(1), { timeout: 3000 });
+    // The low reading landed; the display is still at the high-water mark.
+    expect(screen.getByText("Fetching… 80%")).toBeInTheDocument();
+    expect(screen.queryByText("Fetching… 5%")).not.toBeInTheDocument();
+  });
+
+  it("releases the ratchet when the backend re-queues the part (re-download from 0)", async () => {
+    // Distinct from the test above: that one is a stale reading the bar should ignore;
+    // this one is a real restart the bar must follow down, or it sits frozen at 80%
+    // for the whole re-download.
+    let tick = 0;
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "audio_prepare_part") {
+        tick += 1;
+        // 80% … then the part is re-queued and starts over.
+        return tick <= 1
+          ? { state: "fetching", received: 80, total: 100 }
+          : { state: "fetching", received: 0, total: 100 };
+      }
+      return null;
+    });
+    openCompleted([makePart()]);
+    render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+
+    expect(await screen.findByText("Fetching… 80%")).toBeInTheDocument();
+    await waitFor(() => expect(tick).toBeGreaterThan(1), { timeout: 3000 });
+    await waitFor(() =>
+      expect(screen.getByText("Fetching…")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Fetching… 80%")).not.toBeInTheDocument();
+  });
+
+  it("shows an animated (not dead) track while a part waits for a download permit", async () => {
+    vi.mocked(commands.audioFilesExist).mockResolvedValue([false]);
+    mockSyncInvoke({ p0: { state: "queued" } });
+    openCompleted([makePart()]);
+    const { container } = render(
+      <TooltipProvider>
+        <NoteDetailView />
+      </TooltipProvider>,
+    );
+    await screen.findByText("Waiting to fetch…");
+    expect(container.querySelector(".animate-command-loading")).not.toBeNull();
   });
 });

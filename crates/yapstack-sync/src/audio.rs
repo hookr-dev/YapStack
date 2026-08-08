@@ -56,6 +56,72 @@ pub const PRIORITY_BACKFILL: i64 = 1;
 
 const WALK_DONE_KEY: &str = "audio_backfill_walk_completed_at";
 
+/// Total attempts (first try + retries) a background-lane DB write makes before giving up
+/// on a BUSY/locked database. See [`with_busy_retry`].
+const BUSY_RETRY_ATTEMPTS: u32 = 5;
+
+/// Backoff before the FIRST retry; doubles each attempt (200ms → 400 → 800 → 1.6s, ~3s of
+/// total patience on top of the connection's own `busy_timeout`).
+const BUSY_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// True when `e` is SQLite's transient contention class — `SQLITE_BUSY` (including the
+/// `SQLITE_BUSY_SNAPSHOT` extended code, which the busy handler itself does NOT retry) or
+/// `SQLITE_LOCKED`. These say "someone else holds the write lock right now", never "your
+/// statement or data is wrong", so they are safe to retry verbatim.
+#[must_use]
+pub fn is_busy_error(e: &SyncError) -> bool {
+    matches!(
+        e,
+        SyncError::Sqlite(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run a background-lane DB operation, retrying it with backoff while the database is BUSY.
+///
+/// The audio lane is a BEST-EFFORT BACKGROUND lane: at boot it contends with the changeset
+/// drain's merge/capture transactions and the app's own writer, and a transient
+/// "database is locked" there must NEVER become a user-visible failure (it previously
+/// aborted the whole backfill walk for the session — the walk only re-ran on the next app
+/// start). The connection's `busy_timeout` already waits out short holds; this adds a
+/// second, coarser layer for the long ones. Only the BUSY class is retried — a real SQL or
+/// schema error returns on the first attempt, unchanged and un-delayed.
+///
+/// Sleeps on the calling thread (the lane owns an OS thread), and only ever after an
+/// observed BUSY — an uncontended call pays nothing.
+///
+/// # Errors
+/// The operation's own error: the last BUSY error after [`BUSY_RETRY_ATTEMPTS`] attempts,
+/// or any non-BUSY error immediately.
+pub fn with_busy_retry<T, F>(op_label: &str, mut op: F) -> Result<T, SyncError>
+where
+    F: FnMut() -> Result<T, SyncError>,
+{
+    let mut delay = BUSY_RETRY_BASE_DELAY;
+    let mut attempt = 1u32;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy_error(&e) && attempt < BUSY_RETRY_ATTEMPTS => {
+                tracing::debug!(
+                    target: "yapstack::sync",
+                    lane = "audio",
+                    op = op_label,
+                    attempt,
+                    "database busy; retrying after backoff"
+                );
+                std::thread::sleep(delay);
+                delay *= 2;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The upload lane's entry lifecycle (durable in `state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadState {
@@ -166,8 +232,16 @@ pub fn ensure_queue_table(conn: &Connection) -> Result<(), SyncError> {
 /// the backfill walk can both target the same part without duplicating work. Returns `true`
 /// iff a new row was inserted.
 ///
+/// The caller must have created the queue table ([`ensure_queue_table`]) — the walk and the
+/// uploader lane do it ONCE at start rather than paying a `CREATE TABLE IF NOT EXISTS`
+/// write-statement per row against a contended DB. [`enqueue_on_save`] (the ad-hoc
+/// save-path entry point) still ensures it for its own callers.
+///
+/// The INSERT is wrapped in [`with_busy_retry`]: a boot-time lock held by the changeset
+/// drain must not turn a queued upload into a lost one.
+///
 /// # Errors
-/// Propagates any sqlite error.
+/// Propagates any sqlite error (BUSY only after the retry budget is spent).
 pub fn enqueue(
     conn: &Connection,
     part_id: &str,
@@ -175,16 +249,19 @@ pub fn enqueue(
     session_id: &str,
     priority: i64,
 ) -> Result<bool, SyncError> {
-    ensure_queue_table(conn)?;
-    let n = conn.execute(
-        "INSERT OR IGNORE INTO _yapstack_audio_upload_queue \
-         (part_id, source_path, session_id, priority) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![part_id, source_path, session_id, priority],
-    )?;
+    let n = with_busy_retry("enqueue", || {
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO _yapstack_audio_upload_queue \
+             (part_id, source_path, session_id, priority) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![part_id, source_path, session_id, priority],
+        )?)
+    })?;
     Ok(n > 0)
 }
 
-/// Enqueue on session finalize / dictation save (NORMAL priority).
+/// Enqueue on session finalize / dictation save (NORMAL priority). Ensures the queue table
+/// exists first: this is the ad-hoc entry point (a Tauri command's own short-lived
+/// connection), unlike the lane paths that ensure it once at start.
 ///
 /// # Errors
 /// Propagates any sqlite error.
@@ -194,6 +271,7 @@ pub fn enqueue_on_save(
     source_path: &str,
     session_id: &str,
 ) -> Result<bool, SyncError> {
+    with_busy_retry("ensure_queue_table", || ensure_queue_table(conn))?;
     enqueue(conn, part_id, source_path, session_id, PRIORITY_NORMAL)
 }
 
@@ -206,6 +284,19 @@ pub struct BackfillReport {
     pub enqueued: u64,
     /// Parts skipped because their file is missing on this device.
     pub missing_file: u64,
+    /// Parts whose enqueue FAILED (a still-locked DB after the retry budget, or a sqlite
+    /// fault) and were stepped over so one part could not abort the pass. A non-zero count
+    /// means the walk is NOT marked complete, so the next start retries exactly these.
+    pub skipped: u64,
+}
+
+impl BackfillReport {
+    /// True when this pass covered every examined part (nothing stepped over) and therefore
+    /// earned the durable "walk completed" marker.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.skipped == 0
+    }
 }
 
 /// Re-runnable idempotent backfill walk (D9). Reads `session_audio_parts` and, for each row
@@ -217,14 +308,30 @@ pub struct BackfillReport {
 /// `file_exists` is injected so the walk stays engine-testable without a real filesystem
 /// (the desktop passes a real `Path::exists` check against this device's audio dir).
 ///
+/// ## Per-part fault tolerance (lock-contention fix)
+/// The walk runs at boot, alongside the changeset drain's merges and the app's own writes.
+/// Every per-part enqueue is retried through [`with_busy_retry`], and a part that STILL
+/// fails is STEPPED OVER — counted in [`BackfillReport::skipped`], logged at debug — instead
+/// of aborting the pass. Before this, one `?` on a locked DB abandoned the whole walk for
+/// the session (it could only re-run on the next app start), which is how a transient lock
+/// turned into "this device's library never finished backing up until you restart".
+///
+/// The durable completion marker is written ONLY when nothing was skipped, so a pass that
+/// stepped over stragglers is honestly still incomplete and the next start retries them.
+///
 /// # Errors
-/// Propagates any sqlite error.
+/// Propagates a sqlite error from the walk's SETUP (queue/meta table, reading the part
+/// lists). Per-part failures are never fatal — they surface as `skipped`.
 pub fn backfill_walk<F>(conn: &Connection, mut file_exists: F) -> Result<BackfillReport, SyncError>
 where
     F: FnMut(&str) -> bool,
 {
-    ensure_queue_table(conn)?;
-    crate::state::ensure_meta_table(conn)?;
+    // Hoisted out of the per-row path: one `CREATE TABLE IF NOT EXISTS` write per pass, not
+    // one per part.
+    with_busy_retry("ensure_queue_table", || ensure_queue_table(conn))?;
+    with_busy_retry("ensure_meta_table", || {
+        crate::state::ensure_meta_table(conn)
+    })?;
 
     let mut report = BackfillReport::default();
     let mut stmt = conn.prepare(
@@ -251,9 +358,14 @@ where
             report.missing_file += 1;
             continue;
         }
-        if enqueue(conn, &part_id, &file_path, &session_id, PRIORITY_BACKFILL)? {
-            report.enqueued += 1;
-        }
+        enqueue_or_skip(
+            conn,
+            &part_id,
+            &file_path,
+            &session_id,
+            PRIORITY_BACKFILL,
+            &mut report,
+        );
     }
 
     // S3 dictation fold-in: dictation audio has NO session_audio_parts row (the synthetic
@@ -282,15 +394,71 @@ where
             }
             // session_id == part_id (self): dictation has no owning session; the identity is
             // immutable so upload and fetch derive the SAME AAD regardless of later linking.
-            if enqueue(conn, &dict_id, &file_path, &dict_id, PRIORITY_BACKFILL)? {
-                report.enqueued += 1;
-            }
+            enqueue_or_skip(
+                conn,
+                &dict_id,
+                &file_path,
+                &dict_id,
+                PRIORITY_BACKFILL,
+                &mut report,
+            );
         }
     }
 
-    // Record completion (a timestamp; presence is the "walk ran" signal — re-runnable).
-    crate::state::set_meta(conn, WALK_DONE_KEY, &chrono_now())?;
+    // Record completion (a timestamp; presence is the "walk ran" signal — re-runnable) ONLY
+    // when the pass covered everything. A pass that stepped over a locked part stays
+    // unmarked so the next start walks again and picks the straggler up.
+    if report.is_complete() {
+        if let Err(e) = with_busy_retry("mark_walk_complete", || {
+            crate::state::set_meta(conn, WALK_DONE_KEY, &chrono_now())
+        }) {
+            // The parts ARE queued; only the marker is missing. Leaving it unset just means
+            // one more (idempotent) walk next start — never a user-visible failure.
+            tracing::debug!(
+                target: "yapstack::sync",
+                lane = "audio",
+                "backfill walk completed but its marker could not be written ({e}); will re-walk"
+            );
+        }
+    }
     Ok(report)
+}
+
+/// Enqueue one walked part, counting the outcome. A failure is STEPPED OVER (counted in
+/// [`BackfillReport::skipped`]) rather than aborting the walk: the queue is idempotent, the
+/// pass stays unmarked, and the next start retries exactly the stragglers.
+fn enqueue_or_skip(
+    conn: &Connection,
+    part_id: &str,
+    file_path: &str,
+    session_id: &str,
+    priority: i64,
+    report: &mut BackfillReport,
+) {
+    match enqueue(conn, part_id, file_path, session_id, priority) {
+        Ok(true) => report.enqueued += 1,
+        Ok(false) => {}
+        Err(e) => {
+            report.skipped += 1;
+            // A still-locked DB is the EXPECTED boot-time case and must stay quiet (debug);
+            // anything else is unexpected and worth a warn — neither aborts the walk.
+            if is_busy_error(&e) {
+                tracing::debug!(
+                    target: "yapstack::sync",
+                    lane = "audio",
+                    part_id,
+                    "backfill enqueue skipped — database still busy after retries; will retry next start"
+                );
+            } else {
+                tracing::warn!(
+                    target: "yapstack::sync",
+                    lane = "audio",
+                    part_id,
+                    "backfill enqueue failed ({e}); skipped, will retry next start"
+                );
+            }
+        }
+    }
 }
 
 /// Whether a backfill walk has ever completed on this device.
@@ -328,32 +496,35 @@ pub fn lane_status(conn: &Connection) -> Result<AudioLaneStatus, SyncError> {
 }
 
 /// On app start, any entry left `sealing`/`uploading` by a crash is reset to `pending` so a
-/// re-run resumes it (uploads are idempotent via dedup + D8).
+/// re-run resumes it (uploads are idempotent via dedup + D8). Runs at the most contended
+/// moment there is (boot), so both statements go through [`with_busy_retry`].
 ///
 /// # Errors
-/// Propagates any sqlite error.
+/// Propagates any sqlite error (BUSY only after the retry budget is spent).
 pub fn reset_in_flight(conn: &Connection) -> Result<usize, SyncError> {
-    ensure_queue_table(conn)?;
-    let n = conn.execute(
-        "UPDATE _yapstack_audio_upload_queue SET state='pending', updated_at=datetime('now') \
-         WHERE state IN ('sealing','uploading')",
-        [],
-    )?;
-    Ok(n)
+    with_busy_retry("ensure_queue_table", || ensure_queue_table(conn))?;
+    with_busy_retry("reset_in_flight", || {
+        Ok(conn.execute(
+            "UPDATE _yapstack_audio_upload_queue SET state='pending', updated_at=datetime('now') \
+             WHERE state IN ('sealing','uploading')",
+            [],
+        )?)
+    })
 }
 
 /// Reset `failed` entries to `pending` (app-start retry + the manual-retry seam).
 ///
 /// # Errors
-/// Propagates any sqlite error.
+/// Propagates any sqlite error (BUSY only after the retry budget is spent).
 pub fn retry_failed(conn: &Connection) -> Result<usize, SyncError> {
-    ensure_queue_table(conn)?;
-    let n = conn.execute(
-        "UPDATE _yapstack_audio_upload_queue SET state='pending', last_error=NULL, \
-         updated_at=datetime('now') WHERE state='failed'",
-        [],
-    )?;
-    Ok(n)
+    with_busy_retry("ensure_queue_table", || ensure_queue_table(conn))?;
+    with_busy_retry("retry_failed", || {
+        Ok(conn.execute(
+            "UPDATE _yapstack_audio_upload_queue SET state='pending', last_error=NULL, \
+             updated_at=datetime('now') WHERE state='failed'",
+            [],
+        )?)
+    })
 }
 
 /// Bounded startup sweep for orphaned seal temp files (advisory A3). A crash between

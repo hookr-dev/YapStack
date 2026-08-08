@@ -334,48 +334,63 @@ pub fn retry_crypto_quarantine(
 }
 
 /// Split `rows` into bounded chunks (each ≤ [`CHUNK_ROWS`] rows AND ≤
-/// [`CHUNK_PLAINTEXT_BUDGET`] serialized bytes) and insert each as its own encrypted
-/// outbox entry, in row order, returning the assigned `client_seq`s. This is the ONE
-/// capture-time chunking policy used by [`enqueue_local`] (fresh local writes). The
-/// caller supplies the transaction.
-fn chunk_and_insert(
-    tx: &Connection,
-    cipher: &ChangesetCipher,
-    client_id: uuid::Uuid,
-    schema_version: i32,
-    engine_version: i32,
-    rows: Vec<ChangeRow>,
-) -> Result<Vec<i64>, SyncError> {
-    let mut assigned = Vec::new();
+/// [`CHUNK_PLAINTEXT_BUDGET`] serialized bytes), preserving `crsql_changes` order. This is
+/// the ONE capture-time chunking policy used by [`enqueue_local`] (fresh local writes);
+/// each chunk becomes its own outbox entry AND its own write transaction (see
+/// [`enqueue_local`]), so this returns the plan rather than inserting inline.
+///
+/// A chunk boundary may fall INSIDE one `db_version` group (a single local transaction can
+/// author more rows than one chunk holds), which is why the watermark a chunk may commit is
+/// computed separately by [`chunk_commit_watermark`] — never assumed to be the chunk's max
+/// `db_version`.
+fn plan_capture_chunks(rows: Vec<ChangeRow>) -> Vec<Vec<ChangeRow>> {
+    let mut chunks: Vec<Vec<ChangeRow>> = Vec::new();
     let mut buf: Vec<ChangeRow> = Vec::new();
     let mut acc = 4usize; // Changeset::encode row-count header
     for row in rows {
         let sz = row_encoded_size(&row);
         if !buf.is_empty() && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
-            assigned.push(insert_chunk(
-                tx,
-                cipher,
-                client_id,
-                schema_version,
-                engine_version,
-                std::mem::take(&mut buf),
-            )?);
+            chunks.push(std::mem::take(&mut buf));
             acc = 4;
         }
         acc += sz;
         buf.push(row);
     }
     if !buf.is_empty() {
-        assigned.push(insert_chunk(
-            tx,
-            cipher,
-            client_id,
-            schema_version,
-            engine_version,
-            buf,
-        )?);
+        chunks.push(buf);
     }
-    Ok(assigned)
+    chunks
+}
+
+/// The highest `db_version` this chunk may durably commit as the push watermark, or `None`
+/// when it may commit none.
+///
+/// The watermark means "every local row at or below this `db_version` is captured"
+/// ([`read_local_changes_since`] selects `db_version > watermark`), so it may only advance
+/// past a `db_version` group that is ENTIRELY inside the chunks committed so far. Rows
+/// arrive ordered by `(db_version, seq)`, so:
+///
+/// * if the NEXT chunk starts a strictly higher `db_version` (or there is no next chunk),
+///   this chunk closes its last group → its max `db_version` is safe;
+/// * if the next chunk continues THIS chunk's last `db_version` group, that group is still
+///   open → the safe watermark is the highest `db_version` below it, and `None` when the
+///   whole chunk is one open group (a single huge local transaction — e.g. the cutover
+///   backfill, where every row can share one `db_version`).
+///
+/// Returning `None` (rather than the chunk's max) is what makes a mid-capture crash lossless:
+/// the straddled group is re-read in full on the next run instead of being half-skipped.
+fn chunk_commit_watermark(
+    chunk: &[ChangeRow],
+    next_chunk_first_db_version: Option<i64>,
+) -> Option<i64> {
+    let chunk_max = chunk.last()?.db_version;
+    match next_chunk_first_db_version {
+        // The next chunk continues this chunk's final group: only the groups BELOW it closed.
+        Some(next) if next <= chunk_max => {
+            chunk.iter().rev().map(|r| r.db_version).find(|v| *v < next)
+        }
+        _ => Some(chunk_max),
+    }
 }
 
 /// Encrypt one chunk of rows into a fresh outbox entry under the next `client_seq`.
@@ -406,9 +421,42 @@ fn insert_chunk(
 /// thousands of `crsql_changes` rows (tens of MiB) — far past a single push. So the rows
 /// are split into bounded chunks (each ≤ `CHUNK_ROWS` rows AND ≤ `CHUNK_PLAINTEXT_BUDGET`
 /// serialized bytes), and every chunk becomes its own outbox row with its own monotonic
-/// `client_seq`, in `crsql_changes` order. Capture + watermark advance run in ONE
-/// transaction: a partial failure enqueues nothing and leaves the watermark untouched, so
-/// the same rows retry cleanly (no data loss, no double-enqueue).
+/// `client_seq`, in `crsql_changes` order.
+///
+/// ## One transaction PER CHUNK (lock-contention fix)
+/// Each chunk is captured in its OWN `BEGIN IMMEDIATE` … `COMMIT`, and the push watermark
+/// advances INSIDE that same transaction to the highest `db_version` the chunk fully closed
+/// ([`chunk_commit_watermark`]). The write lock is therefore held for ONE bounded chunk
+/// (≤ [`CHUNK_ROWS`] rows / ≤ [`CHUNK_PLAINTEXT_BUDGET`] plaintext) and RELEASED at every
+/// commit — exactly the per-changeset pattern `pull_direction` already uses on the merge
+/// side. Before this, the first sync of a real library (hundreds of thousands of rows) held
+/// ONE write transaction across the entire encode+encrypt+insert backlog and starved every
+/// other writer on the file (the app's `db_service` writer and the audio backfill walk both
+/// timed out at 10s on the owner's boot log).
+///
+/// ## Crash/failure semantics (deliberate change from all-or-nothing)
+/// A failure or crash mid-capture now leaves the EARLIER chunks committed and their
+/// watermark advanced, instead of rolling the whole capture back. That is correct and
+/// lossless:
+///
+/// * **No loss** — the watermark only ever advances past `db_version` groups that are
+///   ENTIRELY captured, so the next run re-reads every row after it. A group straddling a
+///   chunk boundary keeps the watermark BELOW itself ([`chunk_commit_watermark`] returns the
+///   last closed group, possibly `None`), so the straddled rows are re-read in full.
+/// * **No corruption from re-capture** — the re-read rows are re-encrypted under FRESH
+///   `client_seq`s and pushed again. cr-sqlite changes carry their own clock, so applying the
+///   same rows twice is idempotent (LWW converges to the identical state); the relay stores
+///   them as distinct changesets and peers re-merge them as no-ops. The only cost is the
+///   bandwidth of at most one straddled group plus one chunk — the same argument that makes
+///   the pull side's per-changeset watermark advance safe.
+/// * **Ordering** — chunks are still inserted in `crsql_changes` order under monotonically
+///   increasing `client_seq`s, so the push order is unchanged.
+///
+/// Encryption stays INSIDE each chunk's transaction (it is now bounded to one ≤512 KiB
+/// chunk) because the ciphertext is bound to the `client_seq` as AAD, and that seq is
+/// allocated by the same read-then-write counter step the `BEGIN IMMEDIATE` exists to
+/// serialize (T023 Judge). Encrypting outside would mean minting the seq before taking the
+/// write lock — reintroducing exactly the counter race the immediate transaction closes.
 pub fn enqueue_local(
     conn: &Connection,
     cipher: &ChangesetCipher,
@@ -423,26 +471,42 @@ pub fn enqueue_local(
     if cs.rows.is_empty() {
         return Ok(Vec::new());
     }
-    let max_dbv = cs.rows.iter().map(|r| r.db_version).max().unwrap_or(wm);
 
-    // BEGIN IMMEDIATE: grab the write lock up front. This capture path READS then WRITES the
-    // `client_seq` counter (state::next_client_seq) AND the outbox, all in one transaction. A
-    // DEFERRED transaction takes the write lock only at the first write, so a second connection
-    // (drain vs. capture) that read the same counter could force a read-then-write upgrade into
-    // `SQLITE_BUSY` or a primary-key conflict on `client_seq`. IMMEDIATE + the connection's
-    // `busy_timeout` (crsqlite::apply_sync_pragmas) makes the two writers serialize cleanly
-    // (T023 Judge). `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let assigned = chunk_and_insert(
-        &tx,
-        cipher,
-        client_id,
-        schema_version,
-        engine_version,
-        cs.rows,
-    )?;
-    state::set_push_watermark(&tx, max_dbv)?;
-    tx.commit()?;
+    let chunks = plan_capture_chunks(cs.rows);
+    let mut assigned = Vec::with_capacity(chunks.len());
+    let mut committed_wm = wm;
+    let mut pending = chunks.into_iter().peekable();
+    while let Some(chunk) = pending.next() {
+        let next_first = pending.peek().and_then(|c| c.first()).map(|r| r.db_version);
+        // Monotonic by construction (rows are ordered and every db_version here is > wm), but
+        // clamp anyway so the watermark can never rewind on a surprising input.
+        let next_wm = chunk_commit_watermark(&chunk, next_first).filter(|v| *v > committed_wm);
+
+        // BEGIN IMMEDIATE: grab the write lock up front. This capture path READS then WRITES the
+        // `client_seq` counter (state::next_client_seq) AND the outbox, all in one transaction. A
+        // DEFERRED transaction takes the write lock only at the first write, so a second connection
+        // (drain vs. capture) that read the same counter could force a read-then-write upgrade into
+        // `SQLITE_BUSY` or a primary-key conflict on `client_seq`. IMMEDIATE + the connection's
+        // `busy_timeout` (crsqlite::apply_sync_pragmas) makes the two writers serialize cleanly
+        // (T023 Judge). `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        assigned.push(insert_chunk(
+            &tx,
+            cipher,
+            client_id,
+            schema_version,
+            engine_version,
+            chunk,
+        )?);
+        if let Some(v) = next_wm {
+            state::set_push_watermark(&tx, v)?;
+        }
+        tx.commit()?;
+        if let Some(v) = next_wm {
+            committed_wm = v;
+        }
+    }
     Ok(assigned)
 }
 
@@ -2524,5 +2588,344 @@ mod tests {
             "the conflict recovery marks the counter reconciled this spawn"
         );
         server.join().unwrap();
+    }
+
+    // ----- Chunked capture (lock-contention hardening) -----------------------------------
+    //
+    // The capture path used to wrap the ENTIRE backlog (read → encode → encrypt → insert for
+    // every row since the watermark) in ONE `BEGIN IMMEDIATE`. On a first sync that is
+    // hundreds of thousands of rows holding the file's only write lock, which starved both
+    // the app's own writer and the audio backfill walk (both timed out at 10s on the owner's
+    // boot log). Capture now commits ONE CHUNK PER TRANSACTION and advances the push
+    // watermark inside that same transaction — the push-side mirror of `pull_direction`'s
+    // per-changeset commit. These tests pin the two properties that makes correct: the
+    // watermark never advances past a `db_version` group that is only partly captured, and an
+    // interrupted capture resumes without losing a row.
+
+    /// A value big enough that a couple of rows fill one `CHUNK_PLAINTEXT_BUDGET` chunk, so a
+    /// handful of statements produces a MULTI-chunk backlog without inserting 15k rows.
+    fn big_value(tag: char) -> String {
+        std::iter::repeat_n(tag, 200_000).collect()
+    }
+
+    /// Every row currently staged in the outbox, decrypted back to plaintext change rows in
+    /// `client_seq` order — the "what did capture actually stage" oracle.
+    fn captured_rows(
+        conn: &Connection,
+        cipher: &ChangesetCipher,
+        client_id: Uuid,
+    ) -> Vec<ChangeRow> {
+        let entries: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare("SELECT client_seq, ciphertext FROM _yapstack_outbox ORDER BY client_seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut rows = Vec::new();
+        for (seq, blob) in entries {
+            let pt = cipher.decrypt(client_id, seq, &blob).unwrap();
+            rows.extend(Changeset::decode(&pt).unwrap().rows);
+        }
+        rows
+    }
+
+    /// Identity of a change row for set/multiset comparisons (the payload is bound to it).
+    fn row_key(r: &ChangeRow) -> (String, Vec<u8>, String, i64, i64) {
+        (
+            r.table.clone(),
+            r.pk.clone(),
+            r.cid.clone(),
+            r.db_version,
+            r.seq,
+        )
+    }
+
+    /// Make the NEXT outbox insert past `after` entries fail, simulating a crash/failure in
+    /// the middle of a multi-chunk capture. Pure SQL so no test-only hook exists in the
+    /// production path.
+    fn poison_outbox_after(conn: &Connection, after: i64) {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER outbox_boom BEFORE INSERT ON _yapstack_outbox \
+             WHEN (SELECT count(*) FROM _yapstack_outbox) >= {after} \
+             BEGIN SELECT RAISE(ABORT, 'simulated capture interruption'); END;"
+        ))
+        .unwrap();
+    }
+
+    fn unpoison_outbox(conn: &Connection) {
+        conn.execute_batch("DROP TRIGGER outbox_boom;").unwrap();
+    }
+
+    #[test]
+    fn chunk_watermark_stops_at_the_last_closed_db_version_group() {
+        // The watermark means "every local row at or below this db_version is captured", so a
+        // chunk may only commit a version whose ENTIRE group it holds. Rows arrive ordered by
+        // (db_version, seq).
+        let row = |db_version: i64, seq: i64| ChangeRow {
+            table: "kv".into(),
+            pk: vec![seq as u8],
+            cid: "v".into(),
+            val: Value::Text("x".into()),
+            col_version: 1,
+            db_version,
+            site_id: None,
+            cl: 1,
+            seq,
+        };
+
+        // No next chunk → the chunk closes its last group.
+        let chunk = vec![row(4, 0), row(7, 0)];
+        assert_eq!(chunk_commit_watermark(&chunk, None), Some(7));
+        // Next chunk starts a HIGHER version → the last group closed here too.
+        assert_eq!(chunk_commit_watermark(&chunk, Some(9)), Some(7));
+        // Next chunk CONTINUES version 7 → only version 4 is fully captured.
+        assert_eq!(chunk_commit_watermark(&chunk, Some(7)), Some(4));
+        // The whole chunk is one still-open group → nothing may be committed.
+        let one_group = vec![row(7, 0), row(7, 1)];
+        assert_eq!(chunk_commit_watermark(&one_group, Some(7)), None);
+        // Empty chunk (never planned, but the helper must stay total).
+        assert_eq!(chunk_commit_watermark(&[], Some(1)), None);
+    }
+
+    #[test]
+    fn capture_resumes_after_an_interrupted_chunk_without_loss() {
+        // A failure part-way through a multi-chunk capture now leaves the EARLIER chunks
+        // committed (that is the whole point — the lock is released at every chunk). The
+        // invariant that replaces all-or-nothing: the next run re-reads from the last
+        // committed chunk's watermark and stages every remaining row. Nothing is lost, and any
+        // re-capture is bounded to the interrupted chunk / straddled group.
+        let dev = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&dev);
+        let conn = dev.conn();
+        let cid = state::client_id(conn).unwrap();
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // 9 separate statements → 9 distinct db_versions, each ~200 KiB → several chunks.
+        for (i, tag) in "abcdefghi".chars().enumerate() {
+            conn.execute(
+                "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                rusqlite::params![format!("k{i}"), big_value(tag)],
+            )
+            .unwrap();
+        }
+        let source: Vec<ChangeRow> = read_local_changes_since(conn, 0).unwrap().rows;
+        assert!(
+            plan_capture_chunks(source.clone()).len() >= 3,
+            "fixture must span several chunks"
+        );
+
+        // Interrupt after two chunks are safely committed.
+        ensure_outbox_table(conn).unwrap();
+        poison_outbox_after(conn, 2);
+        let err = enqueue_local(conn, &cipher, cid, sv, ev);
+        assert!(err.is_err(), "the interrupted capture reports its failure");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM _yapstack_outbox", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "the chunks that committed BEFORE the failure survive it (per-chunk commit)"
+        );
+        let partial_wm = state::push_watermark(conn).unwrap();
+        assert!(
+            partial_wm > 0 && partial_wm < source.last().unwrap().db_version,
+            "the watermark advanced with the committed chunks but not past them"
+        );
+        // Resume: a fresh run picks up exactly where the committed watermark left off.
+        unpoison_outbox(conn);
+        enqueue_local(conn, &cipher, cid, sv, ev).unwrap();
+        let staged = captured_rows(conn, &cipher, cid);
+
+        let want: std::collections::HashSet<_> = source.iter().map(row_key).collect();
+        let got: std::collections::HashSet<_> = staged.iter().map(row_key).collect();
+        assert_eq!(
+            got, want,
+            "no local row is lost or invented across the resume"
+        );
+        // Re-capture is allowed (cr-sqlite rows carry their own clock, so a re-applied row is
+        // a no-op) but must stay BOUNDED — never a re-walk of the whole backlog.
+        let duplicates = staged.len() - got.len();
+        assert!(
+            duplicates <= CHUNK_ROWS,
+            "resume re-captured {duplicates} rows — must be bounded by one chunk"
+        );
+
+        // And a third run has nothing left to do: the watermark reached the tip.
+        assert!(enqueue_local(conn, &cipher, cid, sv, ev)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state::push_watermark(conn).unwrap(),
+            source.last().unwrap().db_version
+        );
+    }
+
+    #[test]
+    fn capture_watermark_never_splits_one_db_version_group() {
+        // The dangerous case for a per-chunk watermark: ONE local transaction (one db_version)
+        // authoring more rows than a chunk holds — exactly what the cutover backfill produces.
+        // `read_local_changes_since` selects `db_version > watermark`, so committing a chunk's
+        // max version while the group continues would silently DROP the group's tail. The
+        // watermark therefore stays BELOW an open group, and the whole group is re-read.
+        let dev = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&dev);
+        let conn = dev.conn();
+        let cid = state::client_id(conn).unwrap();
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // ONE transaction → ONE db_version carrying every row.
+        conn.execute_batch("BEGIN;").unwrap();
+        for (i, tag) in "abcdef".chars().enumerate() {
+            conn.execute(
+                "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                rusqlite::params![format!("k{i}"), big_value(tag)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let source: Vec<ChangeRow> = read_local_changes_since(conn, 0).unwrap().rows;
+        let versions: std::collections::HashSet<i64> =
+            source.iter().map(|r| r.db_version).collect();
+        assert_eq!(versions.len(), 1, "fixture is one db_version group");
+        let chunks = plan_capture_chunks(source.clone());
+        assert!(chunks.len() >= 2, "fixture must straddle a chunk boundary");
+
+        // Interrupt mid-group: entries are staged, but the watermark must NOT move — the group
+        // is still open, so the next run must re-read all of it.
+        ensure_outbox_table(conn).unwrap();
+        poison_outbox_after(conn, 2);
+        assert!(enqueue_local(conn, &cipher, cid, sv, ev).is_err());
+        assert_eq!(
+            state::push_watermark(conn).unwrap(),
+            0,
+            "the watermark never advances into a partly-captured db_version group"
+        );
+
+        // Resume re-reads the WHOLE group; nothing is missing.
+        unpoison_outbox(conn);
+        enqueue_local(conn, &cipher, cid, sv, ev).unwrap();
+        let staged = captured_rows(conn, &cipher, cid);
+        let want: std::collections::HashSet<_> = source.iter().map(row_key).collect();
+        let got: std::collections::HashSet<_> = staged.iter().map(row_key).collect();
+        assert_eq!(got, want, "every row of the straddling group is captured");
+        assert_eq!(
+            state::push_watermark(conn).unwrap(),
+            source[0].db_version,
+            "the group's version is committed only once the group is fully captured"
+        );
+    }
+
+    #[test]
+    fn capture_releases_the_write_lock_between_chunks() {
+        // The owner-visible bug: while capture held ONE transaction across the whole backlog,
+        // every other writer on the file (the app's db_service writer, the audio backfill
+        // walk) sat on its busy_timeout and eventually failed with "database is locked".
+        // Modelled with a competing writer that keeps trying THROUGHOUT the capture: with
+        // per-chunk commits it wins the lock repeatedly in the gaps; with a single capture
+        // transaction it could not win until the whole capture finished.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("yapstack-capture-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cap.db");
+        let dev = CrsqlDb::open(&path).unwrap();
+        dev.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        make_kv(&dev);
+        let conn = dev.conn();
+        let cid = state::client_id(conn).unwrap();
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        conn.execute_batch("CREATE TABLE probe_t(id INTEGER PRIMARY KEY, n INTEGER);")
+            .unwrap();
+        state::ensure_meta_table(conn).unwrap();
+        ensure_outbox_table(conn).unwrap();
+
+        // ~24 chunks of backlog.
+        for i in 0..48 {
+            conn.execute(
+                "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                rusqlite::params![format!("k{i}"), big_value('x')],
+            )
+            .unwrap();
+        }
+        assert!(
+            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len() >= 8,
+            "fixture must be a MULTI-chunk backlog"
+        );
+
+        // The stand-in for db_service's writer: an independent connection that, THROUGHOUT the
+        // capture, both watches the outbox and tries to write. Its observations are attributed
+        // to the mid-capture window by what it can SEE, not by wall-clock timing: an
+        // uncommitted capture is invisible to it, so a staged count strictly between 1 and the
+        // final chunk count can only be observed while capture is still running. Under the old
+        // single-transaction capture that window never existed — other connections saw 0 rows
+        // until the very end and lost every write-lock race in between.
+        let total_chunks =
+            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len() as i64;
+        static STOP: AtomicBool = AtomicBool::new(false);
+        STOP.store(false, Ordering::SeqCst);
+        /// (staged outbox entries, push watermark, whether a competing write won the lock)
+        type Observation = (i64, i64, bool);
+        let seen: Arc<Mutex<Vec<Observation>>> = Arc::new(Mutex::new(Vec::new()));
+        let probe_seen = seen.clone();
+        let probe_path = path.clone();
+        let probe = std::thread::spawn(move || {
+            let c = Connection::open(&probe_path).unwrap();
+            // Deliberately IMPATIENT: enough to wait out one chunk's commit, far too little to
+            // wait out a backlog. A long timeout would let ONE lost race consume the whole
+            // observation window and tell us nothing.
+            c.busy_timeout(std::time::Duration::from_millis(25))
+                .unwrap();
+            let mut n = 0i64;
+            while !STOP.load(Ordering::SeqCst) {
+                let staged: i64 = c
+                    .query_row("SELECT count(*) FROM _yapstack_outbox", [], |r| r.get(0))
+                    .unwrap_or(0);
+                if staged < 1 || staged >= total_chunks {
+                    continue; // not provably inside the capture
+                }
+                let wm = state::push_watermark(&c).unwrap_or(-1);
+                let won = c.execute("INSERT INTO probe_t(n) VALUES(?1)", [n]).is_ok();
+                n += 1;
+                probe_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((staged, wm, won));
+            }
+        });
+
+        enqueue_local(conn, &cipher, cid, sv, ev).unwrap();
+        STOP.store(true, Ordering::SeqCst);
+        probe.join().unwrap();
+
+        let obs = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let staged_seen: std::collections::BTreeSet<i64> = obs.iter().map(|o| o.0).collect();
+        let watermarks_seen: std::collections::BTreeSet<i64> = obs.iter().map(|o| o.1).collect();
+        let wins = obs.iter().filter(|o| o.2).count();
+        assert!(
+            staged_seen.len() >= 3,
+            "another connection must see the outbox fill up CHUNK BY CHUNK (saw {staged_seen:?})"
+        );
+        assert!(
+            watermarks_seen.len() >= 2,
+            "the push watermark must advance WITH the committed chunks, visibly to another \
+             connection (saw {watermarks_seen:?})"
+        );
+        assert!(
+            wins >= 2,
+            "a competing writer must WIN the write lock while capture is still running (won \
+             {wins} of {} attempts inside the window)",
+            obs.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -9,6 +9,14 @@ import { log } from "@/lib/logger";
 const SYNC_APPLIED_EVENT = "sync://applied";
 /** Collapse a burst of merge events into one coarse refresh (1.5s). */
 const SYNC_APPLIED_DEBOUNCE_MS = 1500;
+/**
+ * Ceiling on the trailing debounce (C1). A continuously-arriving remote stream
+ * (a peer recording live, a long backlog drained in small batches) resets the
+ * trailing timer on every event and would starve the refresh indefinitely — the
+ * UI would sit stale for as long as the peer keeps writing. The max-wait fires
+ * at most this long after the FIRST event of a burst, regardless of activity.
+ */
+const SYNC_APPLIED_MAX_WAIT_MS = 3000;
 
 /**
  * Poll the builder-managed `backend_ready` flag until the Rust setup hook
@@ -61,6 +69,7 @@ import {
   listSessions,
   getSession,
   getSessionSegments,
+  getNote,
   insertSegment,
   deleteAllSessions,
   togglePin as dbTogglePin,
@@ -448,6 +457,42 @@ interface AppState {
   editingSegmentId: string | null;
   setEditingSegmentId: (id: string | null) => void;
 
+  /**
+   * Store-visible note-edit-in-progress signal — the note-level sibling of
+   * `editingSegmentId` (sync-UX A1b). `notes.content` is ONE last-writer-wins
+   * cell, so a sync-down that replaced the editor's content mid-edit would
+   * destroy unsaved keystrokes. NoteEditor opens the window on a keystroke and
+   * closes it once the debounced save has flushed and typing has gone idle (or
+   * immediately on blur / unmount). While it is set for the open session the
+   * sync refresh does not touch that session's note content.
+   */
+  noteEditingSessionId: string | null;
+  setNoteEditingSessionId: (id: string | null) => void;
+
+  /**
+   * Note content published by the sync refresh for the OPEN session (A1c).
+   * NoteEditor applies it in place when its editing window is closed. This is
+   * deliberately NOT `noteRefreshCounter`: D4 normative says sync must never
+   * bump that counter (it re-runs the load effect for any mounted editor and
+   * would discard an open edit). `seq` makes each publication distinguishable.
+   */
+  remoteNoteUpdate: { sessionId: string; content: string; seq: number } | null;
+
+  /**
+   * A refresh that a guard skipped, waiting to be drained (B5). Without this,
+   * a sync batch that lands while an edit window is open is simply dropped and
+   * the surface stays stale until the NEXT remote write happens to arrive.
+   */
+  pendingViewRefresh: boolean;
+
+  /**
+   * Monotonic count of committed sync-applied coarse refreshes. Surfaces that
+   * own their own DB reads (chat messages) subscribe to this instead of
+   * re-listening to the Tauri event, so they refresh on exactly the batches the
+   * store already committed.
+   */
+  syncAppliedSeq: number;
+
   // Audio playback
   playbackTime: number;
   isPlaying: boolean;
@@ -637,10 +682,16 @@ interface AppState {
   showHiddenSegments: boolean;
   setShowHiddenSegments: (show: boolean) => void;
   refreshViewSessionSegments: () => Promise<void>;
-  /** D4 live refresh: reload the open non-active session's row + segments on a
-   *  sync-applied batch, skipping while an edit is in progress and never bumping
-   *  noteRefreshCounter (LIVE_SESSION_STATE.md Gap 2). */
+  /** D4 live refresh: reload the open non-active session's row + segments + parts
+   *  on a sync-applied batch, skipping while an edit is in progress and never
+   *  bumping noteRefreshCounter (LIVE_SESSION_STATE.md Gap 2). */
   refreshOpenViewSession: () => Promise<void>;
+  /** One batched commit of every coarse list read plus the open-view refresh —
+   *  the body of the debounced `sync://applied` handler (C2). */
+  syncAppliedCoarseRefresh: () => Promise<void>;
+  /** Run a refresh that an edit guard previously skipped (B5). No-op when no
+   *  refresh is pending or a guard is still open. */
+  drainPendingViewRefresh: () => void;
 
   // Segment multi-selection (ephemeral; not persisted). Reset on session change.
   selectedSegmentIds: Set<string>;
@@ -860,6 +911,85 @@ function deriveFolderState(folders: DbFolder[]) {
   };
 }
 
+function shallowEqualRow<T extends object>(a: T, b: T): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const k of aKeys) {
+    if (
+      (a as Record<string, unknown>)[k] !== (b as Record<string, unknown>)[k]
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Diff-merge a freshly-read row list into the one already in the store (C3).
+ *
+ * A sync-applied reload re-reads whole tables, so a wholesale array replacement
+ * hands React a brand-new object for EVERY row — every card in the list is a new
+ * prop identity, memoization is defeated and the whole list visibly jolts even
+ * when a single remote row changed. Keeping the previous object for rows whose
+ * columns are byte-identical means only the rows that actually changed re-render,
+ * and an entirely unchanged read returns the PREVIOUS array (reference-equal), so
+ * zustand subscribers don't even see a state change.
+ */
+function mergeRowsById<T extends { id: string }>(prev: T[], next: T[]): T[] {
+  if (prev.length === 0) return next;
+  const prevById = new Map(prev.map((r) => [r.id, r]));
+  let identical = prev.length === next.length;
+  const merged = next.map((row, i) => {
+    const old = prevById.get(row.id);
+    const kept = old !== undefined && shallowEqualRow(old, row) ? old : row;
+    if (identical && prev[i] !== kept) identical = false;
+    return kept;
+  });
+  return identical ? prev : merged;
+}
+
+/**
+ * Reset a folder filter that points at a folder which no longer exists (B4).
+ * A remote delete of the folder the user is currently browsing otherwise leaves
+ * the list stranded on a dead id: no breadcrumb, no sessions, no way back except
+ * clicking another filter.
+ */
+function reconcileListFilter(
+  filter: ListFilter,
+  folders: DbFolder[],
+): ListFilter {
+  if (filter.type !== "folder" || !filter.folderId) return filter;
+  return folders.some((f) => f.id === filter.folderId)
+    ? filter
+    : { type: "all" };
+}
+
+/** Folder-list patch shared by `loadFolders` and the batched sync refresh. */
+function folderPatch(
+  state: { folders: DbFolder[]; listFilter: ListFilter },
+  next: DbFolder[],
+) {
+  const folders = mergeRowsById(state.folders, next);
+  const listFilter = reconcileListFilter(state.listFilter, folders);
+  // Identity-stable read: the derived tree/maps still describe `folders`, so
+  // rebuilding them would remount the sidebar for nothing.
+  if (folders === state.folders) return { listFilter };
+  return { folders, listFilter, ...deriveFolderState(folders) };
+}
+
+function groupBySession<T extends { session_id: string }>(
+  rows: T[],
+  pick: (row: T) => string,
+): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  for (const row of rows) {
+    if (!map[row.session_id]) map[row.session_id] = [];
+    map[row.session_id].push(pick(row));
+  }
+  return map;
+}
+
 function createAppStore() {
   return create<AppState>()(
     persist(
@@ -894,7 +1024,20 @@ function createAppStore() {
       sessionStopping: false,
       noteRefreshCounter: 0,
       editingSegmentId: null,
-      setEditingSegmentId: (id: string | null) => set({ editingSegmentId: id }),
+      setEditingSegmentId: (id: string | null) => {
+        set({ editingSegmentId: id });
+        // Closing an edit window is the catch-up point for any refresh the
+        // guard skipped (B5).
+        if (id === null) get().drainPendingViewRefresh();
+      },
+      noteEditingSessionId: null,
+      setNoteEditingSessionId: (id: string | null) => {
+        set({ noteEditingSessionId: id });
+        if (id === null) get().drainPendingViewRefresh();
+      },
+      remoteNoteUpdate: null,
+      pendingViewRefresh: false,
+      syncAppliedSeq: 0,
       playbackTime: 0,
       isPlaying: false,
       tags: [],
@@ -1227,7 +1370,9 @@ function createAppStore() {
       loadSessions: async () => {
         try {
           const sessions = await listSessions();
-          set({ sessions });
+          // Diff-merge (C3): unchanged rows keep their object identity so a
+          // sync-applied reload doesn't remount every card in the list.
+          set({ sessions: mergeRowsById(get().sessions, sessions) });
         } catch (e) {
           console.error("Failed to load sessions:", e);
         }
@@ -1238,33 +1383,85 @@ function createAppStore() {
         // SINGLE coarse refresh instead of thrashing the UI. Coarse-only by design (v1): no
         // fine-grained per-row invalidation — reload the whole session/folder/tag views.
         let timer: ReturnType<typeof setTimeout> | undefined;
+        let maxTimer: ReturnType<typeof setTimeout> | undefined;
+        const fire = () => {
+          if (timer) clearTimeout(timer);
+          if (maxTimer) clearTimeout(maxTimer);
+          timer = undefined;
+          maxTimer = undefined;
+          void get().syncAppliedCoarseRefresh();
+        };
         const coarseRefresh = () => {
           if (timer) clearTimeout(timer);
-          timer = setTimeout(() => {
-            timer = undefined;
-            const s = get();
-            void s.loadSessions();
-            void s.loadFolders();
-            void s.loadSessionFolders();
-            void s.loadTags();
-            void s.loadSessionTags();
-            // D4 (Gap 2): live-refresh the OPEN non-active session's row + segments so a
-            // remote-live follow-along fills as segments merge (no manual reopen). The
-            // local active session reads from activeSessionSegments and is skipped.
-            void s.refreshOpenViewSession();
-          }, SYNC_APPLIED_DEBOUNCE_MS);
+          timer = setTimeout(fire, SYNC_APPLIED_DEBOUNCE_MS);
+          // C1: trailing debounce with a max-wait ceiling. The ceiling is armed
+          // by the first event of a burst and is NOT reset by later ones, so a
+          // peer that writes continuously can't starve the refresh.
+          if (!maxTimer) maxTimer = setTimeout(fire, SYNC_APPLIED_MAX_WAIT_MS);
         };
         const unlisten = await listen(SYNC_APPLIED_EVENT, coarseRefresh);
         return () => {
           if (timer) clearTimeout(timer);
+          if (maxTimer) clearTimeout(maxTimer);
           unlisten();
         };
+      },
+
+      /**
+       * One coarse refresh of every list surface a merged batch can touch,
+       * committed as a SINGLE set() (C2). Six independent commits produced six
+       * renders per batch — folders arriving a frame before the sessions that
+       * live in them made the list visibly reshuffle. Reads run concurrently and
+       * land together, so the UI moves once, consistently.
+       */
+      syncAppliedCoarseRefresh: async () => {
+        try {
+          const [
+            sessions,
+            folders,
+            sessionFolderRows,
+            tags,
+            sessionTagRows,
+            dictation,
+          ] = await Promise.all([
+            listSessions(),
+            listFolders(),
+            listAllSessionFolders(),
+            listTags(),
+            listAllSessionTags(),
+            // B1: dictation history is a synced table too — without this the
+            // dictation list stayed on whatever it read at boot.
+            listDictationHistory(),
+          ]);
+          const state = get();
+          set({
+            sessions: mergeRowsById(state.sessions, sessions),
+            ...folderPatch(state, folders),
+            sessionFolderMap: groupBySession(
+              sessionFolderRows,
+              (r) => r.folder_id,
+            ),
+            tags: mergeRowsById(state.tags, tags),
+            sessionTagMap: groupBySession(sessionTagRows, (r) => r.tag_id),
+            dictationHistory: mergeRowsById(state.dictationHistory, dictation),
+            syncAppliedSeq: state.syncAppliedSeq + 1,
+          });
+        } catch (e) {
+          console.error("Failed to refresh views after sync:", e);
+        }
+        // D4 (Gap 2): live-refresh the OPEN non-active session's row + segments +
+        // parts so a remote-live follow-along fills as rows merge (no manual
+        // reopen). Its own commit: it re-checks the open session after its reads
+        // and can navigate away (remote delete), which must not be entangled with
+        // the list commit above. The local active session reads from
+        // activeSessionSegments and is skipped inside.
+        await get().refreshOpenViewSession();
       },
 
       loadFolders: async () => {
         try {
           const folders = await listFolders();
-          set({ folders, ...deriveFolderState(folders) });
+          set(folderPatch(get(), folders));
         } catch (e) {
           console.error("Failed to load folders:", e);
         }
@@ -1273,12 +1470,7 @@ function createAppStore() {
       loadSessionFolders: async () => {
         try {
           const rows = await listAllSessionFolders();
-          const map: Record<string, string[]> = {};
-          for (const row of rows) {
-            if (!map[row.session_id]) map[row.session_id] = [];
-            map[row.session_id].push(row.folder_id);
-          }
-          set({ sessionFolderMap: map });
+          set({ sessionFolderMap: groupBySession(rows, (r) => r.folder_id) });
         } catch (e) {
           console.error("Failed to load session folders:", e);
         }
@@ -1287,7 +1479,7 @@ function createAppStore() {
       loadTags: async () => {
         try {
           const tags = await listTags();
-          set({ tags });
+          set({ tags: mergeRowsById(get().tags, tags) });
         } catch (e) {
           console.error("Failed to load tags:", e);
         }
@@ -1296,12 +1488,7 @@ function createAppStore() {
       loadSessionTags: async () => {
         try {
           const rows = await listAllSessionTags();
-          const map: Record<string, string[]> = {};
-          for (const row of rows) {
-            if (!map[row.session_id]) map[row.session_id] = [];
-            map[row.session_id].push(row.tag_id);
-          }
-          set({ sessionTagMap: map });
+          set({ sessionTagMap: groupBySession(rows, (r) => r.tag_id) });
         } catch (e) {
           console.error("Failed to load session tags:", e);
         }
@@ -2697,7 +2884,9 @@ function createAppStore() {
           reportDbFailure("editSegmentText", "Failed to edit segment", e);
         } finally {
           if (get().editingSegmentId === segmentId) {
-            set({ editingSegmentId: null });
+            // Through the setter, not a bare set(): closing the guard is what
+            // drains a refresh the guard skipped (B5).
+            get().setEditingSegmentId(null);
           }
         }
       },
@@ -2850,37 +3039,116 @@ function createAppStore() {
       },
 
       // D4 live refresh (LIVE_SESSION_STATE.md Gap 2). Reload the OPEN session's row +
-      // segments when it is not the local active one, so a remote-live follow-along
-      // fills as segments merge. Normative constraints:
-      //   - Skip while an edit is in progress (editingSegmentId) so the reload cannot
-      //     clobber an open/in-flight edit or drop an editSegmentText write.
+      // segments + audio parts when it is not the local active one, so a remote-live
+      // follow-along fills as rows merge. Normative constraints:
+      //   - Skip while a segment edit is in progress (editingSegmentId) so the reload
+      //     cannot clobber an open/in-flight edit or drop an editSegmentText write.
+      //     A skip is REMEMBERED (pendingViewRefresh) and drained when the guard
+      //     clears — otherwise the batch is silently lost (B5).
       //   - Never bump noteRefreshCounter (that would re-run NoteEditor's content-reload
-      //     effect and could discard an open note edit); this reloads transcript state
-      //     only, leaving the note editor untouched.
+      //     effect and could discard an open note edit). Note content instead travels
+      //     through `remoteNoteUpdate`, published only when the note-editing window is
+      //     closed (A1c).
+      //   - A vanished row means the session was deleted on another device: clear the
+      //     open view exactly like the local delete path does, rather than leaving an
+      //     editable ghost whose writes resurrect nothing (A2).
       refreshOpenViewSession: async () => {
-        const { selectedSessionId, activeSessionId, editingSegmentId } = get();
+        const {
+          selectedSessionId,
+          activeSessionId,
+          editingSegmentId,
+          noteEditingSessionId,
+        } = get();
         if (!selectedSessionId || selectedSessionId === activeSessionId) return;
-        if (editingSegmentId) return;
+        if (editingSegmentId) {
+          set({ pendingViewRefresh: true });
+          return;
+        }
+        const noteWindowOpen = noteEditingSessionId === selectedSessionId;
         try {
-          const [row, segs] = await Promise.all([
+          const [row, segs, parts, note] = await Promise.all([
             getSession(selectedSessionId),
             getSessionSegments(selectedSessionId),
+            // B3: parts drive the player's timeline. Without this reload an
+            // appended remote part never surfaces until the view is reopened.
+            listSessionAudioParts(selectedSessionId),
+            noteWindowOpen ? Promise.resolve(null) : getNote(selectedSessionId),
           ]);
           // Re-check nothing changed during the await (session switched, or an edit
           // opened) before committing the reload.
           const now = get();
           if (
             now.selectedSessionId !== selectedSessionId ||
-            now.selectedSessionId === now.activeSessionId ||
-            now.editingSegmentId
+            now.selectedSessionId === now.activeSessionId
           ) {
             return;
           }
-          if (!row) return;
-          set({ viewSession: row, viewSessionSegments: segs });
+          if (now.editingSegmentId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
+          if (!row) {
+            // A2: mirror the local-delete clear (see deleteSession) — an open
+            // note-detail view for a row that no longer exists still renders an
+            // editable title/notes surface whose writes go nowhere.
+            set({
+              currentView: "note-list",
+              selectedSessionId: null,
+              viewSession: null,
+              viewSessionSegments: [],
+              viewSessionParts: [],
+              remoteNoteUpdate: null,
+              pendingViewRefresh: false,
+            });
+            toast.info("Session was deleted on another device");
+            return;
+          }
+          set({
+            // Identity-stable (C3): an unchanged row must not re-render the whole
+            // note-detail surface on every batch.
+            viewSession:
+              now.viewSession && shallowEqualRow(now.viewSession, row)
+                ? now.viewSession
+                : row,
+            viewSessionSegments: mergeRowsById(now.viewSessionSegments, segs),
+            viewSessionParts: mergeRowsById(now.viewSessionParts, parts),
+            pendingViewRefresh: false,
+          });
+          // A1c: publish the note row only when no local edit is in flight. The
+          // window can have opened during the awaits above — re-check.
+          if (noteWindowOpen || get().noteEditingSessionId === selectedSessionId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
+          const content = note?.content ?? "";
+          const prev = get().remoteNoteUpdate;
+          if (
+            !prev ||
+            prev.sessionId !== selectedSessionId ||
+            prev.content !== content
+          ) {
+            set({
+              remoteNoteUpdate: {
+                sessionId: selectedSessionId,
+                content,
+                seq: (prev?.seq ?? 0) + 1,
+              },
+            });
+          }
         } catch (e) {
           console.error("Failed to live-refresh open session:", e);
         }
+      },
+
+      // B5 catch-up. Called whenever an edit guard closes; no-op unless a refresh
+      // was actually skipped and every guard is now clear.
+      drainPendingViewRefresh: () => {
+        const { pendingViewRefresh, editingSegmentId, noteEditingSessionId } =
+          get();
+        if (!pendingViewRefresh) return;
+        if (editingSegmentId || noteEditingSessionId) return;
+        set({ pendingViewRefresh: false });
+        void get().refreshOpenViewSession();
       },
 
       // Note refresh

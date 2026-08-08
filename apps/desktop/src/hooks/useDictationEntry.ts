@@ -100,14 +100,10 @@ export function useDictationEntry(entry: DbDictationHistory) {
   const runFetchLoop = useCallback(
     async (opts: { autoPlay: boolean; quiet: boolean }) => {
       fetchAbortRef.current = false;
-      setFetchState({
-        kind: "fetching",
-        percent: 0,
-        received: 0,
-        total: 0,
-        currentPart: 1,
-        totalParts: 1,
-      });
+      // No optimistic opening frame. Publishing a synthetic 0% "fetching" before the
+      // first probe returned made every entry whose audio is cached (or simply absent
+      // from the server) flash a download that never happened. `fetchState` is now only
+      // ever set from a RESOLVED probe.
       for (;;) {
         if (fetchAbortRef.current) {
           setFetchState(null);
@@ -122,27 +118,25 @@ export function useDictationEntry(entry: DbDictationHistory) {
           return;
         }
         const track = deriveTrackFetch([st]);
-        setFetchState(track);
         if (track.kind === "ready" && st.state === "ready") {
           setFetchState(null);
           if (opts.autoPlay) playSrc(convertFileSrc(st.path, "audio-stream"));
           return;
         }
+        // Quiet-mode 30s re-probe (parity with the session view): while the entry stays
+        // open and the server lacks the blob (or the bearer is expired — the drain
+        // refreshes it on its own), keep re-probing on the slow cadence so the fetch
+        // self-starts once the upload/refresh lands. Toasts stay suppressed and the wait
+        // is STATELESS — publishing the on_device/auth_expired state and clearing it a
+        // line later strobed the play button once every 30 seconds forever.
+        const quietReprobe =
+          opts.quiet && (track.kind === "on_device" || track.kind === "auth_expired");
+        setFetchState(quietReprobe ? null : track);
         if (track.kind === "fetching" || track.kind === "queued") {
           await sleep(600);
           continue;
         }
-        // Quiet-mode 30s re-probe (parity with the session view): while the entry stays
-        // open and the server lacks the blob (or the bearer is expired — the drain
-        // refreshes it on its own), keep re-probing on the slow cadence so the fetch
-        // self-starts once the upload/refresh lands. Toasts stay suppressed; the wait is
-        // stateless (fetchState null) and the abort flag at the loop top ends it on
-        // unmount/cancel.
-        if (
-          opts.quiet &&
-          (track.kind === "on_device" || track.kind === "auth_expired")
-        ) {
-          setFetchState(null);
+        if (quietReprobe) {
           await sleep(ON_DEVICE_REPROBE_MS);
           continue;
         }

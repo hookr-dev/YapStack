@@ -141,6 +141,23 @@ const SSE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// changeset interval — audio is best-effort background work, not correctness-critical.
 const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_secs(8);
 
+/// `busy_timeout` for every AD-HOC sqlite connection this module opens (short-lived command
+/// connections and the read-only inspection connections). Matches the engine's own
+/// [`yapstack_sync`] pragma (`crsqlite::BUSY_TIMEOUT`, 10s) so EVERY connection to the live
+/// DB waits out contention with the same patience — a boot-time burst must not fail on the
+/// one connection that happened to be stingier. Applied to the read-only connections too:
+/// they take no write lock, but a WAL checkpoint or a schema write can still make a read
+/// return `SQLITE_BUSY`, and a zero timeout turns that into an instant failure.
+const AD_HOC_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the audio lane waits for the changeset drain's FIRST completed cycle before
+/// running the backfill walk anyway (boot stagger — see [`wait_for_first_drain_cycle`]).
+/// Bounded and fail-open: a drain that is slow, wedged, or not running at all must never
+/// stop the library from being backed up, so this is a politeness delay, not a dependency.
+/// 30s comfortably covers a normal boot burst (the owner's contended cycle finished inside
+/// ~15s) without leaving the lane idle for a perceptible stretch.
+const BACKFILL_STAGGER_BUDGET: Duration = Duration::from_secs(30);
+
 /// How many CONSECUTIVE drain cycles must hit a (non-fatal) push/pull error before the
 /// panel flips to a distinct "Sync error" state (F2). A single blip — relay restart, laptop
 /// sleep, a momentary network drop — is common and self-heals next cycle, so we require a
@@ -2031,6 +2048,7 @@ fn live_is_crr_prepared(live_db: &Path) -> bool {
     ) else {
         return false;
     };
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let clock: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions__crsql_clock'",
@@ -2058,6 +2076,7 @@ fn synced_table_row_counts(db: &Path) -> rusqlite::Result<Vec<(String, i64)>> {
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let mut out = Vec::new();
     for t in schema::SYNC_TABLES {
         // A table may legitimately be absent on an old dev DB; treat as 0 rows.
@@ -2091,6 +2110,7 @@ fn all_user_table_row_counts(db: &Path) -> rusqlite::Result<Vec<(String, i64)>> 
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let names: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' \
@@ -2475,6 +2495,81 @@ fn pull_watermark_pub() -> &'static AtomicI64 {
 /// so the gate is unit-testable without a live relay.
 fn should_wake(event_seq: i64, watermark: i64) -> bool {
     watermark == i64::MIN || event_seq > watermark
+}
+
+// ----- Boot stagger: the audio backfill walk waits out the drain's first cycle -----
+//
+// At boot EVERYTHING starts at once: the changeset drain's catch-up merge + capture, the CRR
+// trigger self-heal, the app's own first writes, and the audio lane's backfill walk. On the
+// owner's log two of those lost the write lock to the same burst ("database is locked" from
+// the walk AND a db_service writer in the same millisecond). The walk is documented
+// idempotent and re-runnable, and its work is pure upload DEBT bookkeeping — nothing is
+// waiting on it — so it is the one lane that can simply go LAST.
+//
+// The gate is a one-way latch: the drain sets it once a full cycle has COMPLETED (or once
+// the drain thread exits, so a stopped/failed drain never strands the lane), and the walk
+// waits on it with a bounded budget. Fail-open by construction: on timeout the walk runs
+// anyway (its per-part busy-retry is what actually guarantees correctness — this gate only
+// buys a calmer boot).
+
+struct FirstCycleGate {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+fn first_cycle_gate() -> &'static FirstCycleGate {
+    static CELL: OnceLock<FirstCycleGate> = OnceLock::new();
+    CELL.get_or_init(|| FirstCycleGate {
+        done: Mutex::new(false),
+        cv: Condvar::new(),
+    })
+}
+
+/// Re-arm the gate for a NEW drain spawn (app start, enable, re-login), so the newly spawned
+/// audio lane waits for THAT drain's first cycle rather than reading a latch a previous drain
+/// left set.
+fn reset_first_drain_cycle() {
+    *first_cycle_gate()
+        .done
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = false;
+}
+
+/// Latch the gate open and wake every waiter. Called at the END of a completed drain cycle
+/// and again when the drain thread exits — idempotent.
+fn note_first_drain_cycle_done() {
+    let mut g = first_cycle_gate()
+        .done
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !*g {
+        *g = true;
+        first_cycle_gate().cv.notify_all();
+    }
+}
+
+/// Block until the drain's first cycle completes, `stop` is raised, or `budget` elapses.
+/// Returns true iff the gate actually opened (false = timed out / stopping — the caller
+/// proceeds anyway).
+fn wait_for_first_drain_cycle(stop: &AtomicBool, budget: Duration) -> bool {
+    let gate = first_cycle_gate();
+    let deadline = Instant::now() + budget;
+    let mut done = gate.done.lock().unwrap_or_else(|e| e.into_inner());
+    while !*done {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        // Slice the wait so `stop` is re-checked promptly during a long budget.
+        let (g, _) = gate
+            .cv
+            .wait_timeout(done, left.min(Duration::from_millis(250)))
+            .unwrap_or_else(|e| e.into_inner());
+        done = g;
+    }
+    true
 }
 
 /// Next SSE reconnect backoff: double `prev`, capped at [`SSE_BACKOFF_MAX`]. Pure so the
@@ -3241,6 +3336,9 @@ fn spawn_drain(
     set_drain_health(DrainHealth::Ok);
     reset_drain_progress();
     reset_audio_lane();
+    // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
+    // cycle (not a previous spawn's) is what releases the backfill walk.
+    reset_first_drain_cycle();
 
     // S2: spawn the INDEPENDENT audio-upload lane before the changeset drain consumes the
     // session tuple. It opens its own connection to the same CRR live DB on its own thread
@@ -3731,6 +3829,11 @@ fn spawn_drain(
                     Err(e) => tracing::warn!("sync: backlog read failed: {e}"),
                 }
 
+                // Boot stagger: one full cycle is done, so the boot burst (catch-up merge +
+                // capture + self-heal) has had the write lock to itself. Releases the audio
+                // lane's backfill walk. Idempotent — only the first call latches.
+                note_first_drain_cycle_done();
+
                 // Idle wait: wake EARLY on an SSE wakeup or a debounced local-write kick, else
                 // fall through after DRAIN_INTERVAL (the fallback floor — the poll never stops).
                 // A wake stored during the cycle above returns this immediately (coalesced to
@@ -3743,6 +3846,10 @@ fn spawn_drain(
                     }
                 });
             }
+            // The drain is gone (stopped, or terminal auth expiry). Release the boot-stagger
+            // latch so the audio lane never waits out its budget for a cycle that will never
+            // come.
+            note_first_drain_cycle_done();
             tracing::info!("sync drain stopped");
         })
         .map_err(|e| e.to_string())?;
@@ -3857,21 +3964,41 @@ fn spawn_audio_uploader(
             if let Err(e) = audio::retry_failed(conn) {
                 tracing::warn!("audio uploader: retry_failed: {e}");
             }
-            // Backfill walk (owner: starts immediately, idempotent, on EVERY device that ever
-            // recorded — the server-completeness invariant). Enqueues every local part whose
-            // file exists on THIS device at LOW priority, behind new recordings.
-            match audio::backfill_walk(conn, |p| std::path::Path::new(p).exists()) {
-                Ok(r) => {
-                    if r.enqueued > 0 || r.missing_file > 0 {
-                        tracing::info!(
-                            "audio backfill: examined {} part(s), enqueued {}, {} missing here",
-                            r.examined,
-                            r.enqueued,
-                            r.missing_file
-                        );
-                    }
+            // Boot stagger: let the changeset drain finish ONE cycle before walking the
+            // library. The walk is idempotent, re-runnable, and nothing waits on it, so it is
+            // the lane that yields — this keeps it out of the boot burst that made two
+            // writers time out on the owner's log. Fail-open: after the budget (or if the
+            // drain stops/never cycles) the walk runs regardless, protected by its own
+            // per-part busy-retry.
+            if !stop.load(Ordering::SeqCst) {
+                let opened = wait_for_first_drain_cycle(&stop, BACKFILL_STAGGER_BUDGET);
+                if !opened && !stop.load(Ordering::SeqCst) {
+                    tracing::debug!(
+                        "audio backfill: starting without a completed drain cycle (waited {}s)",
+                        BACKFILL_STAGGER_BUDGET.as_secs()
+                    );
                 }
-                Err(e) => tracing::warn!("audio backfill walk failed: {e}"),
+            }
+            // Backfill walk (owner: idempotent, on EVERY device that ever recorded — the
+            // server-completeness invariant). Enqueues every local part whose file exists on
+            // THIS device at LOW priority, behind new recordings. Per-part failures are
+            // STEPPED OVER (`skipped`) and leave the pass unmarked, so the next start retries
+            // exactly those — one locked row can no longer abandon the whole walk.
+            if !stop.load(Ordering::SeqCst) {
+                match audio::backfill_walk(conn, |p| std::path::Path::new(p).exists()) {
+                    Ok(r) => {
+                        if r.enqueued > 0 || r.missing_file > 0 || r.skipped > 0 {
+                            tracing::info!(
+                                "audio backfill: examined {} part(s), enqueued {}, {} missing here, {} deferred to next start",
+                                r.examined,
+                                r.enqueued,
+                                r.missing_file,
+                                r.skipped
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("audio backfill walk failed: {e}"),
+                }
             }
             let ctx = AudioSealContext {
                 vault_key,
@@ -4623,7 +4750,7 @@ pub fn audio_enqueue_session(app: tauri::AppHandle, session_id: String) -> Resul
         .as_ref()
         .clone();
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
@@ -4668,7 +4795,7 @@ pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> 
         .as_ref()
         .clone();
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let n = yapstack_sync::audio::retry_failed(&conn).map_err(|e| e.to_string())?;
     Ok(n as u32)
 }
@@ -4736,7 +4863,7 @@ pub fn audio_enqueue_dictation(app: tauri::AppHandle, dictation_id: String) -> R
         .as_ref()
         .clone();
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
     let wav: Option<String> = conn
         .query_row(
@@ -4992,7 +5119,7 @@ pub fn audio_prepare_part(
         .as_ref()
         .clone();
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let Some((session_id, ext)) = resolve_part_identity(&conn, &part_id) else {
         return Err(format!("unknown audio part: {part_id}"));
     };
@@ -5760,6 +5887,7 @@ pub async fn sync_join(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| e.to_string())?;
+    let _ = live_ro.busy_timeout(AD_HOC_BUSY_TIMEOUT);
     let report =
         reconcile::reconcile_local_rows(&live_ro, base.conn()).map_err(|e| e.to_string())?;
     drop(live_ro);
@@ -7825,5 +7953,69 @@ mod tests {
                 "an unarmed kick must not set a deadline"
             );
         }
+    }
+
+    #[test]
+    fn backfill_walk_waits_for_the_first_drain_cycle_then_falls_open() {
+        // Boot stagger: the audio lane's backfill walk holds off until the changeset drain has
+        // completed ONE cycle, so it is not competing for the write lock during the boot burst
+        // (catch-up merge + capture + self-heal). It is a POLITENESS gate, never a dependency:
+        // it fails open on a budget so a slow, wedged, or absent drain can never stop a device
+        // from backing up its library.
+        let never_stop = AtomicBool::new(false);
+
+        // Un-signalled: the waiter times out and reports that it did NOT wait for a cycle.
+        reset_first_drain_cycle();
+        let t0 = Instant::now();
+        assert!(
+            !wait_for_first_drain_cycle(&never_stop, Duration::from_millis(120)),
+            "an un-signalled gate must fall open on the budget, not block forever"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(100),
+            "the waiter actually waited out its budget"
+        );
+
+        // Signalled by a completed cycle: the waiter is released promptly.
+        let signaller = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(40));
+            note_first_drain_cycle_done();
+        });
+        let t1 = Instant::now();
+        assert!(
+            wait_for_first_drain_cycle(&never_stop, Duration::from_secs(10)),
+            "a completed drain cycle releases the walk"
+        );
+        assert!(
+            t1.elapsed() < Duration::from_secs(5),
+            "released by the signal, not by the budget"
+        );
+        signaller.join().unwrap();
+
+        // The latch is one-way and re-entrant until the next drain spawn re-arms it.
+        assert!(wait_for_first_drain_cycle(
+            &never_stop,
+            Duration::from_millis(1)
+        ));
+        note_first_drain_cycle_done();
+        assert!(wait_for_first_drain_cycle(
+            &never_stop,
+            Duration::from_millis(1)
+        ));
+
+        // A stopping lane never waits at all (shutdown must not be delayed by the gate).
+        reset_first_drain_cycle();
+        let stopping = AtomicBool::new(true);
+        let t2 = Instant::now();
+        assert!(!wait_for_first_drain_cycle(
+            &stopping,
+            Duration::from_secs(30)
+        ));
+        assert!(
+            t2.elapsed() < Duration::from_secs(1),
+            "a stopping lane returns immediately"
+        );
+        // Leave the global latch open so no other test in this process can be gated by it.
+        note_first_drain_cycle_done();
     }
 }
