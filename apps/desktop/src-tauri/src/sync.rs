@@ -36,11 +36,12 @@
 //! T029). In debug the whole store is a plaintext dev file (T020: dev-rebuild
 //! keychain re-prompt spam) keyed by `session-v1`.
 //!
-//! Parked (compiled, NOT registered as commands): `sync_seed` / `sync_join` — the
-//! future "migrate an existing library" (snapshot bootstrap + reconcile) feature.
-//! They stay in the tree with `reconcile.rs`; see SYNC_REMEDIATION.md §6b. The
-//! module keeps `#![allow(dead_code)]` because that parked surface (and the DTOs
-//! it alone returns) is intentionally unreferenced by the live command set.
+//! The module keeps `#![allow(dead_code)]` because the sealed-session store above
+//! is split by `#[cfg(not(debug_assertions))]`: the ~25 items that carry it
+//! (`SessionKeyStore`, `seal_session`/`open_session`, the wrap-entry codec, the
+//! tmp-file and lock plumbing) are load-bearing in a release build and unreferenced
+//! in a debug one, and the plaintext dev-file half is unreferenced in release. A
+//! per-item allow on both halves would be the same suppression written 25 times.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -62,11 +63,10 @@ use yapstack_common::auth::{
     LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest, RosterEnvelope,
     RosterUploadRequest, RosterUploadResponse, SignupRequest, TokenResponse,
 };
-use yapstack_sync::crypto::{ChangesetCipher, SnapshotCipher};
-use yapstack_sync::snapshot::{self, SnapshotMeta};
+use yapstack_sync::crypto::ChangesetCipher;
 use yapstack_sync::transport::SyncTransport;
 use yapstack_sync::{
-    cascade, outbox, reconcile, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
+    cascade, outbox, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
     CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION,
 };
 
@@ -1169,51 +1169,6 @@ fn cred_store_backend() -> &'static str {
     }
 }
 
-/// Set once the once-per-boot trace reported a session-read ERROR (R10.1 N2). A later
-/// successful load reads this to decide whether to emit the one-shot recovery follow-up, so the
-/// `Once`-guarded boot trace's permanent `error` verdict is honestly corrected on recovery.
-static BOOT_TRACE_WAS_ERROR: AtomicBool = AtomicBool::new(false);
-
-/// Pure decision for the R10.1 N2 recovery line: emit the one-shot "session recovered on
-/// retry" trace IFF the boot trace recorded a read error, a later load has now SUCCEEDED, and
-/// it has not already been emitted. Pure so the error-then-success honesty is unit-testable
-/// without touching the process-global statics.
-fn should_emit_session_recovered(
-    boot_was_error: bool,
-    load_succeeded: bool,
-    already_emitted: bool,
-) -> bool {
-    boot_was_error && load_succeeded && !already_emitted
-}
-
-/// Emit the R10.1 N2 recovery follow-up AT MOST ONCE: when the boot trace recorded a read
-/// ERROR and a subsequent load has now SUCCEEDED, log that the session recovered on retry —
-/// the honest correction of the permanent `session_present="error"` verdict the `Once`-guarded
-/// boot trace would otherwise leave. No secrets: a single presence boolean.
-fn maybe_log_session_recovered(load_succeeded: bool) {
-    static EMITTED: AtomicBool = AtomicBool::new(false);
-    if !should_emit_session_recovered(
-        BOOT_TRACE_WAS_ERROR.load(Ordering::Relaxed),
-        load_succeeded,
-        EMITTED.load(Ordering::Relaxed),
-    ) {
-        return;
-    }
-    // One-shot even under a race between two retrying threads: only the winner of the swap logs.
-    if EMITTED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let session_present = cred_cache()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .session
-        .is_some();
-    tracing::info!(
-        session_present,
-        "sync boot: session recovered on retry (an earlier boot trace reported a read error)"
-    );
-}
-
 /// Emit the boot session-load outcome EXACTLY ONCE per process, on the first session access.
 ///
 /// R6 item 4(a): the previous trace lived inline in `ensure_cache_loaded`, PAST its
@@ -1228,12 +1183,6 @@ fn maybe_log_session_recovered(load_succeeded: bool) {
 fn log_session_boot_trace(read_error: bool) {
     static BOOT_TRACE: Once = Once::new();
     BOOT_TRACE.call_once(|| {
-        // R10.1 N2: remember that the FIRST boot trace recorded a read error, so a later
-        // successful load can emit the honest "recovered on retry" follow-up rather than
-        // leaving the permanent `session_present="error"` verdict as the last word.
-        if read_error {
-            BOOT_TRACE_WAS_ERROR.store(true, Ordering::Relaxed);
-        }
         let (session_some, identity_present) = {
             let g = cred_cache().read().unwrap_or_else(|e| e.into_inner());
             (g.session.is_some(), g.identity.is_some())
@@ -1299,11 +1248,6 @@ fn ensure_cache_loaded() {
     // Log AFTER the cache is populated (and the write lock released) so the trace reflects the
     // resolved state, exactly once per boot — reporting a read error distinctly.
     log_session_boot_trace(!loaded_ok);
-    // R10.1 N2: if an earlier boot trace reported a read error and THIS retry succeeded, emit
-    // the one-shot recovery follow-up so the log does not leave a stale "error" as the last word.
-    // Only the genuine read-retry path (this branch) can recover; a sign-in write warming the
-    // cache is a fresh sign-in, not a recovery, and correctly does not trigger the line.
-    maybe_log_session_recovered(loaded_ok);
 }
 
 /// Decide the cache state from the two backing-store reads (R10 fix 3). A clean `Ok(None)` is
@@ -1338,7 +1282,12 @@ fn resolve_cache_from_reads(
             identity_err = identity_err.as_deref().unwrap_or("-"),
             "sync boot: credential store read FAILED — leaving cache unloaded so a later access retries (NOT caching signed-out); throttled: silent until it recovers"
         ),
+        // R10.1 N2: `session_present` is the honest correction of the `Once`-guarded boot
+        // trace's permanent `session_present="error"` verdict — whether a session actually
+        // came back, the smoking-gun field for the Windows session-loss investigation. It is
+        // the freshly-read value, not the cache, so it cannot report a stale presence.
         ReadLogEdge::Recovery => tracing::info!(
+            session_present = session.is_some(),
             "sync boot: credential store read recovered — cache now loads normally (was previously failing)"
         ),
         ReadLogEdge::Silent => {}
@@ -1457,9 +1406,9 @@ fn clear_session() -> Result<(), String> {
     clear_session_from_store()?;
     // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
-    set_drain_health(DrainHealth::Ok);
-    reset_drain_progress();
-    reset_audio_lane();
+    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+    DRAIN_PROGRESS.reset();
+    AUDIO_LANE.reset();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -1618,56 +1567,6 @@ fn sync_db_path(live_db: &Path) -> PathBuf {
     live_db.with_file_name("yapstack.sync.db")
 }
 
-/// Prepare the library for sync ONCE: make a hot COPY of the live DB (via
-/// `VACUUM INTO`, which only *reads* the source — the live DB is never opened
-/// for write), then register CRR + `crr_migrate` + reinstate the app-layer
-/// cascade/uniqueness on the COPY. Gated on `SYNC_SCHEMA_VERSION`: if the copy
-/// is already prepared at this schema version, it is a no-op. The live DB is
-/// left completely untouched (safety pattern per T010 CAVEATS / T004 R-notes).
-fn prepare_library_for_sync(live_db: &Path) -> Result<PathBuf, String> {
-    let sync_db = sync_db_path(live_db);
-
-    // Idempotency gate: already prepared at this schema version?
-    if sync_db.exists() {
-        if let Ok(db) = CrsqlDb::open(&sync_db) {
-            if prepared_version(db.conn()).unwrap_or(0) == SYNC_SCHEMA_VERSION {
-                return Ok(sync_db);
-            }
-        }
-        // Stale / partial copy — discard and rebuild from a fresh snapshot.
-        std::fs::remove_file(&sync_db).map_err(|e| e.to_string())?;
-    }
-
-    // Hot snapshot of the live DB. VACUUM INTO reads the source and writes a
-    // fresh compacted copy; it never mutates the source.
-    {
-        let live = Connection::open(live_db).map_err(|e| e.to_string())?;
-        let target = sync_db
-            .to_str()
-            .ok_or_else(|| "non-UTF8 sync db path".to_string())?;
-        live.execute("VACUUM INTO ?1", [target])
-            .map_err(|e| format!("snapshot failed: {e}"))?;
-    }
-
-    // Transform the COPY into CRR form and reinstate the stripped invariants.
-    let db = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
-    let conn = db.conn();
-    schema::crr_migrate(conn).map_err(|e| format!("crr_migrate: {e}"))?;
-    // Same out-of-band ALTER pass as the live in-place cutover: ensure the seed
-    // snapshot produced from this copy carries the runtime-patched columns as
-    // CRR-tracked (not absent), so a peer joining via snapshot never quarantines
-    // speaker_id / chat_messages column changes. Idempotent (schema.rs:329,332).
-    schema::apply_out_of_band_alters(conn).map_err(|e| format!("apply_out_of_band_alters: {e}"))?;
-    // Trigger-arity self-heal (see the drain seam for the full rationale). A snapshot
-    // freshly CRRified above cannot be stale, so this is defence in depth only — it
-    // costs one sqlite_master read + one pragma per table when everything is healthy.
-    heal_crr_trigger_arity(conn);
-    cascade::cascade_gc(conn).map_err(|e| format!("cascade_gc: {e}"))?;
-    uniqueness::enforce_uniqueness(conn).map_err(|e| format!("enforce_uniqueness: {e}"))?;
-    mark_prepared(conn).map_err(|e| e.to_string())?;
-    Ok(sync_db)
-}
-
 /// Repair any CRR table whose cr-sqlite triggers drifted out of arity with its column
 /// list, logging the outcome. Detect-then-heal: on a healthy DB this is a couple of
 /// catalog reads per table and heals nothing.
@@ -1694,18 +1593,6 @@ fn ensure_prep_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _yapstack_sync_prep(schema_version INTEGER NOT NULL);",
     )
-}
-
-fn prepared_version(conn: &Connection) -> rusqlite::Result<u32> {
-    ensure_prep_table(conn)?;
-    let v: Option<i64> = conn
-        .query_row(
-            "SELECT schema_version FROM _yapstack_sync_prep LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    Ok(v.unwrap_or(0) as u32)
 }
 
 fn mark_prepared(conn: &Connection) -> rusqlite::Result<()> {
@@ -2685,6 +2572,25 @@ fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHan
     Ok((shutdown, join))
 }
 
+/// Build the per-lane current-thread runtime (`drain_once` holds `&Connection` across awaits →
+/// `!Send`, so every lane owns one). On failure logs `"{lane}: runtime build failed"` and yields
+/// None so the caller returns, leaving the lane thread dead rather than half-started.
+///
+/// Logging-only: a lane with terminal state to settle first (the audio fetch worker, which must
+/// `finish` its registry slot and release its permit) keeps its own failure arm instead.
+fn current_thread_rt(lane: &str) -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            tracing::error!("{lane}: runtime build failed: {e}");
+            None
+        }
+    }
+}
+
 /// Spawn the long-lived SSE subscriber lane (deliverable 1). Runs on its own thread + runtime
 /// (like the audio uploader), subscribes to `GET /sync/stream` with the DRAIN-PERSISTED bearer
 /// (reloaded on every (re)connect — never self-refreshed), and on a wake whose seq is beyond
@@ -2701,15 +2607,8 @@ fn spawn_sse_subscriber(
     let join = std::thread::Builder::new()
         .name("yapstack-sync-sse".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("sync sse: runtime build failed: {e}");
-                    return;
-                }
+            let Some(rt) = current_thread_rt("sync sse") else {
+                return;
             };
             let client = reqwest::Client::new();
             let mut current_bearer = bearer;
@@ -2856,6 +2755,60 @@ impl DrainHandle {
 /// Managed Tauri state holding the live drain handle (None until sync enabled).
 pub type SyncRuntimeState = Arc<Mutex<Option<DrainHandle>>>;
 
+/// A process-global publish/read cell: a lane thread overwrites the whole snapshot, the
+/// command thread clones it out. Reads and writes are POISON-TOLERANT (`into_inner`) —
+/// a panicking publisher must never make the status surface permanently unreadable.
+///
+/// Only for cells whose `Default` IS the correct seed AND the correct reset value. A cell
+/// with a load-bearing sentinel (e.g. `pull_watermark_pub`'s `i64::MIN` "unknown") must stay
+/// hand-rolled, or the sentinel silently becomes 0.
+struct PubCell<T: Clone + Default> {
+    cell: OnceLock<RwLock<T>>,
+}
+
+impl<T: Clone + Default> PubCell<T> {
+    const fn new() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    fn slot(&self) -> &RwLock<T> {
+        self.cell.get_or_init(|| RwLock::new(T::default()))
+    }
+
+    fn get(&self) -> T {
+        self.slot()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set(&self, next: T) {
+        *self.slot().write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    /// Clear back to the default snapshot, so a later poll never shows stale state from a
+    /// drain/uploader that has stopped or a session that was cleared.
+    fn reset(&self) {
+        self.set(T::default());
+    }
+}
+
+impl<T: Clone + Default + PartialEq> PubCell<T> {
+    /// Publish, returning true if the value CHANGED (so the caller logs only on a
+    /// transition, never every 5s cycle).
+    fn set_if_changed(&self, next: T) -> bool {
+        let mut g = self.slot().write().unwrap_or_else(|e| e.into_inner());
+        if *g != next {
+            *g = next;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ----- Drain health (Bug A/B status surfacing) -----
 //
 // The drain runs on its own thread; `sync_status` runs on the command thread. This
@@ -2894,31 +2847,8 @@ enum DrainHealth {
     Unreachable(String),
 }
 
-fn drain_health_cell() -> &'static RwLock<DrainHealth> {
-    static CELL: OnceLock<RwLock<DrainHealth>> = OnceLock::new();
-    CELL.get_or_init(|| RwLock::new(DrainHealth::Ok))
-}
-
-/// Set the drain health, returning true if it CHANGED (so the caller logs only on a
-/// transition, never every 5s cycle).
-fn set_drain_health(next: DrainHealth) -> bool {
-    let mut g = drain_health_cell()
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    if *g != next {
-        *g = next;
-        true
-    } else {
-        false
-    }
-}
-
-fn drain_health() -> DrainHealth {
-    drain_health_cell()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
+/// Seeded from `Default` — [`DrainHealth::Ok`], i.e. "cycling normally (or not started)".
+static DRAIN_HEALTH: PubCell<DrainHealth> = PubCell::new();
 
 /// What the F2 threshold step decided this cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2994,30 +2924,9 @@ struct DrainProgress {
     crypto_quarantined: u64,
 }
 
-fn drain_progress_cell() -> &'static RwLock<DrainProgress> {
-    static CELL: OnceLock<RwLock<DrainProgress>> = OnceLock::new();
-    CELL.get_or_init(|| RwLock::new(DrainProgress::default()))
-}
-
-fn drain_progress() -> DrainProgress {
-    drain_progress_cell()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// Overwrite the whole progress snapshot (the drain rebuilds it each cycle).
-fn set_drain_progress(next: DrainProgress) {
-    *drain_progress_cell()
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = next;
-}
-
-/// Clear progress back to "nothing pending, never synced" — used when a drain stops or
-/// the session is cleared so a subsequent poll never shows a stale backlog.
-fn reset_drain_progress() {
-    set_drain_progress(DrainProgress::default());
-}
+/// The drain rebuilds the WHOLE snapshot each cycle; `reset()` is "nothing pending,
+/// never synced".
+static DRAIN_PROGRESS: PubCell<DrainProgress> = PubCell::new();
 
 // ----- Audio upload lane status (S2) -----
 //
@@ -3043,24 +2952,9 @@ struct AudioLaneSnapshot {
     backfill_complete: bool,
 }
 
-fn audio_lane_cell() -> &'static RwLock<AudioLaneSnapshot> {
-    static CELL: OnceLock<RwLock<AudioLaneSnapshot>> = OnceLock::new();
-    CELL.get_or_init(|| RwLock::new(AudioLaneSnapshot::default()))
-}
-
-fn audio_lane() -> AudioLaneSnapshot {
-    *audio_lane_cell().read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn set_audio_lane(next: AudioLaneSnapshot) {
-    *audio_lane_cell().write().unwrap_or_else(|e| e.into_inner()) = next;
-}
-
-/// Clear the audio-lane snapshot (uploader stopped / signed out) so a poll never shows a
-/// stale upload backlog.
-fn reset_audio_lane() {
-    set_audio_lane(AudioLaneSnapshot::default());
-}
+/// The uploader publishes the whole snapshot each cycle; `reset()` (uploader stopped /
+/// signed out) clears it so a poll never shows a stale upload backlog.
+static AUDIO_LANE: PubCell<AudioLaneSnapshot> = PubCell::new();
 
 /// The `exp` (unix seconds) claim of a JWT, decoded WITHOUT verifying the signature.
 /// This is only used to schedule a proactive refresh (A5) — a scheduling hint, not a
@@ -3204,7 +3098,7 @@ fn invalidate_session_credentials(mut s: Session) -> Session {
 /// We deliberately DO NOT call `clear_session` (which would drop the whole session and degrade
 /// the UI to the neutral "disconnected/off" state, NOT the AuthExpired surface the requirement
 /// names): instead we keep the record and null only the tokens. Order matters — the store
-/// write happens first, then `set_drain_health(AuthExpired)`. Returns whether AuthExpired newly
+/// write happens first, then the `DRAIN_HEALTH` publish. Returns whether AuthExpired newly
 /// transitioned (for one-shot logging). NEVER logs tokens.
 fn expire_session_terminally() -> bool {
     match load_session() {
@@ -3217,7 +3111,7 @@ fn expire_session_terminally() -> bool {
         Ok(None) => {} // already signed out — nothing to strip.
         Err(e) => tracing::warn!("sync drain: reading session during expiry failed: {e}"),
     }
-    set_drain_health(DrainHealth::AuthExpired)
+    DRAIN_HEALTH.set_if_changed(DrainHealth::AuthExpired)
 }
 
 /// Tauri event emitted to the frontend after a drain cycle that MERGED pulled peer
@@ -3333,9 +3227,9 @@ fn spawn_drain(
     // A fresh drain starts from a clean health slate (clears any lingering auth-expired
     // / blocked state from a previously stopped drain, e.g. after a re-login) and a clean
     // progress slate (session ack count resets; no stale backlog shown, T024).
-    set_drain_health(DrainHealth::Ok);
-    reset_drain_progress();
-    reset_audio_lane();
+    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+    DRAIN_PROGRESS.reset();
+    AUDIO_LANE.reset();
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
     reset_first_drain_cycle();
@@ -3386,15 +3280,8 @@ fn spawn_drain(
     let join = std::thread::Builder::new()
         .name("yapstack-sync-drain".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("sync drain: runtime build failed: {e}");
-                    return;
-                }
+            let Some(rt) = current_thread_rt("sync drain") else {
+                return;
             };
 
             // Open the CRR copy on THIS thread; the connection never leaves it.
@@ -3490,7 +3377,7 @@ fn spawn_drain(
                 Ok(c) => Some(c.max_changeset_seq),
                 Err(e) => {
                     if e.is_network() {
-                        set_drain_health(DrainHealth::Unreachable(e.to_string()));
+                        DRAIN_HEALTH.set_if_changed(DrainHealth::Unreachable(e.to_string()));
                     }
                     tracing::debug!("sync: initial relay tip unknown (completeness failed): {e}");
                     None
@@ -3527,7 +3414,7 @@ fn spawn_drain(
                             p.bytes as f64 / (1024.0 * 1024.0)
                         );
                     }
-                    set_drain_progress(DrainProgress {
+                    DRAIN_PROGRESS.set(DrainProgress {
                         pending_entries: p.entries,
                         pending_bytes: p.bytes,
                         acked_this_session: 0,
@@ -3570,8 +3457,8 @@ fn spawn_drain(
                         );
                         announced_catch_up = true;
                     }
-                    let prev = drain_progress();
-                    set_drain_progress(DrainProgress {
+                    let prev = DRAIN_PROGRESS.get();
+                    DRAIN_PROGRESS.set(DrainProgress {
                         catching_up: prev.pending_entries == 0,
                         pull_behind: start_behind,
                         ..prev
@@ -3588,7 +3475,7 @@ fn spawn_drain(
                         Err(e) => {
                             let msg = e.to_string();
                             if fail_surface_step(&mut consecutive_errors, true) == FailSurface::Surface
-                                && set_drain_health(DrainHealth::Failing(msg.clone()))
+                                && DRAIN_HEALTH.set_if_changed(DrainHealth::Failing(msg.clone()))
                             {
                                 tracing::warn!("sync drain cycle failed: {msg}");
                             }
@@ -3636,7 +3523,7 @@ fn spawn_drain(
                             if let Some(health) = retryable_refresh_health(&fail) {
                                 if fail_surface_step(&mut consecutive_errors, true)
                                     == FailSurface::Surface
-                                    && set_drain_health(health)
+                                    && DRAIN_HEALTH.set_if_changed(health)
                                 {
                                     tracing::warn!(
                                         "sync drain: token refresh deferred — {fail:?}"
@@ -3707,7 +3594,7 @@ fn spawn_drain(
                             "A queued change (#{client_seq}, ~{} MiB on the wire) is too large to sync and was held back.",
                             size / (1024 * 1024)
                         );
-                        if set_drain_health(DrainHealth::Blocked(msg.clone())) {
+                        if DRAIN_HEALTH.set_if_changed(DrainHealth::Blocked(msg.clone())) {
                             tracing::warn!("sync drain: {msg}");
                         }
                     }
@@ -3725,7 +3612,7 @@ fn spawn_drain(
                             DrainHealth::Failing(msg.clone())
                         };
                         if fail_surface_step(&mut consecutive_errors, true) == FailSurface::Surface
-                            && set_drain_health(health)
+                            && DRAIN_HEALTH.set_if_changed(health)
                         {
                             tracing::warn!(
                                 "sync drain: relay error on {consecutive_errors} consecutive cycles: {msg}"
@@ -3735,7 +3622,7 @@ fn spawn_drain(
                     // A fully clean cycle — clear the run and any prior failing/blocked state.
                     None => {
                         fail_surface_step(&mut consecutive_errors, false);
-                        set_drain_health(DrainHealth::Ok);
+                        DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
                     }
                 }
 
@@ -3807,9 +3694,9 @@ fn spawn_drain(
                             }
                             Some(chrono::Utc::now().to_rfc3339())
                         } else {
-                            drain_progress().last_success
+                            DRAIN_PROGRESS.get().last_success
                         };
-                        set_drain_progress(DrainProgress {
+                        DRAIN_PROGRESS.set(DrainProgress {
                             pending_entries: p.entries,
                             pending_bytes: p.bytes,
                             acked_this_session: acked_session,
@@ -3891,7 +3778,7 @@ fn publish_audio_lane(conn: &rusqlite::Connection) {
         .map(|n| n.max(0) as u64)
         .unwrap_or(0);
     let backfill_complete = audio::backfill_walk_completed(conn).unwrap_or(false);
-    set_audio_lane(AudioLaneSnapshot {
+    AUDIO_LANE.set(AudioLaneSnapshot {
         outstanding: counts.outstanding(),
         backfill_outstanding,
         failed: counts.failed,
@@ -3923,15 +3810,8 @@ fn spawn_audio_uploader(
     let join = std::thread::Builder::new()
         .name("yapstack-audio-uploader".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("audio uploader: runtime build failed: {e}");
-                    return;
-                }
+            let Some(rt) = current_thread_rt("audio uploader") else {
+                return;
             };
             // Own connection to the same CRR live DB (extension loaded on THIS connection).
             let db = match CrsqlDb::open(&sync_db) {
@@ -4317,7 +4197,7 @@ fn load_or_create_device_identity() -> Result<([u8; 32], Uuid), String> {
 /// surfaced in `last_error` (roster falls back to empty) rather than failing the call.
 async fn build_status_dto(session: &Session) -> SyncStatusDto {
     // S2: the audio-upload lane's latest published counts (own one-way cell, like progress).
-    let audio = audio_lane();
+    let audio = AUDIO_LANE.get();
     let mut roster = Vec::new();
     let mut last_error = None;
     match http_get_devices(session).await {
@@ -4350,8 +4230,8 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
     // backlog remains, surface a distinct `syncing` phase (the owner had no way to tell a
     // push was in flight). auth_expired / blocked keep their T023 treatment (they take
     // precedence over syncing — an expired session is not "syncing").
-    let progress = drain_progress();
-    let (phase, last_error) = match drain_health() {
+    let progress = DRAIN_PROGRESS.get();
+    let (phase, last_error) = match DRAIN_HEALTH.get() {
         DrainHealth::AuthExpired => (
             "auth_expired".to_string(),
             Some("Your session expired. Sign in again to resume sync.".to_string()),
@@ -4612,6 +4492,33 @@ async fn probe_relay(
     })
 }
 
+/// The LIVE `yapstack.db` path from managed state — the one DB every sync command touches
+/// (post-A3 the live DB *is* the CRR database).
+fn live_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .try_state::<crate::DbPath>()
+        .ok_or_else(|| "db path unavailable".to_string())?
+        .inner()
+        .as_ref()
+        .clone())
+}
+
+/// A short-lived PLAIN connection to the live DB for a command that only touches local,
+/// non-CRR tables (the audio queue). Deliberately NOT `CrsqlDb::open`: a command whose writes
+/// must merge as changesets needs the CRR engine registered on its own connection and opens it
+/// itself. The busy timeout is best-effort — a failure to set it only costs retries.
+fn ad_hoc_conn(db: &Path) -> Result<rusqlite::Connection, String> {
+    let conn = rusqlite::Connection::open(db).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
+    Ok(conn)
+}
+
+/// The session IFF sync is enabled on this device, else `None`. `None` is not an error — the
+/// gated commands are no-ops without a relay, and each supplies its OWN honest early value.
+fn enabled_session() -> Result<Option<Session>, String> {
+    Ok(load_session()?.filter(|s| s.sync_enabled))
+}
+
 /// Typed relay connection probe (T025). Returns a TYPED result the UI branches on:
 /// `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a version gap is
 /// advisory metadata on SUCCESS — never a failure. 5s request budget; the app version is
@@ -4668,12 +4575,7 @@ pub async fn sync_enable(
 ) -> Result<SyncStatusDto, String> {
     let mut session = load_session()?.ok_or_else(|| "Sign in before enabling sync.".to_string())?;
 
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
+    let db_path = live_db_path(&app)?;
     let db_service = app
         .try_state::<crate::db_service::DbServiceState>()
         .ok_or_else(|| "db service unavailable".to_string())?
@@ -4739,18 +4641,11 @@ pub fn sync_sign_out(runtime: State<'_, SyncRuntimeState>) -> Result<(), String>
 #[specta::specta]
 pub fn audio_enqueue_session(app: tauri::AppHandle, session_id: String) -> Result<u32, String> {
     // Only meaningful once sync is on — otherwise the queue has no drainer.
-    match load_session()? {
-        Some(s) if s.sync_enabled => {}
-        _ => return Ok(0),
+    if enabled_session()?.is_none() {
+        return Ok(0);
     }
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
+    let db_path = live_db_path(&app)?;
+    let conn = ad_hoc_conn(&db_path)?;
     yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
@@ -4784,18 +4679,11 @@ pub fn audio_enqueue_session(app: tauri::AppHandle, session_id: String) -> Resul
 #[tauri::command]
 #[specta::specta]
 pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> {
-    match load_session()? {
-        Some(s) if s.sync_enabled => {}
-        _ => return Ok(0),
+    if enabled_session()?.is_none() {
+        return Ok(0);
     }
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
+    let db_path = live_db_path(&app)?;
+    let conn = ad_hoc_conn(&db_path)?;
     let n = yapstack_sync::audio::retry_failed(&conn).map_err(|e| e.to_string())?;
     Ok(n as u32)
 }
@@ -4811,17 +4699,11 @@ pub fn audio_retry_failed_uploads(app: tauri::AppHandle) -> Result<u32, String> 
 #[tauri::command]
 #[specta::specta]
 pub fn sync_retry_crypto_quarantine(app: tauri::AppHandle) -> Result<u32, String> {
-    let session = match load_session()? {
-        Some(s) if s.sync_enabled => s,
-        _ => return Ok(0),
+    let Some(session) = enabled_session()? else {
+        return Ok(0);
     };
     let vault_key = session.vault_key()?;
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
+    let db_path = live_db_path(&app)?;
     // CrsqlDb::open registers the pinned CRR engine + sync pragmas (busy_timeout/WAL), so this
     // second connection merges recovered changesets safely alongside the running drain.
     let db = CrsqlDb::open(&db_path).map_err(|e| e.to_string())?;
@@ -4852,18 +4734,11 @@ pub fn sync_retry_crypto_quarantine(app: tauri::AppHandle) -> Result<u32, String
 #[tauri::command]
 #[specta::specta]
 pub fn audio_enqueue_dictation(app: tauri::AppHandle, dictation_id: String) -> Result<u32, String> {
-    match load_session()? {
-        Some(s) if s.sync_enabled => {}
-        _ => return Ok(0),
+    if enabled_session()?.is_none() {
+        return Ok(0);
     }
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
+    let db_path = live_db_path(&app)?;
+    let conn = ad_hoc_conn(&db_path)?;
     yapstack_sync::audio::ensure_queue_table(&conn).map_err(|e| e.to_string())?;
     let wav: Option<String> = conn
         .query_row(
@@ -5107,19 +4982,12 @@ pub fn audio_prepare_part(
     high_priority: Option<bool>,
 ) -> Result<AudioPreparePartDto, String> {
     let high = high_priority.unwrap_or(false);
-    let session = match load_session()? {
-        Some(s) if s.sync_enabled => s,
-        // No server to fetch from → stays the honest on-device state.
-        _ => return Ok(AudioPreparePartDto::NotOnServer),
+    // No server to fetch from → stays the honest on-device state.
+    let Some(session) = enabled_session()? else {
+        return Ok(AudioPreparePartDto::NotOnServer);
     };
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
+    let db_path = live_db_path(&app)?;
+    let conn = ad_hoc_conn(&db_path)?;
     let Some((session_id, ext)) = resolve_part_identity(&conn, &part_id) else {
         return Err(format!("unknown audio part: {part_id}"));
     };
@@ -5286,12 +5154,7 @@ pub struct AudioCacheStatsDto {
 #[tauri::command]
 #[specta::specta]
 pub fn audio_cache_stats(app: tauri::AppHandle) -> Result<AudioCacheStatsDto, String> {
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
+    let db_path = live_db_path(&app)?;
     let s = yapstack_sync::audio::cache_stats(&fetch_cache_dir(&db_path));
     Ok(AudioCacheStatsDto {
         bytes: s.bytes,
@@ -5308,12 +5171,7 @@ pub fn audio_cache_stats(app: tauri::AppHandle) -> Result<AudioCacheStatsDto, St
 #[tauri::command]
 #[specta::specta]
 pub fn audio_cache_clear(app: tauri::AppHandle) -> Result<AudioCacheStatsDto, String> {
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
+    let db_path = live_db_path(&app)?;
     let cache_dir = fetch_cache_dir(&db_path);
     let _removed =
         yapstack_sync::audio::cache_clear(&cache_dir, |part| fetch_registry().is_active(part));
@@ -5722,230 +5580,6 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
     session.roster_fingerprint = Some(roster_fp);
     store_session(&session)?;
     Ok(build_status_dto(&session).await)
-}
-
-// ----- R1/R2 two-populated-device onboarding (seed / join) -----
-//
-// OWNER DECISION: the Mac (primary ~41 MB DB) SEEDS; the Windows device JOINs. The seed
-// publishes an encrypted DB SNAPSHOT (R2 — not a ~434k-change replay); the join
-// re-bootstraps from it and RECONCILES its own local-only rows with app-level dedup,
-// NEVER independently CRRifying-and-merging (which is silently lossy). See sync::reconcile.
-
-/// One surfaced reconciliation collision (an ambiguous local row that was NOT silently
-/// dropped — the owner reviews these before discarding the old local DB).
-#[derive(Debug, Clone, Serialize, specta::Type)]
-pub struct CollisionDto {
-    pub table: String,
-    pub pk: String,
-    /// "content_diverged" (same PK, different values) or "logical_duplicate".
-    pub kind: String,
-}
-
-/// Result of a join reconciliation. `accounted == inserted + matched + collisions` and
-/// equals the join's local row count — the no-silent-loss guarantee, surfaced to the UI.
-#[derive(Debug, Clone, Serialize, specta::Type)]
-pub struct ReconcileReportDto {
-    pub inserted_local_only: u32,
-    pub matched_identical: u32,
-    pub collisions: Vec<CollisionDto>,
-}
-
-fn snapshot_scratch_dir(live_db: &Path) -> PathBuf {
-    live_db
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// SEED (deliverable R2 seed side): CRRify a COPY of the primary DB, publish it as one
-/// encrypted snapshot, and suppress re-pushing the whole history as changesets (the
-/// snapshot carries it). Then start the drain. This device holds the authoritative
-/// library; the other device joins from the snapshot.
-///
-/// PARKED — unregistered from the command builder (`lib.rs`), NOT a live command. This is the
-/// future "migrate an existing library" (snapshot bootstrap) feature; it stays compiled with
-/// `reconcile.rs` and re-enters the surface when that feature lands. See SYNC_REMEDIATION.md §6b.
-#[allow(dead_code)]
-pub async fn sync_seed(
-    app: tauri::AppHandle,
-    runtime: State<'_, SyncRuntimeState>,
-) -> Result<SyncStatusDto, String> {
-    let mut session = load_session()?.ok_or_else(|| "Sign in before seeding.".to_string())?;
-    let vault_key = session.vault_key()?;
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-
-    // CRRify a COPY of the live DB (VACUUM INTO — the live DB is never opened for write).
-    let sync_db = prepare_library_for_sync(&db_path)?;
-
-    // Produce + encrypt the snapshot from the prepared CRR copy.
-    let scratch = snapshot_scratch_dir(&db_path);
-    let bytes = snapshot::produce_snapshot_bytes(&sync_db, &scratch).map_err(|e| e.to_string())?;
-    let generation = 1u64; // v1: one snapshot generation per seed (re-seed bumps later).
-    let cipher = SnapshotCipher::new(vault_key, session.epoch, session.tenant_id);
-    let blob = cipher
-        .encrypt(generation, &bytes)
-        .map_err(|e| e.to_string())?;
-
-    let transport = HttpTransport::new(base_url(&session.server_url), session.bearer.clone());
-    // Baseline = the relay's current cursor: the join resumes incremental pull from here.
-    let baseline_seq = transport
-        .completeness()
-        .await
-        .map(|c| c.max_changeset_seq)
-        .map_err(|e| e.to_string())?;
-    transport
-        .put_snapshot(
-            SnapshotMeta {
-                generation,
-                baseline_seq,
-            },
-            &blob,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // R2 seed side: do NOT re-emit the whole history as changesets — advance the push
-    // watermark past every row already captured in the snapshot.
-    {
-        let db = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
-        let max_dbv: i64 = db
-            .conn()
-            .query_row(
-                "SELECT coalesce(max(db_version),0) FROM crsql_changes WHERE site_id = crsql_site_id()",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        state::set_push_watermark(db.conn(), max_dbv).map_err(|e| e.to_string())?;
-    }
-
-    start_and_store_drain(&app, &session, &runtime, &sync_db)?;
-    session.sync_enabled = true;
-    store_session(&session)?;
-    Ok(build_status_dto(&session).await)
-}
-
-/// JOIN (deliverable R1 + R2 join side): re-bootstrap from the seed's snapshot into a
-/// fresh CRR base, RECONCILE this device's own local-only rows into it (preserved, with
-/// ambiguous collisions surfaced), then start the drain. NEVER independently
-/// CRRifies-and-merges the live DB (silently lossy). The live DB is only ever READ.
-///
-/// PARKED — unregistered from the command builder (`lib.rs`), NOT a live command. This is the
-/// future "migrate an existing library" (snapshot bootstrap + reconcile) feature; it stays
-/// compiled with `reconcile.rs` and re-enters the surface when that feature lands. See
-/// SYNC_REMEDIATION.md §6b.
-#[allow(dead_code)]
-pub async fn sync_join(
-    app: tauri::AppHandle,
-    runtime: State<'_, SyncRuntimeState>,
-) -> Result<ReconcileReportDto, String> {
-    let mut session = load_session()?.ok_or_else(|| "Sign in before joining.".to_string())?;
-    let vault_key = session.vault_key()?;
-    let db_path = app
-        .try_state::<crate::DbPath>()
-        .ok_or_else(|| "db path unavailable".to_string())?
-        .inner()
-        .as_ref()
-        .clone();
-
-    // Pull the seed's snapshot (surface, never fall back to a lossy self-merge).
-    let transport = HttpTransport::new(base_url(&session.server_url), session.bearer.clone());
-    let (meta, blob) = transport
-        .get_snapshot()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| {
-            "No snapshot on the relay yet — publish one from the seed device first.".to_string()
-        })?;
-    let cipher = SnapshotCipher::new(vault_key, session.epoch, session.tenant_id);
-    let snap_bytes = cipher
-        .decrypt(meta.generation, &blob)
-        .map_err(|e| e.to_string())?;
-
-    // Write it as the CRR base and re-site so this device becomes an independent peer
-    // (fresh site id + client id) that will not re-push the seed's history.
-    let sync_db = sync_db_path(&db_path);
-    snapshot::write_snapshot_file(&sync_db, &snap_bytes).map_err(|e| e.to_string())?;
-    {
-        let base = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
-        reconcile::resite_as_fresh_peer(base.conn()).map_err(|e| e.to_string())?;
-        reconcile::reset_join_local_state(base.conn()).map_err(|e| e.to_string())?;
-    }
-
-    // Reopen (so cr-sqlite re-reads the fresh site id) and reconcile local-only rows.
-    let base = CrsqlDb::open(&sync_db).map_err(|e| e.to_string())?;
-    state::set_pull_watermark(base.conn(), meta.baseline_seq).map_err(|e| e.to_string())?;
-
-    // The live DB is opened READ-ONLY — it is never written (data-safety invariant).
-    let live_ro = Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = live_ro.busy_timeout(AD_HOC_BUSY_TIMEOUT);
-    let report =
-        reconcile::reconcile_local_rows(&live_ro, base.conn()).map_err(|e| e.to_string())?;
-    drop(live_ro);
-
-    // Reinstate the stripped FK cascade + UNIQUE invariants after reconciliation.
-    cascade::cascade_gc(base.conn()).map_err(|e| e.to_string())?;
-    uniqueness::enforce_uniqueness(base.conn()).map_err(|e| e.to_string())?;
-    mark_prepared(base.conn()).map_err(|e| e.to_string())?;
-    drop(base);
-
-    start_and_store_drain(&app, &session, &runtime, &sync_db)?;
-    session.sync_enabled = true;
-    store_session(&session)?;
-
-    Ok(ReconcileReportDto {
-        inserted_local_only: report.inserted_local_only as u32,
-        matched_identical: report.matched_identical as u32,
-        collisions: report
-            .collisions
-            .into_iter()
-            .map(|c| CollisionDto {
-                table: c.table,
-                pk: c.pk,
-                kind: match c.kind {
-                    reconcile::CollisionKind::ContentDiverged => "content_diverged".into(),
-                    reconcile::CollisionKind::LogicalDuplicate => "logical_duplicate".into(),
-                },
-            })
-            .collect(),
-    })
-}
-
-/// Spawn the drain on its dedicated thread and store the handle (shared by seed + join).
-fn start_and_store_drain(
-    app: &tauri::AppHandle,
-    session: &Session,
-    runtime: &State<'_, SyncRuntimeState>,
-    sync_db: &Path,
-) -> Result<(), String> {
-    let vault_key = session.vault_key()?;
-    let handle = spawn_drain(
-        app.clone(),
-        sync_db.to_path_buf(),
-        session.server_url.clone(),
-        session.bearer.clone(),
-        vault_key,
-        session.epoch,
-        session.tenant_id,
-        session.client_id,
-    )?;
-    let mut guard = runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned".to_string())?;
-    if let Some(mut prev) = guard.take() {
-        prev.stop();
-    }
-    *guard = Some(handle);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -7593,20 +7227,6 @@ mod tests {
             );
             assert!(path.exists(), "the final sealed file is present");
             let _ = std::fs::remove_file(&path);
-        }
-
-        #[test]
-        fn recovery_line_emits_once_only_after_an_error_then_success() {
-            // R10.1 N2: the one-shot "session recovered on retry" line fires IFF a boot trace
-            // recorded a read error AND a later load succeeded AND it has not fired yet.
-            // Error boot alone → no line.
-            assert!(!should_emit_session_recovered(true, false, false));
-            // No prior error → never a recovery line (a clean boot needs no correction).
-            assert!(!should_emit_session_recovered(false, true, false));
-            // Error-then-success → emit exactly once.
-            assert!(should_emit_session_recovered(true, true, false));
-            // Already emitted → silent thereafter.
-            assert!(!should_emit_session_recovered(true, true, true));
         }
 
         #[test]

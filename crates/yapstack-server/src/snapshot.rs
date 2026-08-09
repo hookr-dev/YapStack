@@ -14,34 +14,11 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::choke;
-use crate::config::StorageConfig;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::AuthTenant;
-use crate::state::AppState;
+use crate::state::{storage_cfg, AppState};
 use crate::storage;
-
-fn storage_cfg(st: &AppState) -> Result<&StorageConfig, AppError> {
-    st.config
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::Unavailable("snapshot storage not configured".into()))
-}
-
-fn parse_sha256(s: &str) -> Result<(Vec<u8>, String), AppError> {
-    let lower = s.to_ascii_lowercase();
-    if lower.len() != 64 || !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest("sha256: expected 64 hex chars".into()));
-    }
-    let bytes =
-        hex::decode(&lower).map_err(|_| AppError::BadRequest("sha256: invalid hex".into()))?;
-    Ok((bytes, lower))
-}
-
-/// Object key for a tenant's snapshot ciphertext: `tenants/{ws}/snapshot/{sha256}`.
-fn snapshot_object_key(workspace_id: uuid::Uuid, sha_hex: &str) -> String {
-    format!("tenants/{workspace_id}/snapshot/{sha_hex}")
-}
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotPresignRequest {
@@ -73,8 +50,8 @@ pub async fn presign(
     Json(req): Json<SnapshotPresignRequest>,
 ) -> Result<Json<SnapshotPresignResponse>, AppError> {
     let cfg = storage_cfg(&st)?;
-    let (hash, hash_hex) = parse_sha256(&req.sha256)?;
-    let key = snapshot_object_key(auth.tenant_id, &hash_hex);
+    let (hash, hash_hex) = storage::parse_sha256(&req.sha256)?;
+    let key = storage::snapshot_object_key(auth.tenant_id, &hash_hex);
 
     let limits = st.limits.limits(auth.tenant_id).await;
     let help_url = st.config.help_url();
@@ -167,7 +144,7 @@ pub async fn head(
             download_url: None,
         }));
     };
-    let key = snapshot_object_key(auth.tenant_id, &hex::encode(hash));
+    let key = storage::snapshot_object_key(auth.tenant_id, &hex::encode(hash));
     let signed = storage::presign(cfg, "GET", &key, None, chrono::Utc::now());
     Ok(Json(SnapshotHeadResponse {
         present: true,

@@ -499,6 +499,16 @@ downgraded. Wrapped-key AADs (§4.2) likewise gain `version` as their first fiel
 
 - **Changesets:**
   `AAD = LP(version, "yapstack.changeset.v1", tenant_id, client_id, client_seq, schema_version, engine_version)`
+- **DB snapshots (R2 bootstrap — registry gap-fill, DOCUMENTS SHIPPED BEHAVIOR, not a change):**
+  `AAD = LP(version, "yapstack.snapshot.v1", tenant_id, generation_u64)`, with the data-key
+  wrap under its own domain `LP(version, "yapstack.wrap.snapshot.v1", epoch_u32)` (§4.2).
+  `generation_u64` is big-endian. A snapshot is the seed device's compact CRR database
+  file, sealed with the same two-envelope construction as a changeset (fresh random data
+  key wrapped under the vault key, payload sealed under that data key) but bound to
+  `generation` instead of `(client_id, client_seq)`; the distinct wrap domain keeps a
+  snapshot data key from ever being opened as a changeset one. These are the AADs
+  `crates/yapstack-sync/src/crypto.rs` has built since R2 shipped — recorded here because
+  they were missing from this table, not newly specified.
 - **Audio blobs (RETIRED — never shipped, amendment §1.5):**
   `AAD = LP(version, "yapstack.audio.v1", tenant_id, session_id)`. This whole-blob domain
   is **retired**: zero blobs were ever sealed under it (the empty-tables invariant). Audio
@@ -909,6 +919,8 @@ items are retryable (e.g. after a key-state change or vault-key rotation).
 | Domain yapstack.audio.v1 (**RETIRED**, §1.5) | `796170737461636b2e617564696f2e7631` |
 | Domain yapstack.audio.stream.v1 | `796170737461636b2e617564696f2e73747265616d2e7631` |
 | Wrap domain yapstack.wrap.audio.stream.v1 | `796170737461636b2e777261702e617564696f2e73747265616d2e7631` |
+| Domain yapstack.snapshot.v1 (§5.2, shipped) | `796170737461636b2e736e617073686f742e7631` |
+| Wrap domain yapstack.wrap.snapshot.v1 (§5.2, shipped) | `796170737461636b2e777261702e736e617073686f742e7631` |
 | Domain yapstack.share.v1 | `796170737461636b2e73686172652e7631` |
 
 ---

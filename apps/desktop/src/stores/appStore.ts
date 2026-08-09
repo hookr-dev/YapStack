@@ -872,6 +872,33 @@ const defaultSyncConfig: SyncConfig = {
   deviceFingerprint: null,
 };
 
+/** Zero-value snapshot the status-fetch error path spreads over when there is no
+ *  previous status to carry forward. Must stay EXHAUSTIVE over `SyncStatus`: every
+ *  field added here is one the error snapshot can no longer silently drop. */
+const EMPTY_SYNC_STATUS: SyncStatus = {
+  phase: "disconnected",
+  serverUrl: "",
+  email: null,
+  deviceFingerprint: null,
+  roster: [],
+  vaultKeyEpoch: null,
+  rosterFingerprint: null,
+  syncEnabled: false,
+  lastError: null,
+  billingUrl: null,
+  pendingEntries: 0,
+  pendingBytes: 0,
+  ackedThisSession: 0,
+  lastSuccess: null,
+  pullBehind: 0,
+  cryptoQuarantined: 0,
+  audioUploadOutstanding: 0,
+  audioBackfillOutstanding: 0,
+  audioUploadFailed: 0,
+  audioUploadedTotal: 0,
+  audioBackfillComplete: false,
+};
+
 function updateSessionFolderMap(
   current: Record<string, string[]>,
   sessionId: string,
@@ -1918,7 +1945,6 @@ function createAppStore() {
         set({ syncConfig: { ...get().syncConfig, ...partial } });
       },
       setSyncStatus: (status) => {
-        set({ syncStatus: status });
         // Mirror the non-secret handles the UI persists. Never store tokens or
         // the vault key here — those stay in the OS keychain (Rust side).
         //
@@ -1930,18 +1956,21 @@ function createAppStore() {
         // empty one, and never null a persisted email from a signed-out DTO. Sign-out
         // clears the email deliberately through its OWN path (handleSignOut →
         // setSyncConfig({ email: null })), not through a status poll.
-        if (status) {
-          const prev = get().syncConfig;
-          set({
-            syncConfig: {
-              ...prev,
-              serverUrl: status.serverUrl || prev.serverUrl,
-              email: status.email ?? prev.email,
-              syncEnabled: status.syncEnabled,
-              deviceFingerprint: status.deviceFingerprint,
-            },
-          });
-        }
+        const prev = get().syncConfig;
+        set({
+          syncStatus: status,
+          ...(status
+            ? {
+                syncConfig: {
+                  ...prev,
+                  serverUrl: status.serverUrl || prev.serverUrl,
+                  email: status.email ?? prev.email,
+                  syncEnabled: status.syncEnabled,
+                  deviceFingerprint: status.deviceFingerprint,
+                },
+              }
+            : {}),
+        });
       },
       refreshSyncStatus: async () => {
         try {
@@ -1957,32 +1986,23 @@ function createAppStore() {
           // classifies connect/timeout at the transport). This catch is only for
           // a failed status COMMAND itself, so we still surface it verbatim as an
           // error and never fabricate `relayConn = unreachable` by string-parsing.
+          //
+          // Carry the whole previous snapshot forward by construction: a status-fetch
+          // failure is a connection problem, not evidence the backlog changed (T024),
+          // and a field this path forgets to copy (cryptoQuarantined did) silently
+          // blanks a standing warning on one IPC blip. Only the four identity fields
+          // come from syncConfig, which is authoritative for them. NOT routed through
+          // `setSyncStatus` — an error snapshot must not run the syncConfig mirror.
           const prev = get().syncStatus;
           set({
             syncStatus: {
+              ...(prev ?? EMPTY_SYNC_STATUS),
               phase: "error",
+              lastError: msg,
               serverUrl: get().syncConfig.serverUrl,
               email: get().syncConfig.email,
               deviceFingerprint: get().syncConfig.deviceFingerprint,
-              roster: prev?.roster ?? [],
-              vaultKeyEpoch: prev?.vaultKeyEpoch ?? null,
-              rosterFingerprint: prev?.rosterFingerprint ?? null,
               syncEnabled: get().syncConfig.syncEnabled,
-              lastError: msg,
-              billingUrl: prev?.billingUrl ?? null,
-              // Preserve the last-known progress snapshot; a status-fetch failure
-              // is a connection problem, not evidence the backlog changed (T024).
-              pendingEntries: prev?.pendingEntries ?? 0,
-              pendingBytes: prev?.pendingBytes ?? 0,
-              ackedThisSession: prev?.ackedThisSession ?? 0,
-              lastSuccess: prev?.lastSuccess ?? null,
-              pullBehind: prev?.pullBehind ?? 0,
-              // Audio lane: preserve the last-known counts across a status-fetch blip.
-              audioUploadOutstanding: prev?.audioUploadOutstanding ?? 0,
-              audioBackfillOutstanding: prev?.audioBackfillOutstanding ?? 0,
-              audioUploadFailed: prev?.audioUploadFailed ?? 0,
-              audioUploadedTotal: prev?.audioUploadedTotal ?? 0,
-              audioBackfillComplete: prev?.audioBackfillComplete ?? false,
             },
           });
         }

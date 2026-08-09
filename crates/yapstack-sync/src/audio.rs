@@ -320,8 +320,8 @@ impl BackfillReport {
 /// stepped over stragglers is honestly still incomplete and the next start retries them.
 ///
 /// # Errors
-/// Propagates a sqlite error from the walk's SETUP (queue/meta table, reading the part
-/// lists). Per-part failures are never fatal — they surface as `skipped`.
+/// Propagates a sqlite error from the walk's SETUP (queue table, reading the part lists).
+/// Per-part failures are never fatal — they surface as `skipped`.
 pub fn backfill_walk<F>(conn: &Connection, mut file_exists: F) -> Result<BackfillReport, SyncError>
 where
     F: FnMut(&str) -> bool,
@@ -329,44 +329,16 @@ where
     // Hoisted out of the per-row path: one `CREATE TABLE IF NOT EXISTS` write per pass, not
     // one per part.
     with_busy_retry("ensure_queue_table", || ensure_queue_table(conn))?;
-    with_busy_retry("ensure_meta_table", || {
-        crate::state::ensure_meta_table(conn)
-    })?;
 
     let mut report = BackfillReport::default();
-    let mut stmt = conn.prepare(
+    walk_source(
+        conn,
         "SELECT id, session_id, file_path FROM session_audio_parts \
          WHERE file_path IS NOT NULL AND file_path <> ''",
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        &mut file_exists,
+        &mut report,
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    // Collect first so the SELECT cursor is closed before we enqueue (INSERTs into a
-    // different table, but collecting keeps the borrow window tight and obvious).
-    let mut parts: Vec<(String, String, String)> = Vec::new();
-    for row in rows {
-        parts.push(row?);
-    }
-    drop(stmt);
-    for (part_id, session_id, file_path) in parts {
-        report.examined += 1;
-        if !file_exists(&file_path) {
-            report.missing_file += 1;
-            continue;
-        }
-        enqueue_or_skip(
-            conn,
-            &part_id,
-            &file_path,
-            &session_id,
-            PRIORITY_BACKFILL,
-            &mut report,
-        );
-    }
 
     // S3 dictation fold-in: dictation audio has NO session_audio_parts row (the synthetic
     // dictation session_id has no `sessions` row, so the finalize path skips part
@@ -374,35 +346,23 @@ where
     // `session_id` self-referential (the same value used at enqueue-on-save). Walk those rows
     // too so every dictation WAV that exists on THIS device becomes upload debt — the
     // server-completeness invariant covers dictation, not only session recordings.
-    if table_exists(conn, "dictation_history") {
-        let mut dstmt = conn.prepare(
+    //
+    // Tolerant of older schemas / engine test DBs that predate `dictation_history`.
+    if crate::schema::table_exists(conn, "dictation_history").unwrap_or(false) {
+        walk_source(
+            conn,
             "SELECT id, wav_file_path FROM dictation_history \
              WHERE wav_file_path IS NOT NULL AND wav_file_path <> ''",
+            |r| {
+                // session_id == part_id (self): dictation has no owning session; the identity
+                // is immutable so upload and fetch derive the SAME AAD regardless of later
+                // linking.
+                let dict_id: String = r.get(0)?;
+                Ok((dict_id.clone(), dict_id, r.get(1)?))
+            },
+            &mut file_exists,
+            &mut report,
         )?;
-        let drows =
-            dstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        let mut dparts: Vec<(String, String)> = Vec::new();
-        for row in drows {
-            dparts.push(row?);
-        }
-        drop(dstmt);
-        for (dict_id, file_path) in dparts {
-            report.examined += 1;
-            if !file_exists(&file_path) {
-                report.missing_file += 1;
-                continue;
-            }
-            // session_id == part_id (self): dictation has no owning session; the identity is
-            // immutable so upload and fetch derive the SAME AAD regardless of later linking.
-            enqueue_or_skip(
-                conn,
-                &dict_id,
-                &file_path,
-                &dict_id,
-                PRIORITY_BACKFILL,
-                &mut report,
-            );
-        }
     }
 
     // Record completion (a timestamp; presence is the "walk ran" signal — re-runnable) ONLY
@@ -422,6 +382,51 @@ where
         }
     }
     Ok(report)
+}
+
+/// Walk one audio source table, enqueueing every row whose file exists on THIS device at
+/// [`PRIORITY_BACKFILL`]. `row` maps a source row to `(part_id, session_id, file_path)` — the
+/// AAD identity binding stays in Rust at the call site, never folded into the SQL projection.
+///
+/// # Errors
+/// Propagates a sqlite error from preparing/reading the source list. Per-part enqueue
+/// failures are never fatal — they surface as [`BackfillReport::skipped`].
+fn walk_source<F, M>(
+    conn: &Connection,
+    sql: &str,
+    row: M,
+    file_exists: &mut F,
+    report: &mut BackfillReport,
+) -> Result<(), SyncError>
+where
+    F: FnMut(&str) -> bool,
+    M: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String)>,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], row)?;
+    // Collect first so the SELECT cursor is closed before we enqueue (INSERTs into a
+    // different table, but collecting keeps the borrow window tight and obvious).
+    let mut parts: Vec<(String, String, String)> = Vec::new();
+    for r in rows {
+        parts.push(r?);
+    }
+    drop(stmt);
+    for (part_id, session_id, file_path) in parts {
+        report.examined += 1;
+        if !file_exists(&file_path) {
+            report.missing_file += 1;
+            continue;
+        }
+        enqueue_or_skip(
+            conn,
+            &part_id,
+            &file_path,
+            &session_id,
+            PRIORITY_BACKFILL,
+            report,
+        );
+    }
+    Ok(())
 }
 
 /// Enqueue one walked part, counting the outcome. A failure is STEPPED OVER (counted in
@@ -466,7 +471,6 @@ fn enqueue_or_skip(
 /// # Errors
 /// Propagates any sqlite error.
 pub fn backfill_walk_completed(conn: &Connection) -> Result<bool, SyncError> {
-    crate::state::ensure_meta_table(conn)?;
     Ok(crate::state::get_meta(conn, WALK_DONE_KEY)?.is_some())
 }
 
@@ -625,17 +629,6 @@ fn delete_entry(conn: &Connection, part_id: &str) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Whether a table exists (used to make the dictation fold-in tolerant of older schemas /
-/// engine test DBs that predate `dictation_history`).
-fn table_exists(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
 /// Whether the audio part's SOURCE row still exists (a deleted source → drop the queue entry
 /// silently, D9). An audio part is identified by its own UUID, which is EITHER a
 /// `session_audio_parts.id` (session recordings) OR a `dictation_history.id` (dictation
@@ -652,7 +645,8 @@ fn part_source_exists(conn: &Connection, part_id: &str) -> Result<bool, SyncErro
     if n > 0 {
         return Ok(true);
     }
-    if table_exists(conn, "dictation_history") {
+    // Tolerant of older schemas / engine test DBs that predate `dictation_history`.
+    if crate::schema::table_exists(conn, "dictation_history").unwrap_or(false) {
         let n: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM dictation_history WHERE id=?1)",
             [part_id],
@@ -1329,9 +1323,8 @@ impl FetchRegistry {
 //
 // The keep-until-clear cache is user-visible storage; these primitives back the sync
 // panel's "Fetched audio: N MB — Clear" row. They NEVER touch the fetch-tmp dir (in-flight
-// encrypted downloads) and the clear additionally skips both in-cache-dir decrypt temps
-// (FETCH_TEMP_PREFIX) and any file whose part has a live registry slot — the simplest rule
-// that can never corrupt an in-flight fetch.
+// encrypted downloads); both walk the cache dir through `settled_cache_files`, and the clear
+// additionally skips any file whose part has a live registry slot.
 
 /// Point-in-time cache footprint: decrypted audio files only (decrypt temps excluded).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1340,28 +1333,42 @@ pub struct CacheStats {
     pub files: u64,
 }
 
+/// The cache dir's SETTLED entries — regular files (directly in `cache_dir`, no recursion)
+/// whose name is valid UTF-8 and does NOT carry the [`FETCH_TEMP_PREFIX`] decrypt-temp
+/// prefix — yielded as `(entry, name, len)`. Skipping in-flight decrypt temps and anything
+/// that is not a regular file is the simplest rule that can never corrupt an in-flight
+/// fetch. A missing dir yields nothing; best-effort per entry (an unreadable entry is simply
+/// not yielded). Uses `metadata()` (FOLLOWS symlinks), unlike [`sweep_orphan_temps`], which
+/// deliberately uses `file_type()` on its own prefix.
+fn settled_cache_files(cache_dir: &Path) -> impl Iterator<Item = (std::fs::DirEntry, String, u64)> {
+    std::fs::read_dir(cache_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            if name.starts_with(FETCH_TEMP_PREFIX) {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let len = meta.len();
+            Some((entry, name, len))
+        })
+}
+
 /// Total bytes + file count of the fetch cache dir. A missing dir is an empty cache (not
-/// an error). Skips [`FETCH_TEMP_PREFIX`] decrypt temps and subdirectories; best-effort
-/// per entry (an unreadable entry is simply not counted).
+/// an error). Counts only settled files: [`FETCH_TEMP_PREFIX`] decrypt temps and anything
+/// that is not a regular file are skipped; best-effort per entry (an unreadable entry is
+/// simply not counted).
 #[must_use]
 pub fn cache_stats(cache_dir: &Path) -> CacheStats {
     let mut stats = CacheStats::default();
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return stats;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with(FETCH_TEMP_PREFIX) {
-            continue; // an in-flight decrypt temp is not settled cache content
-        }
-        match entry.metadata() {
-            Ok(m) if m.is_file() => {
-                stats.bytes = stats.bytes.saturating_add(m.len());
-                stats.files += 1;
-            }
-            _ => {}
-        }
+    for (_, _, len) in settled_cache_files(cache_dir) {
+        stats.bytes = stats.bytes.saturating_add(len);
+        stats.files += 1;
     }
     stats
 }
@@ -1374,29 +1381,17 @@ pub fn cache_stats(cache_dir: &Path) -> CacheStats {
 /// reclaimed. A missing dir reclaims nothing.
 pub fn cache_clear<F: Fn(&str) -> bool>(cache_dir: &Path, is_active: F) -> CacheStats {
     let mut removed = CacheStats::default();
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return removed;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with(FETCH_TEMP_PREFIX) {
-            continue; // never touch an in-flight decrypt temp
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue; // never recurse into / remove a directory
-        }
+    for (entry, name, len) in settled_cache_files(cache_dir) {
         // Cache files are `<part_id>.<ext>`; the stem is the part identity.
-        let stem = std::path::Path::new(name)
+        let stem = std::path::Path::new(&name)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(name);
+            .unwrap_or(&name);
         if is_active(stem) {
             continue; // live fetch slot → the part is (or may momentarily be) in use
         }
         if std::fs::remove_file(entry.path()).is_ok() {
-            removed.bytes = removed.bytes.saturating_add(meta.len());
+            removed.bytes = removed.bytes.saturating_add(len);
             removed.files += 1;
         }
     }

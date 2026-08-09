@@ -19,7 +19,6 @@ import {
   deriveFetchGlyph,
   clampMonotonicPercent,
   isFetchRestart,
-  formatFetchProgress,
   formatTrackFetchLabel,
   formatNoSpace,
   nextPollDelayMs,
@@ -598,16 +597,6 @@ describe("deriveFetchGlyph (compact play affordances)", () => {
       kind: "blocked",
       label: "boom",
     });
-  });
-});
-
-describe("formatFetchProgress", () => {
-  it("shows a percent once progress is known", () => {
-    expect(formatFetchProgress(42)).toBe("Fetching 42%");
-  });
-  it("falls back to an indeterminate label at 0 / unknown", () => {
-    expect(formatFetchProgress(0)).toBe("Fetching…");
-    expect(formatFetchProgress(NaN)).toBe("Fetching…");
   });
 });
 

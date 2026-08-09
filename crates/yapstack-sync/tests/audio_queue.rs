@@ -104,7 +104,10 @@ async fn full_roundtrip_seal_upload_download_open_is_byte_equal() {
 
     // Download the blob and decrypt it → byte-equal to the source WAV.
     let fetched = dir.path().join("fetched.blob");
-    assert!(relay.get_audio(PART_1, &fetched).await.unwrap());
+    assert!(relay
+        .get_audio_streaming(PART_1, &fetched, &audio::FetchProgress::default())
+        .await
+        .unwrap());
     let mut out = Vec::new();
     let id = yapstack_crypto::audio_stream::AudioIdentity {
         tenant_id: ctx.tenant_id,
@@ -146,7 +149,10 @@ async fn single_upload_stores_object_with_mapping_refcount_one() {
 
     // Recover the uploaded hash by fetching + hashing the stored object.
     let fetched = dir.path().join("f.blob");
-    assert!(relay.get_audio(PART_1, &fetched).await.unwrap());
+    assert!(relay
+        .get_audio_streaming(PART_1, &fetched, &audio::FetchProgress::default())
+        .await
+        .unwrap());
     let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
         std::fs::read(&fetched).unwrap(),
     ));

@@ -83,24 +83,18 @@ pub fn apply_or_quarantine(conn: &Connection, r: &ChangeRow) -> Result<bool, Syn
 /// changeset under boot-time contention.
 pub fn merge_changeset(conn: &Connection, cs: &Changeset) -> Result<(usize, usize), SyncError> {
     ensure_pending_table(conn)?;
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut applied = 0usize;
     let mut quarantined = 0usize;
-    let mut inner = || -> Result<(), SyncError> {
-        for r in &cs.rows {
-            if apply_or_quarantine(conn, r)? {
-                quarantined += 1;
-            } else {
-                applied += 1;
-            }
+    for r in &cs.rows {
+        if apply_or_quarantine(&tx, r)? {
+            quarantined += 1;
+        } else {
+            applied += 1;
         }
-        Ok(())
-    };
-    if let Err(e) = inner() {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
     }
-    conn.execute_batch("COMMIT;")?;
+    tx.commit()?;
     Ok((applied, quarantined))
 }
 
@@ -122,30 +116,24 @@ pub fn replay_pending(conn: &Connection) -> Result<usize, SyncError> {
         v
     };
 
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut replayed = 0usize;
-    let mut inner = || -> Result<(), SyncError> {
-        for (id, blob) in &candidates {
-            let cs = Changeset::decode(blob)?;
-            let Some(r) = cs.rows.first() else {
-                // malformed/empty — drop it, do not wedge the queue.
-                conn.execute("DELETE FROM _yapstack_pending_changes WHERE id=?1", [id])?;
-                continue;
-            };
-            if is_unknown_column(conn, r)? {
-                continue; // still gapped; keep for a later migration.
-            }
-            apply_change(conn, r)?;
-            conn.execute("DELETE FROM _yapstack_pending_changes WHERE id=?1", [id])?;
-            replayed += 1;
+    for (id, blob) in &candidates {
+        let cs = Changeset::decode(blob)?;
+        let Some(r) = cs.rows.first() else {
+            // malformed/empty — drop it, do not wedge the queue.
+            tx.execute("DELETE FROM _yapstack_pending_changes WHERE id=?1", [id])?;
+            continue;
+        };
+        if is_unknown_column(&tx, r)? {
+            continue; // still gapped; keep for a later migration.
         }
-        Ok(())
-    };
-    if let Err(e) = inner() {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
+        apply_change(&tx, r)?;
+        tx.execute("DELETE FROM _yapstack_pending_changes WHERE id=?1", [id])?;
+        replayed += 1;
     }
-    conn.execute_batch("COMMIT;")?;
+    tx.commit()?;
     Ok(replayed)
 }
 

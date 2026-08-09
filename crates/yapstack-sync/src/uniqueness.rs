@@ -26,19 +26,14 @@ pub struct UniquenessStats {
 
 /// Enforce all three dropped uniqueness constraints. One transaction.
 pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncError> {
-    conn.execute_batch("BEGIN;")?;
-    let mut stats = UniquenessStats::default();
-    let inner = |stats: &mut UniquenessStats| -> Result<(), SyncError> {
-        stats.notes_removed = dedup_notes(conn)?;
-        stats.tags_merged = dedup_tags(conn)?;
-        stats.audio_parts_removed = dedup_audio_parts(conn)?;
-        Ok(())
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    let stats = UniquenessStats {
+        notes_removed: dedup_notes(&tx)?,
+        tags_merged: dedup_tags(&tx)?,
+        audio_parts_removed: dedup_audio_parts(&tx)?,
     };
-    if let Err(e) = inner(&mut stats) {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
-    }
-    conn.execute_batch("COMMIT;")?;
+    tx.commit()?;
     Ok(stats)
 }
 

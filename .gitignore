@@ -63,6 +63,7 @@ apps/desktop/src-tauri/gen/
 # Local Claude Code / agent scratch state
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+.claude/worktrees/
 
 # GoalBuddy board scaffolding — process state (local board URL, receipts), not
 # stable docs. User-facing docs live under docs/ and are routed via INDEX.md.

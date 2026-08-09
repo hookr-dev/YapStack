@@ -52,7 +52,7 @@ pub async fn pull(
     tx.commit().await?;
 
     let has_more = rows.len() as i64 > limit;
-    let mut changes: Vec<PulledChange> = rows
+    let changes: Vec<PulledChange> = rows
         .into_iter()
         .take(limit as usize)
         .map(|(seq, cid, cseq, ct, sv, ev)| PulledChange {
@@ -67,8 +67,6 @@ pub async fn pull(
 
     // next_seq is the last returned seq (dense), or the caller's cursor when empty.
     let next_seq = changes.last().map_or(q.since, |c| c.changeset_seq);
-    // Truncate defensively in case take() kept the +1 (it won't, but be explicit).
-    changes.truncate(limit as usize);
 
     Ok(Json(PullResponse {
         changes,

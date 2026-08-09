@@ -286,9 +286,6 @@ pub fn open_segments<R: Read, W: Write>(
         if n == 0 {
             break;
         }
-        if n < STREAM_TAG_LEN {
-            return Err(CryptoError::Malformed); // a segment is at least its tag
-        }
         if let Some(prev) = pending.take() {
             let pt = dec
                 .decrypt_next(Payload {
@@ -305,6 +302,8 @@ pub fn open_segments<R: Read, W: Write>(
     }
     // No segment at all after a valid header is a truncated blob.
     let last = pending.ok_or(CryptoError::Malformed)?;
+    // A segment shorter than its tag needs no pre-check: `decrypt_last` rejects it as
+    // [`CryptoError::Open`].
     let pt = dec
         .decrypt_last(Payload {
             msg: &last,

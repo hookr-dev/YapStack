@@ -106,7 +106,9 @@ pub async fn signup(
     let user_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
 
-    let mut tx = st.pool.begin().await?;
+    // One RLS guard primitive for the whole crate. Setting it up front is a no-op for the
+    // non-RLS `users`/`workspaces` inserts below and arms the tenant-scoped ones after them.
+    let mut tx = db::begin_tenant_tx(&st.pool, workspace_id).await?;
 
     // Identity bootstrap tables (non-RLS). Unique(lower(email)) enforces one account.
     let inserted = sqlx::query(
@@ -134,12 +136,6 @@ pub async fn signup(
     sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
         .bind(workspace_id)
         .bind("")
-        .execute(&mut *tx)
-        .await?;
-
-    // Enter the tenant RLS context for the tenant-scoped inserts below.
-    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
-        .bind(workspace_id.to_string())
         .execute(&mut *tx)
         .await?;
 
@@ -261,14 +257,10 @@ pub async fn login_finish(
         return Err(AppError::Unauthorized);
     }
 
-    // Fetch the signed roster + its signature for bootstrap (§7.5 step 2).
-    let roster: Option<(Value, Vec<u8>)> = db_fetch_roster(&st, row.workspace_id).await?;
+    let mut tx = db::begin_tenant_tx(&st.pool, row.workspace_id).await?;
 
-    let mut tx = st.pool.begin().await?;
-    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
-        .bind(row.workspace_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+    // Fetch the signed roster + its signature for bootstrap (§7.5 step 2).
+    let roster: Option<(Value, Vec<u8>)> = fetch_roster(&mut tx, row.workspace_id).await?;
 
     // Enroll-as-PENDING (§7.5 step 1): a NEW device that presents an Ed25519 pubkey and
     // is not already in the devices table is inserted PENDING — authenticated to the
@@ -314,17 +306,17 @@ pub async fn login_finish(
     }))
 }
 
-async fn db_fetch_roster(
-    st: &AppState,
+/// The one definition of the roster read. Borrows the CALLER's tenant transaction — login
+/// and recover each already open one, so the roster costs no extra pool checkout.
+async fn fetch_roster(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workspace_id: Uuid,
 ) -> Result<Option<(Value, Vec<u8>)>, AppError> {
-    let mut tx = db::begin_tenant_tx(&st.pool, workspace_id).await?;
     let roster: Option<(Value, Vec<u8>)> =
         sqlx::query_as("SELECT device_list, signature FROM device_roster WHERE workspace_id = $1")
             .bind(workspace_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
-    tx.commit().await?;
     Ok(roster)
 }
 
@@ -385,11 +377,12 @@ pub async fn recover(
         return Err(AppError::Unauthorized);
     }
 
+    let mut tx = db::begin_tenant_tx(&st.pool, row.workspace_id).await?;
+
     // Authenticated. Serve the recovery-wrapped vault key + roster for the client to
     // unwrap locally and re-establish. The relay never unwraps it (no vault key).
-    let roster: Option<(Value, Vec<u8>)> = db_fetch_roster(&st, row.workspace_id).await?;
+    let roster: Option<(Value, Vec<u8>)> = fetch_roster(&mut tx, row.workspace_id).await?;
 
-    let mut tx = db::begin_tenant_tx(&st.pool, row.workspace_id).await?;
     let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, None).await?;
     tx.commit().await?;
 

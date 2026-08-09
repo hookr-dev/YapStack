@@ -34,18 +34,6 @@ extern "C" {
     fn sqlite3_crsqlite_init(db: *mut c_void, err: *mut *mut c_char, api: *const c_void) -> i32;
 }
 
-/// Retained for API compatibility. cr-sqlite is now initialized **per connection**
-/// (see [`init_crsqlite_on`] / [`CrsqlDb::open`]); there is intentionally no
-/// process-global registration. Callers holding a plain [`rusqlite::Connection`]
-/// that need cr-sqlite must go through [`CrsqlDb`].
-///
-/// NOTE: retained as a no-op only so pre-existing callers/tests keep compiling; it
-/// registers nothing. Do not add new callers.
-pub fn register_crsqlite() {
-    // No-op: process-global auto-extension registration was removed (T022) to
-    // stop cr-sqlite from polluting the desktop app's sqlx connection pool.
-}
-
 /// How long a contended writer waits for the lock before giving up with `SQLITE_BUSY`. The
 /// sync DB can be held by MORE than one connection at once — the drain thread plus any
 /// capture/status path that opens the same file — so a brief overlap must serialize, not
@@ -125,16 +113,11 @@ impl CrsqlDb {
     /// Prove the extension initialized on this connection: the `crsql_site_id()`
     /// scalar (16-byte site id) must be callable. Fails closed.
     fn confirm_crr(conn: &Connection) -> Result<(), SyncError> {
-        let site: Vec<u8> = conn
-            .query_row("SELECT crsql_site_id()", [], |r| r.get(0))
-            .map_err(|e| SyncError::CrrUnavailable(e.to_string()))?;
-        if site.len() != 16 {
-            return Err(SyncError::CrrUnavailable(format!(
-                "crsql_site_id returned {} bytes, expected 16",
-                site.len()
-            )));
-        }
-        Ok(())
+        // The explicit `Vec<u8>` typing keeps the probe fail-closed: a NULL or
+        // non-blob result errors here rather than passing as "initialized".
+        conn.query_row("SELECT crsql_site_id()", [], |r| r.get::<_, Vec<u8>>(0))
+            .map(|_| ())
+            .map_err(|e| SyncError::CrrUnavailable(e.to_string()))
     }
 
     /// This connection's 16-byte cr-sqlite site id.
@@ -146,10 +129,6 @@ impl CrsqlDb {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.conn
     }
 }
 

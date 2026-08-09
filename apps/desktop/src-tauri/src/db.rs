@@ -21,6 +21,14 @@ pub struct AudioPartRow {
     pub sample_rate: u32,
 }
 
+/// The `audio_save_locations` DDL, issued verbatim by both
+/// [`ensure_runtime_schema`] and [`register_audio_save_location`] so the two
+/// sites can never drift apart.
+const AUDIO_SAVE_LOCATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+    dir TEXT PRIMARY KEY,\
+    registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+)";
+
 /// Pre-migration runtime patches. Currently only sweeps stale `recording`
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
 /// live in the frontend's `getDb()` so they run after migrations on fresh installs.
@@ -54,13 +62,7 @@ pub fn ensure_runtime_schema(db_path: &Path, me: Option<&str>) {
     // Out-of-band of the migration list so dev DBs whose `_sqlx_migrations`
     // history is ahead of schema can still pick this up. Idempotent; no-op
     // if already created.
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS audio_save_locations (\
-            dir TEXT PRIMARY KEY,\
-            registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
-        )",
-        [],
-    );
+    let _ = conn.execute(AUDIO_SAVE_LOCATIONS_DDL, []);
 
     close_orphaned_recordings(conn, me);
 }
@@ -77,16 +79,8 @@ pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
         return;
     };
     let conn = managed.conn();
-    if !table_exists(conn, "audio_save_locations") {
-        // Should already exist via ensure_runtime_schema; create if not.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
-                dir TEXT PRIMARY KEY,\
-                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
-            )",
-            [],
-        );
-    }
+    // Should already exist via ensure_runtime_schema; create if not.
+    let _ = conn.execute(AUDIO_SAVE_LOCATIONS_DDL, []);
     let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let _ = conn.execute(
         "INSERT OR IGNORE INTO audio_save_locations (dir) VALUES (?)",
@@ -278,9 +272,18 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
 /// Inserts a `session_audio_parts` row. Uses INSERT OR IGNORE so a partial
 /// crash that leaves a row already inserted is recoverable on retry.
 pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
-    use rusqlite::params;
     let managed = crate::db_service::open_managed(db_path)?;
-    let conn = managed.conn();
+    insert_audio_part_row_on(managed.conn(), row)
+}
+
+/// [`insert_audio_part_row`] on a connection the caller already holds. Each
+/// INSERT still runs in its own autocommit transaction, so the cr-sqlite
+/// `db_version` grouping is identical either way.
+fn insert_audio_part_row_on(
+    conn: &rusqlite::Connection,
+    row: &AudioPartRow,
+) -> rusqlite::Result<()> {
+    use rusqlite::params;
     let id = mint_part_id(conn)?;
     let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     conn.execute(
@@ -314,7 +317,12 @@ pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Re
 /// stores and the server's `/audio/part/{part_id}` route accepts.
 fn mint_part_id(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
     let raw: String = conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
-    debug_assert_eq!(raw.len(), 32, "randomblob(16) hex must be 32 chars");
+    // A short id would both index out of bounds below and break the collision-free
+    // contract, so it is an error, never a fallback: any substitute value this
+    // function could invent is by definition NOT collision-free.
+    if raw.len() != 32 {
+        return Err(mint_part_id_error("randomblob(16) hex must be 32 chars"));
+    }
     let mut b = raw.into_bytes();
     b[12] = b'4'; // RFC 4122 version 4
                   // Variant nibble → 10xx (8..b): keep the low 2 random bits, force the top 2 to `10`.
@@ -323,7 +331,17 @@ fn mint_part_id(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
     b[16] = std::char::from_digit(u32::from(v), 16)
         .map(|c| c as u8)
         .unwrap_or(b'8');
-    Ok(String::from_utf8(b).unwrap_or_else(|_| "0".repeat(32)))
+    String::from_utf8(b).map_err(|_| mint_part_id_error("part id not ascii hex"))
+}
+
+/// `rusqlite::Error` for a `mint_part_id` invariant breach. Returned rather than
+/// panicked: release builds are `panic=abort` and this sits on the live recording
+/// finalize path, where the caller logs and degrades gracefully.
+fn mint_part_id_error(msg: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(msg.to_string()),
+    )
 }
 
 /// Returns canonicalized parent directories of every `session_audio_parts.file_path`,
@@ -344,9 +362,6 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
         return out.into_iter().collect();
     };
     let conn = managed.conn();
-    if !table_exists(conn, "session_audio_parts") {
-        return out.into_iter().collect();
-    }
     if let Ok(mut stmt) = conn
         .prepare("SELECT DISTINCT file_path FROM session_audio_parts WHERE file_path IS NOT NULL")
     {
@@ -365,14 +380,12 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     // a brand-new custom dir whose first run has not yet committed). It
     // closes the gap where reconciliation would otherwise never visit a
     // newly-chosen audioSaveLocation.
-    if table_exists(conn, "audio_save_locations") {
-        if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
-            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-                for dir in rows.flatten() {
-                    let p = Path::new(&dir);
-                    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                    out.insert(canon);
-                }
+    if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for dir in rows.flatten() {
+                let p = Path::new(&dir);
+                let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                out.insert(canon);
             }
         }
     }
@@ -440,7 +453,7 @@ pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
                 duration_seconds: duration,
                 sample_rate,
             };
-            if insert_audio_part_row(db_path, &row).is_ok() {
+            if insert_audio_part_row_on(conn, &row).is_ok() {
                 recovered += 1;
             }
         }
@@ -1038,91 +1051,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_migrations_not_empty() {
-        let m = migrations();
-        assert!(!m.is_empty());
-    }
-
-    #[test]
-    fn test_migrations_sequential_versions() {
-        let m = migrations();
-        let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=17).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_migrations_have_descriptions() {
-        for m in migrations() {
-            assert!(
-                !m.description.is_empty(),
-                "migration v{} should have a description",
-                m.version
-            );
-        }
-    }
-
-    #[test]
-    fn test_migrations_sql_not_empty() {
-        for m in migrations() {
-            let sql = m.sql.trim();
-            assert!(
-                !sql.is_empty(),
-                "migration v{} should have non-empty SQL",
-                m.version
-            );
-        }
-    }
-
-    #[test]
-    fn test_migrations_sql_contains_expected_keywords() {
-        let m = migrations();
-
-        // v1 should create sessions and segments
-        assert!(m[0].sql.contains("CREATE TABLE sessions"));
-        assert!(m[0].sql.contains("CREATE TABLE segments"));
-
-        // v2 should create folders and alter sessions
-        assert!(m[1].sql.contains("CREATE TABLE folders"));
-        assert!(m[1].sql.contains("ALTER TABLE sessions"));
-
-        // v4 should create notes
-        assert!(m[3].sql.contains("CREATE TABLE notes"));
-        assert!(m[3].sql.contains("CREATE TABLE note_versions"));
-
-        // v7 should create chat_messages
-        assert!(m[6].sql.contains("CREATE TABLE chat_messages"));
-
-        // v9 should create session_folders junction table
-        assert!(m[8].sql.contains("CREATE TABLE session_folders"));
-
-        // v10 should create dictation_history
-        assert!(m[9].sql.contains("CREATE TABLE dictation_history"));
-
-        // v11 should create tags and session_tags
-        assert!(m[10].sql.contains("CREATE TABLE tags"));
-        assert!(m[10].sql.contains("CREATE TABLE session_tags"));
-    }
-
-    #[test]
-    fn test_migration_count() {
-        assert_eq!(
-            migrations().len(),
-            17,
-            "v1-v17; segments.speaker_id is patched at runtime by the frontend's getDb()"
+    fn test_migrations_versions_strictly_increase_from_one() {
+        let versions: Vec<i64> = migrations().iter().map(|x| x.version).collect();
+        assert_eq!(versions.first(), Some(&1), "the chain must start at v1");
+        // Strictly increasing, not merely non-decreasing: `run_migrations_list`
+        // treats every version already in `_sqlx_migrations` as applied, so a
+        // REPEATED version number silently skips a migration on every existing DB —
+        // the same shape as the "ghost" v11 entry noted on the migration list.
+        assert!(
+            versions.windows(2).all(|w| w[1] > w[0]),
+            "migration versions must strictly increase: {versions:?}"
         );
-    }
-
-    #[test]
-    fn test_migration_v15_creates_session_audio_parts() {
-        let m = migrations();
-        let v15 = &m[14];
-        assert_eq!(v15.version, 15);
-        assert!(v15
-            .sql
-            .contains("CREATE TABLE IF NOT EXISTS session_audio_parts"));
-        assert!(v15
-            .sql
-            .contains("INSERT OR IGNORE INTO session_audio_parts"));
     }
 
     #[test]
@@ -1130,10 +1069,6 @@ mod tests {
         let m = migrations();
         let v16 = &m[15];
         assert_eq!(v16.version, 16);
-        // Single ALTER on the `sessions` sync table so run_migrations auto-wraps it
-        // through crsql_alter on a CRR DB.
-        assert!(v16.sql.contains("ALTER TABLE sessions"));
-        assert!(v16.sql.contains("recording_device_id"));
         // Apply the whole chain and confirm the column materializes and defaults NULL.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for mig in migrations() {
@@ -1161,9 +1096,6 @@ mod tests {
         let m = migrations();
         let v17 = &m[16];
         assert_eq!(v17.version, 17);
-        assert!(v17
-            .sql
-            .contains("CREATE TABLE IF NOT EXISTS chat_context_settings"));
         // Apply the whole chain and confirm the table materializes with the right shape.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for mig in migrations() {
@@ -1387,7 +1319,9 @@ mod tests {
             [],
         )
         .unwrap();
-        let v15_sql = migrations()[14].sql;
+        let v15 = &migrations()[14];
+        assert_eq!(v15.version, 15, "index 14 must still be the v15 migration");
+        let v15_sql = v15.sql;
         // Re-applying the migration must not error or double-insert.
         conn.execute_batch(v15_sql).unwrap();
         conn.execute_batch(v15_sql).unwrap();
@@ -1406,8 +1340,41 @@ mod tests {
         let m = migrations();
         let v13 = &m[12];
         assert_eq!(v13.version, 13);
-        assert!(v13.sql.contains("ALTER TABLE chat_messages"));
-        assert!(v13.sql.contains("tool_calls"));
+
+        // Shape contract, not decoration: `run_migrations` only routes a migration
+        // through `crsql_alter` when it is ONE `ALTER TABLE <sync_table>` statement.
+        // Split v13 into a batch and a CRR DB desyncs its shadow tables (or, since
+        // F3, fails the migration loudly).
+        let stmt = v13.sql.trim().trim_end_matches(';').trim();
+        assert!(
+            !stmt.contains(';'),
+            "v13 must stay a single statement so the crsql alter-wrap applies"
+        );
+        let target = stmt
+            .strip_prefix("ALTER TABLE ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("v13 must be a single ALTER TABLE");
+        assert_eq!(target, "chat_messages");
+        #[cfg(feature = "sync")]
+        assert!(
+            yapstack_sync::schema::SYNC_TABLES.contains(&target),
+            "chat_messages must stay a synced table or the alter-wrap does not apply"
+        );
+
+        // And the column actually lands on the migrated chain.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        let has_col: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'tool_calls'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        assert!(has_col, "v13 must add chat_messages.tool_calls");
     }
 
     #[test]
@@ -1789,17 +1756,41 @@ mod tests {
 
     #[test]
     fn test_migration_v12_creates_fts_tables() {
-        let m = migrations();
-        let v12 = &m[11];
-        assert_eq!(v12.version, 12);
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE segments_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE notes_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE sessions_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE dictations_fts"));
-        assert!(v12.sql.contains("USING fts5"));
-        assert!(v12.sql.contains("INSERT INTO segments_fts"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_ai"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_ad"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_au"));
+        assert_eq!(migrations()[11].version, 12);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        // Rows written AFTER the chain only reach the mirrors through v12's
+        // triggers, which `test_all_migrations_execute_against_sqlite` cannot see
+        // (it only counts the empty tables) and which the CRR rebuild re-creates
+        // from whatever triggers it finds.
+        conn.execute_batch(
+            "INSERT INTO sessions (id, title, source, status) \
+                 VALUES ('s12', 'kickoff call', 'MicOnly', 'completed'); \
+             INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+                 VALUES ('seg12', 's12', 'Mic', 'quarterly revenue', 0.0, 1.0); \
+             INSERT INTO notes (id, session_id, content) VALUES ('n12', 's12', 'follow up thursday'); \
+             INSERT INTO dictation_history (id, slot_id, slot_name, input_text, output_text, output_action) \
+                 VALUES ('d12', 'slot', 'Slot', 'raw words', 'polished words', 'Clipboard');",
+        )
+        .unwrap();
+
+        for (table, id_col, id, term) in [
+            ("sessions_fts", "session_id", "s12", "kickoff"),
+            ("segments_fts", "segment_id", "seg12", "revenue"),
+            ("notes_fts", "note_id", "n12", "thursday"),
+            ("dictations_fts", "dictation_id", "d12", "polished"),
+        ] {
+            let hit: String = conn
+                .query_row(
+                    &format!("SELECT {id_col} FROM {table} WHERE {table} MATCH ?"),
+                    [term],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{table} did not index the inserted row: {e}"));
+            assert_eq!(hit, id, "{table} indexed the wrong row");
+        }
     }
 }

@@ -123,15 +123,6 @@ impl DrainReport {
     pub fn first_transport_error(&self) -> Option<&SyncError> {
         self.push_error.as_ref().or(self.pull_error.as_ref())
     }
-
-    /// Changesets this device is still behind the last-known relay tip — `server_max -
-    /// pull_watermark`, clamped at 0. `None` when the tip is unknown this cycle (the caller
-    /// keeps its previous last-known value). The PULL side is honestly caught up ONLY when
-    /// this is `Some(0)`; any `Some(n > 0)` means a "catching up" state, never "up to date"
-    /// (R12). Counts CHANGESETS (commit-ordered seqs), not cells/changes.
-    pub fn pull_behind(&self) -> Option<i64> {
-        self.server_max.map(|m| (m - self.pull_watermark).max(0))
-    }
 }
 
 /// Fold a freshly-observed tenant tip into a report's running `server_max` max. A `None`
@@ -200,10 +191,16 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
 /// corrupt/tampered changeset stays here as a permanent, visible tamper/corruption signal.
 ///
 /// The stored `ciphertext` is the base64 envelope EXACTLY as received (it may itself be
-/// un-decodable), plus the AAD inputs a retry needs to re-derive the plaintext
-/// (`author_client_id`, `client_seq`, schema/engine versions) and the short non-sensitive
-/// `detail` naming the stage that failed. No key, nonce, or plaintext material is stored.
+/// un-decodable), plus the wire row's `author_client_id`/`client_seq` and the SERVER-SUPPLIED
+/// `schema_version`/`engine_version` hints, kept as forensic capture. Those two version
+/// columns are explicitly NOT the AAD inputs: the changeset AAD's schema/engine versions come
+/// from the local [`ChangesetCipher`]'s own fields, never from the server's plaintext metadata
+/// (CRYPTO_SPEC §5.4 — decrypt first; the version that authenticated is the truth). Also stores
+/// the short non-sensitive `detail` naming the stage that failed. No key, nonce, or plaintext
+/// material is stored.
 pub fn ensure_crypto_quarantine_table(conn: &Connection) -> Result<(), SyncError> {
+    // §5.4 C4: `schema_version`/`engine_version` are the server's plaintext hints, retained for
+    // the not-yet-implemented hint-vs-AAD mismatch check — never read as AAD inputs.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _yapstack_crypto_quarantine (\
             changeset_seq INTEGER PRIMARY KEY, \
@@ -783,13 +780,7 @@ async fn reconcile_seq_counter<T: SyncTransport + ?Sized>(
 ) -> Result<bool, SyncError> {
     state::ensure_meta_table(conn)?;
     ensure_outbox_table(conn)?;
-    let resp = transport.completeness().await?;
-    let server_max = resp
-        .per_client
-        .iter()
-        .find(|t| t.client_id == client_id)
-        .map(|t| t.max_client_seq)
-        .unwrap_or(0);
+    let server_max = relay_tail(transport, client_id).await?;
     let local = state::client_seq(conn)?;
     if server_max <= local {
         // The counter is at or ahead of the relay tail — no regression. Record that we have
@@ -809,6 +800,23 @@ async fn reconcile_seq_counter<T: SyncTransport + ?Sized>(
     reseed_counter_to_tail(conn, server_max)?;
     state::mark_seq_reconciled(conn)?;
     Ok(true)
+}
+
+/// Ask the relay for THIS device's tail `client_seq` — the highest `(client_id, client_seq)`
+/// it holds for us — via one `completeness` round-trip. `0` when the relay reports no tail for
+/// this client. Shared by the G1 regression check and the G3 conflict recovery; the error is
+/// propagated so an unreachable relay defers rather than reads as a tail of 0.
+async fn relay_tail<T: SyncTransport + ?Sized>(
+    transport: &T,
+    client_id: uuid::Uuid,
+) -> Result<i64, SyncError> {
+    let resp = transport.completeness().await?;
+    Ok(resp
+        .per_client
+        .iter()
+        .find(|t| t.client_id == client_id)
+        .map(|t| t.max_client_seq)
+        .unwrap_or(0))
 }
 
 /// Reseed the local `client_seq` counter to `target` (the relay tail), reset the push
@@ -843,13 +851,7 @@ async fn recover_from_conflict<T: SyncTransport + ?Sized>(
     state::ensure_meta_table(conn)?;
     ensure_outbox_table(conn)?;
     state::clear_seq_reconciled(conn)?;
-    let resp = transport.completeness().await?;
-    let server_max = resp
-        .per_client
-        .iter()
-        .find(|t| t.client_id == client_id)
-        .map(|t| t.max_client_seq)
-        .unwrap_or(0);
+    let server_max = relay_tail(transport, client_id).await?;
     let local = state::client_seq(conn)?;
     let target = server_max.max(local);
     tracing::warn!(
@@ -1006,7 +1008,6 @@ fn decode_pulled_changeset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::SnapshotMeta;
     use async_trait::async_trait;
     use rusqlite::types::Value;
     use std::sync::Mutex;
@@ -1112,12 +1113,6 @@ mod tests {
         async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
             Ok(CompletenessResponse::default())
         }
-        async fn put_snapshot(&self, _m: SnapshotMeta, _c: &[u8]) -> Result<(), SyncError> {
-            Ok(())
-        }
-        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-            Ok(None)
-        }
     }
 
     /// A plain (no-CRR) in-memory DB with an `_yapstack_outbox` pre-seeded with the given
@@ -1191,12 +1186,6 @@ mod tests {
             }
             async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
                 Ok(CompletenessResponse::default())
-            }
-            async fn put_snapshot(&self, _m: SnapshotMeta, _c: &[u8]) -> Result<(), SyncError> {
-                Ok(())
-            }
-            async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-                Ok(None)
             }
         }
 
@@ -1333,47 +1322,101 @@ mod tests {
             .unwrap();
     }
 
-    /// Wraps a real [`MockRelay`] but ALWAYS fails push, delegating every other call — proves
-    /// F1's "a push failure never prevents the pull".
-    struct PushFails(Arc<MockRelay>);
-    #[async_trait]
-    impl SyncTransport for PushFails {
-        async fn push(&self, _r: PushRequest) -> Result<PushResponse, SyncError> {
-            Err(SyncError::Transport("push boom (test)".into()))
+    /// Wraps a real [`MockRelay`] and injects ONE declared fault; every other call delegates.
+    /// Implements only the three required methods, so the snapshot and audio seams keep the
+    /// trait's unsupported defaults rather than reaching the inner relay — no outbox test may
+    /// silently start exercising a path it does not name.
+    struct Faulty {
+        inner: Arc<MockRelay>,
+        push_err: Option<FaultFn>,
+        pull_err: Option<FaultFn>,
+        pull_mutate: Option<PullMutateFn>,
+        completeness_fail_remaining: std::sync::atomic::AtomicUsize,
+    }
+    type FaultFn = Box<dyn Fn() -> SyncError + Send + Sync>;
+    type PullMutateFn = Box<dyn Fn(&mut PullResponse) + Send + Sync>;
+
+    impl Faulty {
+        fn new(inner: Arc<MockRelay>) -> Self {
+            Self {
+                inner,
+                push_err: None,
+                pull_err: None,
+                pull_mutate: None,
+                completeness_fail_remaining: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
-        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
-            self.0.pull(since, limit).await
+
+        /// ALWAYS fail push — proves F1's "a push failure never prevents the pull".
+        fn failing_push(mut self) -> Self {
+            self.push_err = Some(Box::new(|| SyncError::Transport("push boom (test)".into())));
+            self
         }
-        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
-            self.0.completeness().await
+
+        /// ALWAYS fail pull — proves F1's "a pull failure never masks push success".
+        fn failing_pull(mut self) -> Self {
+            self.pull_err = Some(Box::new(|| SyncError::Transport("pull boom (test)".into())));
+            self
         }
-        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
-            self.0.put_snapshot(m, c).await
+
+        /// On pull, replace the ciphertext of the changeset at `seq` with a value that cannot
+        /// be base64-decoded — modelling a peer write this device cannot decrypt/decode. Every
+        /// genuine changeset passes through untouched.
+        fn corrupt_seq(mut self, seq: i64) -> Self {
+            self.pull_mutate = Some(Box::new(move |resp: &mut PullResponse| {
+                for c in &mut resp.changes {
+                    if c.changeset_seq == seq {
+                        c.ciphertext = "!!! not base64 !!!".to_string();
+                    }
+                }
+            }));
+            self
         }
-        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-            self.0.get_snapshot().await
+
+        /// Fail `completeness` the next `n` times (then delegate), so a test can drive G1 to
+        /// DEFER (completeness unreachable at drain start) yet let G2's later reconcile
+        /// succeed. Typed [`SyncError::Network`] — the unreachable-relay classification lane
+        /// the desktop keys `DrainHealth::Unreachable` off, distinct from `Transport`.
+        fn completeness_down(mut self, n: usize) -> Self {
+            self.completeness_fail_remaining = std::sync::atomic::AtomicUsize::new(n);
+            self
         }
     }
 
-    /// Wraps a real [`MockRelay`] but ALWAYS fails pull, delegating every other call — proves
-    /// F1's "a pull failure never masks push success".
-    struct PullFails(Arc<MockRelay>);
     #[async_trait]
-    impl SyncTransport for PullFails {
+    impl SyncTransport for Faulty {
         async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
-            self.0.push(r).await
+            match &self.push_err {
+                Some(err) => Err(err()),
+                None => self.inner.push(r).await,
+            }
         }
-        async fn pull(&self, _s: i64, _l: i64) -> Result<PullResponse, SyncError> {
-            Err(SyncError::Transport("pull boom (test)".into()))
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            if let Some(err) = &self.pull_err {
+                return Err(err());
+            }
+            let mut resp = self.inner.pull(since, limit).await?;
+            if let Some(mutate) = &self.pull_mutate {
+                mutate(&mut resp);
+            }
+            Ok(resp)
         }
         async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
-            self.0.completeness().await
-        }
-        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
-            self.0.put_snapshot(m, c).await
-        }
-        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-            self.0.get_snapshot().await
+            use std::sync::atomic::Ordering;
+            if self
+                .completeness_fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(SyncError::Network("completeness down (test)".into()));
+            }
+            self.inner.completeness().await
         }
     }
 
@@ -1405,7 +1448,7 @@ mod tests {
         b.conn()
             .execute("INSERT INTO kv(id,v) VALUES('k2','B-val')", [])
             .unwrap();
-        let failing = PushFails(relay.clone());
+        let failing = Faulty::new(relay.clone()).failing_push();
         let report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
             .await
             .unwrap();
@@ -1448,7 +1491,7 @@ mod tests {
         b.conn()
             .execute("INSERT INTO kv(id,v) VALUES('k9','B-only')", [])
             .unwrap();
-        let failing = PullFails(relay.clone());
+        let failing = Faulty::new(relay.clone()).failing_pull();
         let report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
             .await
             .unwrap();
@@ -1472,10 +1515,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn full_outbox_ack_is_not_up_to_date_while_pull_behind() {
         // The R12 bug: "up to date" was declared whenever the OUTBOX drained, ignoring the
-        // PULL backlog. The report now exposes `pull_behind()` (server tip − pull watermark)
-        // so the caller can gate honestly: a cycle that fully acks the outbox while the pull
-        // has NOT reached the relay tip reports `pull_behind() > 0` (NOT up to date); only
-        // once the watermark reaches the tip does it read caught up (`Some(0)`).
+        // PULL backlog. The report exposes `server_max` (the tip this cycle disclosed) and
+        // `pull_watermark` so the caller can gate honestly: a cycle that fully acks the outbox
+        // while the pull has NOT reached the relay tip is behind by a POSITIVE shortfall (NOT
+        // up to date); only once the watermark reaches the tip does it read caught up (0).
         let a = CrsqlDb::open_in_memory().unwrap();
         let b = CrsqlDb::open_in_memory().unwrap();
         make_kv(&a);
@@ -1499,11 +1542,11 @@ mod tests {
 
         // B pushes ONE local write (fully acked) but its PULL fails this cycle: the outbox
         // empties, yet B is still behind A's changesets. The push disclosed the tenant tip,
-        // so `pull_behind()` is a POSITIVE, honest shortfall — never "up to date".
+        // so the shortfall is POSITIVE and honest — never "up to date".
         b.conn()
             .execute("INSERT INTO kv(id,v) VALUES('b0','x')", [])
             .unwrap();
-        let failing = PullFails(relay.clone());
+        let failing = Faulty::new(relay.clone()).failing_pull();
         let behind_report = drain_once(b.conn(), &cipher, &failing, cb, sv, ev)
             .await
             .unwrap();
@@ -1512,8 +1555,14 @@ mod tests {
             behind_report.pull_error.is_some(),
             "the pull failed this cycle"
         );
+        assert_eq!(
+            behind_report.server_max,
+            Some(4),
+            "the push disclosed the tenant tip (A's 3 + B's own entry)"
+        );
         let behind = behind_report
-            .pull_behind()
+            .server_max
+            .map(|m| (m - behind_report.pull_watermark).max(0))
             .expect("push disclosed the tenant tip");
         assert!(
             behind > 0,
@@ -1529,7 +1578,13 @@ mod tests {
             "the catch-up cycle was clean"
         );
         assert_eq!(
-            caught_up.pull_behind(),
+            caught_up.pull_watermark, 4,
+            "the catch-up cycle drained to the relay tip"
+        );
+        assert_eq!(
+            caught_up
+                .server_max
+                .map(|m| (m - caught_up.pull_watermark).max(0)),
             Some(0),
             "up to date ONLY once the watermark reached the relay tip"
         );
@@ -1542,38 +1597,6 @@ mod tests {
     }
 
     // ----- R5: honest crypto accounting — a crypto skip stops the pull, never lies -----
-
-    /// Wraps a [`MockRelay`] and, on pull, replaces the ciphertext of the changeset at
-    /// `corrupt_seq` with a value that cannot be base64-decoded — modelling a peer write this
-    /// device cannot decrypt/decode. Every genuine changeset passes through untouched.
-    struct CorruptPullAt {
-        inner: Arc<MockRelay>,
-        corrupt_seq: i64,
-    }
-    #[async_trait]
-    impl SyncTransport for CorruptPullAt {
-        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
-            self.inner.push(r).await
-        }
-        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
-            let mut resp = self.inner.pull(since, limit).await?;
-            for c in &mut resp.changes {
-                if c.changeset_seq == self.corrupt_seq {
-                    c.ciphertext = "!!! not base64 !!!".to_string();
-                }
-            }
-            Ok(resp)
-        }
-        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
-            self.inner.completeness().await
-        }
-        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
-            self.inner.put_snapshot(m, c).await
-        }
-        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-            self.inner.get_snapshot().await
-        }
-    }
 
     /// Publish three distinct changesets from `a` through a healthy `relay` → dense seq 1,2,3.
     async fn publish_three(a: &CrsqlDb, relay: &MockRelay, cipher: &ChangesetCipher, ca: Uuid) {
@@ -1621,10 +1644,7 @@ mod tests {
         };
 
         // Pull through a transport that corrupts changeset seq=2 into un-decodable base64.
-        let corrupt = CorruptPullAt {
-            inner: relay.clone(),
-            corrupt_seq: 2,
-        };
+        let corrupt = Faulty::new(relay.clone()).corrupt_seq(2);
         let report = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
             .await
             .unwrap();
@@ -1789,10 +1809,7 @@ mod tests {
         publish_three(&a, relay.as_ref(), &cipher, ca).await;
 
         // First pull corrupts seq=2 into un-decodable base64 → quarantined verbatim, pull advances.
-        let corrupt = CorruptPullAt {
-            inner: relay.clone(),
-            corrupt_seq: 2,
-        };
+        let corrupt = Faulty::new(relay.clone()).corrupt_seq(2);
         let r1 = drain_once(b.conn(), &cipher, &corrupt, cb, sv, ev)
             .await
             .unwrap();
@@ -2226,46 +2243,6 @@ mod tests {
         );
     }
 
-    /// A relay that fails `completeness` a fixed number of times (then delegates), so a test
-    /// can drive G1 to DEFER (completeness unreachable at drain start) yet let G2's later
-    /// reconcile succeed. Every other call delegates to the inner [`MockRelay`].
-    struct CompletenessFlaky {
-        inner: Arc<MockRelay>,
-        fail_remaining: std::sync::atomic::AtomicUsize,
-    }
-    #[async_trait]
-    impl SyncTransport for CompletenessFlaky {
-        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
-            self.inner.push(r).await
-        }
-        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
-            self.inner.pull(since, limit).await
-        }
-        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
-            use std::sync::atomic::Ordering;
-            if self
-                .fail_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    if n > 0 {
-                        Some(n - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok()
-            {
-                return Err(SyncError::Network("completeness down (test)".into()));
-            }
-            self.inner.completeness().await
-        }
-        async fn put_snapshot(&self, m: SnapshotMeta, c: &[u8]) -> Result<(), SyncError> {
-            self.inner.put_snapshot(m, c).await
-        }
-        async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-            self.inner.get_snapshot().await
-        }
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn deferred_reconcile_gates_push_no_silent_loss() {
         // F1 gating: when G1 cannot reconcile at drain start (completeness unreachable), the
@@ -2298,10 +2275,7 @@ mod tests {
             .unwrap();
 
         // Cycle 1: completeness is down, so reconcile fails and the push is gated.
-        let flaky = CompletenessFlaky {
-            inner: relay.clone(),
-            fail_remaining: std::sync::atomic::AtomicUsize::new(1),
-        };
+        let flaky = Faulty::new(relay.clone()).completeness_down(1);
         let report = drain_once(dev.conn(), &cipher, &flaky, cid, sv, ev)
             .await
             .unwrap();

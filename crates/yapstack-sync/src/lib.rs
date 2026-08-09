@@ -30,7 +30,7 @@ pub mod state;
 pub mod transport;
 pub mod uniqueness;
 
-pub use crsqlite::{register_crsqlite, CrsqlDb};
+pub use crsqlite::CrsqlDb;
 
 use yapstack_crypto::CryptoError;
 

@@ -148,25 +148,3 @@ pub async fn admit(
         help_url,
     ))
 }
-
-/// Release `bytes` of storage previously metered (e.g. on rollback compensation or a
-/// soft-delete). Never drives a counter negative. Not wired into a GC job in v1.
-///
-/// # Errors
-/// [`AppError::Db`] on a database failure.
-pub async fn release_storage(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant: Uuid,
-    bytes: u64,
-) -> Result<(), AppError> {
-    let b = i64::try_from(bytes).unwrap_or(i64::MAX);
-    sqlx::query(
-        "UPDATE tenant_usage SET storage_bytes = GREATEST(0, storage_bytes - $2) \
-         WHERE tenant_id = $1",
-    )
-    .bind(tenant)
-    .bind(b)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}

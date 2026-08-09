@@ -12,12 +12,12 @@
 //! it is the owner's real data (T004 R1).
 //!
 //! ## The device-role model (owner decision: MAC SEEDS)
-//! Exactly one device is the [`DeviceRole::Seed`]: it holds the primary DB, CRRifies it
+//! Exactly one device is the seed device: it holds the primary DB, CRRifies it
 //! on a copy ([`crate::schema::crr_migrate`]), and publishes it as a snapshot
-//! ([`crate::snapshot`]). Every other device is a [`DeviceRole::Join`]: it does NOT
-//! CRRify-and-merge its own DB. It **re-bootstraps** from the seed's snapshot into a
-//! fresh CRR base, then RECONCILES its own local-only rows into that base at the app
-//! layer with dedup — matching on stable identity, inserting genuinely-local rows as
+//! ([`crate::snapshot`]). Every other device is a join device ([`resite_as_fresh_peer`]):
+//! it does NOT CRRify-and-merge its own DB. It **re-bootstraps** from the seed's snapshot
+//! into a fresh CRR base, then RECONCILES its own local-only rows into that base at the
+//! app layer with dedup — matching on stable identity, inserting genuinely-local rows as
 //! new writes, and **surfacing** any ambiguous collision rather than silently dropping.
 //!
 //! ## Why re-siting is required
@@ -39,15 +39,6 @@ use uuid::Uuid;
 
 use crate::schema::SYNC_TABLES;
 use crate::SyncError;
-
-/// A device's role in a two-populated-device reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceRole {
-    /// Holds the primary DB; CRRifies a copy and seeds the relay with a snapshot.
-    Seed,
-    /// Re-bootstraps from the seed's snapshot and reconciles its own local-only rows.
-    Join,
-}
 
 /// Why a local row could not be cleanly placed — SURFACED for owner review, never a
 /// silent drop.
@@ -131,32 +122,26 @@ pub fn resite_as_fresh_peer(conn: &Connection) -> Result<(), SyncError> {
     let fresh = *Uuid::new_v4().as_bytes();
     let clocks = clock_tables(conn)?;
 
-    conn.execute_batch("BEGIN;")?;
-    let inner = || -> Result<(), SyncError> {
-        // Mint the join's fresh local identity at ordinal 0 (frees the seed's blob).
-        conn.execute(
-            "UPDATE crsql_site_id SET site_id = ?1 WHERE ordinal = 0",
-            rusqlite::params![fresh.to_vec()],
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    // Mint the join's fresh local identity at ordinal 0 (frees the seed's blob).
+    tx.execute(
+        "UPDATE crsql_site_id SET site_id = ?1 WHERE ordinal = 0",
+        rusqlite::params![fresh.to_vec()],
+    )?;
+    // Register the seed as a peer at a new ordinal.
+    tx.execute(
+        "INSERT INTO crsql_site_id (site_id, ordinal) VALUES (?1, ?2)",
+        rusqlite::params![seed_sid, next_ord],
+    )?;
+    // Re-attribute the snapshot's local rows (ordinal 0) to the seed's peer ordinal.
+    for clock in &clocks {
+        tx.execute(
+            &format!("UPDATE \"{clock}\" SET site_id = ?1 WHERE site_id = 0"),
+            rusqlite::params![next_ord],
         )?;
-        // Register the seed as a peer at a new ordinal.
-        conn.execute(
-            "INSERT INTO crsql_site_id (site_id, ordinal) VALUES (?1, ?2)",
-            rusqlite::params![seed_sid, next_ord],
-        )?;
-        // Re-attribute the snapshot's local rows (ordinal 0) to the seed's peer ordinal.
-        for clock in &clocks {
-            conn.execute(
-                &format!("UPDATE \"{clock}\" SET site_id = ?1 WHERE site_id = 0"),
-                rusqlite::params![next_ord],
-            )?;
-        }
-        Ok(())
-    };
-    if let Err(e) = inner() {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
     }
-    conn.execute_batch("COMMIT;")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -287,18 +272,12 @@ pub fn reconcile_local_rows(
     base: &Connection,
 ) -> Result<ReconcileReport, SyncError> {
     let mut report = ReconcileReport::default();
-    base.execute_batch("BEGIN;")?;
-    let mut run = || -> Result<(), SyncError> {
-        for &table in SYNC_TABLES {
-            reconcile_table(local, base, table, &mut report)?;
-        }
-        Ok(())
-    };
-    if let Err(e) = run() {
-        let _ = base.execute_batch("ROLLBACK;");
-        return Err(e);
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(base, rusqlite::TransactionBehavior::Deferred)?;
+    for &table in SYNC_TABLES {
+        reconcile_table(local, &tx, table, &mut report)?;
     }
-    base.execute_batch("COMMIT;")?;
+    tx.commit()?;
     Ok(report)
 }
 
@@ -331,6 +310,28 @@ fn reconcile_table(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // Row-invariant SQL: these depend only on pk_cols/copy_cols, so they are built (and the
+    // INSERT compiled) once per table rather than once per source row.
+    let pk_where = pk_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("\"{c}\" = ?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let placeholders = (1..=copy_cols.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ins = format!(
+        "INSERT INTO \"{table}\" ({}) VALUES ({placeholders})",
+        copy_cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut ins_stmt = base.prepare(&ins)?;
+
     let mut stmt = local.prepare(&sel)?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -340,12 +341,6 @@ fn reconcile_table(
         }
 
         // 1. PK identity match against the base.
-        let pk_where = pk_cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("\"{c}\" = ?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(" AND ");
         let pk_vals: Vec<Value> = pk_cols
             .iter()
             .filter_map(|c| values_of(c, &copy_cols, &values).cloned())
@@ -392,19 +387,7 @@ fn reconcile_table(
         }
 
         // 3. Genuinely local-only: insert as a new local write (preserved, drains out).
-        let placeholders = (1..=copy_cols.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ins = format!(
-            "INSERT INTO \"{table}\" ({}) VALUES ({placeholders})",
-            copy_cols
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        base.execute(&ins, params_from_iter(values.iter()))?;
+        ins_stmt.execute(params_from_iter(values.iter()))?;
         report.inserted_local_only += 1;
     }
     Ok(())

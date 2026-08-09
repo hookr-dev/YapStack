@@ -21,15 +21,6 @@ export const DEFAULT_SYNC_SERVER_URL = "https://sync.yapstack.app";
 
 // ----- Wire types (contract with the Rust `sync` command surface) -----
 
-/** `GET /sync/info` echo. `billingUrl` is present ONLY when the deployment
- *  advertises a control plane (hosted); self-host omits it and the UI shows no
- *  upgrade affordance (ENTITLEMENTS_SEAM §client-billing-discovery). */
-export interface SyncInfo {
-  serverUrl: string;
-  version: string;
-  billingUrl: string | null;
-}
-
 /** `sync_probe` success (T025). A version gap rides here as `versionAdvisory` — it is
  *  advisory ("update this app"), never a probe failure. */
 export interface RelayProbeOk {
@@ -126,6 +117,8 @@ export interface SyncStatus {
   syncEnabled: boolean;
   /** Last connection / auth error surfaced verbatim (never auto-routed). */
   lastError: string | null;
+  /** Present ONLY when the deployment advertises a control plane (hosted); self-host
+   *  omits it. Originally a `GET /sync/info` echo — it now rides on `sync_status`. */
   billingUrl: string | null;
   /** Unacked outbox entries still to push (0 == up to date). Drives the
    *  "Syncing — N remaining" indicator (T024). */
@@ -443,12 +436,6 @@ export function deriveTrackFetch(parts: AudioPartPrepare[]): TrackFetch {
   return { kind: "ready" };
 }
 
-/** "Fetching 42%" / "Fetching…" copy for the in-progress bar. */
-export function formatFetchProgress(percent: number): string {
-  if (!Number.isFinite(percent) || percent <= 0) return "Fetching…";
-  return `Fetching ${Math.min(100, Math.round(percent))}%`;
-}
-
 /**
  * Aggregate in-progress copy: single-part tracks read "Fetching… N%", multi-part tracks
  * "Fetching part K of M — N%" (K = the first in-flight part's ordinal among the missing
@@ -612,7 +599,7 @@ export function enqueueAudioForSession(sessionId: string): void {
  * UI is gated on this so self-host builds never show a "buy" affordance
  * (ENTITLEMENTS_SEAM: OSS/self-host advertises no billing_url).
  */
-export function shouldShowUpgrade(info: Pick<SyncInfo, "billingUrl">): boolean {
+export function shouldShowUpgrade(info: { billingUrl: string | null }): boolean {
   return typeof info.billingUrl === "string" && info.billingUrl.length > 0;
 }
 

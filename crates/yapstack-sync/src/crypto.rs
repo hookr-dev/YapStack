@@ -38,6 +38,51 @@ const SNAPSHOT_DOMAIN: &[u8] = b"yapstack.snapshot.v1";
 /// `version(1) + commitment(32) + nonce(24) + ct(32) + tag(16)`.
 const WRAPPED_KEY_LEN: usize = 1 + 32 + 24 + 32 + 16;
 
+/// The two-envelope compose/decompose shared by every cipher in this module
+/// (§4.1/§4.2): a fresh random data key wrapped under the account `vault_key`, the
+/// payload sealed under that data key, concatenated as `wrapped_data_key || sealed`.
+///
+/// The implementor supplies its OWN wrap AAD by name, so only the payload AAD is
+/// ever passed positionally — the two AADs cannot be transposed at a call site, which
+/// would silently move a §5.2 payload binding onto the key wrap.
+trait TwoEnvelope {
+    fn vault_key(&self) -> &[u8; 32];
+    fn wrap_aad(&self) -> Vec<u8>;
+
+    fn seal(&self, payload_aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SyncError> {
+        let mut data_key = [0u8; 32];
+        let mut wrap_nonce = [0u8; 24];
+        let mut ct_nonce = [0u8; 24];
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut data_key);
+        rng.fill_bytes(&mut wrap_nonce);
+        rng.fill_bytes(&mut ct_nonce);
+
+        let wrapped = seal_committing(self.vault_key(), &wrap_nonce, &data_key, &self.wrap_aad())?;
+        debug_assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
+        let sealed = seal_standard(&data_key, &ct_nonce, plaintext, payload_aad)?;
+
+        let mut out = Vec::with_capacity(wrapped.len() + sealed.len());
+        out.extend_from_slice(&wrapped);
+        out.extend_from_slice(&sealed);
+        Ok(out)
+    }
+
+    fn open(&self, payload_aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, SyncError> {
+        if blob.len() < WRAPPED_KEY_LEN {
+            return Err(SyncError::Crypto(CryptoError::Malformed));
+        }
+        let (wrapped, sealed) = blob.split_at(WRAPPED_KEY_LEN);
+        let data_key_vec = open_committing(self.vault_key(), wrapped, &self.wrap_aad())?;
+        let data_key: [u8; 32] = data_key_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| SyncError::Crypto(CryptoError::Malformed))?;
+        let pt = open_standard(&data_key, sealed, payload_aad)?;
+        Ok(pt)
+    }
+}
+
 /// Immutable per-account/device crypto context for changesets.
 #[derive(Clone)]
 pub struct ChangesetCipher {
@@ -65,10 +110,6 @@ impl ChangesetCipher {
         }
     }
 
-    fn wrap_aad(&self) -> Vec<u8> {
-        lp(&[&[VERSION], WRAP_DATA_DOMAIN, &self.epoch.to_be_bytes()])
-    }
-
     fn changeset_aad(&self, client_id: Uuid, client_seq: i64) -> Vec<u8> {
         lp(&[
             &[VERSION],
@@ -89,27 +130,7 @@ impl ChangesetCipher {
         client_seq: i64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SyncError> {
-        let mut data_key = [0u8; 32];
-        let mut wrap_nonce = [0u8; 24];
-        let mut ct_nonce = [0u8; 24];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut data_key);
-        rng.fill_bytes(&mut wrap_nonce);
-        rng.fill_bytes(&mut ct_nonce);
-
-        let wrapped = seal_committing(&self.vault_key, &wrap_nonce, &data_key, &self.wrap_aad())?;
-        debug_assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
-        let sealed = seal_standard(
-            &data_key,
-            &ct_nonce,
-            plaintext,
-            &self.changeset_aad(client_id, client_seq),
-        )?;
-
-        let mut out = Vec::with_capacity(wrapped.len() + sealed.len());
-        out.extend_from_slice(&wrapped);
-        out.extend_from_slice(&sealed);
-        Ok(out)
+        self.seal(&self.changeset_aad(client_id, client_seq), plaintext)
     }
 
     /// Decrypt an outbox blob authored by `(client_id, client_seq)`.
@@ -122,21 +143,17 @@ impl ChangesetCipher {
         client_seq: i64,
         blob: &[u8],
     ) -> Result<Vec<u8>, SyncError> {
-        if blob.len() < WRAPPED_KEY_LEN {
-            return Err(SyncError::Crypto(CryptoError::Malformed));
-        }
-        let (wrapped, sealed) = blob.split_at(WRAPPED_KEY_LEN);
-        let data_key_vec = open_committing(&self.vault_key, wrapped, &self.wrap_aad())?;
-        let data_key: [u8; 32] = data_key_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| SyncError::Crypto(CryptoError::Malformed))?;
-        let pt = open_standard(
-            &data_key,
-            sealed,
-            &self.changeset_aad(client_id, client_seq),
-        )?;
-        Ok(pt)
+        self.open(&self.changeset_aad(client_id, client_seq), blob)
+    }
+}
+
+impl TwoEnvelope for ChangesetCipher {
+    fn vault_key(&self) -> &[u8; 32] {
+        &self.vault_key
+    }
+
+    fn wrap_aad(&self) -> Vec<u8> {
+        lp(&[&[VERSION], WRAP_DATA_DOMAIN, &self.epoch.to_be_bytes()])
     }
 }
 
@@ -162,10 +179,6 @@ impl SnapshotCipher {
         }
     }
 
-    fn wrap_aad(&self) -> Vec<u8> {
-        lp(&[&[VERSION], WRAP_SNAPSHOT_DOMAIN, &self.epoch.to_be_bytes()])
-    }
-
     fn payload_aad(&self, generation: u64) -> Vec<u8> {
         lp(&[
             &[VERSION],
@@ -178,42 +191,22 @@ impl SnapshotCipher {
     /// Encrypt a snapshot payload for `generation`. Returns the opaque blob
     /// `wrapped_data_key || sealed_snapshot`.
     pub fn encrypt(&self, generation: u64, plaintext: &[u8]) -> Result<Vec<u8>, SyncError> {
-        let mut data_key = [0u8; 32];
-        let mut wrap_nonce = [0u8; 24];
-        let mut ct_nonce = [0u8; 24];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut data_key);
-        rng.fill_bytes(&mut wrap_nonce);
-        rng.fill_bytes(&mut ct_nonce);
-
-        let wrapped = seal_committing(&self.vault_key, &wrap_nonce, &data_key, &self.wrap_aad())?;
-        debug_assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
-        let sealed = seal_standard(
-            &data_key,
-            &ct_nonce,
-            plaintext,
-            &self.payload_aad(generation),
-        )?;
-
-        let mut out = Vec::with_capacity(wrapped.len() + sealed.len());
-        out.extend_from_slice(&wrapped);
-        out.extend_from_slice(&sealed);
-        Ok(out)
+        self.seal(&self.payload_aad(generation), plaintext)
     }
 
     /// Decrypt a snapshot blob for `generation`. A tampered/wrong-generation/wrong-key
     /// blob returns an error (never a panic on attacker bytes, §11.3).
     pub fn decrypt(&self, generation: u64, blob: &[u8]) -> Result<Vec<u8>, SyncError> {
-        if blob.len() < WRAPPED_KEY_LEN {
-            return Err(SyncError::Crypto(CryptoError::Malformed));
-        }
-        let (wrapped, sealed) = blob.split_at(WRAPPED_KEY_LEN);
-        let data_key_vec = open_committing(&self.vault_key, wrapped, &self.wrap_aad())?;
-        let data_key: [u8; 32] = data_key_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| SyncError::Crypto(CryptoError::Malformed))?;
-        let pt = open_standard(&data_key, sealed, &self.payload_aad(generation))?;
-        Ok(pt)
+        self.open(&self.payload_aad(generation), blob)
+    }
+}
+
+impl TwoEnvelope for SnapshotCipher {
+    fn vault_key(&self) -> &[u8; 32] {
+        &self.vault_key
+    }
+
+    fn wrap_aad(&self) -> Vec<u8> {
+        lp(&[&[VERSION], WRAP_SNAPSHOT_DOMAIN, &self.epoch.to_be_bytes()])
     }
 }

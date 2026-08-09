@@ -98,9 +98,6 @@ fn synthetic_default(ty: &str) -> &'static str {
 /// pass through verbatim.
 fn emit_default(dflt: &str) -> String {
     let t = dflt.trim();
-    if t.is_empty() {
-        return "''".to_string();
-    }
     let u = t.to_ascii_uppercase();
     let literal = t.starts_with('(')
         || t.starts_with('\'')
@@ -163,12 +160,7 @@ pub fn derive_rebuild_body(conn: &Connection, table: &str) -> Result<String, Syn
 
     let mut defs: Vec<String> = Vec::with_capacity(cols.len() + 1);
     for c in &cols {
-        let ty = c.ty.trim();
-        let mut d = if ty.is_empty() {
-            format!("\"{}\"", c.name)
-        } else {
-            format!("\"{}\" {ty}", c.name)
-        };
+        let mut d = format!("\"{}\" {}", c.name, c.ty.trim());
         if c.pk > 0 {
             // PK columns are always NOT NULL; a single TEXT PK is declared inline.
             d.push_str(" NOT NULL");
@@ -199,7 +191,7 @@ pub fn derive_rebuild_body(conn: &Connection, table: &str) -> Result<String, Syn
 }
 
 /// True if `table` currently exists in the schema.
-fn table_exists(conn: &Connection, table: &str) -> Result<bool, SyncError> {
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool, SyncError> {
     let n: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
         [table],
@@ -245,23 +237,19 @@ pub fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncEr
     // column count/order always matches `SELECT *`, regardless of migration drift
     // such as the runtime-patched `segments.speaker_id` (R8 fresh-install fix).
     let body = derive_rebuild_body(conn, table)?;
-    conn.execute_batch("BEGIN;")?;
-    let build = || -> Result<(), SyncError> {
-        conn.execute_batch(&format!("CREATE TABLE \"{tmp}\" ({body});"))?;
-        conn.execute_batch(&format!("INSERT INTO \"{tmp}\" SELECT * FROM \"{table}\";"))?;
-        conn.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
-        conn.execute_batch(&format!("ALTER TABLE \"{tmp}\" RENAME TO \"{table}\";"))?;
-        for t in &triggers {
-            conn.execute_batch(&format!("{t};"))?;
-        }
-        Ok(())
-    };
-    if let Err(e) = build() {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`; the
+    // `DropBehavior::Rollback` default is what unwinds a half-done rebuild.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    tx.execute_batch(&format!("CREATE TABLE \"{tmp}\" ({body});"))?;
+    tx.execute_batch(&format!("INSERT INTO \"{tmp}\" SELECT * FROM \"{table}\";"))?;
+    tx.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
+    tx.execute_batch(&format!("ALTER TABLE \"{tmp}\" RENAME TO \"{table}\";"))?;
+    for t in &triggers {
+        tx.execute_batch(&format!("{t};"))?;
     }
-    conn.execute_batch("COMMIT;")?;
+    tx.commit()?;
 
+    // AFTER the commit: `crsql_as_crr` must see the rebuilt table as committed schema.
     conn.query_row(&format!("SELECT crsql_as_crr('{table}')"), [], |_| Ok(()))
         .map_err(|e| SyncError::Migration(format!("crsql_as_crr('{table}'): {e}")))?;
     Ok(())
@@ -314,24 +302,17 @@ pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
 /// matters more for the heal than for a migration: detection runs ONCE per drain spawn,
 /// so one lost race would postpone the repair until the next app restart.
 fn alter_dance(conn: &Connection, table: &str, alter_sql: Option<&str>) -> Result<(), SyncError> {
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let inner = || -> Result<(), SyncError> {
-        conn.query_row(&format!("SELECT crsql_begin_alter('{table}')"), [], |_| {
-            Ok(())
-        })?;
-        if let Some(sql) = alter_sql {
-            conn.execute_batch(&format!("{sql};"))?;
-        }
-        conn.query_row(&format!("SELECT crsql_commit_alter('{table}')"), [], |_| {
-            Ok(())
-        })?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.query_row(&format!("SELECT crsql_begin_alter('{table}')"), [], |_| {
         Ok(())
-    };
-    if let Err(e) = inner() {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
+    })?;
+    if let Some(sql) = alter_sql {
+        tx.execute_batch(&format!("{sql};"))?;
     }
-    conn.execute_batch("COMMIT;")?;
+    tx.query_row(&format!("SELECT crsql_commit_alter('{table}')"), [], |_| {
+        Ok(())
+    })?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -379,11 +360,13 @@ pub fn crr_tables(conn: &Connection) -> Result<Vec<String>, SyncError> {
     Ok(out)
 }
 
-/// The three triggers cr-sqlite generates per CRR table (`triggers.rs:12-20`). ALL
-/// three must exist: `is_crr` here probes the clock table, and cr-sqlite's own `is_crr`
-/// probes only `__crsql_itrig` (`is_crr.rs:10-26`), so neither alone notices a table
-/// that lost one of them.
-const CRR_TRIGGER_SUFFIXES: [&str; 3] = ["__crsql_itrig", "__crsql_utrig", "__crsql_dtrig"];
+/// Of the three triggers cr-sqlite generates per CRR table (`triggers.rs:12-20`), the two
+/// whose existence nothing else proves. ALL three must still exist: `is_crr` here probes
+/// the clock table, and cr-sqlite's own `is_crr` probes only `__crsql_itrig`
+/// (`is_crr.rs:10-26`), so neither alone notices a table that lost one of them.
+/// `__crsql_utrig` is omitted only because the slot comparison below already has to fetch
+/// its SQL, and reports stale when it is absent.
+const CRR_TRIGGERS_NOT_COVERED_BY_SLOT_COMPARE: [&str; 2] = ["__crsql_itrig", "__crsql_dtrig"];
 
 /// The SQL text of trigger `name`, or `None` if it does not exist.
 fn trigger_sql(conn: &Connection, name: &str) -> Result<Option<String>, SyncError> {
@@ -482,7 +465,7 @@ pub fn crr_triggers_are_stale(conn: &Connection, table: &str) -> Result<bool, Sy
     if !is_crr(conn, table)? {
         return Ok(false);
     }
-    for suffix in CRR_TRIGGER_SUFFIXES {
+    for suffix in CRR_TRIGGERS_NOT_COVERED_BY_SLOT_COMPARE {
         if trigger_sql(conn, &format!("{table}{suffix}"))?.is_none() {
             return Ok(true);
         }
@@ -503,6 +486,8 @@ pub fn crr_triggers_are_stale(conn: &Connection, table: &str) -> Result<bool, Sy
     expected.extend(non_pks.iter().map(|c| format!("NEW.{}", c.name)));
     expected.extend(non_pks.iter().map(|c| format!("OLD.{}", c.name)));
 
+    // Doubles as the `__crsql_utrig` existence leg of check 1 (it is the one suffix the
+    // loop above leaves out), so the `None` arm is load-bearing, not defensive.
     let utrig = match trigger_sql(conn, &format!("{table}__crsql_utrig"))? {
         Some(s) => s,
         None => return Ok(true),

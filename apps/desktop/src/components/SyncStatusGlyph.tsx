@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Cloud, CloudCheck, CloudAlert, CloudOff, RefreshCw } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
-import { syncCommands } from "@/lib/sync";
+import { isCommandNotFound } from "@/lib/sync";
 import {
   deriveSyncDisplay,
   type SyncDisplayIcon,
@@ -145,18 +145,18 @@ function SyncGlyphIcon({
  * on this build; `false` permanently once we learn the `sync_status` command
  * isn't registered.
  *
- * No-sync-build guard (§4, critical): `refreshSyncStatus` swallows its own
- * errors into a verbatim `lastError`, so we cannot observe a missing-command
- * rejection through it. We therefore probe `sync_status` directly on the first
- * tick — in a plain `tauri dev` (no `-f sync`) build the command is unregistered
- * and Tauri v2 rejects with `"Command sync_status not found"`. We detect that
- * once and stop for good, so we never hot-loop or console-spam. Any *other*
- * rejection means the command exists but failed at runtime (network/auth); we
- * hand that back to the store's normal verbatim-error handler and keep polling.
+ * No-sync-build guard (§4, critical): in a plain `tauri dev` (no `-f sync`) build
+ * the command is unregistered and Tauri v2 rejects with `"Command sync_status not
+ * found"`. `refreshSyncStatus` parks that rejection verbatim in `lastError`, so we
+ * read the signal back off the store through the SAME `isCommandNotFound` full-equality
+ * rule the Sync tab uses — never a substring test, which would mistake a real failure
+ * raised *by* a registered command for "feature absent". We detect it once and stop for
+ * good, so we never hot-loop or console-spam. Any *other* failure means the command
+ * exists but failed at runtime (network/auth); the store surfaces it verbatim and we
+ * keep polling.
  */
 function useAmbientSyncPoll(engaged: boolean): boolean {
   const refreshSyncStatus = useAppStore((s) => s.refreshSyncStatus);
-  const setSyncStatus = useAppStore((s) => s.setSyncStatus);
   const [available, setAvailable] = useState(true);
 
   useEffect(() => {
@@ -164,7 +164,6 @@ function useAmbientSyncPoll(engaged: boolean): boolean {
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let capabilityChecked = false;
 
     const schedule = () => {
       const phase = useAppStore.getState().syncStatus?.phase;
@@ -174,26 +173,16 @@ function useAmbientSyncPoll(engaged: boolean): boolean {
 
     const tick = async () => {
       if (cancelled) return;
+      await refreshSyncStatus();
+      if (cancelled) return;
 
-      if (!capabilityChecked) {
-        capabilityChecked = true;
-        try {
-          const status = await syncCommands.status();
-          if (cancelled) return;
-          setSyncStatus(status);
-        } catch (e) {
-          if (cancelled) return;
-          if (isMissingCommand(e)) {
-            setAvailable(false);
-            return; // never reschedule — permanently off for this session
-          }
-          await refreshSyncStatus();
-        }
-      } else {
-        await refreshSyncStatus();
+      const s = useAppStore.getState().syncStatus;
+      if (s?.phase === "error" && isCommandNotFound(s.lastError, "sync_status")) {
+        setAvailable(false);
+        return; // never reschedule — permanently off for this session
       }
 
-      if (!cancelled) schedule();
+      schedule();
     };
 
     void tick();
@@ -201,17 +190,7 @@ function useAmbientSyncPoll(engaged: boolean): boolean {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [engaged, refreshSyncStatus, setSyncStatus]);
+  }, [engaged, refreshSyncStatus]);
 
   return available;
-}
-
-/** Tauri v2 rejects an unregistered command with `"Command {name} not found"`
- *  (tauri/src/webview/mod.rs). A genuine runtime failure surfaces network/auth
- *  phrasing, not "not found", so this signature won't false-positive on a real
- *  build's transient error. */
-function isMissingCommand(e: unknown): boolean {
-  const msg =
-    e instanceof Error ? e.message : typeof e === "string" ? e : String(e);
-  return /not found/i.test(msg);
 }

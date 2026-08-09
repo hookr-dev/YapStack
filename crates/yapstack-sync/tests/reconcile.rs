@@ -22,7 +22,9 @@ use yapstack_sync::schema::{crr_migrate, SYNC_TABLES};
 use yapstack_sync::snapshot::{produce_snapshot_bytes, write_snapshot_file, SnapshotMeta};
 use yapstack_sync::state;
 use yapstack_sync::transport::{MockRelay, SyncTransport};
-use yapstack_sync::{cascade, uniqueness, CrsqlDb, CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION};
+use yapstack_sync::{
+    cascade, change, uniqueness, CrsqlDb, CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION,
+};
 
 const TENANT: Uuid = Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0001);
 const VAULT_KEY: [u8; 32] = [42u8; 32];
@@ -64,14 +66,7 @@ fn build_seed_crr(plain: &Path, crr_path: &Path) {
     // changesets (R2 seed side): the snapshot carries it, so the push watermark starts
     // at the current max local db_version.
     let _ = state::client_id(db.conn()).unwrap();
-    let max_dbv: i64 = db
-        .conn()
-        .query_row(
-            "SELECT coalesce(max(db_version),0) FROM crsql_changes WHERE site_id = crsql_site_id()",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let max_dbv = change::max_local_db_version(db.conn()).unwrap();
     state::set_push_watermark(db.conn(), max_dbv).unwrap();
 }
 
@@ -112,6 +107,28 @@ fn snapshot_roundtrip_reopens_as_identical_crr_base() {
             "table {t} content preserved"
         );
     }
+}
+
+/// AAD domain separation (§4.2/§5.2): the two ciphers hold the SAME vault key, epoch
+/// and tenant, so only their distinct domains keep a changeset blob from opening as a
+/// snapshot — and the reverse. Both directions must fail with everything else matched.
+#[test]
+fn changeset_and_snapshot_blobs_do_not_cross_open() {
+    let client = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0007);
+    let changeset = changeset_cipher();
+    let snapshot = SnapshotCipher::new(VAULT_KEY, 0, TENANT);
+
+    let cs_blob = changeset.encrypt(client, 1, b"payload").unwrap();
+    assert!(
+        snapshot.decrypt(1, &cs_blob).is_err(),
+        "a changeset blob must not open under the snapshot domain"
+    );
+
+    let snap_blob = snapshot.encrypt(1, b"payload").unwrap();
+    assert!(
+        changeset.decrypt(client, 1, &snap_blob).is_err(),
+        "a snapshot blob must not open under the changeset domain"
+    );
 }
 
 #[test]

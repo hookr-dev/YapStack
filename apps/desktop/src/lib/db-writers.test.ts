@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Capturing db-backend mock: record every execute(query, values) so we can assert
 // the recording_device_id attribution reaches the SQL (LIVE_SESSION_STATE D2).
 const { executeMock } = vi.hoisted(() => ({
-  executeMock: vi.fn().mockResolvedValue({ rowsAffected: 1, lastInsertId: 0 }),
+  executeMock: vi.fn().mockResolvedValue({ rowsAffected: 1 }),
 }));
 
 vi.mock("@/lib/db-backend", () => ({

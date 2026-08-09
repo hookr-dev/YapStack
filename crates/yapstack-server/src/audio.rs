@@ -30,15 +30,15 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 use yapstack_common::sync::PresignResponse;
 
 use crate::choke;
-use crate::config::StorageConfig;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::AuthTenant;
-use crate::state::AppState;
+use crate::state::{storage_cfg, AppState};
 use crate::storage;
 
 #[derive(Debug, Deserialize)]
@@ -56,21 +56,23 @@ pub struct PresignQuery {
     pub session_id: Uuid,
 }
 
-fn parse_sha256(s: &str) -> Result<(Vec<u8>, String), AppError> {
-    let lower = s.to_ascii_lowercase();
-    if lower.len() != 64 || !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest("sha256: expected 64 hex chars".into()));
-    }
-    let bytes =
-        hex::decode(&lower).map_err(|_| AppError::BadRequest("sha256: invalid hex".into()))?;
-    Ok((bytes, lower))
-}
-
-fn storage_cfg(st: &AppState) -> Result<&StorageConfig, AppError> {
-    st.config
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::Unavailable("audio storage not configured".into()))
+/// Add one mapping reference to a blob (D8 MAPPING-COUNT). The single definition of the
+/// increment: refcount goes UP → `released_at` is cleared, so a blob that had dipped to
+/// <= 0 is no longer GC-eligible.
+async fn add_ref(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    hash: &[u8],
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE audio_blobs SET refcount = refcount + 1, released_at = NULL \
+         WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
+    )
+    .bind(tenant)
+    .bind(hash)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn upload_response(key: String, url: String, content_length: u64) -> Json<PresignResponse> {
@@ -92,7 +94,7 @@ pub async fn presign(
     Query(q): Query<PresignQuery>,
 ) -> Result<Json<PresignResponse>, AppError> {
     let cfg = storage_cfg(&st)?;
-    let (hash, hash_hex) = parse_sha256(&q.sha256)?;
+    let (hash, hash_hex) = storage::parse_sha256(&q.sha256)?;
     let key = storage::object_key(auth.tenant_id, &hash_hex);
 
     let limits = st.limits.limits(auth.tenant_id).await;
@@ -168,14 +170,7 @@ pub async fn presign(
         if !same_part_same_blob {
             // refcount goes UP → the blob is referenced again: clear released_at so a blob
             // that had dipped to <= 0 is no longer GC-eligible (D8 GC invariant).
-            sqlx::query(
-                "UPDATE audio_blobs SET refcount = refcount + 1, released_at = NULL \
-                 WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
-            )
-            .bind(auth.tenant_id)
-            .bind(&hash)
-            .execute(&mut *tx)
-            .await?;
+            add_ref(&mut tx, auth.tenant_id, &hash).await?;
         }
     } else {
         // NEW blob as this tx saw it. Insert FIRST so two concurrent identical new-blob
@@ -206,14 +201,7 @@ pub async fn presign(
             stored_size = stored.map_or(q.size, |(s,)| s.max(0) as u64);
             if !same_part_same_blob {
                 // refcount goes UP → clear released_at (see the sibling increment above).
-                sqlx::query(
-                    "UPDATE audio_blobs SET refcount = refcount + 1, released_at = NULL \
-                     WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
-                )
-                .bind(auth.tenant_id)
-                .bind(&hash)
-                .execute(&mut *tx)
-                .await?;
+                add_ref(&mut tx, auth.tenant_id, &hash).await?;
             }
         } else {
             // We created the blob: meter the declared size once at the choke point. If it

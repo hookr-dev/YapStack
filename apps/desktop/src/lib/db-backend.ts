@@ -17,8 +17,6 @@ import { invoke } from "@tauri-apps/api/core";
 export interface QueryResult {
   /** Rows affected by the last INSERT/UPDATE/DELETE. */
   rowsAffected: number;
-  /** `last_insert_rowid()` after the statement. */
-  lastInsertId: number;
 }
 
 export interface DbConnection {

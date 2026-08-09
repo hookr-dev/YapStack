@@ -157,6 +157,11 @@ export function SyncTab() {
     (d) => d.pending && !d.isSelf,
   );
 
+  // The single named self-host gate (ENTITLEMENTS_SEAM) — decided once here so the
+  // upgrade card and its click handler share one decision instead of re-guarding.
+  const billingUrl =
+    syncStatus && shouldShowUpgrade(syncStatus) ? syncStatus.billingUrl : null;
+
   // A build compiled WITHOUT the `sync` cargo feature registers none of the
   // `sync_*` commands, so the mount status call above rejects with Tauri's exact
   // "Command sync_status not found" (which `refreshSyncStatus` parks in
@@ -312,7 +317,7 @@ export function SyncTab() {
       {signedIn && syncEnabled && <FetchedAudioCard />}
 
       {/* Upgrade — only when a billing_url is advertised (unchanged). */}
-      {syncStatus && shouldShowUpgrade(syncStatus) && syncStatus.billingUrl && (
+      {billingUrl && (
         <Card className={CARD}>
           <CardContent
             className={`${BODY} flex items-center justify-between gap-3`}
@@ -326,10 +331,7 @@ export function SyncTab() {
             <Button
               size="sm"
               variant="outline"
-              onClick={() =>
-                syncStatus.billingUrl &&
-                openUrl(syncStatus.billingUrl).catch(() => {})
-              }
+              onClick={() => openUrl(billingUrl).catch(() => {})}
             >
               Upgrade
               <ExternalLink className="h-3 w-3" />
@@ -586,6 +588,53 @@ function SyncStatusLine({
 }
 
 /**
+ * One-shot async button action: owns the busy flag and the SINGLE verbatim failure
+ * surfacing for this panel. `toast.error` gets the error's own text — never reworded,
+ * never auto-routed (feedback_surface_ai_errors); centralizing it here is what keeps
+ * that invariant from drifting across the panel's actions. `fn` performs its own side
+ * effects and returns the success copy, so each action owns its wording.
+ */
+function useAsyncAction(fn: () => Promise<string>): {
+  run: () => Promise<void>;
+  busy: boolean;
+} {
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    setBusy(true);
+    try {
+      toast.success(await fn());
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { run, busy };
+}
+
+/** The panel's retry control: a spinner while busy, the refresh glyph otherwise. */
+function BusyButton({
+  busy,
+  label,
+  onClick,
+}: {
+  busy: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <Button size="sm" variant="outline" onClick={onClick} disabled={busy}>
+      {busy ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <RefreshCw className="h-3.5 w-3.5" />
+      )}
+      {label}
+    </Button>
+  );
+}
+
+/**
  * Audio backup card (S2): the audio-upload lane surfaced DISTINCTLY from changeset
  * sync (never merged, per repo posture). Shows an in-flight line (with the
  * existing-library backfill nuance), an "all backed up" resting line, or a failed
@@ -598,7 +647,13 @@ function AudioBackupCard({
   status: SyncStatus;
   onRetried: () => void;
 }) {
-  const [retrying, setRetrying] = useState(false);
+  const { run: handleRetry, busy: retrying } = useAsyncAction(async () => {
+    const n = await syncCommands.retryFailedAudioUploads();
+    onRetried();
+    return n > 0
+      ? `Retrying ${n} upload${n === 1 ? "" : "s"}…`
+      : "Nothing to retry.";
+  });
   const audio = deriveAudioBackup(status);
   // Unmounting this card whenever the counts fall back to zero yanked a whole card out of
   // the middle of the stack and jumped every card below it — while the user was looking
@@ -608,22 +663,6 @@ function AudioBackupCard({
   if (audio.state !== "hidden") everReported.current = true;
   const resting = audio.state === "hidden";
   if (resting && !everReported.current) return null;
-
-  const handleRetry = async () => {
-    setRetrying(true);
-    try {
-      const n = await syncCommands.retryFailedAudioUploads();
-      toast.success(
-        n > 0 ? `Retrying ${n} upload${n === 1 ? "" : "s"}…` : "Nothing to retry.",
-      );
-      onRetried();
-    } catch (e) {
-      // Surface verbatim — never auto-route.
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRetrying(false);
-    }
-  };
 
   if (resting) {
     return (
@@ -674,19 +713,11 @@ function AudioBackupCard({
           {audio.label}
         </div>
         {audio.state === "failed" && (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleRetry}
-            disabled={retrying}
-          >
-            {retrying ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            Retry
-          </Button>
+          <BusyButton
+            busy={retrying}
+            label="Retry"
+            onClick={() => void handleRetry()}
+          />
         )}
       </CardContent>
     </Card>
@@ -709,27 +740,15 @@ function CryptoQuarantineWarning({
   status: SyncStatus;
   onRetried: () => void;
 }) {
-  const [retrying, setRetrying] = useState(false);
+  const { run: handleRetry, busy: retrying } = useAsyncAction(async () => {
+    const recovered = await syncCommands.retryCryptoQuarantine();
+    onRetried();
+    return recovered > 0
+      ? `Recovered ${recovered} changeset${recovered === 1 ? "" : "s"}.`
+      : "Still unreadable — the key for these changes has not arrived yet.";
+  });
   const n = Math.max(0, status.cryptoQuarantined ?? 0);
   if (n === 0) return null;
-
-  const handleRetry = async () => {
-    setRetrying(true);
-    try {
-      const recovered = await syncCommands.retryCryptoQuarantine();
-      toast.success(
-        recovered > 0
-          ? `Recovered ${recovered} changeset${recovered === 1 ? "" : "s"}.`
-          : "Still unreadable — the key for these changes has not arrived yet.",
-      );
-      onRetried();
-    } catch (e) {
-      // Surface verbatim — never auto-route.
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRetrying(false);
-    }
-  };
 
   const noun = n === 1 ? "changeset" : "changesets";
   return (
@@ -746,19 +765,11 @@ function CryptoQuarantineWarning({
           in transit. It is kept safely and never dropped. Retry once every device
           is approved.
         </p>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={handleRetry}
-          disabled={retrying}
-        >
-          {retrying ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3.5 w-3.5" />
-          )}
-          Retry
-        </Button>
+        <BusyButton
+          busy={retrying}
+          label="Retry"
+          onClick={() => void handleRetry()}
+        />
       </AlertDescription>
     </Alert>
   );
@@ -773,7 +784,13 @@ function CryptoQuarantineWarning({
  */
 function FetchedAudioCard() {
   const [stats, setStats] = useState<AudioCacheStats | null>(null);
-  const [clearing, setClearing] = useState(false);
+  const { run: handleClear, busy: clearing } = useAsyncAction(async () => {
+    const remaining = await syncCommands.audioCacheClear();
+    setStats(remaining);
+    return remaining.bytes > 0
+      ? `Cleared — ${formatBytes(remaining.bytes)} still in use by an active fetch`
+      : "Fetched audio cleared";
+  });
 
   const refresh = useCallback(async () => {
     try {
@@ -795,24 +812,6 @@ function FetchedAudioCard() {
   }, [refresh]);
 
   if (!stats || stats.bytes <= 0) return null;
-
-  const handleClear = async () => {
-    setClearing(true);
-    try {
-      const remaining = await syncCommands.audioCacheClear();
-      setStats(remaining);
-      toast.success(
-        remaining.bytes > 0
-          ? `Cleared — ${formatBytes(remaining.bytes)} still in use by an active fetch`
-          : "Fetched audio cleared",
-      );
-    } catch (e) {
-      // Surface verbatim — never auto-route.
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearing(false);
-    }
-  };
 
   return (
     // Fades/slides in rather than popping into the middle of the stack the moment the

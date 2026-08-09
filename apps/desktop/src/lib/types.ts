@@ -868,9 +868,13 @@ export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; sy
  */
 export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
 /**
- * Result of a `db_execute`, matching tauri-plugin-sql's `QueryResult` shape.
+ * The write path's affected-row signal — the only success-side answer a
+ * `db_execute` returns. (It once mirrored tauri-plugin-sql's `QueryResult`; that
+ * plugin is gone, and `last_insert_id` went with it: every table in this schema
+ * has a TEXT UUID primary key, so `last_insert_rowid()` only ever yielded an
+ * implicit rowid no caller can use.)
  */
-export type DbExecuteResult = { rowsAffected: number; lastInsertId: number }
+export type DbExecuteResult = { rowsAffected: number }
 export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**

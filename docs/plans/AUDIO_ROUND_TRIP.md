@@ -202,7 +202,7 @@ invariant (top of doc):
 - **S1 — engine-only, no UI (testable headless).** The CRYPTO_SPEC amendment draft + Judge
   crypto review (gates the rest of S1); stream cipher module (`aead::stream`-based seal/open
   to/from files, header, wrap); transport methods (`presign_audio` / `put_audio` /
-  `get_audio`) with **streaming bodies**; durable two-priority `audio_upload_queue` +
+  `get_audio_streaming`) with **streaming bodies**; durable two-priority `audio_upload_queue` +
   background uploader on finalize/dictation-save with drain-health surfacing; server deltas
   (part_id keying + existence-checked presign); **CSPRNG UUIDv4 part-id minting** (D6
   mandate — replaces the clock-derived id at `db.rs:284-288`). Ships every §Verification

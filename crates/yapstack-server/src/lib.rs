@@ -76,8 +76,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sync/pull", get(sync::pull::pull))
         .route("/sync/completeness", get(sync::completeness::completeness))
-        // Phase-2 seam: SSE liveness optimization. Mounted but no current client caller —
-        // the desktop drain uses polling pull (spec-compliant). See SYNC_REMEDIATION.md §6b.
+        // SSE wakeup stream (§7a). Client: yapstack_sync::transport::stream_wakeups, driven
+        // by the desktop drain's SSE subscriber lane. Hint-only — pull remains the source of
+        // truth.
         .route("/sync/stream", get(sync::stream::stream))
         // --- audio E2E blobs (§9, audio round-trip D6/D8) ---
         // Blobs are addressed by the session_audio_parts row UUID (part_id); presign gains

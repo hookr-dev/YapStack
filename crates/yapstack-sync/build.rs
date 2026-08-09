@@ -21,7 +21,7 @@
 //! `.dylib`); it is proven here and by the crate's tests, which register a CRR and
 //! call `crsql_as_crr` / `crsql_changes` through a `rusqlite` connection.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Pinned cr-sqlite release (matches `vendor/cr-sqlite`, tag v0.16.3).
@@ -57,20 +57,10 @@ fn main() {
 
     // Rebuild triggers.
     println!("cargo:rerun-if-changed=build.rs");
-    for f in [
-        "crsqlite.c",
-        "crsqlite.h",
-        "changes-vtab.c",
-        "changes-vtab.h",
-        "ext-data.c",
-        "ext-data.h",
-        "ext.h",
-        "consts.h",
-        "util.h",
-        "rust.h",
-    ] {
-        println!("cargo:rerun-if-changed={}", c_src.join(f).display());
-    }
+    // Directory watch (cargo scans it recursively), so the C shims AND the vendored
+    // SQLite headers under `src/sqlite` — which `cc` includes below — all trigger a
+    // rebuild. An enumerated file list silently missed the header dir.
+    println!("cargo:rerun-if-changed={}", c_src.display());
     println!(
         "cargo:rerun-if-changed={}",
         bundle_static.join("src/lib.rs").display()
@@ -167,6 +157,4 @@ fn main() {
     // --- 3. Link the Rust static bundle. ---
     println!("cargo:rustc-link-search=native={}", rust_lib_dir.display());
     println!("cargo:rustc-link-lib=static=crsql_bundle_static");
-
-    let _ = Path::new(&sqlite_hdr); // keep sqlite_hdr referenced for clarity
 }

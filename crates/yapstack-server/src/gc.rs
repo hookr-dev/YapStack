@@ -121,6 +121,9 @@ pub async fn run_sweep(
 
             // PHASE 2: delete the row — re-asserting eligibility so a blob that was referenced
             // again (refcount back up / released_at cleared) after the scan is NOT removed.
+            // TODO(AUDIO_ROUND_TRIP D10): `tenant_usage.storage_bytes` is never decremented —
+            // it is monotonic, so GC'd bytes are never reclaimed. The decrement belongs in this
+            // tx (it holds the tenant guard and `blob.size`); doing it is a behavior change.
             let mut tx = db::begin_tenant_tx(pool, workspace_id).await?;
             let res = sqlx::query(
                 "DELETE FROM audio_blobs \

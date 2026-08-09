@@ -3,7 +3,6 @@
 
 mod support;
 
-use rusqlite::Connection;
 use yapstack_sync::schema::{self, SYNC_TABLES};
 use yapstack_sync::CrsqlDb;
 
@@ -130,17 +129,18 @@ fn crr_migration_roundtrip_fresh_chain_13col_segments() {
 #[ignore = "requires YAPSTACK_SPIKE_DB pointing at a .backup COPY of the live DB"]
 fn crr_migration_roundtrip_real_db() {
     let path = std::env::var("YAPSTACK_SPIKE_DB").expect("set YAPSTACK_SPIKE_DB");
-    yapstack_sync::register_crsqlite();
-    let conn = Connection::open(&path).unwrap();
+    // cr-sqlite lives on the [`CrsqlDb`] connection only; a plain connection has no
+    // `crsql_*` functions, so the migration must run through it (drop finalizes).
+    let db = CrsqlDb::open(&path).unwrap();
+    let conn = db.conn();
     let pre: Vec<(&str, (i64, u64))> = SYNC_TABLES
         .iter()
-        .map(|t| (*t, support::fingerprint(&conn, t)))
+        .map(|t| (*t, support::fingerprint(conn, t)))
         .collect();
-    schema::crr_migrate(&conn).expect("migration on real-DB copy");
+    schema::crr_migrate(conn).expect("migration on real-DB copy");
     for (t, (pn, ph)) in &pre {
-        let (n, h) = support::fingerprint(&conn, t);
+        let (n, h) = support::fingerprint(conn, t);
         assert_eq!(n, *pn, "{t}: row count drifted");
         assert_eq!(h, *ph, "{t}: fingerprint drifted");
     }
-    conn.execute_batch("SELECT crsql_finalize();").unwrap();
 }

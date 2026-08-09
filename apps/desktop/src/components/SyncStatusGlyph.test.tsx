@@ -53,8 +53,8 @@ function baseStatus(over: Partial<SyncStatus> = {}): SyncStatus {
   };
 }
 
-/** Seed store + make the capability probe resolve the same status, so the async
- *  probe re-sets an identical value (no visual change) rather than clobbering. */
+/** Seed store + make the poll's `sync_status` fetch resolve the same status, so the
+ *  first tick re-sets an identical value (no visual change) rather than clobbering. */
 function seed({
   status,
   conn = { kind: "idle" },
@@ -88,8 +88,8 @@ function renderGlyph() {
   );
 }
 
-/** Render + let the one-shot capability probe settle (so its async setSyncStatus
- *  runs inside act and never leaks into the next test). */
+/** Render + let the poll's first tick settle (so its async setSyncStatus runs
+ *  inside act and never leaks into the next test). */
 async function renderSettled() {
   const utils = renderGlyph();
   await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("sync_status"));
@@ -124,7 +124,7 @@ describe("SyncStatusGlyph — visibility", () => {
     invokeMock.mockRejectedValue(new Error("Command sync_status not found"));
     const { container } = renderGlyph();
     await waitFor(() => expect(container.firstChild).toBeNull());
-    // Capability probe fired exactly once; missing-command stops rescheduling.
+    // Status fetched exactly once; the parked missing-command error stops rescheduling.
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith("sync_status");
   });
@@ -222,8 +222,12 @@ describe("SyncStatusGlyph — interaction", () => {
 });
 
 describe("SyncStatusGlyph — app-wide polling", () => {
+  // The cadence test swaps the store action for a spy; put the real one back so a
+  // later test still exercises the actual fetch-and-park path.
+  const realRefreshSyncStatus = useAppStore.getState().refreshSyncStatus;
   afterEach(() => {
     vi.useRealTimers();
+    useAppStore.setState({ refreshSyncStatus: realRefreshSyncStatus });
   });
 
   it("polls at the 2s syncing cadence via refreshSyncStatus and stops on unmount", async () => {
@@ -234,22 +238,39 @@ describe("SyncStatusGlyph — app-wide polling", () => {
 
     const { unmount } = renderGlyph();
 
-    // Flush the immediate capability probe (direct sync_status invoke).
+    // The first tick fires immediately.
     await vi.advanceTimersByTimeAsync(1);
-    expect(refreshSyncStatus).not.toHaveBeenCalled();
+    expect(refreshSyncStatus).toHaveBeenCalledTimes(1);
 
-    // Still nothing well before the 2s syncing cadence elapses.
+    // Nothing further well before the 2s syncing cadence elapses.
     await vi.advanceTimersByTimeAsync(1500);
-    expect(refreshSyncStatus).not.toHaveBeenCalled();
+    expect(refreshSyncStatus).toHaveBeenCalledTimes(1);
 
     // Fires past ~2s — and before the 5s idle cadence would have — proving the
     // tighter syncing cadence is in effect.
     await vi.advanceTimersByTimeAsync(1000);
-    expect(refreshSyncStatus).toHaveBeenCalledTimes(1);
+    expect(refreshSyncStatus).toHaveBeenCalledTimes(2);
 
     unmount();
     await vi.advanceTimersByTimeAsync(10000);
     // Cleanup cleared the pending timer — no further polls after unmount.
-    expect(refreshSyncStatus).toHaveBeenCalledTimes(1);
+    expect(refreshSyncStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps polling when a REGISTERED command fails with 'not found' text", async () => {
+    // Full equality against "Command sync_status not found" only: a runtime failure
+    // whose text merely CONTAINS "not found" must never read as "feature absent"
+    // and disable the glyph for the rest of the session.
+    vi.useFakeTimers();
+    seed({ status: null });
+    invokeMock.mockRejectedValue(new Error("audio blob not found on relay"));
+
+    const { container } = renderGlyph();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    // Still available: the verbatim error renders and the idle cadence keeps going.
+    expect(container.firstChild).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
   });
 });

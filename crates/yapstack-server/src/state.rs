@@ -6,7 +6,8 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use yapstack_entitlements::{AllowAll, StoredLimits, TenantLimitSource};
 
-use crate::config::Config;
+use crate::config::{Config, StorageConfig};
+use crate::error::AppError;
 use crate::jwt::JwtKeys;
 use crate::ratelimit::RateLimiter;
 use crate::sse::SseHub;
@@ -57,4 +58,16 @@ impl AppState {
     pub fn admin_enabled(&self) -> bool {
         self.admin_key.is_some()
     }
+}
+
+/// The configured object-storage backend, or a 503 if the deployment has none. Shared by
+/// every presign path (audio, snapshot) so they answer with one message.
+///
+/// # Errors
+/// [`AppError::Unavailable`] when `[storage]` is absent from the config.
+pub(crate) fn storage_cfg(st: &AppState) -> Result<&StorageConfig, AppError> {
+    st.config
+        .storage
+        .as_ref()
+        .ok_or_else(|| AppError::Unavailable("object storage not configured".into()))
 }

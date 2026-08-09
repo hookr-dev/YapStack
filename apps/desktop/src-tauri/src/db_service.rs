@@ -140,12 +140,15 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Result of a `db_execute`, matching tauri-plugin-sql's `QueryResult` shape.
+/// The write path's affected-row signal — the only success-side answer a
+/// `db_execute` returns. (It once mirrored tauri-plugin-sql's `QueryResult`; that
+/// plugin is gone, and `last_insert_id` went with it: every table in this schema
+/// has a TEXT UUID primary key, so `last_insert_rowid()` only ever yielded an
+/// implicit rowid no caller can use.)
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DbExecuteResult {
     pub rows_affected: u64,
-    pub last_insert_id: i64,
 }
 
 /// One selected row as an ordered-by-name JSON object, matching the plugin.
@@ -186,10 +189,8 @@ impl Pool {
         let mut stmt = conn.prepare(query)?;
         bind_all(&mut stmt, values)?;
         let rows_affected = stmt.raw_execute()?;
-        let last_insert_id = conn.last_insert_rowid();
         Ok(DbExecuteResult {
             rows_affected: rows_affected as u64,
-            last_insert_id,
         })
     }
 
@@ -762,6 +763,32 @@ fn log_db_failure(role: &'static str, preview: &str, e: &rusqlite::Error) {
     }
 }
 
+/// Run one DB command off the async runtime and report it honestly.
+///
+/// Honest errors: the command's `Err` string used to be the ONLY record of a
+/// failed statement — the frontend swallowed it into a generic toast and nothing
+/// reached the rolling log. It is logged here, at the layer that still has the
+/// statement, the connection `role`, and — crucially — the TYPED error, so a
+/// transient lock is not shouted at the same volume as a broken statement.
+async fn run_db<T: Send + 'static>(
+    svc: DbServiceState,
+    query: String,
+    values: Vec<JsonValue>,
+    role: &'static str,
+    f: impl FnOnce(&DbService, &str, &[JsonValue]) -> rusqlite::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    // Computed before `query` moves into the blocking closure. Cheap (bounded to
+    // ~40 chars) and unconditional so a failure is never silent.
+    let preview = sql_preview(&query);
+    let raw = tokio::task::spawn_blocking(move || f(&svc, &query, &values))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(ref e) = raw {
+        log_db_failure(role, &preview, e);
+    }
+    raw.map_err(|e| e.to_string())
+}
+
 /// `db.execute(sql, params)` — write path. Rejects on SQL error so the
 /// frontend's `.catch()` on idempotent runtime patches keeps working.
 #[tauri::command]
@@ -771,22 +798,14 @@ pub async fn db_execute(
     query: String,
     values: Vec<JsonValue>,
 ) -> Result<DbExecuteResult, String> {
-    // Computed before `query` moves into the blocking closure. Cheap (bounded to
-    // ~40 chars) and unconditional so a failure is never silent.
-    let preview = sql_preview(&query);
-    let svc = service.inner().clone();
-    let raw = tokio::task::spawn_blocking(move || svc.execute(&query, &values))
-        .await
-        .map_err(|e| e.to_string())?;
-    // Honest errors: the command's `Err` string used to be the ONLY record of a
-    // failed write — the frontend swallowed it into a generic toast and nothing
-    // reached the rolling log. Log it here, at the layer that still has the
-    // statement, the connection role, and — crucially — the TYPED error, so a
-    // transient lock is not shouted at the same volume as a broken statement.
-    if let Err(ref e) = raw {
-        log_db_failure("writer", &preview, e);
-    }
-    let result = raw.map_err(|e| e.to_string());
+    let result = run_db(
+        service.inner().clone(),
+        query,
+        values,
+        "writer",
+        |svc, q, v| svc.execute(q, v),
+    )
+    .await;
     // Local-write kick (SSE-latency deliverable 2): a committed local write nudges the sync
     // drain to run a push-capturing cycle promptly (debounced). No-op when sync is off or no
     // drain is running; never affects the command's result.
@@ -805,15 +824,14 @@ pub async fn db_select(
     query: String,
     values: Vec<JsonValue>,
 ) -> Result<Vec<DbRow>, String> {
-    let preview = sql_preview(&query);
-    let svc = service.inner().clone();
-    let raw = tokio::task::spawn_blocking(move || svc.select(&query, &values))
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Err(ref e) = raw {
-        log_db_failure("reader", &preview, e);
-    }
-    raw.map_err(|e| e.to_string())
+    run_db(
+        service.inner().clone(),
+        query,
+        values,
+        "reader",
+        |svc, q, v| svc.select(q, v),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -825,6 +843,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         (dir, path)
+    }
+
+    /// Every migration version in list order. Read from the list rather than
+    /// hardcoded so adding a migration needs no test edit.
+    fn all_versions() -> Vec<i64> {
+        crate::db::migrations().iter().map(|m| m.version).collect()
     }
 
     fn service_with_schema() -> (tempfile::TempDir, DbService) {
@@ -868,12 +892,12 @@ mod tests {
         let (_dir, path) = temp_db();
         let conn = Connection::open(&path).unwrap();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, (1..=17).collect::<Vec<i64>>());
+        assert_eq!(applied, all_versions());
         // Bookkeeping recorded.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, all_versions().len() as i64);
         // Core tables exist.
         for t in ["sessions", "segments", "notes", "chat_messages", "tags"] {
             let exists: bool = conn
@@ -915,7 +939,7 @@ mod tests {
             );",
         )
         .unwrap();
-        for v in 1..=17i64 {
+        for v in all_versions() {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
                  VALUES (?, 'preexisting', 1, x'', 0)",

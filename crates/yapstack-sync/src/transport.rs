@@ -30,11 +30,21 @@ pub trait SyncTransport: Send + Sync {
 
     /// R2: publish the encrypted DB snapshot (the seed device's bootstrap artifact).
     /// The relay stores it as an opaque blob and never reads it.
-    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError>;
+    ///
+    /// Default: unsupported (test transports that never touch the snapshot seam inherit this).
+    async fn put_snapshot(&self, _meta: SnapshotMeta, _ciphertext: &[u8]) -> Result<(), SyncError> {
+        Err(SyncError::Transport("snapshot put not supported".into()))
+    }
 
     /// R2: fetch the latest encrypted snapshot for the tenant, or `None` if the seed
     /// has not published one yet (a join device then falls back to full changeset pull).
-    async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError>;
+    ///
+    /// Default: unsupported — NOT `Ok(None)`. `Ok(None)` is reserved for a real transport's
+    /// "no snapshot published yet" answer, so a transport that never implemented this cannot
+    /// silently degrade a join into a lossy full-changeset pull (it fails as a transport fault).
+    async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
+        Err(SyncError::Transport("snapshot get not supported".into()))
+    }
 
     /// Audio round-trip: presign a blob upload addressed by the `session_audio_parts` row
     /// UUID (`part_id`, D6). The server's existence-checked response (D8) either reports
@@ -65,39 +75,24 @@ pub trait SyncTransport: Send + Sync {
         Err(SyncError::Transport("audio put not supported".into()))
     }
 
-    /// Fetch the blob for `part_id`, streaming it to `dest_path`. `Ok(false)` when the blob
-    /// is not yet available on the relay (HTTP 404 — the row converged before its audio
-    /// uploaded); `Ok(true)` on a completed download. This is the fetch-path transport seam;
-    /// the on-demand UI trigger + decrypt-to-cache is a later slice.
-    ///
-    /// Default: unsupported.
-    async fn get_audio(
-        &self,
-        _part_id: &str,
-        _dest_path: &std::path::Path,
-    ) -> Result<bool, SyncError> {
-        Err(SyncError::Transport("audio get not supported".into()))
-    }
-
     /// Fetch the blob for `part_id` to `dest_path` (S3 on-demand playback), reporting live
     /// download progress into `progress` (`received` bytes and the server-declared `total`
-    /// content-length) and honouring cooperative cancellation (`progress.cancel`). Same
-    /// availability contract as [`get_audio`]: `Ok(false)` = blob not yet on the relay
-    /// (HTTP 404), `Ok(true)` = completed download. A caller-requested cancel aborts the
+    /// content-length) and honouring cooperative cancellation (`progress.cancel`).
+    /// `Ok(false)` = blob not yet on the relay (HTTP 404 — the row converged before its audio
+    /// uploaded), `Ok(true)` = completed download. A caller-requested cancel aborts the
     /// stream, removes the partial file, and returns [`SyncError::Transport`] carrying
     /// [`FETCH_CANCELLED`] so the fetch layer can classify it as a user cancel (not an
     /// error) WITHOUT a new shared-error variant. The body is streamed frame-by-frame —
     /// never buffered whole (O(frame) memory, matching the upload path's discipline).
     ///
-    /// Default: fall back to the coarse [`get_audio`] (no progress/cancel granularity), so a
-    /// transport that never plays audio still compiles.
+    /// Default: unsupported.
     async fn get_audio_streaming(
         &self,
-        part_id: &str,
-        dest_path: &std::path::Path,
+        _part_id: &str,
+        _dest_path: &std::path::Path,
         _progress: &crate::audio::FetchProgress,
     ) -> Result<bool, SyncError> {
-        self.get_audio(part_id, dest_path).await
+        Err(SyncError::Transport("audio get not supported".into()))
     }
 }
 
@@ -379,43 +374,6 @@ impl SyncTransport for HttpTransport {
             .map_err(map_send_error)?
             .error_for_status()?;
         Ok(())
-    }
-
-    async fn get_audio(
-        &self,
-        part_id: &str,
-        dest_path: &std::path::Path,
-    ) -> Result<bool, SyncError> {
-        use futures_util::StreamExt;
-        use tokio::io::AsyncWriteExt;
-
-        let resp = self
-            .client
-            .get(format!("{}/audio/part/{}", self.base_url, part_id))
-            .bearer_auth(self.bearer())
-            .send()
-            .await
-            .map_err(map_send_error)?;
-        // Row present but blob not yet uploaded on the source device → not-yet-available.
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
-        let resp = check_auth(resp)?; // 401 → refreshable; other non-2xx → error_for_status
-
-        let mut file = tokio::fs::File::create(dest_path)
-            .await
-            .map_err(|e| SyncError::Transport(format!("create audio cache file: {e}")))?;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?; // reqwest::Error → SyncError::Http
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| SyncError::Transport(format!("write audio cache file: {e}")))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| SyncError::Transport(format!("flush audio cache file: {e}")))?;
-        Ok(true)
     }
 
     async fn get_audio_streaming(
@@ -728,27 +686,6 @@ impl SyncTransport for MockRelay {
         Ok(())
     }
 
-    async fn get_audio(
-        &self,
-        part_id: &str,
-        dest_path: &std::path::Path,
-    ) -> Result<bool, SyncError> {
-        let bytes = {
-            let g = self.inner.lock().unwrap();
-            match g
-                .audio_mappings
-                .get(part_id)
-                .and_then(|h| g.audio_present.get(h))
-            {
-                Some(b) => b.clone(),
-                None => return Ok(false), // mapping unknown or object not yet uploaded
-            }
-        };
-        std::fs::write(dest_path, &bytes)
-            .map_err(|e| SyncError::Transport(format!("mock get write: {e}")))?;
-        Ok(true)
-    }
-
     async fn get_audio_streaming(
         &self,
         part_id: &str,
@@ -813,6 +750,45 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    /// A tiny raw HTTP responder (no extra deps, no live relay): serves `responses` in order,
+    /// ONE complete canned response per accepted connection. Every canned response carries
+    /// `connection: close`, so reqwest opens a fresh connection per request — hence one
+    /// accept per element. Each accept drains the request until end-of-headers so the
+    /// client's write completes before we reply+close. Returns the bound address and the
+    /// responder's `JoinHandle` so the caller keeps its `server.join().unwrap()` (a panic in
+    /// the responder thread must still fail the test).
+    fn canned_server(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        (addr, handle)
+    }
+
+    /// One canned status-only response (empty body), the shape both push classifier tests serve.
+    fn status_only(status_line: &str) -> String {
+        format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
     #[test]
     fn classify_status_isolates_401() {
         // The pure classifier is the load-bearing distinction (Bug A): only 401 is the
@@ -834,32 +810,10 @@ mod tests {
     /// tiny raw HTTP responder (no extra deps) serves the two canned statuses.
     #[tokio::test(flavor = "current_thread")]
     async fn push_distinguishes_401_from_other_errors() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for status_line in ["401 Unauthorized", "500 Internal Server Error"] {
-                let (mut sock, _) = listener.accept().unwrap();
-                // Drain the request until end-of-headers so the client's write completes
-                // before we reply+close (the body here is a tiny empty PushRequest).
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                loop {
-                    let n = sock.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let resp = format!(
-                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                );
-                let _ = sock.write_all(resp.as_bytes());
-                let _ = sock.flush();
-            }
-        });
+        let (addr, server) = canned_server(vec![
+            status_only("401 Unauthorized"),
+            status_only("500 Internal Server Error"),
+        ]);
 
         let t = HttpTransport::new(format!("http://{addr}"), "access-token");
         let e401 = t.push(PushRequest::default()).await.unwrap_err();
@@ -887,30 +841,10 @@ mod tests {
     /// two canned statuses over a tiny raw HTTP responder (no live Postgres, no extra deps).
     #[tokio::test(flavor = "current_thread")]
     async fn push_classifies_409_as_conflict() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for status_line in ["409 Conflict", "500 Internal Server Error"] {
-                let (mut sock, _) = listener.accept().unwrap();
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                loop {
-                    let n = sock.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let resp = format!(
-                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                );
-                let _ = sock.write_all(resp.as_bytes());
-                let _ = sock.flush();
-            }
-        });
+        let (addr, server) = canned_server(vec![
+            status_only("409 Conflict"),
+            status_only("500 Internal Server Error"),
+        ]);
 
         let t = HttpTransport::new(format!("http://{addr}"), "access-token");
         let e409 = t.push(PushRequest::default()).await.unwrap_err();
@@ -967,30 +901,13 @@ mod tests {
     /// A tiny raw HTTP responder serves two events (no extra deps, no live relay).
     #[tokio::test(flavor = "current_thread")]
     async fn stream_wakeups_parses_events_until_close() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 1024];
-            loop {
-                let n = sock.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            // Interleave a keep-alive comment + the event field lines; only the two `data:`
-            // seqs must surface. Close the socket after → clean stream end.
-            let body =
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
-                : keep-alive\n\nevent: wakeup\ndata: 1\n\nevent: wakeup\ndata: 2\n\n";
-            let _ = sock.write_all(body.as_bytes());
-            let _ = sock.flush();
-        });
+        // Interleave a keep-alive comment + the event field lines; only the two `data:`
+        // seqs must surface. Close the socket after → clean stream end.
+        let (addr, server) = canned_server(vec![
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+             : keep-alive\n\nevent: wakeup\ndata: 1\n\nevent: wakeup\ndata: 2\n\n"
+                .to_string(),
+        ]);
 
         let client = reqwest::Client::new();
         let mut wakes = Vec::new();
@@ -1008,27 +925,7 @@ mod tests {
     /// self-refresh here.
     #[tokio::test(flavor = "current_thread")]
     async fn stream_wakeups_maps_401_to_unauthorized() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 1024];
-            loop {
-                let n = sock.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let resp =
-                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-            let _ = sock.write_all(resp.as_bytes());
-            let _ = sock.flush();
-        });
+        let (addr, server) = canned_server(vec![status_only("401 Unauthorized")]);
 
         let client = reqwest::Client::new();
         let err = stream_wakeups(&client, &format!("http://{addr}"), "stale", |_| {})

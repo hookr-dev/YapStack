@@ -11,6 +11,8 @@
 //!
 //! Presigned URLs are BEARER CAPABILITIES: callers must never log them.
 
+use std::sync::OnceLock;
+
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +30,31 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 #[must_use]
 pub fn object_key(workspace_id: uuid::Uuid, ciphertext_sha256_hex: &str) -> String {
     format!("tenants/{workspace_id}/blobs/{ciphertext_sha256_hex}")
+}
+
+/// Build the object key for a tenant's R2 snapshot ciphertext:
+/// `tenants/{workspace_id}/snapshot/{ciphertext_sha256_hex}`. Deliberately its own named
+/// function rather than a `kind` argument on [`object_key`]: these keys are the addresses a
+/// presigned DELETE is issued against, so the segment must not be typo-able at a call site.
+#[must_use]
+pub fn snapshot_object_key(workspace_id: uuid::Uuid, ciphertext_sha256_hex: &str) -> String {
+    format!("tenants/{workspace_id}/snapshot/{ciphertext_sha256_hex}")
+}
+
+/// Parse a client-supplied ciphertext SHA-256 into `(bytes, lowercase_hex)`. Shared by the
+/// audio and snapshot presign paths — both address blobs by their ciphertext hash.
+///
+/// # Errors
+/// [`AppError::BadRequest`] if the input is not 64 hex characters.
+pub(crate) fn parse_sha256(s: &str) -> Result<(Vec<u8>, String), crate::error::AppError> {
+    use crate::error::AppError;
+    let lower = s.to_ascii_lowercase();
+    if lower.len() != 64 || !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest("sha256: expected 64 hex chars".into()));
+    }
+    let bytes =
+        hex::decode(&lower).map_err(|_| AppError::BadRequest("sha256: invalid hex".into()))?;
+    Ok((bytes, lower))
 }
 
 /// RFC 3986 percent-encoding. When `encode_slash` is false, `/` is preserved (path
@@ -154,6 +181,43 @@ pub fn presign(
     PresignedUrl { url }
 }
 
+/// The one outbound HTTP client, built lazily and shared: a per-call `Client` rebuilds the
+/// connection pool and TLS config on every presign dedup hit and every GC'd blob. The build
+/// error is STORED rather than panicked on — the GC sweep runs in a background task, so a
+/// failure must surface as [`AppError::Unavailable`] on the call, never as an abort.
+static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn storage_client() -> Result<&'static reqwest::Client, crate::error::AppError> {
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| crate::error::AppError::Unavailable(format!("storage client: {e}")))
+}
+
+/// Presign `method` for `key`, issue it, and return only the status code. The response body
+/// is never read — no blob bytes cross the relay. The presigned URL is a bearer capability:
+/// it must never be logged, including in the error paths below.
+async fn signed_request(
+    cfg: &StorageConfig,
+    method: reqwest::Method,
+    key: &str,
+) -> Result<u16, crate::error::AppError> {
+    use crate::error::AppError;
+    let signed = presign(cfg, method.as_str(), key, None, chrono::Utc::now());
+    let resp = storage_client()?
+        .request(method.clone(), &signed.url)
+        .send()
+        .await
+        .map_err(|e| AppError::Unavailable(format!("storage {method} failed: {e}")))?;
+    Ok(resp.status().as_u16())
+}
+
 /// Metadata-only existence check against object storage (audio D8). Presigns a `HEAD` and
 /// issues it: `2xx` → present, `404` → absent. It reads ONLY existence/metadata — never
 /// blob bytes, never plaintext. A short connect/read timeout keeps a slow or unreachable
@@ -165,19 +229,7 @@ pub fn presign(
 /// fails, or the backend returns an unexpected status (neither 2xx nor 404).
 pub async fn object_exists(cfg: &StorageConfig, key: &str) -> Result<bool, crate::error::AppError> {
     use crate::error::AppError;
-    let signed = presign(cfg, "HEAD", key, None, chrono::Utc::now());
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AppError::Unavailable(format!("storage client: {e}")))?;
-    let resp = client
-        .head(&signed.url)
-        .send()
-        .await
-        .map_err(|e| AppError::Unavailable(format!("storage HEAD failed: {e}")))?;
-    let code = resp.status().as_u16();
-    match code {
+    match signed_request(cfg, reqwest::Method::HEAD, key).await? {
         200..=299 => Ok(true),
         404 => Ok(false),
         other => Err(AppError::Unavailable(format!(
@@ -203,19 +255,7 @@ pub async fn object_exists(cfg: &StorageConfig, key: &str) -> Result<bool, crate
 /// and retries on the next sweep rather than dropping a still-referenced blob).
 pub async fn delete_object(cfg: &StorageConfig, key: &str) -> Result<(), crate::error::AppError> {
     use crate::error::AppError;
-    let signed = presign(cfg, "DELETE", key, None, chrono::Utc::now());
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AppError::Unavailable(format!("storage client: {e}")))?;
-    let resp = client
-        .delete(&signed.url)
-        .send()
-        .await
-        .map_err(|e| AppError::Unavailable(format!("storage DELETE failed: {e}")))?;
-    let code = resp.status().as_u16();
-    match code {
+    match signed_request(cfg, reqwest::Method::DELETE, key).await? {
         200..=299 | 404 => Ok(()),
         other => Err(AppError::Unavailable(format!(
             "storage DELETE returned unexpected status {other}"
