@@ -168,5 +168,5 @@ Run through this before declaring a task done.
 
 - **macOS Apple Silicon** is the primary target. Code must work there.
 - **Intel Mac** is best-effort: don't break it, don't optimize for it.
-- **Windows** is unsupported officially; Parakeet GPU is WebGPU/Dawn (shipping on macOS, planned for Windows behind `YAPSTACK_PARAKEET_ACCEL=webgpu` per ADR 0004) and Whisper stays CPU on Windows. Don't delete platform-specific branches without an ADR.
+- **Windows** is unsupported officially; Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Whisper stays CPU on Windows. Don't delete platform-specific branches without an ADR.
 - **Tauri secret signing**: the `tauri.conf.json` `pubkey` is the **public** half of an Ed25519 minisign keypair. The private key lives in GitHub Actions Secrets. Do not regenerate without user direction — rotation invalidates auto-update for every existing install.

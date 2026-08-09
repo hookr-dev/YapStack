@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Paginated logs.** The Logs panel loads more recent entries on open and adds a "Load older entries" control to page further back through the in-memory buffer.
 
 ### Changed
+- **Parakeet uses the GPU by default on Windows.** WebGPU acceleration was opt-in behind `YAPSTACK_PARAKEET_ACCEL=webgpu` while it awaited hardware validation; that validation passed, so Windows now runs Parakeet on the GPU automatically. If the GPU can't initialize, transcription falls back to CPU and says so in the logs instead of silently pretending it used the GPU. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. Whisper remains CPU on Windows (#81).
 - **Advanced transcription settings are capability-gated.** Prompt Context / Prompt Decay now appear only for engines that support an initial prompt (hidden for Parakeet); persisted values are kept when the rows are hidden.
 - **Folder dialog reframed around AI context.** The folder description is now the prominent "Context for AI" field, and the icon grid collapses into an expandable picker. The transcript bulk-selection bar's copy is simplified to a single attributed-markdown copy.
 

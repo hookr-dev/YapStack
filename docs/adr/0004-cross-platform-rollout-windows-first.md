@@ -86,6 +86,15 @@ unproven "COM cleanup crashes on CI" hypothesis.
   flipping it on by default is itself gated on a golden-transcript + RTFx
   smoke-test on real NVIDIA/AMD/Intel Windows GPUs; until then it ships CPU-default
   behind `YAPSTACK_PARAKEET_ACCEL=webgpu`.
+
+  > **Update — Gate C passed (2026-07-05).** The Windows canary validated WebGPU as
+  > both correct and clearly faster than CPU, so non-macOS `Auto` now attempts
+  > WebGPU (`engines/parakeet.rs`, `auto_exec_config`). Registration is **strict**
+  > (`error_on_failure`): an EP-init failure surfaces through `load_model`'s
+  > explicit CPU fallback — logged as `live_accel_fallback` with an honest
+  > `accel` label — rather than `ort` silently falling back to CPU while the
+  > telemetry still claims `webgpu`. `YAPSTACK_PARAKEET_ACCEL=cpu` is the escape
+  > hatch. The gate above is satisfied, not waived.
 - **Linux stays honestly labeled as unbuilt.** The documented state and gap
   list exist so the deferral is a recorded decision, not an oversight; the plan
   doc is the pickup point when Linux is scheduled. When Linux ships, a follow-up

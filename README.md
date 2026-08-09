@@ -60,7 +60,7 @@ Building from source: see [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Short ve
 |---|---|---|
 | macOS (Apple Silicon) | ✅ Officially supported | Primary target. Metal Whisper, WebGPU + int8 Parakeet. |
 | macOS (Intel) | ⚠️ Best-effort | Builds, reduced performance, limited testing. |
-| Windows | 🧪 Experimental | CI publishes experimental installers with each release. Parakeet runs CPU int8 by default (WebGPU opt-in via `YAPSTACK_PARAKEET_ACCEL=webgpu`); Whisper is CPU. See [ADR 0004](docs/adr/0004-cross-platform-rollout-windows-first.md). |
+| Windows | 🧪 Experimental | CI publishes experimental installers with each release. Parakeet uses WebGPU with the int8 model, falling back to CPU if the GPU can't initialize (force CPU with `YAPSTACK_PARAKEET_ACCEL=cpu`); Whisper is CPU. See [ADR 0004](docs/adr/0004-cross-platform-rollout-windows-first.md). |
 | Linux | ❌ Not yet | No current build target. |
 
 ## Sync & self-hosting (optional)
