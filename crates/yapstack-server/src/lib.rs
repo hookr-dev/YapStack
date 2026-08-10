@@ -33,7 +33,7 @@ pub mod sync;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
-use axum::Router;
+use axum::{Extension, Router};
 use yapstack_common::sync::MAX_PUSH_BYTES;
 
 pub use config::Config;
@@ -64,7 +64,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/recover", post(auth::recover))
         // --- device authorization (§7.3/§7.4/§7.5) ---
         .route("/devices", get(devices::list))
-        .route("/devices/roster", put(devices::put_roster))
+        .route(
+            "/devices/roster",
+            get(devices::get_roster).put(devices::put_roster),
+        )
         // --- changeset relay (§7) ---
         // The push route raises the default 2 MiB body limit to admit a maximal legal
         // batch (base64 of MAX_PUSH_BYTES + envelope) so the handler's own byte cap is
@@ -102,5 +105,11 @@ pub fn build_router(state: AppState) -> Router {
     // the ones that do exit long before the post-boot initial delay elapses.
     gc::spawn(&state);
 
-    router.with_state(state)
+    // Share the trusted-proxy allowlist into request extensions so the generic `ClientIp`
+    // extractor can read it without a state bound. `ConnectInfo<SocketAddr>` (the wire
+    // peer) is supplied by `main`'s `into_make_service_with_connect_info`.
+    let trusted_proxies = state.trusted_proxies.clone();
+    router
+        .layer(Extension(trusted_proxies))
+        .with_state(state)
 }

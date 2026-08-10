@@ -54,25 +54,39 @@ URL (behind TLS in production, see below).
 
 Every tenant-scoped table is `ENABLE` + `FORCE ROW LEVEL SECURITY` with a fail-closed
 predicate keyed on a transaction-local `app.tenant_id` guard (see
-`crates/yapstack-server/migrations/0001_initial.sql`). Because `FORCE` RLS applies **even
-to the table owner**, tenant isolation holds regardless of which role the server
-connects as.
+`crates/yapstack-server/migrations/0001_initial.sql`). `FORCE` RLS applies even to the
+table owner **but not to a Postgres superuser** — a superuser (or any role with the
+`BYPASSRLS` attribute) bypasses row security entirely. So tenant isolation does **not**
+hold "regardless of role": **it holds only when the serving connection is a non-owner,
+non-superuser role.** If the server connects as a superuser, the RLS policies are inert
+and the only isolation left is the hand-written `workspace_id = $tenant` predicates in
+the queries. That is why the serving connection must be `yapstack_app`.
 
-The migrations also create a **non-owner** role, `yapstack_app`, and grant it only
-`SELECT/INSERT/UPDATE/DELETE` on the tenant tables. The DB init script
-(`deploy/postgres-init/00-yapstack-roles.sh`) creates it with `LOGIN` + the
-`YAPSTACK_APP_PASSWORD` password so you can run the **serving** connection as this
-non-owner for defense-in-depth (it can never own or bypass RLS).
+The migrations create that **non-owner** role, `yapstack_app`, and grant it only
+`SELECT/INSERT/UPDATE/DELETE` on the tenant tables (plus `EXECUTE` on the SECURITY
+DEFINER `yapstack_lookup_login` used by the pre-tenant login/recover paths). The DB init
+script (`deploy/postgres-init/00-yapstack-roles.sh`) creates it with `LOGIN` + the
+`YAPSTACK_APP_PASSWORD` password so the **serving** connection runs as this non-owner —
+it can never own tables or bypass RLS.
 
-- **Default compose:** the server connects as the DB **owner** (`POSTGRES_USER`) so its
-  in-process migration step can run. `FORCE` RLS still isolates every tenant. This is the
-  zero-config path.
-- **Hardened split (recommended for multi-tenant hosting):**
-  1. Run migrations once as the owner (a fresh `docker compose up` does this).
-  2. Point the server's `DATABASE_URL` at the non-owner role:
-     `postgres://yapstack_app:${YAPSTACK_APP_PASSWORD}@postgres:5432/${POSTGRES_DB}`.
-  3. Apply future schema upgrades as the owner (the non-owner cannot run DDL), then
-     restart the server.
+Migrations are the **only** step that needs `CREATE` on schema `public`, so they run as
+the owner. The serving role never runs DDL: `db::migrate` reads the applied-migration
+watermark and **skips** the migrator when the schema is already current, so booting as
+`yapstack_app` needs no schema privileges.
+
+- **Default compose:** a one-shot `migrate` service applies the schema as the DB
+  **owner** (`POSTGRES_USER`), then the long-running `server` connects as the non-owner
+  `yapstack_app` role. This is the zero-config path **and** the hardened posture — no
+  extra steps.
+- **Managed Postgres caveat:** the pre-tenant login lookup runs through a SECURITY
+  DEFINER function owned by the migration owner. This bypasses RLS correctly when that
+  owner is a superuser (the compose default) or any `BYPASSRLS` role. On a managed
+  provider where even the migration owner is a plain non-superuser table owner subject to
+  `FORCE` RLS, grant that owner `BYPASSRLS` (or run migrations as a role that has it) so
+  the login lookup can bridge the pre-tenant read.
+- **Future schema upgrades:** re-run the one-shot migrate step as the owner
+  (`docker compose run --rm migrate`, or a fresh `docker compose up` which runs it
+  automatically), then restart the server.
 
 ## Reverse proxy (TLS)
 
@@ -94,6 +108,20 @@ Then set `MINIO_PUBLIC_ENDPOINT=https://storage.example.com` in `.env` so presig
 audio/snapshot URLs point clients at the public MinIO hostname, and restart. Keep
 request-body limits generous on the `/audio/*` and `/snapshot/*` paths — clients upload
 **directly to MinIO**, but the presign POSTs are small.
+
+**Rate limiting behind the proxy.** The relay throttles `login`, `signup`, and `push`
+per client IP. Behind TLS termination it only sees the proxy's address, so it trusts the
+`X-Forwarded-For` header **only** when the connecting peer is a configured trusted proxy
+— otherwise it fails **closed** (ignores XFF and keys on the peer, so a spoofed header
+can't rotate into fresh buckets). Set `YAPSTACK_TRUSTED_PROXIES` in `.env` to the source
+IP the relay sees your proxy connect from (with the compose stack, that's the Docker
+bridge gateway, typically `172.x.0.1` — `docker network inspect` shows it). Leave it
+unset only if the relay is exposed directly with no proxy in front.
+
+**Optional signup gate.** To keep a private relay from accepting open sign-ups, set
+`YAPSTACK_SIGNUP_INVITE` to a shared secret. When set, `POST /auth/signup` requires a
+matching `X-YapStack-Invite` header (constant-time compared); unset leaves signup open
+(the default). Login, refresh, and recovery are unaffected.
 
 Notes on scale: SSE live-push (`GET /sync/stream`) is best-effort; **pull is the source
 of truth**. Running more than one app server requires a `LISTEN/NOTIFY` (or Redis) bus

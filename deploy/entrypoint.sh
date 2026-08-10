@@ -26,6 +26,26 @@ toml_escape() {
     printf 'database_url = "%s"\n' "$(toml_escape "$DATABASE_URL")"
     printf 'jwt_secret = "%s"\n' "$(toml_escape "$JWT_SECRET")"
     printf 'server_pepper = "%s"\n' "$(toml_escape "$SERVER_PEPPER")"
+
+    # Trusted reverse-proxy IPs (comma-separated). X-Forwarded-For is honored ONLY when
+    # the immediate wire peer is one of these; unset => fail-closed (XFF ignored, the
+    # connecting peer is the rate-limit key). Set to the IP the relay sees Caddy connect
+    # FROM so per-client rate limits work behind the proxy (docs/self-hosting.md).
+    if [ -n "${YAPSTACK_TRUSTED_PROXIES:-}" ]; then
+        printf 'trusted_proxies = ['
+        _tp_sep=''
+        # POSIX word-split on commas.
+        _tp_ifs="$IFS"; IFS=','
+        for _tp in $YAPSTACK_TRUSTED_PROXIES; do
+            _tp="$(printf '%s' "$_tp" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$_tp" ] && continue
+            printf '%s"%s"' "$_tp_sep" "$(toml_escape "$_tp")"
+            _tp_sep=', '
+        done
+        IFS="$_tp_ifs"
+        printf ']\n'
+    fi
+
     printf '\n[sync]\n'
     printf 'protocol_version = 1\n'
     printf 'min_client_version = "1.0.0"\n'

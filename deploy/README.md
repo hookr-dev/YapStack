@@ -74,6 +74,8 @@ deliberately **no `[limits]` section and no admin key**.
 | `YAPSTACK_GC_ENABLED` | `true` | Audio-blob GC master switch (`1`/`true`/`on` vs `0`/`false`/`off`). |
 | `YAPSTACK_GC_INTERVAL_SECS` | `86400` | Seconds between GC sweeps (one also runs shortly after boot). |
 | `YAPSTACK_GC_GRACE_SECS` | `604800` | How long a blob must be unreferenced before GC may delete it. |
+| `YAPSTACK_TRUSTED_PROXIES` | *(empty)* | Comma-separated reverse-proxy IPs. `X-Forwarded-For` is honored only when the connecting peer is listed; empty = fail-closed (XFF ignored, the peer is the rate-limit key). Set to the IP the relay sees your proxy connect from so per-client login/signup/push limits work behind TLS. |
+| `YAPSTACK_SIGNUP_INVITE` | *(empty)* | Optional signup gate. Set = `POST /auth/signup` requires a matching `X-YapStack-Invite` header; empty = open. |
 | `JWT_SECRET` | *required* | Signs session tokens. `openssl rand -hex 32`. |
 | `SERVER_PEPPER` | *required* | Auth-verifier pepper. `openssl rand -hex 32`. |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | *required* | Postgres owner credentials + database name. |

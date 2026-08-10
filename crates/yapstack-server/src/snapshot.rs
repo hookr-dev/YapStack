@@ -55,30 +55,83 @@ pub async fn presign(
 
     let limits = st.limits.limits(auth.tenant_id).await;
     let help_url = st.config.help_url();
+    let generation = i64::try_from(req.generation).unwrap_or(i64::MAX);
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
 
-    // Idempotent: this exact generation+hash was already recorded.
+    // A row for this generation may already exist.
     let existing: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT ciphertext_sha256 FROM snapshots \
          WHERE workspace_id = $1 AND generation = $2",
     )
     .bind(auth.tenant_id)
-    .bind(i64::try_from(req.generation).unwrap_or(i64::MAX))
+    .bind(generation)
     .fetch_optional(&mut *tx)
     .await?;
+
     if let Some((existing_hash,)) = existing {
+        // The row's bytes were metered at first presign, so no path below re-meters
+        // (D8: mirror `audio::presign`). Release the read tx before the network HEAD.
+        tx.commit().await?;
+
+        // HEAD object storage to tell a genuinely-published snapshot apart from a row whose
+        // direct PUT died. Uncertainty (a HEAD error) errs toward absent → re-upload, never
+        // a phantom `done`.
+        let existing_key =
+            storage::snapshot_object_key(auth.tenant_id, &hex::encode(&existing_hash));
+        let existing_present = storage::object_exists(cfg, &existing_key)
+            .await
+            .unwrap_or_default();
+
         if existing_hash == hash {
-            tx.commit().await?;
+            if existing_present {
+                // Idempotent: the exact generation+hash is already published.
+                return Ok(Json(SnapshotPresignResponse {
+                    already_exists: true,
+                    upload_url: None,
+                    object_key: key,
+                }));
+            }
+            // Row committed but the PUT died: hand back a fresh upload_url (no re-meter).
+            let signed = storage::presign(cfg, "PUT", &key, Some(req.size), chrono::Utc::now());
             return Ok(Json(SnapshotPresignResponse {
-                already_exists: true,
-                upload_url: None,
+                already_exists: false,
+                upload_url: Some(signed.url),
                 object_key: key,
             }));
         }
-        return Err(AppError::Conflict(
-            "snapshot generation already published with a different hash".into(),
-        ));
+
+        // Hash CHANGE for the same generation.
+        if existing_present {
+            // A genuinely-published snapshot already occupies this generation.
+            return Err(AppError::Conflict(
+                "snapshot generation already published with a different hash".into(),
+            ));
+        }
+        // Old object absent (dead PUT + fresh-key reseal retry, crypto.rs:53-62): overwrite
+        // the row with the new hash/size so the seed can finish publishing this generation.
+        // No re-meter — the bytes were reserved at first presign.
+        let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+        sqlx::query(
+            "UPDATE snapshots \
+             SET ciphertext_sha256 = $3, size_bytes = $4, baseline_seq = $5 \
+             WHERE workspace_id = $1 AND generation = $2",
+        )
+        .bind(auth.tenant_id)
+        .bind(generation)
+        .bind(&hash)
+        .bind(i64::try_from(req.size).unwrap_or(i64::MAX))
+        .bind(req.baseline_seq)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let signed = storage::presign(cfg, "PUT", &key, Some(req.size), chrono::Utc::now());
+        return Ok(Json(SnapshotPresignResponse {
+            already_exists: false,
+            upload_url: Some(signed.url),
+            object_key: key,
+        }));
     }
 
     // Record the new snapshot generation, then meter its bytes at the choke point. If
@@ -89,7 +142,7 @@ pub async fn presign(
          VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(auth.tenant_id)
-    .bind(i64::try_from(req.generation).unwrap_or(i64::MAX))
+    .bind(generation)
     .bind(&hash)
     .bind(i64::try_from(req.size).unwrap_or(i64::MAX))
     .bind(req.baseline_seq)
@@ -145,6 +198,20 @@ pub async fn head(
         }));
     };
     let key = storage::snapshot_object_key(auth.tenant_id, &hex::encode(hash));
+
+    // Existence-check before advertising present:true (D8, mirror `audio`). A row whose
+    // direct PUT died would otherwise hand a joining device a download_url that 404s,
+    // failing bootstrap hard; report present:false so the client degrades to changeset
+    // replay. Uncertainty (a HEAD error) errs toward absent for the same reason.
+    if !storage::object_exists(cfg, &key).await.unwrap_or_default() {
+        return Ok(Json(SnapshotHeadResponse {
+            present: false,
+            generation: 0,
+            baseline_seq: 0,
+            download_url: None,
+        }));
+    }
+
     let signed = storage::presign(cfg, "GET", &key, None, chrono::Utc::now());
     Ok(Json(SnapshotHeadResponse {
         present: true,

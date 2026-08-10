@@ -658,3 +658,323 @@ async fn pending_caller_put_roster_forbidden_active_accepted() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// =====================================================================================
+// PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
+//   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"
+//   #2  "Signed roster membership is authored from the relay's unverified device index"
+// These are INVESTIGATOR proving tests — do NOT ship as the fix. They pin the current
+// buggy mechanism against a live relay so the remediation has a red/green harness.
+// =====================================================================================
+
+/// Enroll a NEW device as PENDING via login/finish; return (client_id, access_token).
+/// Faithful to the client bootstrap: a fresh device presents its own client_id +
+/// Ed25519 pub and is enrolled pending (not auto-promoted).
+async fn enroll_pending(app: &axum::Router, email: &str, auth_key: &str) -> (uuid::Uuid, String) {
+    let client_id = uuid::Uuid::new_v4();
+    let access = login_finish_as(app, email, auth_key, client_id).await.0;
+    (client_id, access)
+}
+
+/// login/finish for an EXPLICIT client_id. Enrolls it pending on first call; on a later
+/// call for an already-active device it is a no-op promotion (ON CONFLICT DO NOTHING)
+/// that still returns fresh tokens + the served roster — the ONLY way a client
+/// re-anchors its counter cache (`verify_and_inspect_roster` reads the served counter).
+/// Returns (access_token, served_roster_counter).
+async fn login_finish_as(
+    app: &axum::Router,
+    email: &str,
+    auth_key: &str,
+    client_id: uuid::Uuid,
+) -> (String, i64) {
+    let pub_b64 = B64.encode([0x07u8; 32]);
+    let resp = post(
+        app,
+        "/auth/login/finish",
+        json!({
+            "email": email,
+            "auth_key": auth_key,
+            "client_id": client_id,
+            "ed25519_pub": pub_b64,
+            "label": "device"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    // The served roster's counter is the value the client would re-anchor its cache to.
+    let counter = body["device_list"]["counter"].as_i64().unwrap_or(0);
+    (access, counter)
+}
+
+/// FINDING #1 — the cached-counter approval deadlock, end to end against a live relay.
+///
+/// This test models the client's `sync_approve_device` counter algorithm EXACTLY
+/// (apps/desktop/src-tauri/src/sync.rs:5550 `new_counter = session.roster_counter + 1`,
+/// write-back only on success at :5579; the cache is re-anchored ONLY by
+/// signup/login/recover/successful-approve — never by `sync_status`/`GET /devices`,
+/// which carry no counter). A device whose cache lags by one — a perfectly ordinary
+/// state the moment ANOTHER active device performs an approval — computes `stale + 1`,
+/// which equals the stored counter, and `put_roster` returns 409. The write-back never
+/// runs, so the cache stays stale and EVERY retry sends the same value: a permanent lock.
+///
+/// NOTE ON RED/GREEN: the 409 here is the relay behaving CORRECTLY (anti-rollback is by
+/// design, pinned by `roster_counter_anti_rollback_rejects_stale_or_equal`). The defect
+/// is client-side (stale cache + no re-anchor). So this test DEMONSTRATES the lockout
+/// mechanism and STAYS GREEN; the genuinely-red gate for the fix is the companion test
+/// `finding1_no_get_roster_route_to_reanchor_counter` below.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn finding1_cached_counter_permanently_409_locks_lagging_approver() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let vault_key = [0x33u8; 32];
+
+    // D1 signs up: server counter = 0, D1's cached counter = 0.
+    let d1 = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, d1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let d1_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut d1_cache: i64 = 0;
+
+    // D1 approves D2 -> server counter 1. D1 write-back advances its cache to 1.
+    // D2 enrolled pending at counter 0 (its login cached 0, before this approval).
+    let (d2, _d2_enroll_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, d1_cache + 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &d1_access,
+        json!({ "device_list": roster, "signature": sig, "counter": d1_cache + 1,
+                "vault_key_epoch": 0, "active_devices": [d1, d2] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    d1_cache = body_json(resp).await["counter"].as_i64().unwrap(); // -> 1
+
+    // D2 is now ACTIVE. To become a working approver it re-anchors its counter cache the
+    // only way a client can — a full login (verify_and_inspect_roster reads the served
+    // roster's counter). Same client_id d2, now active; the login returns counter = 1.
+    // This IS the sign-out/sign-in escape hatch the finding names (and the one that wipes
+    // the TOFU baselines in the sibling crypto finding).
+    let (d2_access, d2_served_counter) = login_finish_as(&app, &email, &auth_key, d2).await;
+    let mut d2_cache: i64 = d2_served_counter;
+    assert_eq!(d2_cache, 1, "D2 re-anchored to the current counter via login");
+
+    // D2 approves D3 -> server counter 2. D1's cache is STILL 1 (nothing told it).
+    let (d3, _d3_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, d2_cache + 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &d2_access,
+        json!({ "device_list": roster, "signature": sig, "counter": d2_cache + 1,
+                "vault_key_epoch": 0, "active_devices": [d2, d3] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    d2_cache = body_json(resp).await["counter"].as_i64().unwrap(); // -> 2
+    assert_eq!(d2_cache, 2);
+
+    // Now D1 tries to approve D4 with its stale cache (1): it sends counter = 1 + 1 = 2,
+    // which is NOT strictly greater than the stored 2 -> 409.
+    let (d4, _d4_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, d1_cache + 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &d1_access,
+        json!({ "device_list": roster, "signature": sig, "counter": d1_cache + 1,
+                "vault_key_epoch": 0, "active_devices": [d1, d4] }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "lagging approver sending stale+1 is rejected by anti-rollback"
+    );
+    // The client write-back (sync.rs:5579) only runs on a 2xx; the cache stays 1.
+    // d1_cache is UNCHANGED here, modelling that the stale value is never advanced.
+    assert_eq!(d1_cache, 1, "stale cache is never advanced after a 409");
+
+    // Retry: the client recomputes the SAME stale+1 (there is no 409 handling in
+    // sync.rs — grep 409/Conflict yields nothing) -> 409 again. Permanent lock.
+    let (roster, sig) = signed_roster(&vault_key, d1_cache + 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &d1_access,
+        json!({ "device_list": roster, "signature": sig, "counter": d1_cache + 1,
+                "vault_key_epoch": 0, "active_devices": [d1, d4] }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the retry re-sends the same stale counter and is locked out permanently"
+    );
+}
+
+/// FINDING #1 (RED GATE) — the relay exposes NO route to re-anchor the roster counter,
+/// which is why the lockout above is permanent. The finding's FIX is to "expose the
+/// current roster (counter + device_list + signature) on a GET" so the client can
+/// re-anchor before signing. This test asserts that endpoint exists and returns the
+/// current counter. It FAILS on the reviewed tree (no such route: `/devices/roster`
+/// has only a PUT handler, lib.rs:67) and PASSES once the re-anchor GET is added.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn finding1_no_get_roster_route_to_reanchor_counter() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let d1 = uuid::Uuid::new_v4();
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, d1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Advance the stored counter to 1 so a re-anchor GET would have something to report.
+    let vault_key = [0x33u8; 32];
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({ "device_list": roster, "signature": sig, "counter": 1,
+                "vault_key_epoch": 0, "active_devices": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The FIX must let a client learn the authoritative counter without a full re-login.
+    let resp = get_auth(&app, "/devices/roster", &access).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a GET /devices/roster re-anchor route must exist (finding #1 fix); \
+         on the reviewed tree there is none, so this is the RED gate"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["counter"].as_i64(),
+        Some(1),
+        "the re-anchor route must report the current authoritative counter"
+    );
+}
+
+/// FINDING #2 — the ONLY membership source `sync_approve_device` consults is
+/// `GET /devices` (sync.rs:5517), and it folds EVERY row whose relay-supplied
+/// `status == "active"` into the vault-signed roster (sync.rs:5536-5548, :5574),
+/// never consulting the previously-verified roster (`verify_and_inspect_roster`,
+/// sync.rs:4069-4102, extracts self-membership ONLY). This test proves the crux:
+/// that `status` field is a RELAY-CONTROLLED, cryptographically-UNBOUND value — a
+/// compromised relay can flip a pending attacker device to "active" with a plain
+/// UPDATE, and `GET /devices` reports it verbatim. An honest approver folding on that
+/// value would therefore sign a membership attestation the vault-key holder never
+/// intended. (§0 threat model: the relay is honest-but-curious, potentially compromised.)
+///
+/// The client-side FOLDING itself is inline in the async command and not unit-reachable,
+/// so this is a STRUCTURAL demonstration of the untrusted input + a code citation; it
+/// stays green (it pins current relay behavior). The fix's red gate belongs on the
+/// client: build the roster from the last VERIFIED roster, using `GET /devices` only to
+/// discover pending candidates.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn finding2_get_devices_status_is_relay_mutable_unsigned_membership_source() {
+    let st = setup().await;
+    let pool = st.pool.clone();
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x22u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+
+    // Owner's active device.
+    let d1 = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, d1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let signup = body_json(resp).await;
+    let d1_access = signup["access_token"].as_str().unwrap().to_string();
+    let tenant: uuid::Uuid = signup["tenant_id"].as_str().unwrap().parse().unwrap();
+
+    // An attacker who holds the password (the §7.5 adversary) enrolls a device -> PENDING.
+    let (attacker, _attacker_access) = enroll_pending(&app, &email, &auth_key).await;
+
+    // Sanity: the relay reports the attacker as pending.
+    let resp = get_auth(&app, "/devices", &d1_access).await;
+    let list = body_json(resp).await;
+    let att = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(attacker.to_string()))
+        .expect("attacker device present")
+        .clone();
+    assert_eq!(att["status"], json!("pending"));
+
+    // COMPROMISED RELAY: flip the attacker's advisory status to "active" with a plain
+    // UPDATE. `devices.status` carries NO signature and NO vault-key binding — it is pure
+    // relay-owned metadata, exactly the value the client trusts as its membership source.
+    let mut tx = yapstack_server::db::begin_tenant_tx(&pool, tenant)
+        .await
+        .unwrap();
+    let rows = sqlx::query(
+        "UPDATE devices SET status = 'active' WHERE workspace_id = $1 AND client_id = $2",
+    )
+    .bind(tenant)
+    .bind(attacker)
+    .execute(&mut *tx)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(rows, 1, "relay flipped one row pending->active with no crypto");
+    tx.commit().await.unwrap();
+
+    // The honest approver's SOLE membership source now reports the attacker as active.
+    // sync_approve_device (sync.rs:5536-5538) includes precisely these rows in the
+    // vault-signed roster + `active_devices`, with no cross-check against the last
+    // verified roster and no human review (the out-of-band fingerprint check covers only
+    // the single `find`-matched pending TARGET, sync.rs:5520-5531).
+    let resp = get_auth(&app, "/devices", &d1_access).await;
+    let list = body_json(resp).await;
+    let att = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(attacker.to_string()))
+        .expect("attacker device present")
+        .clone();
+    assert_eq!(
+        att["status"],
+        json!("active"),
+        "GET /devices — the client's only membership source — reports relay-chosen, \
+         cryptographically-unbound membership; an honest approver folds it into a \
+         vault-signed roster (finding #2)"
+    );
+}

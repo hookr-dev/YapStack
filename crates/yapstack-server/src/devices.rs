@@ -28,7 +28,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use uuid::Uuid;
 use yapstack_common::auth::{
-    DeviceInfo, DevicesResponse, RosterUploadRequest, RosterUploadResponse,
+    DeviceInfo, DevicesResponse, RosterFetchResponse, RosterUploadRequest, RosterUploadResponse,
 };
 
 use crate::db;
@@ -76,6 +76,41 @@ pub async fn list(
         })
         .collect();
     Ok(Json(DevicesResponse { devices }))
+}
+
+/// `GET /devices/roster` — the stored signed roster + its authoritative anti-rollback
+/// watermarks (§7.4/§7.5). Served verbatim and opaquely (the relay holds no vault key and
+/// never reads the roster). Readable by ANY authenticated device in the tenant — including
+/// a still-PENDING device bootstrapping — so a client can re-anchor its `counter` from the
+/// authoritative value before signing a new roster, instead of relying on a stale cached
+/// counter (the approval 409-lock fix). Authz is the validated JWT's `tenant_id` (RLS
+/// scope, never request-supplied); no active-device gate, as a pending device also needs
+/// this to bootstrap. This is a pure READ — it advances nothing.
+pub async fn get_roster(
+    State(st): State<AppState>,
+    auth: AuthTenant,
+) -> Result<Json<RosterFetchResponse>, AppError> {
+    let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+    let row: Option<(serde_json::Value, Vec<u8>, i64, i64)> = sqlx::query_as(
+        "SELECT device_list, signature, counter, vault_key_epoch FROM device_roster \
+         WHERE workspace_id = $1",
+    )
+    .bind(auth.tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    // A roster row always exists for an authenticated tenant (created at signup); its
+    // absence is a corrupt account, not a client-supplied condition.
+    let Some((device_list, signature, counter, vault_key_epoch)) = row else {
+        return Err(AppError::NotFound);
+    };
+    Ok(Json(RosterFetchResponse {
+        device_list,
+        signature: B64.encode(signature),
+        counter,
+        vault_key_epoch,
+    }))
 }
 
 /// `PUT /devices/roster` — upload a re-signed roster with §7.4 anti-rollback.

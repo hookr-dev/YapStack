@@ -8,6 +8,7 @@
 //! never request-supplied.
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -63,8 +64,27 @@ fn gen_salt() -> [u8; 16] {
 /// `POST /auth/signup`
 pub async fn signup(
     State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Json(req): Json<SignupRequest>,
 ) -> Result<Json<TokenResponse>, AppError> {
+    // Per-IP throttle keyed on the trustworthy client IP (nil workspace), applied before
+    // any DB work so a signup flood can't churn the box.
+    if !st.signup_ratelimit.check(Uuid::nil(), &ip) {
+        return Err(AppError::RateLimited);
+    }
+    // Optional invite gate: when `YAPSTACK_SIGNUP_INVITE` is set, require a matching
+    // `X-YapStack-Invite` header (constant-time compare). Unset ⇒ open (default).
+    if let Some(expected) = st.signup_invite.as_deref() {
+        let provided = headers
+            .get("x-yapstack-invite")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !ct_eq(provided.as_bytes(), expected.as_bytes()) {
+            return Err(AppError::Unauthorized);
+        }
+    }
+
     // auth_key is secret key material (§2.3); hold it in memory that zeroizes on drop.
     let auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
     // recovery_auth_key is likewise a second-hash INPUT (§6.2), not a stored secret;
@@ -89,19 +109,17 @@ pub async fn signup(
     let ed_pub = b64_decode("device_list.ed25519_pub", &req.device_list.ed25519_pub)?;
 
     // Server picks a fresh per-account server_salt and stores the SECOND hash (§3.1).
+    // The Argon2id hash runs on the blocking pool under the concurrency semaphore
+    // (see `AppState::server_verifier`); the spent `auth_key` moves in and zeroizes there.
     let server_salt = gen_salt();
-    let verifier = yapstack_crypto::kdf::server_verifier(&auth_key, &server_salt)
-        .map_err(|e| AppError::Internal(format!("verifier: {e}")))?;
+    let verifier = st.server_verifier(auth_key, server_salt.to_vec()).await?;
     // The recovery code authenticates the SAME way (§6.2): an independent per-account
     // salt + second hash of the client-derived recovery auth key. Stored, then discarded
     // — the relay can verify a presented recovery code but never recover it or the code.
     let recovery_salt = gen_salt();
-    let recovery_verifier =
-        yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &recovery_salt)
-            .map_err(|e| AppError::Internal(format!("recovery_verifier: {e}")))?;
-    // Both inputs are now spent; drop them (Zeroizing wipes the bytes, never persisted).
-    drop(auth_key);
-    drop(recovery_auth_key);
+    let recovery_verifier = st
+        .server_verifier(recovery_auth_key, recovery_salt.to_vec())
+        .await?;
 
     let user_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
@@ -229,16 +247,28 @@ struct AuthRow {
 /// `POST /auth/login/finish` — round 2 of §3.2.
 pub async fn login_finish(
     State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<LoginFinishRequest>,
 ) -> Result<Json<LoginFinishResponse>, AppError> {
+    // Per-IP throttle keyed on the trustworthy client IP (nil workspace), applied BEFORE
+    // the user lookup so it is identical for known and unknown emails (no user-existence
+    // oracle) and caps online verifier-guessing.
+    if !st.login_ratelimit.check(Uuid::nil(), &ip) {
+        return Err(AppError::RateLimited);
+    }
+
     // Secret key material (§2.3): zeroize on drop rather than leaving it in a plain Vec.
     let auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
 
+    // Login is PRE-tenant: no app.tenant_id context exists yet, so the FORCE-RLS
+    // `workspace_members` cannot be read directly under the non-owner serving role.
+    // Resolve the (user, workspace) mapping via the SECURITY DEFINER lookup, then read
+    // the non-RLS `users` columns. `yapstack_lookup_login` returns a row set (v1: one
+    // workspace per user), so `fetch_optional` takes the single expected row.
     let row: Option<AuthRow> = sqlx::query_as(
-        "SELECT u.id, m.workspace_id, u.verifier, u.server_salt, u.salt_enc, \
+        "SELECT u.id, l.workspace_id, u.verifier, u.server_salt, u.salt_enc, \
          u.wrapped_vault_key_password \
-         FROM users u JOIN workspace_members m ON m.user_id = u.id \
-         WHERE lower(u.email) = lower($1)",
+         FROM yapstack_lookup_login($1) l JOIN users u ON u.id = l.user_id",
     )
     .bind(&req.email)
     .fetch_optional(&st.pool)
@@ -247,12 +277,11 @@ pub async fn login_finish(
     // Uniform failure for unknown user AND bad verifier (no oracle). We still compute
     // a verifier against a dummy salt on the unknown path to reduce timing skew.
     let Some(row) = row else {
-        let _ = yapstack_crypto::kdf::server_verifier(&auth_key, &gen_salt());
+        let _ = st.server_verifier(auth_key, gen_salt().to_vec()).await;
         return Err(AppError::Unauthorized);
     };
 
-    let computed = yapstack_crypto::kdf::server_verifier(&auth_key, &row.server_salt)
-        .map_err(|e| AppError::Internal(format!("verifier: {e}")))?;
+    let computed = st.server_verifier(auth_key, row.server_salt.clone()).await?;
     if !ct_eq(&computed, &row.verifier) {
         return Err(AppError::Unauthorized);
     }
@@ -350,11 +379,13 @@ pub async fn recover(
     let recovery_auth_key =
         Zeroizing::new(b64_decode("recovery_auth_key", &req.recovery_auth_key)?);
 
+    // Same pre-tenant resolution as login/finish: the SECURITY DEFINER lookup bridges
+    // the FORCE-RLS `workspace_members` before a tenant context exists (row set; v1
+    // single workspace per user), then the non-RLS `users` columns are read.
     let row: Option<RecoverRow> = sqlx::query_as(
-        "SELECT u.id, m.workspace_id, u.recovery_salt, u.recovery_verifier, u.salt_enc, \
+        "SELECT u.id, l.workspace_id, u.recovery_salt, u.recovery_verifier, u.salt_enc, \
          u.wrapped_vault_key_recovery \
-         FROM users u JOIN workspace_members m ON m.user_id = u.id \
-         WHERE lower(u.email) = lower($1)",
+         FROM yapstack_lookup_login($1) l JOIN users u ON u.id = l.user_id",
     )
     .bind(&req.email)
     .fetch_optional(&st.pool)
@@ -363,16 +394,15 @@ pub async fn recover(
     // Uniform failure for unknown user AND bad recovery code (no oracle), computing a
     // dummy hash on every reject path to flatten timing.
     let Some(row) = row else {
-        let _ = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &gen_salt());
+        let _ = st.server_verifier(recovery_auth_key, gen_salt().to_vec()).await;
         return Err(AppError::Unauthorized);
     };
     let (Some(rec_salt), Some(rec_verifier)) = (row.recovery_salt, row.recovery_verifier) else {
-        let _ = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &gen_salt());
+        let _ = st.server_verifier(recovery_auth_key, gen_salt().to_vec()).await;
         return Err(AppError::Unauthorized);
     };
 
-    let computed = yapstack_crypto::kdf::server_verifier(&recovery_auth_key, &rec_salt)
-        .map_err(|e| AppError::Internal(format!("recovery_verifier: {e}")))?;
+    let computed = st.server_verifier(recovery_auth_key, rec_salt).await?;
     if !ct_eq(&computed, &rec_verifier) {
         return Err(AppError::Unauthorized);
     }

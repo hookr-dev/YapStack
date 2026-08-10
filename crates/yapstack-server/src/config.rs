@@ -36,6 +36,12 @@ pub struct Config {
     /// Per-`(workspace_id, ip)` push rate limit (architecture §10). Defaulted.
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    /// IPs of trusted reverse proxies (e.g. the local Caddy/nginx terminating TLS).
+    /// `X-Forwarded-For` is honored ONLY when the immediate wire peer is in this list;
+    /// empty (the default) ⇒ fail-closed (XFF ignored, the connecting peer is the
+    /// rate-limit key). Tunable per deployment.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// Relay blob GC (deletes unreferenced audio objects + rows after a grace period).
     /// Defaulted; env-overridable via [`GcConfig::resolved`].
     #[serde(default)]
@@ -70,18 +76,36 @@ pub struct RateLimitConfig {
     /// Max `POST /sync/push` calls per `(workspace_id, ip)` per rolling minute.
     #[serde(default = "default_push_per_minute")]
     pub push_per_minute: u32,
+    /// Max `POST /auth/login/finish` attempts per client IP per rolling minute. Applied
+    /// identically to unknown emails (no user-existence oracle). Sane default; tunable.
+    #[serde(default = "default_login_per_minute")]
+    pub login_per_minute: u32,
+    /// Max `POST /auth/signup` attempts per client IP per rolling minute. Sane default;
+    /// tunable.
+    #[serde(default = "default_signup_per_minute")]
+    pub signup_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             push_per_minute: default_push_per_minute(),
+            login_per_minute: default_login_per_minute(),
+            signup_per_minute: default_signup_per_minute(),
         }
     }
 }
 
 fn default_push_per_minute() -> u32 {
     120
+}
+
+fn default_login_per_minute() -> u32 {
+    10
+}
+
+fn default_signup_per_minute() -> u32 {
+    5
 }
 
 /// Relay blob GC tunables (hardening item 5). A background sweep deletes audio blobs whose
@@ -248,6 +272,28 @@ impl Config {
         self.limits.is_some()
     }
 
+    /// Parse `trusted_proxies` into `IpAddr`s, silently dropping malformed entries
+    /// (a bad allowlist entry must not weaken the default fail-closed posture).
+    #[must_use]
+    pub fn trusted_proxy_ips(&self) -> Vec<std::net::IpAddr> {
+        self.trusted_proxies
+            .iter()
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+
+    /// The optional signup invite token, read from `YAPSTACK_SIGNUP_INVITE`. When set
+    /// (non-empty), `POST /auth/signup` requires a matching `X-YapStack-Invite` header;
+    /// unset (the default) leaves signup open. Env-configured so operators can gate a
+    /// self-host relay without editing the config file.
+    #[must_use]
+    pub fn signup_invite() -> Option<String> {
+        std::env::var("YAPSTACK_SIGNUP_INVITE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     /// The 32-byte Ed25519 admin public key, parsed from `ed25519:<base64>`. `None`
     /// when `[limits]` is absent (admin API disabled) or the value is malformed (which
     /// also disables the admin API — fail-closed for the admin surface specifically,
@@ -293,6 +339,43 @@ mod tests {
         assert_eq!(cfg.gc.interval_secs, 86_400);
         assert_eq!(cfg.gc.grace_secs, 604_800);
         assert_eq!(cfg.gc.grace().num_days(), 7);
+    }
+
+    #[test]
+    fn ratelimit_defaults_and_trusted_proxies_parse() {
+        let toml = r#"
+            database_url = "postgres://localhost/yapstack"
+            jwt_secret = "s"
+            server_pepper = "p"
+        "#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        // Sane auth throttle defaults (tunable via [ratelimit]).
+        assert_eq!(cfg.ratelimit.login_per_minute, 10);
+        assert_eq!(cfg.ratelimit.signup_per_minute, 5);
+        assert_eq!(cfg.ratelimit.push_per_minute, 120);
+        // Absent trusted_proxies => fail-closed (empty allowlist).
+        assert!(cfg.trusted_proxy_ips().is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_parse_drops_junk() {
+        let toml = r#"
+            database_url = "postgres://localhost/yapstack"
+            jwt_secret = "s"
+            server_pepper = "p"
+            trusted_proxies = ["10.0.0.1", "not-an-ip", "::1"]
+
+            [ratelimit]
+            login_per_minute = 3
+            signup_per_minute = 2
+        "#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let ips = cfg.trusted_proxy_ips();
+        assert_eq!(ips.len(), 2); // junk entry dropped
+        assert!(ips.contains(&"10.0.0.1".parse().unwrap()));
+        assert!(ips.contains(&"::1".parse().unwrap()));
+        assert_eq!(cfg.ratelimit.login_per_minute, 3);
+        assert_eq!(cfg.ratelimit.signup_per_minute, 2);
     }
 
     #[test]

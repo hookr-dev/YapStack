@@ -214,6 +214,20 @@ pub struct RosterUploadResponse {
     pub vault_key_epoch: i64,
 }
 
+/// `GET /devices/roster` — the stored signed roster (§7.5), served verbatim so ANY
+/// authenticated device (including a still-pending one bootstrapping) can re-anchor its
+/// anti-rollback `counter` before signing a new roster. `device_list`/`signature` are the
+/// opaque blobs the relay stored (it holds no vault key and never authored them); the
+/// caller verifies them with the vault-derived roster key. `counter`/`vault_key_epoch`
+/// are the authoritative anti-rollback watermarks (§7.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterFetchResponse {
+    pub device_list: Value,
+    pub signature: String,
+    pub counter: i64,
+    pub vault_key_epoch: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

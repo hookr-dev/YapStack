@@ -3,6 +3,7 @@
 //! Relay entry point. Loads `yapstack-relay.toml`, connects Postgres, runs
 //! migrations, and serves. Zero outbound calls.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
@@ -45,6 +46,14 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Migrate-as-owner one-shot: the compose `migrate` service connects as the DB owner,
+    // applies migrations, and exits, so the long-running server can serve as the
+    // non-owner `yapstack_app` role (which never runs DDL — `db::migrate` then skips).
+    if std::env::var("YAPSTACK_MIGRATE_ONLY").is_ok_and(|v| matches!(v.as_str(), "1" | "true")) {
+        tracing::info!("migrations applied; exiting (YAPSTACK_MIGRATE_ONLY)");
+        return ExitCode::SUCCESS;
+    }
+
     let state = AppState::new(pool, config);
     let app = build_router(state);
 
@@ -57,7 +66,11 @@ async fn main() -> ExitCode {
     };
     tracing::info!(addr = %bind_addr, "yapstack-server listening");
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // `into_make_service_with_connect_info` surfaces the wire peer as
+    // `ConnectInfo<SocketAddr>`, the ground truth for `ClientIp` rate-limit keys.
+    if let Err(e) =
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+    {
         tracing::error!(error = %e, "server error");
         return ExitCode::FAILURE;
     }

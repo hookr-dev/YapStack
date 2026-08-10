@@ -65,6 +65,29 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-yapstack}
     restart: "no"
 
+  # One-shot: apply schema migrations as the DB OWNER, then exit. This is the ONLY
+  # step that needs CREATE on schema public; the long-running `server` then serves as
+  # the non-owner `yapstack_app` role (which never runs DDL — `db::migrate` skips when
+  # the schema is already applied). Same image as `server`; owner DSN + migrate-only.
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    image: yapstack-server:local
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      YAPSTACK_MIGRATE_ONLY: "true"
+      DATABASE_URL: ${MIGRATE_DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
+      # Only DATABASE_URL is used on this path, but the entrypoint renders the full TOML,
+      # so the same required secrets must be present.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      SERVER_PEPPER: ${SERVER_PEPPER:?set SERVER_PEPPER in .env}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
   server:
     build:
       context: ..
@@ -76,14 +99,17 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
     environment:
       # The entrypoint renders yapstack-relay.toml from these before exec'ing the server.
       YAPSTACK_BIND_ADDR: ${YAPSTACK_BIND_ADDR:-0.0.0.0:8080}
-      # Default: connect as the DB owner (FORCE RLS still isolates it). To harden, run
-      # migrations once as the owner then set DATABASE_URL in .env to the non-owner
-      # yapstack_app DSN (docs/self-hosting.md) — overridable here so that hardening is
-      # a .env edit, never a compose edit.
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
+      # Serve as the NON-OWNER `yapstack_app` role by default: FORCE RLS is a real
+      # backstop (a superuser serving connection bypasses RLS, leaving only the
+      # hand-written workspace_id predicate). The one-shot `migrate` service above
+      # applies schema as the owner first; the serving role never runs DDL. Override
+      # DATABASE_URL in .env to change the serving connection.
+      DATABASE_URL: ${DATABASE_URL:-postgres://yapstack_app:${YAPSTACK_APP_PASSWORD:?set YAPSTACK_APP_PASSWORD in .env}@postgres:5432/${POSTGRES_DB}}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       SERVER_PEPPER: ${SERVER_PEPPER:?set SERVER_PEPPER in .env}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
@@ -99,6 +125,16 @@ services:
       YAPSTACK_GC_ENABLED: ${YAPSTACK_GC_ENABLED:-true}
       YAPSTACK_GC_INTERVAL_SECS: ${YAPSTACK_GC_INTERVAL_SECS:-86400}
       YAPSTACK_GC_GRACE_SECS: ${YAPSTACK_GC_GRACE_SECS:-604800}
+      # Trusted reverse-proxy IPs (comma-separated). The entrypoint renders these into
+      # `trusted_proxies` TOML; unset => fail-closed (X-Forwarded-For ignored, the wire
+      # peer is the rate-limit key). Set to the source IP the relay sees the proxy connect
+      # FROM so per-client login/signup/push rate limits work behind TLS termination.
+      YAPSTACK_TRUSTED_PROXIES: ${YAPSTACK_TRUSTED_PROXIES:-}
+      # Optional signup invite gate. Read straight from the process env by
+      # Config::signup_invite (crates/yapstack-server/src/config.rs) — no TOML rendering.
+      # Unset/empty => signup open (default). Set => POST /auth/signup requires a matching
+      # `X-YapStack-Invite` header.
+      YAPSTACK_SIGNUP_INVITE: ${YAPSTACK_SIGNUP_INVITE:-}
     ports:
       - "${YAPSTACK_HTTP_PORT:-8080}:8080"
     healthcheck:
