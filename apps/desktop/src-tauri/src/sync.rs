@@ -3680,6 +3680,12 @@ fn spawn_drain(
             // clean cycle (or a sticky Oversized) resets it.
             let mut consecutive_errors: u32 = 0;
 
+            // Set whenever a cycle merged work; consumed by the next CLEAN (fully-drained) cycle
+            // so deterministic maintenance still runs when the merge and the drained-to-tip cycle
+            // fall apart (a pull that failed mid-backlog advances the watermark but returns an
+            // error). In-memory: on restart the first inbound merge re-arms it.
+            let mut maintenance_pending = false;
+
             // Seed the SSE lane's watermark gate with our starting local pull position so an
             // early wake for an already-merged seq is skipped (deliverable 1).
             if let Ok(wm) = state::pull_watermark(conn) {
@@ -3790,13 +3796,18 @@ fn spawn_drain(
                 }
 
                 // Reinstate the stripped FK cascade + UNIQUE invariants deterministically after a
-                // merge (R4/R5). Maintenance is safe on ANY pull state — no convergence gate — because
-                // cascade and dedup only ever touch PROVEN rows: cascade deletes/nulls children solely
-                // of PROVEN-DELETED parents (even col_version '-1' sentinel in {parent}__crsql_clock),
-                // and dedup acts only on rows whose relevant columns are PROVEN-MERGED (have a
-                // {table}__crsql_clock entry). Truncated / mid-pull / quarantined rows lack those
-                // proofs and are therefore untouched, so running maintenance every merge cycle is safe.
-                if report.applied + report.replayed > 0 {
+                // merge (R4/R5). The proven-guards make maintenance safe against SYNTHETIC-DEFAULT
+                // partial rows (cascade only touches PROVEN-DELETED parents; dedup only rows whose
+                // relevant columns are PROVEN-MERGED). But `proven ⇏ fresh`: a proven-but-STALE
+                // editable LWW winner (notes.updated_at, tags.name) read on a PARTIAL pull can pick
+                // the wrong winner and permanently tombstone a genuine row. So only run on a CLEAN,
+                // fully-drained pull (`pull_error.is_none()` — the same drained-to-tip signal
+                // `drain_once` uses), where every column's latest edit up to the tip is present.
+                if maintenance_ready(
+                    report.applied + report.replayed > 0,
+                    report.pull_error.is_none(),
+                    &mut maintenance_pending,
+                ) {
                     if let Err(e) = cascade::cascade_gc(conn) {
                         tracing::warn!("sync drain: cascade_gc: {e}");
                     }
@@ -4377,6 +4388,23 @@ fn verify_roster_signed(
 /// verbatim from the last VERIFIED roster (no v1 eviction: every prior member carries
 /// forward), so their keys come solely from the signed roster and the relay's `/devices`
 /// view of them is never consulted.
+/// Whether deterministic maintenance (`cascade_gc` / `enforce_uniqueness`) may run this drain
+/// cycle. It runs ONLY on a clean, fully-drained pull (`pull_error_none`): the proven-guards make
+/// it safe against synthetic-default partial rows, but a proven-but-STALE editable LWW winner read
+/// on a partial (mid-backlog-failed) pull could pick the wrong winner and permanently tombstone a
+/// genuine row. `pending` carries a merge that happened on a non-clean cycle forward, so the next
+/// clean cycle still maintains even if it merged nothing itself.
+fn maintenance_ready(merged: bool, pull_error_none: bool, pending: &mut bool) -> bool {
+    if merged {
+        *pending = true;
+    }
+    if pull_error_none && *pending {
+        *pending = false;
+        return true;
+    }
+    false
+}
+
 fn build_roster_membership(
     verified_prev: &[RosterDeviceEntry],
     get_devices: &[DeviceInfo],
@@ -6366,6 +6394,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entries2.len(), 1);
+    }
+
+    #[test]
+    fn maintenance_only_runs_on_a_clean_drained_pull() {
+        // A partial pull (mid-backlog transport failure) merged some rows but did NOT reach tip.
+        // Maintenance must NOT run then — a proven-but-stale LWW winner could tombstone a genuine
+        // row — but the merge must be remembered and maintained on the next CLEAN cycle.
+        let mut pending = false;
+        // Clean cycle with a merge → runs immediately.
+        assert!(maintenance_ready(true, true, &mut pending));
+        assert!(!pending);
+        // Partial cycle (pull errored) that merged work → deferred, remembered.
+        assert!(!maintenance_ready(true, false, &mut pending));
+        assert!(pending);
+        // A later clean cycle that merged NOTHING itself still maintains the deferred work.
+        assert!(maintenance_ready(false, true, &mut pending));
+        assert!(!pending);
+        // Idle clean cycle with nothing pending → no-op.
+        assert!(!maintenance_ready(false, true, &mut pending));
     }
 
     #[test]
