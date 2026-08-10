@@ -66,7 +66,7 @@ use yapstack_common::auth::{
 use yapstack_sync::crypto::ChangesetCipher;
 use yapstack_sync::transport::SyncTransport;
 use yapstack_sync::{
-    cascade, outbox, quarantine, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
+    cascade, outbox, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
     CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION,
 };
 
@@ -1180,12 +1180,14 @@ fn store_identity_to_store(id: &DeviceIdentity) -> Result<(), String> {
 /// Keychain account name for the per-account anchor entry (item 1). Keyed by
 /// (server_url, email) via a SHA-256 digest so the (potentially long / punctuation-heavy)
 /// server URL + email map to a stable, fixed-width, credential-name-safe key that supports
-/// MULTIPLE accounts on one install. The email is lowercased first so a case-variant sign-in
-/// resolves to the SAME anchor.
+/// MULTIPLE accounts on one install. Both the server URL (via `base_url`) and the email are
+/// canonicalized first so a case/slash-variant sign-in resolves to the SAME anchor.
 fn anchor_account_name(server_url: &str, email: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(server_url.as_bytes());
+    // Canonicalize the URL (lowercase scheme+host, strip trailing slash) so casing/slash variants
+    // of the same relay map to ONE anchor. The email is lowercased for the same reason.
+    h.update(base_url(server_url).as_bytes());
     h.update([0u8]); // domain separator between the two fields
     h.update(email.to_ascii_lowercase().as_bytes());
     format!("{}{:x}", KEYCHAIN_ACCOUNT_ANCHOR_PREFIX, h.finalize())
@@ -2278,28 +2280,6 @@ fn reconcile_account_binding(live_db: &Path, session_tenant: Uuid) -> Result<(),
     Ok(())
 }
 
-/// Safety-net reset on the `perform_cutover` idempotency path (item 1): an already-CRR live DB
-/// short-circuits before the staging-block watermark reset. If it carries NO account binding —
-/// e.g. it was CRR-prepared by a build predating the per-account anchor — we cannot prove its
-/// watermarks belong to the current account, so reset them + empty the outbox. A device with a
-/// binding is left untouched here; `reconcile_account_binding` (called from `sync_enable` / boot
-/// with the explicit session tenant) then decides same-account-keep vs switch-reset.
-fn reset_watermarks_if_unbound(live_db: &Path) -> Result<(), String> {
-    let db = CrsqlDb::open(live_db).map_err(|e| e.to_string())?;
-    let conn = db.conn();
-    state::ensure_meta_table(conn).map_err(|e| e.to_string())?;
-    if state::get_meta(conn, K_BOUND_TENANT)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        tracing::info!(
-            "sync: already-CRR live DB has no account binding at cutover — resetting watermarks + outbox"
-        );
-        reset_sync_state_for_new_binding(conn)?;
-    }
-    Ok(())
-}
-
 fn perform_cutover(
     live_db: &Path,
     db_service: &crate::db_service::DbServiceState,
@@ -2315,11 +2295,10 @@ fn cutover_with_fault(
     // Step 1: idempotency gate. An already-CRR live DB just needs its legacy copy gone.
     if live_is_crr_prepared(live_db) {
         discard_legacy_sync_copy(live_db);
-        // Item 1: the staging-block watermark reset below is skipped on the idempotency path.
-        // If this already-CRR DB carries no account binding, reset its stale sync state so a
-        // re-enable can never silently zero-sync behind a stale watermark. (An account-bound
-        // DB is reconciled against the explicit session tenant in `sync_enable` / boot.)
-        reset_watermarks_if_unbound(live_db)?;
+        // Item 1: the staging-block watermark reset below is skipped on the idempotency path, but
+        // `reconcile_account_binding` runs immediately after `perform_cutover` on BOTH production
+        // paths (`sync_enable`, `start_drain_if_enabled`) and resets+binds on any tenant mismatch
+        // — including a missing (None) binding — so no separate unbound-reset is needed here.
         return Ok(());
     }
 
@@ -3811,16 +3790,13 @@ fn spawn_drain(
                 }
 
                 // Reinstate the stripped FK cascade + UNIQUE invariants deterministically after a
-                // merge (R4/R5) — but ONLY on a CONVERGED prefix. The maintenance passes reason
-                // over whole logical rows, so running them mid-pull (a page still to come) or with
-                // schema-gapped rows still parked in the pending-replay quarantine would see
-                // truncated rows as spurious collisions/orphans and tombstone genuine data. Gate
-                // on the pull having reached the relay tip AND no schema-gap replays outstanding.
-                // (A standing CRYPTO quarantine is NOT gated here: cascade's proven-delete keeps
-                // it safe, so maintenance must not be permanently disabled by one bad ciphertext.)
-                let converged = report.reached_tip
-                    && matches!(quarantine::pending_count(conn), Ok(0));
-                if report.applied + report.replayed > 0 && converged {
+                // merge (R4/R5). Maintenance is safe on ANY pull state — no convergence gate — because
+                // cascade and dedup only ever touch PROVEN rows: cascade deletes/nulls children solely
+                // of PROVEN-DELETED parents (even col_version '-1' sentinel in {parent}__crsql_clock),
+                // and dedup acts only on rows whose relevant columns are PROVEN-MERGED (have a
+                // {table}__crsql_clock entry). Truncated / mid-pull / quarantined rows lack those
+                // proofs and are therefore untouched, so running maintenance every merge cycle is safe.
+                if report.applied + report.replayed > 0 {
                     if let Err(e) = cascade::cascade_gc(conn) {
                         tracing::warn!("sync drain: cascade_gc: {e}");
                     }
@@ -4399,27 +4375,14 @@ fn verify_roster_signed(
 /// advisory `status` to `active`, so folding on that value would sign a membership the
 /// vault-key holder never intended — the finding-#2 defect). Existing members are copied
 /// verbatim from the last VERIFIED roster (no v1 eviction: every prior member carries
-/// forward). If the relay now reports a DIFFERENT `ed25519_pub` for an existing member
-/// than the one in the last signed roster, we HARD-FAIL rather than sign over a key the
-/// owner never approved (possible relay key-substitution / tamper).
+/// forward), so their keys come solely from the signed roster and the relay's `/devices`
+/// view of them is never consulted.
 fn build_roster_membership(
     verified_prev: &[RosterDeviceEntry],
-    get_devices: &[DeviceInfo],
     target: &DeviceInfo,
 ) -> Result<Vec<RosterDeviceEntry>, String> {
     let mut entries: Vec<RosterDeviceEntry> = Vec::with_capacity(verified_prev.len() + 1);
     for prev in verified_prev {
-        // Tamper check: if the relay reports this member with a different key than the one
-        // the last verified roster bound, refuse to sign (§0 hostile-relay threat model).
-        if let Some(relay) = get_devices.iter().find(|d| d.client_id == prev.client_id) {
-            if relay.ed25519_pub != prev.ed25519_pub {
-                return Err(format!(
-                    "relay reports a different ed25519_pub for existing member {} than the \
-                     last signed roster — refusing to sign (possible tamper)",
-                    prev.client_id
-                ));
-            }
-        }
         entries.push(prev.clone());
     }
     // Add the fingerprint-verified target (unless it is already a carried-forward member).
@@ -4448,8 +4411,30 @@ fn pending_login_cell() -> &'static Mutex<Option<PendingLogin>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// Canonicalize a relay base URL: lowercase the case-insensitive scheme + authority (RFC 3986)
+/// and strip any trailing slash, leaving the case-sensitive path verbatim. This is the SINGLE
+/// URL-normalization site — reused for request routing AND (via `anchor_account_name`) for the
+/// per-account keychain anchor key, so https://SYNC.example.com and https://sync.example.com
+/// resolve to ONE identity instead of silently splitting into two TOFU baselines.
 fn base_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
+    let trimmed = url.trim().trim_end_matches('/');
+    match trimmed.find("://") {
+        Some(sep) => {
+            let scheme = &trimmed[..sep];
+            let rest = &trimmed[sep + 3..];
+            let (authority, path) = match rest.find('/') {
+                Some(p) => (&rest[..p], &rest[p..]),
+                None => (rest, ""),
+            };
+            format!(
+                "{}://{}{}",
+                scheme.to_ascii_lowercase(),
+                authority.to_ascii_lowercase(),
+                path
+            )
+        }
+        None => trimmed.to_ascii_lowercase(),
+    }
 }
 
 /// Send a request and decode JSON, surfacing a relay error body VERBATIM on non-2xx
@@ -5972,23 +5957,26 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
             &vault_key,
             session.roster_counter,
         )?;
-        // The anti-rollback counter MUST come from the SIGNATURE-BOUND value inside the
-        // verified canonical roster — never the untrusted plaintext `RosterFetchResponse.counter`
-        // (a hostile relay could inflate that field to force a counter jump that evicts a
-        // member on the next rollback check). Hard-fail if the plaintext field disagrees with
-        // the signed counter: that is tamper, so refuse to sign and surface.
+        // The anti-rollback counter comes from the SIGNATURE-BOUND value inside the verified
+        // canonical roster — never the untrusted plaintext `RosterFetchResponse.counter`, which
+        // is not read at all past verification.
         let verified_counter = prev_roster.counter;
-        if fetched.counter as u64 != verified_counter {
-            return Err(
-                "roster counter mismatch: relay's plaintext counter disagrees with the \
-                 signed roster — refusing to sign (possible tamper)"
-                    .into(),
-            );
-        }
-        // Re-anchor the cache to the verified authoritative state, ending the 409-lock even
-        // if we bail below (a stale cache is never carried past this point).
+        // Ratchet the anti-rollback floor forward to the verified counter and PERSIST it (session
+        // cache + per-account keychain anchor) BEFORE attempting the mutation. Even if we abort
+        // below (target fingerprint gone, or the PUT loses to a concurrent approval) the floor has
+        // advanced, so a validly-signed OLDER roster can never be replayed against us afterwards.
+        // `verify_roster_signed` already proved verified_counter >= our floor, so this only moves
+        // forward. `update_session` merges just our two fields under the lock (never clobbering a
+        // token the drain may have rotated during the network round-trips).
         session.roster_counter = verified_counter as i64;
         session.roster_fingerprint = Some(prev_fp);
+        let ratchet_counter = session.roster_counter;
+        let ratchet_fp = session.roster_fingerprint.clone();
+        session = update_session(move |s| {
+            s.roster_counter = ratchet_counter;
+            s.roster_fingerprint = ratchet_fp;
+        })?;
+        persist_account_anchor(&session)?;
 
         // (c) GET /devices ONLY to discover the pending target by its out-of-band-verified
         // fingerprint (§7.5 step 4) — never as the membership source.
@@ -6007,7 +5995,7 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
 
         // Membership = verified previous roster carried forward + the verified target,
         // hard-failing on any relay-reported key substitution for an existing member (f).
-        let entries = build_roster_membership(&prev_roster.devices, &devices.devices, target)?;
+        let entries = build_roster_membership(&prev_roster.devices, target)?;
         let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
 
         // (d) new counter = verified (signature-bound) counter + 1.
@@ -6038,8 +6026,11 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
         .await?;
 
         match outcome {
-            RosterPutOutcome::Ok(resp) => {
-                session.roster_counter = resp.counter;
+            RosterPutOutcome::Ok(_resp) => {
+                // Persist the LOCALLY-SIGNED counter we just authored (verified_counter + 1) — never
+                // the relay's echoed `resp.counter`. A relay that returns 200 with a bogus (lower)
+                // counter must not be able to lower our anti-rollback floor.
+                session.roster_counter = new_counter;
                 session.roster_fingerprint = Some(roster_fp);
                 break;
             }
@@ -6310,15 +6301,12 @@ mod tests {
     #[test]
     fn build_roster_membership_carries_verified_prev_and_adds_target() {
         // Finding #2 regression gate: the NEW roster's membership is authored from the
-        // VERIFIED previous roster carried forward + the single verified target — NOT from
-        // the relay's advisory `GET /devices` status. A relay-flipped extra "active" row
-        // must NOT be folded in; every prior member must carry forward with ITS OWN key.
+        // VERIFIED previous roster carried forward (with ITS OWN key) + the single verified
+        // target — the relay's advisory `GET /devices` status is never a membership source.
         let self_id = Uuid::from_u128(1);
         let target_id = Uuid::from_u128(2);
-        let attacker_id = Uuid::from_u128(3);
         let self_pub = B64.encode([0x11u8; 32]);
         let target_pub = B64.encode([0x22u8; 32]);
-        let attacker_pub = B64.encode([0x33u8; 32]);
 
         let verified_prev = vec![RosterDeviceEntry {
             client_id: self_id,
@@ -6333,40 +6321,18 @@ mod tests {
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
         };
-        // The relay index reports self (active), the target (pending), AND an attacker the
-        // relay has fraudulently flipped to "active".
-        let get_devices = vec![
-            DeviceInfo {
-                client_id: self_id,
-                ed25519_pub: self_pub.clone(),
-                label: "self".into(),
-                status: "active".into(),
-                added_at: "2026-01-01T00:00:00Z".into(),
-            },
-            target.clone(),
-            DeviceInfo {
-                client_id: attacker_id,
-                ed25519_pub: attacker_pub,
-                label: "attacker".into(),
-                status: "active".into(),
-                added_at: "2026-03-01T00:00:00Z".into(),
-            },
-        ];
 
-        let entries = build_roster_membership(&verified_prev, &get_devices, &target).unwrap();
+        let entries = build_roster_membership(&verified_prev, &target).unwrap();
         let ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
         assert_eq!(
             ids,
             vec![self_id, target_id],
-            "only the carried-forward verified member + the verified target are signed; \
-             the relay-flipped attacker is NOT folded in"
+            "only the carried-forward verified member + the verified target are signed"
         );
-        assert!(!ids.contains(&attacker_id));
 
         // A target that is already a carried-forward member is not duplicated.
         let entries2 = build_roster_membership(
             &verified_prev,
-            &get_devices,
             &DeviceInfo {
                 client_id: self_id,
                 ed25519_pub: self_pub.clone(),
@@ -6377,37 +6343,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entries2.len(), 1);
-    }
-
-    #[test]
-    fn build_roster_membership_hard_fails_on_member_pubkey_substitution() {
-        // Finding #2 (f): if the relay reports a DIFFERENT ed25519_pub for an existing
-        // verified member, refuse to sign — never carry the substituted key forward.
-        let self_id = Uuid::from_u128(1);
-        let target_id = Uuid::from_u128(2);
-        let verified_prev = vec![RosterDeviceEntry {
-            client_id: self_id,
-            ed25519_pub: B64.encode([0x11u8; 32]),
-            label: "self".into(),
-            added_at: "2026-01-01T00:00:00Z".into(),
-        }];
-        let target = DeviceInfo {
-            client_id: target_id,
-            ed25519_pub: B64.encode([0x22u8; 32]),
-            label: "target".into(),
-            status: "pending".into(),
-            added_at: "2026-02-01T00:00:00Z".into(),
-        };
-        // Relay reports self with a SUBSTITUTED key.
-        let get_devices = vec![DeviceInfo {
-            client_id: self_id,
-            ed25519_pub: B64.encode([0xEEu8; 32]),
-            label: "self".into(),
-            status: "active".into(),
-            added_at: "2026-01-01T00:00:00Z".into(),
-        }];
-        let err = build_roster_membership(&verified_prev, &get_devices, &target).unwrap_err();
-        assert!(err.contains("different ed25519_pub"), "got: {err}");
     }
 
     #[test]
@@ -6838,69 +6773,6 @@ mod tests {
         let db = CrsqlDb::open(&path).unwrap();
         assert_eq!(state::push_watermark(db.conn()).unwrap(), 0);
         assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0);
-    }
-
-    /// PROVING — signout-lifecycle #1 (CRITICAL): "Sign-out never resets DB sync state; a
-    /// second account then silently syncs nothing." RED on the current tree.
-    ///
-    /// Account A enables sync (the cutover zeroes the watermarks) and syncs for a while,
-    /// advancing pull/push to A's tenant tip. The user signs out and enables sync as account
-    /// B. `sync_enable` re-runs `perform_cutover`, but the idempotency gate
-    /// (`live_is_crr_prepared`, sync.rs:2084-2087) short-circuits to `Ok(())` BEFORE the
-    /// watermark reset that lives only in the staging-prep block (sync.rs:2155-2156); and
-    /// `clear_session` (sync.rs:1405-1416) writes NOTHING to the DB — no tenant identity is
-    /// persisted anywhere in the DB (state.rs keys are tenant-agnostic). So B's drain starts
-    /// with A's stale watermark: B's per-tenant `changeset_seq` starts at 1, so
-    /// `pull(since = 5000)` is empty forever and `read_local_changes_since(push_watermark)`
-    /// skips the whole pre-existing library — zero rows ever cross, behind a green panel.
-    ///
-    /// This asserts the DESIRED post-re-enable state (watermarks reset to 0). It FAILS today
-    /// because the second cutover returns early and never touches the watermarks.
-    #[test]
-    fn signout_then_reenable_on_new_account_leaves_stale_watermarks_unreset() {
-        let (_dir, path, svc) = cutover_fixture();
-
-        // Account A: the first enable runs the full cutover and zeroes the watermarks.
-        perform_cutover(&path, &svc).expect("account A enable-time cutover");
-        {
-            let db = CrsqlDb::open(&path).unwrap();
-            assert_eq!(
-                state::pull_watermark(db.conn()).unwrap(),
-                0,
-                "A starts clean"
-            );
-            assert_eq!(
-                state::push_watermark(db.conn()).unwrap(),
-                0,
-                "A starts clean"
-            );
-        }
-
-        // Account A syncs for months: the drain advances the watermarks to A's tenant tip.
-        {
-            let db = CrsqlDb::open(&path).unwrap();
-            state::set_pull_watermark(db.conn(), 5000).unwrap();
-            state::set_push_watermark(db.conn(), 4200).unwrap();
-        }
-
-        // The user signs out (clear_session touches nothing in the DB) and enables sync as a
-        // DIFFERENT account B. `sync_enable` re-runs the cutover on the same, already-CRR
-        // live DB → the idempotency gate returns Ok immediately.
-        perform_cutover(&path, &svc).expect("account B re-enable cutover (idempotency no-op)");
-
-        // A new account's drain MUST start from a clean slate. On the current tree the stale
-        // 5000/4200 survive, so account B silently syncs nothing in either direction.
-        let db = CrsqlDb::open(&path).unwrap();
-        assert_eq!(
-            state::pull_watermark(db.conn()).unwrap(),
-            0,
-            "re-enable on a new account must reset the pull watermark, else pull(since=stale) is empty forever"
-        );
-        assert_eq!(
-            state::push_watermark(db.conn()).unwrap(),
-            0,
-            "re-enable on a new account must reset the push watermark, else the local library is never uploaded"
-        );
     }
 
     /// Item 1 (fix): `reconcile_account_binding` — the tenant-keyed reset the SPEC places in
