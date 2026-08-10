@@ -738,6 +738,10 @@ export function NoteDetailView() {
       const next: Record<string, AudioPartPrepare> = {};
       // Sequential, ordered submission: part_index order = FIFO admission order in Rust.
       for (const id of ids) {
+        // Cancel/navigate-away between parts must not re-submit the remaining
+        // ones: the single in-flight prepare is left to land in cache, but every
+        // still-queued part stops here.
+        if (cancelled) return;
         try {
           // highPriority: the session the user is LOOKING AT outranks background
           // dictation prefetches in the global fetch queue (promotes if already queued).

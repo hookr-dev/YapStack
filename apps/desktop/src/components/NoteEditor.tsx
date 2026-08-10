@@ -264,6 +264,16 @@ function HighlightDropdown({
 
 /** Debounced autosave delay after the last keystroke. */
 const NOTE_SAVE_DEBOUNCE_MS = 1000;
+/** Backoff schedule for retrying a save that failed (e.g. a transient DB lock). */
+const NOTE_SAVE_RETRY_BASE_MS = 500;
+const NOTE_SAVE_RETRY_MAX_MS = 15000;
+const NOTE_SAVE_MAX_RETRIES = 5;
+/**
+ * Cap on how many times `closeWhenIdle` re-arms while a save is still pending.
+ * A save that never resolves (neither succeeds nor rejects) must not pin the
+ * note-editing window — and therefore suppress sync-down — indefinitely.
+ */
+const NOTE_CLOSE_MAX_REARMS = 10;
 /**
  * How long after the last keystroke the note-editing window stays open once the
  * pending save has flushed. Long enough that a normal typing pause never lets a
@@ -302,6 +312,21 @@ export function NoteEditor({
   // so a publication that predates the content we just read can never be applied
   // back over it.
   const appliedRemoteSeq = useRef(0);
+  // Monotonic load generation, bumped every time editor content is replaced
+  // programmatically (load, A1c sync-down). An autosave that was issued for one
+  // (session, generation) and resolves after a newer load must NOT write its
+  // stale HTML back into the in-memory baselines — that would corrupt the
+  // baselines the load just set and reject legitimate sync-downs afterwards.
+  const loadGenRef = useRef(0);
+  // Live editor handle for the unmount flush and the failed-save backoff retry,
+  // both of which run outside the render/`useEditor` closure.
+  const editorRef = useRef<Editor | null>(null);
+  // Failed-save state: true once a save has actually rejected, so `closeWhenIdle`
+  // can release the editing window instead of pinning it on a write that won't
+  // land. Cleared on the next successful save.
+  const saveFailedRef = useRef(false);
+  const saveRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveRetryCountRef = useRef(0);
 
   const setNoteEditingSessionId = useAppStore((s) => s.setNoteEditingSessionId);
   const remoteNoteUpdate = useAppStore((s) => s.remoteNoteUpdate);
@@ -322,33 +347,73 @@ export function NoteEditor({
    */
   const persistIfChanged = useCallback(async (html: string): Promise<boolean> => {
     const id = sessionIdRef.current;
+    const gen = loadGenRef.current;
     if (html === docBaseline.current) return false; // (a)
+    // The editor has moved on (session switched, or content reloaded) since this
+    // save was issued: the write to `id` is still correct for `id`, but its
+    // baselines/conflict-toast belong to a document that is no longer on screen.
+    const editorMovedOn = () =>
+      sessionIdRef.current !== id || loadGenRef.current !== gen;
     try {
       const stored = await getNote(id);
-      if (stored === null && lastSavedContent.current !== "") {
-        // (b, delete variant) — the row we loaded is gone; this save recreates it.
-        // (A note that never existed loads as "" and takes neither branch.)
-        log.warn(
-          `note ${id}: row deleted on another device since load; local version resurrects it (LWW)`,
-          "note-editor",
-        );
-        toast.info(
-          "Note was deleted on another device — your version was restored",
-        );
-      } else if ((stored?.content ?? "") !== lastSavedContent.current) {
-        // (b) — remote edit landed since we loaded this note.
-        log.warn(
-          `note ${id}: remote edit landed since load; local version wins (LWW)`,
-          "note-editor",
-        );
-        toast.info("Note updated on another device — your version was saved");
+      if (!editorMovedOn()) {
+        if (stored === null && lastSavedContent.current !== "") {
+          // (b, delete variant) — the row we loaded is gone; this save recreates it.
+          // (A note that never existed loads as "" and takes neither branch.)
+          log.warn(
+            `note ${id}: row deleted on another device since load; local version resurrects it (LWW)`,
+            "note-editor",
+          );
+          toast.info(
+            "Note was deleted on another device — your version was restored",
+          );
+        } else if ((stored?.content ?? "") !== lastSavedContent.current) {
+          // (b) — remote edit landed since we loaded this note.
+          log.warn(
+            `note ${id}: remote edit landed since load; local version wins (LWW)`,
+            "note-editor",
+          );
+          toast.info("Note updated on another device — your version was saved");
+        }
       }
       await saveNote(id, html);
-      lastSavedContent.current = html;
-      docBaseline.current = html;
+      // Save landed — clear any failure/backoff state for this editor.
+      saveFailedRef.current = false;
+      saveRetryCountRef.current = 0;
+      if (saveRetryRef.current) {
+        clearTimeout(saveRetryRef.current);
+        saveRetryRef.current = null;
+      }
+      // Only advance the in-memory baselines if they still describe THIS save's
+      // document; otherwise a newer load already set them and we must not clobber.
+      if (!editorMovedOn()) {
+        lastSavedContent.current = html;
+        docBaseline.current = html;
+      }
       return true;
     } catch (e) {
-      console.error("Failed to save note:", e);
+      // The save was lost — surface it (toast + file log) instead of swallowing,
+      // keep the content dirty, and schedule a bounded backoff retry so a
+      // transient lock does not silently wedge the editor.
+      const detail = e instanceof Error ? e.message : String(e);
+      log.error(`note ${id}: failed to save: ${detail}`, "note-editor");
+      toast.error(`Couldn't save note: ${detail}`, { id: `note-save-${id}` });
+      saveFailedRef.current = true;
+      if (
+        !saveRetryRef.current &&
+        saveRetryCountRef.current < NOTE_SAVE_MAX_RETRIES
+      ) {
+        const delay = Math.min(
+          NOTE_SAVE_RETRY_BASE_MS * 2 ** saveRetryCountRef.current,
+          NOTE_SAVE_RETRY_MAX_MS,
+        );
+        saveRetryRef.current = setTimeout(() => {
+          saveRetryRef.current = null;
+          saveRetryCountRef.current += 1;
+          const ed = editorRef.current;
+          if (ed && !ed.isDestroyed) void persistIfChanged(ed.getHTML());
+        }, delay);
+      }
       return false;
     }
   }, []);
@@ -415,11 +480,20 @@ export function NoteEditor({
       // Close the window once typing has gone idle AND the pending save flushed.
       // Re-armed on every keystroke; blur closes it immediately.
       if (windowTimeoutRef.current) clearTimeout(windowTimeoutRef.current);
+      let rearms = 0;
       const closeWhenIdle = () => {
         if (editor.isDestroyed) return;
-        if (editor.getHTML() !== docBaseline.current) {
-          // Save still in flight (or it failed) — keep the window open rather
-          // than exposing unsaved text to a sync-down.
+        if (
+          editor.getHTML() !== docBaseline.current &&
+          // A save that has actually FAILED must not pin the window: the content
+          // stays dirty and the backoff retry keeps trying, but leaving the
+          // window open would suppress sync-down for this session forever.
+          !saveFailedRef.current &&
+          rearms < NOTE_CLOSE_MAX_REARMS
+        ) {
+          // Save still in flight — keep the window open rather than exposing
+          // unsaved text to a sync-down.
+          rearms += 1;
           windowTimeoutRef.current = setTimeout(
             closeWhenIdle,
             NOTE_SAVE_DEBOUNCE_MS,
@@ -439,6 +513,10 @@ export function NoteEditor({
     },
   });
 
+  // Keep a live handle for callbacks that run outside this render (unmount
+  // flush, failed-save retry) without adding `editor` to their dependency lists.
+  editorRef.current = editor;
+
   /**
    * The single place editor content is replaced programmatically (load, and the
    * A1c sync-down). `emitUpdate: false` because a programmatic replacement is
@@ -452,6 +530,10 @@ export function NoteEditor({
         clearTimeout(saveTimeoutRef.current);
         saveTimeoutRef.current = null;
       }
+      // Replacing the document invalidates any autosave already in flight: bump
+      // the generation so a late save continuation cannot write its stale HTML
+      // back over the baselines we set here.
+      loadGenRef.current += 1;
       editor.commands.setContent(content, { emitUpdate: false });
       lastSavedContent.current = content;
       docBaseline.current = editor.getHTML();
@@ -462,6 +544,9 @@ export function NoteEditor({
   // Load note content on mount and when refreshKey changes. `refreshKey` is a
   // LOCAL signal (AI tool wrote the note, etc.) — the sync path never bumps it.
   useEffect(() => {
+    // Cancellation token: a load for a superseded session/refreshKey must not
+    // apply its content after a newer load has started (fast session switch).
+    let cancelled = false;
     async function load() {
       if (!editor) return;
       // Anything published before this read is, by definition, not newer than
@@ -469,19 +554,25 @@ export function NoteEditor({
       appliedRemoteSeq.current =
         useAppStore.getState().remoteNoteUpdate?.seq ?? 0;
       const note = await getNote(sessionId);
+      if (cancelled) return;
       let content = note?.content ?? "";
       // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes
       if (content.includes("[[seg:")) {
         const segments = await getSessionSegments(sessionId);
+        if (cancelled) return;
         content = convertCitationsToSegmentRefs(content, segments);
         // Persist the converted content so future loads don't need re-conversion
         if (note && content !== note.content) {
           await saveNote(sessionId, content);
+          if (cancelled) return;
         }
       }
       applyContent(content);
     }
     load();
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId, editor, refreshKey, applyContent]);
 
   // Blur = end of the edit window: flush a real save (no-op when unchanged) and
@@ -534,18 +625,27 @@ export function NoteEditor({
     applyContent(remoteNoteUpdate.content);
   }, [editor, sessionId, remoteNoteUpdate, applyContent]);
 
-  // Cleanup on unmount: drop pending timers and release the editing window if
-  // this editor still owns it (a stuck window would suppress sync-down forever).
+  // Cleanup on unmount: flush any pending text, drop pending timers, and release
+  // the editing window if this editor still owns it (a stuck window would
+  // suppress sync-down forever).
   useEffect(() => {
     return () => {
+      // Flush unsaved text before the editor is torn down so an unmount
+      // mid-debounce (fast session switch, view close) doesn't drop it.
+      const ed = editorRef.current;
+      if (ed && !ed.isDestroyed) {
+        const html = ed.getHTML();
+        if (html !== docBaseline.current) void persistIfChanged(html);
+      }
       if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
       if (windowTimeoutRef.current) clearTimeout(windowTimeoutRef.current);
+      if (saveRetryRef.current) clearTimeout(saveRetryRef.current);
       const store = useAppStore.getState();
       if (store.noteEditingSessionId === sessionIdRef.current) {
         store.setNoteEditingSessionId(null);
       }
     };
-  }, []);
+  }, [persistIfChanged]);
 
   // Listen for segment reference insertion events
   useEffect(() => {
