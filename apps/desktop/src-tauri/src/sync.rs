@@ -4379,10 +4379,22 @@ fn verify_roster_signed(
 /// view of them is never consulted.
 fn build_roster_membership(
     verified_prev: &[RosterDeviceEntry],
+    get_devices: &[DeviceInfo],
     target: &DeviceInfo,
 ) -> Result<Vec<RosterDeviceEntry>, String> {
     let mut entries: Vec<RosterDeviceEntry> = Vec::with_capacity(verified_prev.len() + 1);
     for prev in verified_prev {
+        // Tamper check (§0 hostile-relay threat model): if the relay reports this member with a
+        // different key than the one the last verified roster bound, refuse to sign and surface.
+        if let Some(relay) = get_devices.iter().find(|d| d.client_id == prev.client_id) {
+            if relay.ed25519_pub != prev.ed25519_pub {
+                return Err(format!(
+                    "relay reports a different ed25519_pub for existing member {} than the \
+                     last signed roster — refusing to sign (possible tamper)",
+                    prev.client_id
+                ));
+            }
+        }
         entries.push(prev.clone());
     }
     // Add the fingerprint-verified target (unless it is already a carried-forward member).
@@ -5961,6 +5973,16 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
         // canonical roster — never the untrusted plaintext `RosterFetchResponse.counter`, which
         // is not read at all past verification.
         let verified_counter = prev_roster.counter;
+        // Tamper check: the relay's plaintext counter must match the signature-bound one. A
+        // mismatch means the relay's advisory column diverged from the signed content (only
+        // possible via tampering or a relay bug) — refuse to sign and surface.
+        if fetched.counter as u64 != verified_counter {
+            return Err(
+                "relay's plaintext roster counter disagrees with the signed \
+                 roster — refusing to sign (possible tamper)"
+                    .to_string(),
+            );
+        }
         // Ratchet the anti-rollback floor forward to the verified counter and PERSIST it (session
         // cache + per-account keychain anchor) BEFORE attempting the mutation. Even if we abort
         // below (target fingerprint gone, or the PUT loses to a concurrent approval) the floor has
@@ -5995,7 +6017,7 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
 
         // Membership = verified previous roster carried forward + the verified target,
         // hard-failing on any relay-reported key substitution for an existing member (f).
-        let entries = build_roster_membership(&prev_roster.devices, target)?;
+        let entries = build_roster_membership(&prev_roster.devices, &devices.devices, target)?;
         let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
 
         // (d) new counter = verified (signature-bound) counter + 1.
@@ -6322,7 +6344,7 @@ mod tests {
             added_at: "2026-02-01T00:00:00Z".into(),
         };
 
-        let entries = build_roster_membership(&verified_prev, &target).unwrap();
+        let entries = build_roster_membership(&verified_prev, &[], &target).unwrap();
         let ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
         assert_eq!(
             ids,
@@ -6333,6 +6355,7 @@ mod tests {
         // A target that is already a carried-forward member is not duplicated.
         let entries2 = build_roster_membership(
             &verified_prev,
+            &[],
             &DeviceInfo {
                 client_id: self_id,
                 ed25519_pub: self_pub.clone(),
@@ -6343,6 +6366,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entries2.len(), 1);
+    }
+
+    #[test]
+    fn build_roster_membership_hard_fails_on_member_pubkey_substitution() {
+        // Finding #2 (f): if the relay reports a DIFFERENT ed25519_pub for an existing
+        // verified member, refuse to sign — never carry the substituted key forward.
+        let self_id = Uuid::from_u128(1);
+        let target_id = Uuid::from_u128(2);
+        let verified_prev = vec![RosterDeviceEntry {
+            client_id: self_id,
+            ed25519_pub: B64.encode([0x11u8; 32]),
+            label: "self".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let target = DeviceInfo {
+            client_id: target_id,
+            ed25519_pub: B64.encode([0x22u8; 32]),
+            label: "target".into(),
+            status: "pending".into(),
+            added_at: "2026-02-01T00:00:00Z".into(),
+        };
+        // Relay reports self with a SUBSTITUTED key.
+        let get_devices = vec![DeviceInfo {
+            client_id: self_id,
+            ed25519_pub: B64.encode([0xEEu8; 32]),
+            label: "self".into(),
+            status: "active".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let err = build_roster_membership(&verified_prev, &get_devices, &target).unwrap_err();
+        assert!(err.contains("different ed25519_pub"), "got: {err}");
     }
 
     #[test]
