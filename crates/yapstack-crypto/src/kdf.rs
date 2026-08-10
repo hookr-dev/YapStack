@@ -90,6 +90,22 @@ pub fn recovery_key(recovery_bytes: &[u8; 20]) -> Vec<u8> {
     hkdf::expand(recovery_bytes, RECOVERY_INFO, 32)
 }
 
+/// Recovery split (§6.2 / KAT §13.7): the single 64-byte HKDF-Expand of the recovery
+/// code, split into `(recovery_key, recovery_auth_key)`. Block 1 (`okm[0..32]`) is
+/// byte-identical to [`recovery_key`] (the offline vault-WRAP key); block 2 (`okm[32..64]`)
+/// is the domain-separated online AUTH token POSTed to `/auth/recover`. This is the single
+/// source of truth for the split so the desktop auth ceremony and the §13.7 KAT vectors
+/// can never drift apart.
+#[must_use]
+pub fn recovery_split(recovery_bytes: &[u8; 20]) -> ([u8; 32], [u8; 32]) {
+    let okm = hkdf::expand(recovery_bytes, RECOVERY_INFO, 64);
+    let mut wrap = [0u8; 32];
+    wrap.copy_from_slice(&okm[0..32]);
+    let mut auth = [0u8; 32];
+    auth.copy_from_slice(&okm[32..64]);
+    (wrap, auth)
+}
+
 /// Device-list signing seed (§7.2): HKDF-Expand over the vault key.
 #[must_use]
 pub fn devlist_sign_seed(vault_key: &[u8; 32]) -> [u8; 32] {
