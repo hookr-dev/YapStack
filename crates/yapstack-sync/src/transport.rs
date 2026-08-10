@@ -310,15 +310,14 @@ impl SyncTransport for HttpTransport {
         let url = head.download_url.ok_or_else(|| {
             SyncError::Transport("snapshot head present but no download_url".into())
         })?;
-        let bytes = self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec();
+        let resp = self.client.get(url).send().await?;
+        // The head advertised a snapshot, but the object may be gone (e.g. a dead PUT whose
+        // row outlived its bytes, or a race with relay GC). Degrade to changeset replay
+        // instead of hard-failing bootstrap.
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let bytes = resp.error_for_status()?.bytes().await?.to_vec();
         Ok(Some((
             SnapshotMeta {
                 generation: head.generation,

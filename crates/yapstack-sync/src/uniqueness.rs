@@ -39,30 +39,47 @@ pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncErro
 
 /// One note per session. Winner = freshest `updated_at`, tie-break lowest `id`
 /// (both synced → deterministic). Losing notes are deleted.
+///
+/// Only rows whose `session_id` (the uniqueness key) is a PROVEN merged value participate:
+/// a mid-row pull can materialize `notes.session_id` at its CRR-rebuild synthetic default,
+/// making distinct notes collide spuriously and tombstone a real note permanently. Same
+/// proven-column gate as [`dedup_audio_parts`].
 fn dedup_notes(conn: &Connection) -> Result<usize, SyncError> {
+    let proven = "SELECT pk.id FROM \"notes__crsql_pks\" pk \
+        JOIN \"notes__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'session_id'";
     // A note is a loser if, within its session_id group, another note sorts higher
     // by (updated_at DESC, id ASC).
-    let sql = "DELETE FROM notes WHERE id IN (\
+    let sql = format!(
+        "DELETE FROM notes WHERE id IN (\
         SELECT n.id FROM notes n \
         JOIN notes w ON w.session_id = n.session_id AND w.id <> n.id \
-        WHERE (w.updated_at > n.updated_at) \
-           OR (w.updated_at = n.updated_at AND w.id < n.id))";
-    Ok(conn.execute(sql, [])?)
+        WHERE ((w.updated_at > n.updated_at) \
+           OR (w.updated_at = n.updated_at AND w.id < n.id)) \
+          AND n.id IN ({proven}) AND w.id IN ({proven}))"
+    );
+    Ok(conn.execute(&sql, [])?)
 }
 
 /// Tag names unique case-insensitively. Winner per NOCASE name = lowest `id`.
 /// Repoint `session_tags.tag_id` from losers to the winner (dedup associations),
 /// drop now-duplicate junction rows, then delete loser tags.
+///
+/// Only tags whose `name` (the uniqueness key) is a PROVEN merged value participate: a
+/// mid-row pull can materialize `tags.name` at its CRR-rebuild synthetic default, making
+/// distinct tags collide spuriously and merge away a real tag permanently. Same
+/// proven-column gate as [`dedup_audio_parts`].
 fn dedup_tags(conn: &Connection) -> Result<usize, SyncError> {
+    let proven = "SELECT pk.id FROM \"tags__crsql_pks\" pk \
+        JOIN \"tags__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'name'";
     // Map each loser tag id -> winner id.
     let pairs: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT t.id AS loser, \
                     (SELECT m.id FROM tags m \
-                     WHERE m.name = t.name COLLATE NOCASE \
+                     WHERE m.name = t.name COLLATE NOCASE AND m.id IN ({proven}) \
                      ORDER BY m.id ASC LIMIT 1) AS winner \
-             FROM tags t",
-        )?;
+             FROM tags t WHERE t.id IN ({proven})",
+        ))?;
         let all = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -88,10 +105,24 @@ fn dedup_tags(conn: &Connection) -> Result<usize, SyncError> {
 }
 
 /// `(session_id, part_index)` unique. Winner = lowest `id`; losers deleted.
+///
+/// Only rows whose BOTH key columns are PROVEN merged values participate: a mid-row pull
+/// can materialize `session_audio_parts` with `part_index` at its CRR-rebuild synthetic
+/// default `0` (its column change simply has not arrived yet), which would collide
+/// spuriously with a genuine part 0 and tombstone it permanently. A column is proven when
+/// `{table}__crsql_clock` carries an entry for it (present for every real insert/merge, see
+/// tableinfo.rs; absent for a synthetic default) — the dedup analog of cascade's
+/// proven-delete gate.
 fn dedup_audio_parts(conn: &Connection) -> Result<usize, SyncError> {
-    let sql = "DELETE FROM session_audio_parts WHERE id IN (\
-        SELECT a.id FROM session_audio_parts a \
-        JOIN session_audio_parts w \
-          ON w.session_id = a.session_id AND w.part_index = a.part_index AND w.id < a.id)";
-    Ok(conn.execute(sql, [])?)
+    let proven = "SELECT pk.id FROM \"session_audio_parts__crsql_pks\" pk \
+        JOIN \"session_audio_parts__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'session_id' \
+        JOIN \"session_audio_parts__crsql_clock\" cp ON cp.key = pk.__crsql_key AND cp.col_name = 'part_index'";
+    let sql = format!(
+        "DELETE FROM session_audio_parts WHERE id IN (\
+         SELECT a.id FROM session_audio_parts a \
+         JOIN session_audio_parts w \
+           ON w.session_id = a.session_id AND w.part_index = a.part_index AND w.id < a.id \
+         WHERE a.id IN ({proven}) AND w.id IN ({proven}))"
+    );
+    Ok(conn.execute(&sql, [])?)
 }
