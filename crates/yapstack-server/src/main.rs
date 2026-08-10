@@ -50,6 +50,13 @@ async fn main() -> ExitCode {
     // applies migrations, and exits, so the long-running server can serve as the
     // non-owner `yapstack_app` role (which never runs DDL — `db::migrate` then skips).
     if std::env::var("YAPSTACK_MIGRATE_ONLY").is_ok_and(|v| matches!(v.as_str(), "1" | "true")) {
+        // Owner connection: heal the non-owner serving role for in-place upgrades whose
+        // volume created `yapstack_app` as NOLOGIN with no password (pre-serve-as-app).
+        // Migration 0008 flipped LOGIN; set the password from the env secret. Idempotent.
+        if let Err(e) = db::ensure_app_role_password(&pool).await {
+            tracing::error!(error = %e, "failed to set yapstack_app password");
+            return ExitCode::FAILURE;
+        }
         tracing::info!("migrations applied; exiting (YAPSTACK_MIGRATE_ONLY)");
         return ExitCode::SUCCESS;
     }

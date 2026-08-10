@@ -59,9 +59,9 @@ pub async fn presign(
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
 
-    // A row for this generation may already exist.
-    let existing: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT ciphertext_sha256 FROM snapshots \
+    // A row for this generation may already exist. Read its hash AND the size we metered.
+    let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT ciphertext_sha256, size_bytes FROM snapshots \
          WHERE workspace_id = $1 AND generation = $2",
     )
     .bind(auth.tenant_id)
@@ -69,9 +69,8 @@ pub async fn presign(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some((existing_hash,)) = existing {
-        // The row's bytes were metered at first presign, so no path below re-meters
-        // (D8: mirror `audio::presign`). Release the read tx before the network HEAD.
+    if let Some((existing_hash, existing_size)) = existing {
+        // Release the read tx before the network HEAD; any write path below reopens one.
         tx.commit().await?;
 
         // HEAD object storage to tell a genuinely-published snapshot apart from a row whose
@@ -83,6 +82,8 @@ pub async fn presign(
             .await
             .unwrap_or_default();
 
+        let existing_size = existing_size.max(0) as u64;
+
         if existing_hash == hash {
             if existing_present {
                 // Idempotent: the exact generation+hash is already published.
@@ -92,8 +93,12 @@ pub async fn presign(
                     object_key: key,
                 }));
             }
-            // Row committed but the PUT died: hand back a fresh upload_url (no re-meter).
-            let signed = storage::presign(cfg, "PUT", &key, Some(req.size), chrono::Utc::now());
+            // Row committed but the PUT died: hand back a fresh upload_url. Pin the SIZE we
+            // already metered (mirror `audio::presign`), never the newly-declared one — the
+            // hash is unchanged, so accepting a larger declared size would store unmetered
+            // bytes under the same content-addressed key.
+            let signed =
+                storage::presign(cfg, "PUT", &key, Some(existing_size), chrono::Utc::now());
             return Ok(Json(SnapshotPresignResponse {
                 already_exists: false,
                 upload_url: Some(signed.url),
@@ -108,22 +113,39 @@ pub async fn presign(
                 "snapshot generation already published with a different hash".into(),
             ));
         }
-        // Old object absent (dead PUT + fresh-key reseal retry, crypto.rs:53-62): overwrite
-        // the row with the new hash/size so the seed can finish publishing this generation.
-        // No re-meter — the bytes were reserved at first presign.
+
+        // Old object absent (dead PUT + fresh-key reseal retry, crypto.rs:53-62): re-point
+        // the row at the new hash/size so the seed can finish publishing this generation.
+        // Meter only the POSITIVE delta over the size already reserved — the resealed
+        // ciphertext can be larger, and re-signing a bigger PUT with no metering is a quota
+        // bypass. The UPDATE is a COMPARE-AND-SWAP on the hash we read: if a concurrent
+        // retry (or a raced publish) advanced this row between our read and write, we must
+        // NOT blind-overwrite it (that could orphan a valid object and point the row at a
+        // missing one) — we roll back our metering and report a conflict instead.
         let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
-        sqlx::query(
+        let delta = req.size.saturating_sub(existing_size);
+        choke::admit(&mut tx, auth.tenant_id, &limits, delta, &help_url).await?;
+        let updated = sqlx::query(
             "UPDATE snapshots \
              SET ciphertext_sha256 = $3, size_bytes = $4, baseline_seq = $5 \
-             WHERE workspace_id = $1 AND generation = $2",
+             WHERE workspace_id = $1 AND generation = $2 AND ciphertext_sha256 = $6",
         )
         .bind(auth.tenant_id)
         .bind(generation)
         .bind(&hash)
         .bind(i64::try_from(req.size).unwrap_or(i64::MAX))
         .bind(req.baseline_seq)
+        .bind(&existing_hash)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() == 0 {
+            // The row no longer holds the hash we read. Undo the delta reservation and
+            // return a conflict; the client re-reads and retries against current state.
+            tx.rollback().await?;
+            return Err(AppError::Conflict(
+                "snapshot generation concurrently updated; retry".into(),
+            ));
+        }
         tx.commit().await?;
 
         let signed = storage::presign(cfg, "PUT", &key, Some(req.size), chrono::Utc::now());

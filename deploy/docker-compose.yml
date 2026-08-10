@@ -81,6 +81,11 @@ services:
     environment:
       YAPSTACK_MIGRATE_ONLY: "true"
       DATABASE_URL: ${MIGRATE_DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
+      # Migration 0008 flips yapstack_app to LOGIN on in-place upgrades; this owner
+      # one-shot then sets its password from the secret (docker init scripts do NOT rerun
+      # on an existing volume, so a pre-serve-as-app volume has the role as NOLOGIN with no
+      # password). Idempotent — matches the value the init script set on a fresh volume.
+      YAPSTACK_APP_PASSWORD: ${YAPSTACK_APP_PASSWORD:?set YAPSTACK_APP_PASSWORD in .env}
       # Only DATABASE_URL is used on this path, but the entrypoint renders the full TOML,
       # so the same required secrets must be present.
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}

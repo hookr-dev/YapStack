@@ -1,0 +1,17 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- YapStack relay — heal the non-owner serving role on in-place upgrades.
+--
+-- Migration 0001 creates `yapstack_app` as NOLOGIN; on a FRESH volume the compose
+-- init script (`deploy/postgres-init/00-yapstack-roles.sh`) then re-creates it as
+-- LOGIN + password before the server ever connects. But docker init scripts DO NOT
+-- rerun on an existing volume, so a deployment upgrading from the era when the server
+-- connected as the DB OWNER still has `yapstack_app` as NOLOGIN — and the new
+-- serve-as-`yapstack_app` default then fails to authenticate.
+--
+-- This migration runs on the OWNER migrate one-shot and, being newly added, applies to
+-- those existing volumes too. It flips the LOGIN attribute idempotently (a no-op on a
+-- fresh deploy where the role is already LOGIN). The role's PASSWORD cannot be set from
+-- static SQL because the secret lives only in the environment, so the same migrate
+-- one-shot sets it from `YAPSTACK_APP_PASSWORD` right after migrations run
+-- (`db::ensure_app_role_password`, wired in `main.rs`).
+ALTER ROLE yapstack_app WITH LOGIN;

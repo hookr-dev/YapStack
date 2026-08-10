@@ -58,6 +58,36 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     migrator.run(pool).await
 }
 
+/// Set the `yapstack_app` password from `YAPSTACK_APP_PASSWORD` (owner migrate one-shot
+/// only). Migration `0008` flips the role to LOGIN on an in-place upgrade, but the secret
+/// lives only in the environment — not in static migration SQL — so the owner connection
+/// applies it here. Idempotent: on a fresh deploy the compose init script already set the
+/// same password, so this re-asserts it; when the env var is unset/empty it is a no-op
+/// (migration `0008` still ensured LOGIN).
+///
+/// Runs as the migration OWNER (superuser on the default compose), the only role able to
+/// `ALTER` another role. The serving path never calls this — `yapstack_app` cannot alter
+/// itself, and its boot skips migrations entirely.
+///
+/// # Errors
+/// Returns a `sqlx::Error` if the `ALTER ROLE` fails.
+pub async fn ensure_app_role_password(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let password = match std::env::var("YAPSTACK_APP_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return Ok(()),
+    };
+    // Quote the secret as a SQL literal SERVER-SIDE (`ALTER ROLE ... PASSWORD` takes no
+    // bind parameters); never interpolate the raw secret into the DDL text ourselves.
+    let quoted: String = sqlx::query_scalar("SELECT quote_literal($1)")
+        .bind(&password)
+        .fetch_one(pool)
+        .await?;
+    sqlx::query(&format!("ALTER ROLE yapstack_app WITH PASSWORD {quoted}"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Begin a transaction with the RLS guard set: `app.tenant_id` is bound
 /// TRANSACTION-LOCAL (the `true` third arg to `set_config`), so it cannot leak across
 /// pooled connections. Reading it back with `current_setting('app.tenant_id', true)`
