@@ -40,13 +40,17 @@ pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncErro
 /// One note per session. Winner = freshest `updated_at`, tie-break lowest `id`
 /// (both synced → deterministic). Losing notes are deleted.
 ///
-/// Only rows whose `session_id` (the uniqueness key) is a PROVEN merged value participate:
-/// a mid-row pull can materialize `notes.session_id` at its CRR-rebuild synthetic default,
-/// making distinct notes collide spuriously and tombstone a real note permanently. Same
-/// proven-column gate as [`dedup_audio_parts`].
+/// Only rows whose `session_id` (the uniqueness key) AND `updated_at` (the LWW winner column)
+/// are BOTH PROVEN merged values participate: a mid-row pull can materialize `notes.session_id`
+/// at its CRR-rebuild synthetic default (making distinct notes collide spuriously) OR
+/// materialize `updated_at` at its live `datetime('now')` default (making a partial note
+/// out-rank and tombstone a genuine, complete note that carries an older real timestamp). The
+/// destructive comparison keys off `updated_at`, so it too must be proven. Same proven-column
+/// gate as [`dedup_audio_parts`], extended to the winner column.
 fn dedup_notes(conn: &Connection) -> Result<usize, SyncError> {
     let proven = "SELECT pk.id FROM \"notes__crsql_pks\" pk \
-        JOIN \"notes__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'session_id'";
+        JOIN \"notes__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'session_id' \
+        JOIN \"notes__crsql_clock\" cu ON cu.key = pk.__crsql_key AND cu.col_name = 'updated_at'";
     // A note is a loser if, within its session_id group, another note sorts higher
     // by (updated_at DESC, id ASC).
     let sql = format!(
@@ -66,8 +70,10 @@ fn dedup_notes(conn: &Connection) -> Result<usize, SyncError> {
 ///
 /// Only tags whose `name` (the uniqueness key) is a PROVEN merged value participate: a
 /// mid-row pull can materialize `tags.name` at its CRR-rebuild synthetic default, making
-/// distinct tags collide spuriously and merge away a real tag permanently. Same
-/// proven-column gate as [`dedup_audio_parts`].
+/// distinct tags collide spuriously and merge away a real tag permanently. The LWW winner
+/// here is the lowest `id` — the PRIMARY KEY, which every row carries (it can never sit at a
+/// synthetic default), so the `name` proof already covers the winner column with nothing more
+/// to gate. Same proven-column gate as [`dedup_audio_parts`].
 fn dedup_tags(conn: &Connection) -> Result<usize, SyncError> {
     let proven = "SELECT pk.id FROM \"tags__crsql_pks\" pk \
         JOIN \"tags__crsql_clock\" cs ON cs.key = pk.__crsql_key AND cs.col_name = 'name'";

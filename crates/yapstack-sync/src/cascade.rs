@@ -53,7 +53,7 @@ const CASCADE_JUNCTION: &[Junction] = &[
     ),
 ];
 
-/// SET-NULL sites: null the FK column when its referent is gone. `(table, fk_col,
+/// SET-NULL sites: null the FK column when its referent is PROVEN deleted. `(table, fk_col,
 /// parent, parent_pk)`.
 const SET_NULL: &[(&str, &str, &str, &str)] = &[
     ("folders", "parent_id", "folders", "id"),
@@ -101,12 +101,16 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
         stats.deleted += tx.execute(&sql, [])?;
     }
     for (table, fk, parent, ppk) in SET_NULL {
-        // SET-NULL is non-destructive, so nulling on mere absence is acceptable here
-        // (a resurrected parent can simply be re-pointed) — no proven-delete gate.
+        // Null the FK only when its referent is PROVEN deleted — never on mere absence,
+        // exactly as CASCADE_DELETE above. A merely-not-yet-merged / crypto-quarantined
+        // parent (absent, but with NO delete sentinel) must NOT cause its children's fk to
+        // be nulled: its insert may simply not have arrived yet, and nulling a live
+        // reference against that transient absence would be a permanent, propagating edit.
         let sql = format!(
             "UPDATE \"{table}\" SET \"{fk}\" = NULL \
              WHERE \"{fk}\" IS NOT NULL AND \
-             \"{fk}\" NOT IN (SELECT \"{ppk}\" FROM \"{parent}\")"
+             \"{fk}\" IN ({})",
+            proven_deleted_pks(parent, ppk)
         );
         stats.nulled += tx.execute(&sql, [])?;
     }

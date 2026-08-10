@@ -259,3 +259,70 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
         "the author device must not lose its children to the peer's cascade tombstone"
     );
 }
+
+/// FINDING (fix 2): `dedup_notes` gated its proven-merged guard only on `session_id` — the
+/// GROUPING key — not on `updated_at`, the DESTRUCTIVE LWW winner column. A partial note whose
+/// only merged column is `session_id` materializes `updated_at` at the live `datetime('now')`
+/// default, which OUT-RANKS a genuine complete note carrying an older real timestamp, so the
+/// unconditional dedup tombstones the complete note permanently. Requiring `updated_at` proven
+/// too excludes the partial note from the winner set, so a value that never actually merged can
+/// no longer destroy a real note.
+#[test]
+fn dedup_notes_must_not_tombstone_a_complete_note_for_a_partial_synthetic_updated_at() {
+    // Peer B holds a genuine, COMPLETE note for session s0 with an OLD real `updated_at`. Every
+    // column is locally written, so both `session_id` AND `updated_at` are proven.
+    let b = migrated(false);
+    b.conn()
+        .execute(
+            "INSERT INTO notes(id,session_id,content,updated_at) \
+             VALUES('n-complete','s0','real body','2000-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+    // Device A authors a DIFFERENT note on the same session; a mid-row pull delivers only its
+    // `session_id` head, so on B its `updated_at` stays at the synthetic `datetime('now')`
+    // default — NEWER than the complete note's 2000 timestamp, hence a spurious higher rank.
+    let a = migrated(false);
+    a.conn()
+        .execute(
+            "INSERT INTO notes(id,session_id,content) VALUES('n-partial','s0','partial')",
+            [],
+        )
+        .unwrap();
+    let cs = read_local_changes_since(a.conn(), 0).unwrap();
+    let mut page1 = Changeset::default();
+    for r in &cs.rows {
+        let pk = String::from_utf8_lossy(&r.pk).to_string();
+        let is_partial = r.table == "notes" && pk.contains("n-partial");
+        let is_head = r.cid == "-1" || r.cid == "session_id";
+        if !is_partial || is_head {
+            page1.rows.push(r.clone());
+        }
+    }
+    merge_changeset(b.conn(), &page1).unwrap();
+
+    // Precondition: the partial note materialized, colliding on session_id=s0 (its synthetic
+    // `updated_at` out-ranks the complete note's real 2000 timestamp).
+    assert_eq!(
+        count(b.conn(), "SELECT count(*) FROM notes WHERE session_id='s0'"),
+        2,
+        "precondition: partial merge yields a transient session_id collision"
+    );
+
+    // The drain runs `enforce_uniqueness` after any applied>0 merge — on this mid-row state.
+    enforce_uniqueness(b.conn()).unwrap();
+
+    // CONVERGED INVARIANT: the complete note SURVIVES. Its removal would have keyed off a winner
+    // column (`updated_at`) the partial note never actually merged. THIS FAILS on the
+    // session_id-only guard, which lets the synthetic timestamp out-rank and tombstone it.
+    assert_eq!(
+        count(
+            b.conn(),
+            "SELECT count(*) FROM notes WHERE id='n-complete' AND content='real body'"
+        ),
+        1,
+        "the genuine complete note must not be tombstoned by a partial note's synthetic \
+         updated_at"
+    );
+}

@@ -96,13 +96,6 @@ pub struct DrainReport {
     pub push_error: Option<SyncError>,
     /// The pull direction's non-fatal error this cycle, if any. `None` on a clean pull.
     pub pull_error: Option<SyncError>,
-    /// True when the pull half drained cleanly all the way to the relay tip this cycle (its
-    /// last page had `has_more == false`, or there was nothing to pull). `false` when the pull
-    /// stopped short — a transport/merge error, or a mid-multi-page state. The post-merge
-    /// maintenance passes (cascade/uniqueness) may only run on a converged prefix, so the
-    /// desktop drain gates them on this being `true` — never on a partly-drained page whose
-    /// straddling rows would look like spurious collisions/orphans.
-    pub reached_tip: bool,
     /// This device's pull watermark (highest fully-merged commit-ordered `changeset_seq`) as
     /// of the END of this cycle. Compared against [`Self::server_max`] to decide the honest
     /// "up to date" vs. "catching up" state (R12) — an empty outbox alone is NOT up to date.
@@ -346,35 +339,16 @@ pub fn retry_crypto_quarantine(
 /// A chunk boundary may fall INSIDE one `db_version` group (a single local transaction can
 /// author more rows than one chunk holds), which is why the watermark a chunk may commit is
 /// computed separately by [`chunk_commit_watermark`] — never assumed to be the chunk's max
-/// `db_version`. It is NEVER cut inside a single logical `(table, pk)` row, though: the
-/// per-column change rows of one row are contiguous in `crsql_changes` order, and a peer
-/// that drains to a chunk boundary must see whole rows only (a truncated row materializes
-/// its NOT-NULL columns at CRR-rebuild synthetic defaults, which the post-merge maintenance
-/// passes then mistake for genuine collisions/orphans).
+/// `db_version`.
 fn plan_capture_chunks(rows: Vec<ChangeRow>) -> Vec<Vec<ChangeRow>> {
     let mut chunks: Vec<Vec<ChangeRow>> = Vec::new();
     let mut buf: Vec<ChangeRow> = Vec::new();
     let mut acc = 4usize; // Changeset::encode row-count header
-    let mut group_start = 0usize; // index in `buf` where the current (table, pk) group began
     for row in rows {
         let sz = row_encoded_size(&row);
-        let starts_new_group = buf
-            .last()
-            .map(|prev| prev.table != row.table || prev.pk != row.pk)
-            .unwrap_or(true);
-        if starts_new_group {
-            group_start = buf.len();
-        }
-        // Only ever cut on a logical-row boundary. When the size cap is reached mid-row we
-        // carry the trailing partial (table, pk) group into the next chunk; that carried
-        // group is exempt from the cap, so a single logical row wider than
-        // CHUNK_PLAINTEXT_BUDGET ships over-budget (soft cap — every sync table is narrow).
-        if group_start > 0 && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
-            let carried = buf.split_off(group_start);
-            acc = 4 + carried.iter().map(row_encoded_size).sum::<usize>();
+        if !buf.is_empty() && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
             chunks.push(std::mem::take(&mut buf));
-            buf = carried;
-            group_start = 0;
+            acc = 4;
         }
         acc += sz;
         buf.push(row);
@@ -1016,9 +990,6 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
             break;
         }
     }
-    // The loop only exits here (rather than via a `?`) once it has drained to the relay tip —
-    // an empty page or a final `has_more == false`. Signal that converged prefix to the caller.
-    report.reached_tip = true;
     Ok(())
 }
 
@@ -3001,105 +2972,6 @@ mod tests {
             state::push_watermark(conn).unwrap(),
             source[0].db_version,
             "the group's version is committed only once the group is fully captured"
-        );
-    }
-
-    #[test]
-    fn ratified_chunking_never_exposes_a_half_merged_synthetic_default_row() {
-        // RATIFIED PATH — fix (1), row-atomic chunking. The `data_integrity_prove` RED test
-        // drives the maintenance passes DIRECTLY on a hand-split changeset; this test covers
-        // the fix that makes that split IMPOSSIBLE at the source. `plan_capture_chunks` must
-        // never cut between the per-column change rows of one logical `(table, pk)`. A peer
-        // draining chunk-by-chunk then only ever materializes WHOLE rows — a NOT-NULL column
-        // (`part_index`) is never left at its CRR-rebuild synthetic default `0` while its real
-        // value is still in flight, which is the exact partial row `enforce_uniqueness` would
-        // mistake for a genuine part-0 collision and tombstone permanently.
-        let dev = CrsqlDb::open_in_memory().unwrap();
-        let sap = "CREATE TABLE session_audio_parts(\
-                     id TEXT NOT NULL PRIMARY KEY, \
-                     session_id TEXT NOT NULL DEFAULT '', \
-                     part_index INTEGER NOT NULL DEFAULT 0, \
-                     file_path TEXT NOT NULL DEFAULT '');";
-        dev.conn().execute_batch(sap).unwrap();
-        dev.conn()
-            .query_row("SELECT crsql_as_crr('session_audio_parts')", [], |_| Ok(()))
-            .unwrap();
-        let conn = dev.conn();
-
-        // Six genuine parts for one session; `file_path` carries a big value so the backlog's
-        // per-column change rows straddle several `CHUNK_PLAINTEXT_BUDGET` boundaries — the
-        // condition under which the old size-only cut fell INSIDE a logical row.
-        for i in 0..6 {
-            conn.execute(
-                "INSERT INTO session_audio_parts(id,session_id,part_index,file_path) \
-                 VALUES(?1,'s0',?2,?3)",
-                rusqlite::params![format!("ap{i}"), i, big_value('x')],
-            )
-            .unwrap();
-        }
-
-        let source = read_local_changes_since(conn, 0).unwrap().rows;
-        // Each part authors several per-column change rows, so a size cut CAN land inside one.
-        let multi_col = source.iter().filter(|r| r.pk == source[0].pk).count();
-        assert!(
-            multi_col > 1,
-            "a logical row must span multiple per-column change rows"
-        );
-
-        let chunks = plan_capture_chunks(source.clone());
-        assert!(chunks.len() >= 2, "fixture must span multiple chunks");
-
-        // ROW-ATOMIC: every `(table, pk)` group lands WHOLLY in exactly one chunk.
-        let mut pk_chunk: std::collections::HashMap<(String, Vec<u8>), usize> =
-            std::collections::HashMap::new();
-        for (ci, chunk) in chunks.iter().enumerate() {
-            for r in chunk {
-                let key = (r.table.clone(), r.pk.clone());
-                if let Some(prev) = pk_chunk.insert(key.clone(), ci) {
-                    assert_eq!(prev, ci, "logical row {key:?} was split across chunks");
-                }
-            }
-        }
-
-        // END-TO-END: a fresh peer draining chunk-by-chunk only ever holds COMPLETE rows.
-        let peer = CrsqlDb::open_in_memory().unwrap();
-        peer.conn().execute_batch(sap).unwrap();
-        peer.conn()
-            .query_row("SELECT crsql_as_crr('session_audio_parts')", [], |_| Ok(()))
-            .unwrap();
-        for chunk in &chunks {
-            let cs = Changeset {
-                rows: chunk.clone(),
-            };
-            merge_changeset(peer.conn(), &cs).unwrap();
-            // A half-merged row would surface `file_path` at its synthetic default `''`.
-            let partial: i64 = peer
-                .conn()
-                .query_row(
-                    "SELECT count(*) FROM session_audio_parts WHERE file_path = ''",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                partial, 0,
-                "row-atomic chunking must never expose a half-merged (synthetic-default) row"
-            );
-        }
-
-        // Converged: all six distinct parts survive — no part was tombstoned by a spurious
-        // synthetic-default collision, because none ever materialized.
-        let total: i64 = peer
-            .conn()
-            .query_row(
-                "SELECT count(*) FROM session_audio_parts WHERE session_id = 's0'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            total, 6,
-            "all genuine parts converge with no spurious dedup"
         );
     }
 
