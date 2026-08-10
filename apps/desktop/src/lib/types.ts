@@ -617,9 +617,32 @@ async syncApproveDevice(fingerprint: string) : Promise<Result<SyncStatusDto, str
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Sign out. ASYNC (item 3) so `DrainHandle::stop()` — which JOINS the audio/SSE/kick lanes —
+ * runs on a blocking pool thread, NEVER on the Tauri event loop; a synchronous command body
+ * would freeze the whole UI for as long as a lane takes to reach its stop check. The per-
+ * account anchor is deliberately NOT cleared (item 1): a routine sign-out preserves the
+ * account's anti-substitution baselines so the next sign-in stays a known device, not TOFU.
+ * `sync_forget_account` is the explicit path that clears an anchor.
+ */
 async syncSignOut() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_sign_out") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Explicitly forget an account (item 1): clears its per-account anchor — the tenant binding
+ * and §3.2-C3 / §7.4 anti-substitution baselines that routine sign-out preserves. After this,
+ * the next sign-in for this account is treated as a first-time (TOFU) device. Distinct from
+ * `sync_sign_out`, which keeps the anchor. UI wiring (a "Forget this account" action) is out
+ * of prototype scope; the command + logic are implemented here and registered in lib.rs.
+ */
+async syncForgetAccount(serverUrl: string, email: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_forget_account", { serverUrl, email }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
