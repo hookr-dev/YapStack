@@ -153,7 +153,12 @@ async fn login_finish_succeeds_under_app_role() {
     let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
 
     // signup runs INSIDE begin_tenant_tx, so app.tenant_id IS set and RLS passes here.
-    let resp = post(&app, "/auth/signup", signup_body(&email, &salt_enc, &auth_key)).await;
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -162,7 +167,11 @@ async fn login_finish_succeeds_under_app_role() {
 
     // login/begin is pre-tenant but touches only the non-RLS `users` table — fine.
     let resp = post(&app, "/auth/login/begin", json!({ "email": email })).await;
-    assert_eq!(resp.status(), StatusCode::OK, "login/begin (users only) should be OK");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "login/begin (users only) should be OK"
+    );
 
     // login/finish: the `users JOIN workspace_members` runs in AUTOCOMMIT (no tenant tx),
     // so app.tenant_id is unset -> RLS predicate is NULL -> 0 rows -> the handler returns
@@ -196,8 +205,17 @@ async fn recover_succeeds_under_app_role() {
     let salt_enc = [0x24u8; 16];
     let auth_key = client_auth_key("hunter2 hunter2 hunter2", &salt_enc);
 
-    let resp = post(&app, "/auth/signup", signup_body(&email, &salt_enc, &auth_key)).await;
-    assert_eq!(resp.status(), StatusCode::OK, "signup must succeed as the app role");
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body(&email, &salt_enc, &auth_key),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "signup must succeed as the app role"
+    );
 
     // /auth/recover: same `users JOIN workspace_members` in autocommit -> 0 rows -> 401.
     // The recovery path is the ONLY route a locked-out user has; it is permanently dead.

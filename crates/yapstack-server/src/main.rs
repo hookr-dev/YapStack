@@ -68,8 +68,11 @@ async fn main() -> ExitCode {
 
     // `into_make_service_with_connect_info` surfaces the wire peer as
     // `ConnectInfo<SocketAddr>`, the ground truth for `ClientIp` rate-limit keys.
-    if let Err(e) =
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
     {
         tracing::error!(error = %e, "server error");
         return ExitCode::FAILURE;

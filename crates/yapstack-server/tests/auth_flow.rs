@@ -771,7 +771,10 @@ async fn finding1_cached_counter_permanently_409_locks_lagging_approver() {
     // the TOFU baselines in the sibling crypto finding).
     let (d2_access, d2_served_counter) = login_finish_as(&app, &email, &auth_key, d2).await;
     let mut d2_cache: i64 = d2_served_counter;
-    assert_eq!(d2_cache, 1, "D2 re-anchored to the current counter via login");
+    assert_eq!(
+        d2_cache, 1,
+        "D2 re-anchored to the current counter via login"
+    );
 
     // D2 approves D3 -> server counter 2. D1's cache is STILL 1 (nothing told it).
     let (d3, _d3_access) = enroll_pending(&app, &email, &auth_key).await;
@@ -953,7 +956,10 @@ async fn finding2_get_devices_status_is_relay_mutable_unsigned_membership_source
     .await
     .unwrap()
     .rows_affected();
-    assert_eq!(rows, 1, "relay flipped one row pending->active with no crypto");
+    assert_eq!(
+        rows, 1,
+        "relay flipped one row pending->active with no crypto"
+    );
     tx.commit().await.unwrap();
 
     // The honest approver's SOLE membership source now reports the attacker as active.

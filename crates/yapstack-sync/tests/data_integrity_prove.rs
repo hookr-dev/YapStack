@@ -84,7 +84,10 @@ fn dedup_must_not_destroy_a_partially_merged_audio_part() {
     // Device B — a fresh peer with no shared ancestry — drains pull page 1 to the tip.
     let b = migrated(false);
     let (applied, _q) = merge_changeset(b.conn(), &page1).unwrap();
-    assert!(applied > 0, "page 1 must apply changes so the drain runs maintenance");
+    assert!(
+        applied > 0,
+        "page 1 must apply changes so the drain runs maintenance"
+    );
 
     // The truncated `ap-zzz` materialized with part_index defaulted to 0 — a spurious
     // collision with the genuine `ap0` that exists ONLY because the pull is mid-row.
@@ -160,7 +163,10 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
     // Device C authors a complete session S with children.
     let c = migrated(false);
     c.conn()
-        .execute("INSERT INTO sessions(id,title) VALUES('S','My Session')", [])
+        .execute(
+            "INSERT INTO sessions(id,title) VALUES('S','My Session')",
+            [],
+        )
         .unwrap();
     for g in 0..3 {
         c.conn()
@@ -172,7 +178,10 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
             .unwrap();
     }
     c.conn()
-        .execute("INSERT INTO notes(id,session_id,content) VALUES('nS','S','note')", [])
+        .execute(
+            "INSERT INTO notes(id,session_id,content) VALUES('nS','S','note')",
+            [],
+        )
         .unwrap();
 
     let cs = read_local_changes_since(c.conn(), 0).unwrap();
@@ -193,9 +202,15 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
     // Device B merges the children; the parent stays quarantined (absent).
     let b = migrated(false);
     let (applied, _q) = merge_changeset(b.conn(), &without_parent).unwrap();
-    assert!(applied > 0, "children must apply so the drain runs cascade_gc");
+    assert!(
+        applied > 0,
+        "children must apply so the drain runs cascade_gc"
+    );
     assert_eq!(
-        count(b.conn(), "SELECT count(*) FROM segments WHERE session_id='S'"),
+        count(
+            b.conn(),
+            "SELECT count(*) FROM segments WHERE session_id='S'"
+        ),
         3,
         "precondition: children present"
     );
@@ -220,7 +235,10 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
     // the children were tombstoned at cl 2 and the restore cannot bring them back.
     // THESE ASSERTIONS FAIL ON THE BUGGY TREE.
     assert_eq!(
-        count(b.conn(), "SELECT count(*) FROM segments WHERE session_id='S'"),
+        count(
+            b.conn(),
+            "SELECT count(*) FROM segments WHERE session_id='S'"
+        ),
         3,
         "children must survive a parent that was merely not-yet-merged"
     );
@@ -233,7 +251,10 @@ fn cascade_gc_must_not_destroy_children_of_a_not_yet_merged_parent() {
     // Global permanence: the cascade tombstones propagate back to author C.
     support::direct_merge(b.conn(), c.conn(), 0);
     assert_eq!(
-        count(c.conn(), "SELECT count(*) FROM segments WHERE session_id='S'"),
+        count(
+            c.conn(),
+            "SELECT count(*) FROM segments WHERE session_id='S'"
+        ),
         3,
         "the author device must not lose its children to the peer's cascade tombstone"
     );

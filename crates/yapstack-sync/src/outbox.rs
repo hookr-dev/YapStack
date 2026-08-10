@@ -2669,7 +2669,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(kv_count(dev.conn()), 2, "precondition: two own rows are local");
+        assert_eq!(
+            kv_count(dev.conn()),
+            2,
+            "precondition: two own rows are local"
+        );
 
         // Force the relay to re-serve our OWN changesets on the next pull by rewinding the
         // pull watermark; the rows are still local so the re-merge must be a no-op.
@@ -3036,11 +3040,11 @@ mod tests {
 
         let source = read_local_changes_since(conn, 0).unwrap().rows;
         // Each part authors several per-column change rows, so a size cut CAN land inside one.
-        let multi_col = source
-            .iter()
-            .filter(|r| r.pk == source[0].pk)
-            .count();
-        assert!(multi_col > 1, "a logical row must span multiple per-column change rows");
+        let multi_col = source.iter().filter(|r| r.pk == source[0].pk).count();
+        assert!(
+            multi_col > 1,
+            "a logical row must span multiple per-column change rows"
+        );
 
         let chunks = plan_capture_chunks(source.clone());
         assert!(chunks.len() >= 2, "fixture must span multiple chunks");
@@ -3064,7 +3068,9 @@ mod tests {
             .query_row("SELECT crsql_as_crr('session_audio_parts')", [], |_| Ok(()))
             .unwrap();
         for chunk in &chunks {
-            let cs = Changeset { rows: chunk.clone() };
+            let cs = Changeset {
+                rows: chunk.clone(),
+            };
             merge_changeset(peer.conn(), &cs).unwrap();
             // A half-merged row would surface `file_path` at its synthetic default `''`.
             let partial: i64 = peer
@@ -3091,7 +3097,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(total, 6, "all genuine parts converge with no spurious dedup");
+        assert_eq!(
+            total, 6,
+            "all genuine parts converge with no spurious dedup"
+        );
     }
 
     #[test]

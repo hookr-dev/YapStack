@@ -167,10 +167,17 @@ async fn snapshot_dead_put_must_be_retryable_not_409_forever() {
 
     // Presign generation 5. Server records the row + meters bytes, hands back upload_url.
     let resp = post(&app, "/snapshot/presign", Some(&tok), presign_body(&h1, 5)).await;
-    assert_eq!(resp.status(), StatusCode::OK, "first presign should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "first presign should succeed"
+    );
     let v = body_json(resp).await;
     assert_eq!(v["already_exists"], false);
-    assert!(v["upload_url"].is_string(), "first presign returns upload_url");
+    assert!(
+        v["upload_url"].is_string(),
+        "first presign returns upload_url"
+    );
     // --- The direct PUT to object storage now DIES: we deliberately never upload. ---
 
     // The seed retries. Fresh-key reseal → different hash H2 for the SAME generation 5.

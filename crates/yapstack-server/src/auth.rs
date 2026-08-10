@@ -281,7 +281,9 @@ pub async fn login_finish(
         return Err(AppError::Unauthorized);
     };
 
-    let computed = st.server_verifier(auth_key, row.server_salt.clone()).await?;
+    let computed = st
+        .server_verifier(auth_key, row.server_salt.clone())
+        .await?;
     if !ct_eq(&computed, &row.verifier) {
         return Err(AppError::Unauthorized);
     }
@@ -394,11 +396,15 @@ pub async fn recover(
     // Uniform failure for unknown user AND bad recovery code (no oracle), computing a
     // dummy hash on every reject path to flatten timing.
     let Some(row) = row else {
-        let _ = st.server_verifier(recovery_auth_key, gen_salt().to_vec()).await;
+        let _ = st
+            .server_verifier(recovery_auth_key, gen_salt().to_vec())
+            .await;
         return Err(AppError::Unauthorized);
     };
     let (Some(rec_salt), Some(rec_verifier)) = (row.recovery_salt, row.recovery_verifier) else {
-        let _ = st.server_verifier(recovery_auth_key, gen_salt().to_vec()).await;
+        let _ = st
+            .server_verifier(recovery_auth_key, gen_salt().to_vec())
+            .await;
         return Err(AppError::Unauthorized);
     };
 

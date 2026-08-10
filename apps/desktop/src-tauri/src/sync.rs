@@ -1104,8 +1104,7 @@ fn update_session_wrapped<F: FnOnce(&mut Session)>(
     let _guard = session_store_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut s = load_session_wrapped(ks, enc_path)?
-        .ok_or_else(|| "not signed in".to_string())?;
+    let mut s = load_session_wrapped(ks, enc_path)?.ok_or_else(|| "not signed in".to_string())?;
     f(&mut s);
     store_session_wrapped_locked(ks, enc_path, &s)?;
     Ok(s)
@@ -1217,7 +1216,10 @@ fn store_account_anchor(
 /// Explicitly forget one account's anchor (the `sync_forget_account` command). This is the
 /// ONLY path that removes an anchor — routine sign-out (`clear_session`) MUST NOT.
 fn clear_account_anchor(server_url: &str, email: &str) -> Result<(), String> {
-    store_delete(&anchor_account_name(server_url, email), DELETE_REASON_SIGN_OUT)
+    store_delete(
+        &anchor_account_name(server_url, email),
+        DELETE_REASON_SIGN_OUT,
+    )
 }
 
 /// Write/update the per-account anchor from a freshly-stored session (item 1). Called at
@@ -4345,8 +4347,7 @@ fn verify_and_inspect_roster(
     this_client_id: Uuid,
     cached_counter: i64,
 ) -> Result<(u32, u64, bool, String), String> {
-    let (roster, fp) =
-        verify_roster_signed(device_list, signature_b64, vault_key, cached_counter)?;
+    let (roster, fp) = verify_roster_signed(device_list, signature_b64, vault_key, cached_counter)?;
     let active = roster.devices.iter().any(|d| d.client_id == this_client_id);
     Ok((roster.vault_key_epoch, roster.counter, active, fp))
 }
@@ -5799,9 +5800,8 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
         .map(|a| a.roster_counter)
         .or_else(|| {
             load_session().ok().flatten().and_then(|s| {
-                (s.server_url == pending.server_url
-                    && s.email.eq_ignore_ascii_case(&pending.email))
-                .then_some(s.roster_counter)
+                (s.server_url == pending.server_url && s.email.eq_ignore_ascii_case(&pending.email))
+                    .then_some(s.roster_counter)
             })
         })
         .unwrap_or(-1);
@@ -6007,8 +6007,7 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
 
         // Membership = verified previous roster carried forward + the verified target,
         // hard-failing on any relay-reported key substitution for an existing member (f).
-        let entries =
-            build_roster_membership(&prev_roster.devices, &devices.devices, target)?;
+        let entries = build_roster_membership(&prev_roster.devices, &devices.devices, target)?;
         let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
 
         // (d) new counter = verified (signature-bound) counter + 1.
@@ -6049,8 +6048,7 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
             RosterPutOutcome::Conflict if attempts < 2 => continue,
             RosterPutOutcome::Conflict => {
                 return Err(
-                    "roster upload kept losing to a concurrent approval — please try again"
-                        .into(),
+                    "roster upload kept losing to a concurrent approval — please try again".into(),
                 )
             }
         }
@@ -6866,8 +6864,16 @@ mod tests {
         perform_cutover(&path, &svc).expect("account A enable-time cutover");
         {
             let db = CrsqlDb::open(&path).unwrap();
-            assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0, "A starts clean");
-            assert_eq!(state::push_watermark(db.conn()).unwrap(), 0, "A starts clean");
+            assert_eq!(
+                state::pull_watermark(db.conn()).unwrap(),
+                0,
+                "A starts clean"
+            );
+            assert_eq!(
+                state::push_watermark(db.conn()).unwrap(),
+                0,
+                "A starts clean"
+            );
         }
 
         // Account A syncs for months: the drain advances the watermarks to A's tenant tip.
@@ -8147,7 +8153,10 @@ mod tests {
                 Some("refresh1"),
                 "merge preserved the drain's rotated refresh token"
             );
-            assert_eq!(merged.bearer, "access1", "merge preserved the rotated access token");
+            assert_eq!(
+                merged.bearer, "access1",
+                "merge preserved the rotated access token"
+            );
 
             let final_session = load_session_wrapped(&ks, &path).unwrap().unwrap();
             assert_eq!(final_session.roster_counter, 6);
@@ -8197,7 +8206,10 @@ mod tests {
             let anchor = load_account_anchor(server, email)
                 .unwrap()
                 .expect("anchor survives sign-out (only sync_forget_account clears it)");
-            assert_eq!(anchor.roster_counter, 7, "§7.4 anti-rollback floor preserved");
+            assert_eq!(
+                anchor.roster_counter, 7,
+                "§7.4 anti-rollback floor preserved"
+            );
             let baseline = B64
                 .decode(anchor.salt_enc_b64.as_ref().unwrap().as_bytes())
                 .unwrap();
@@ -8583,7 +8595,10 @@ mod tests {
             // Capture the observable state: a LIVE (new) debouncer still exists, so the flag
             // must be armed and a kick must register a deadline.
             let armed_with_live_debouncer = KICK_ARMED.load(Ordering::Acquire);
-            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *kick_channel()
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             note_local_write();
             let kick_registered = kick_channel()
                 .deadline
@@ -8595,7 +8610,10 @@ mod tests {
             new_shutdown.store(true, Ordering::SeqCst);
             kick_channel().cv.notify_all();
             new_join.join().unwrap();
-            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *kick_channel()
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             KICK_ARMED.store(false, Ordering::SeqCst);
 
             assert!(
@@ -8615,7 +8633,10 @@ mod tests {
             let _serial = KICK_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             // KICK_ARMED starts false in a unit-test process (no debouncer thread).
             KICK_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
-            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *kick_channel()
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             note_local_write();
             assert_eq!(
                 *kick_channel().deadline.lock().unwrap(),

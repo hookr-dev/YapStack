@@ -109,7 +109,5 @@ pub fn build_router(state: AppState) -> Router {
     // extractor can read it without a state bound. `ConnectInfo<SocketAddr>` (the wire
     // peer) is supplied by `main`'s `into_make_service_with_connect_info`.
     let trusted_proxies = state.trusted_proxies.clone();
-    router
-        .layer(Extension(trusted_proxies))
-        .with_state(state)
+    router.layer(Extension(trusted_proxies)).with_state(state)
 }
