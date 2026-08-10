@@ -757,7 +757,7 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
 
     // PULL direction: always attempted, even when push failed. A transport/pull error rides
     // on `pull_error`; whatever it managed to apply before failing is retained (F1).
-    if let Err(e) = pull_direction(conn, cipher, transport, client_id, &mut report).await {
+    if let Err(e) = pull_direction(conn, cipher, transport, &mut report).await {
         report.pull_error = Some(e);
     }
 
@@ -924,10 +924,11 @@ async fn push_direction<T: SyncTransport + ?Sized>(
 }
 
 /// Pull new changesets, decrypt, and merge them IN COMMIT ORDER, advancing the pull
-/// watermark only past changesets that were fully merged (or are our own echo). The pull
-/// half of one [`drain_once`] cycle; its error is captured into `DrainReport::pull_error`
-/// so a download failure cannot mask push progress. Own-echo changes (matching `client_id`)
-/// are skipped as already-local.
+/// watermark only past changesets that were fully merged. The pull half of one
+/// [`drain_once`] cycle; its error is captured into `DrainReport::pull_error` so a download
+/// failure cannot mask push progress. Own-authored changesets are merged like any other
+/// (cr-sqlite merge is idempotent → a no-op when the row is already local, and a genuine
+/// re-acquire when a restore rolled the local DB back past an own post-backup edit).
 ///
 /// Honest crypto accounting (R5 → Item 1: quarantine-and-advance). A changeset we cannot
 /// decrypt/decode is NEVER silently skipped-and-forgotten (the "up to date" lie), but it also
@@ -946,7 +947,6 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
     conn: &Connection,
     cipher: &ChangesetCipher,
     transport: &T,
-    client_id: uuid::Uuid,
     report: &mut DrainReport,
 ) -> Result<(), SyncError> {
     loop {
@@ -956,9 +956,14 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
             break;
         }
         for pc in &resp.changes {
-            if pc.client_id == client_id {
-                continue; // our own echo; already local — `resp.next_seq` covers the advance.
-            }
+            // Own-authored changesets are merged like any other. cr-sqlite merge is
+            // idempotent, so re-applying a change already present locally is a no-op (no
+            // dup/tombstone artifact), while a change the relay holds but the local DB has
+            // LOST — e.g. after a file restore that rolled the DB-side watermarks back past
+            // an own post-backup edit — is correctly re-acquired. Skipping own echoes would
+            // assert the false invariant "own authorship implies local presence" and would
+            // silently drop such rows forever. Crypto/quarantine handling below is identical
+            // to peer changesets.
             let cs = match decode_pulled_changeset(cipher, pc) {
                 Ok(cs) => cs,
                 Err(detail) => {
@@ -1005,7 +1010,7 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
             tokio::task::yield_now().await;
         }
         // Whole page consumed cleanly — advance to the relay's reported next_seq (>= last_good;
-        // covers a trailing run of our own echoes with no merge to move the watermark).
+        // covers a trailing run with no merge to move the watermark, e.g. quarantined seqs).
         state::set_pull_watermark(conn, resp.next_seq)?;
         if !resp.has_more {
             break;
@@ -2512,6 +2517,177 @@ mod tests {
         assert!(
             relay_holds_kv_value(relay.as_ref(), &cipher, cid, "post-restore").await,
             "the post-restore edit reached the relay (no silent loss)"
+        );
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_re_fetches_own_post_backup_changes_from_relay() {
+        // OWN-ECHO SKIP (red test). A device authors k3 and pushes it to the relay AFTER a
+        // backup, then the DB file is restored to the older backup (which does NOT contain k3).
+        // On restore the DB-side watermarks roll back with the file, so the relay re-serves k3
+        // on the next drain — but `pull_direction` skips every changeset whose author is this
+        // device (`if pc.client_id == client_id { continue; }`) as "our own echo, already
+        // local". After the restore that assumption is false: k3 lives ONLY on the relay, and
+        // the re-walk (reseed_counter_to_tail) only re-pushes rows STILL in the local DB — k3
+        // is gone from the local DB, so it is never re-emitted either. The device therefore
+        // permanently loses its own post-backup edit with no error. This test asserts the
+        // CORRECT behaviour (k3 comes back after a full drain); it FAILS on the current tree.
+        let dir = std::env::temp_dir().join(format!("yapstack-ownecho-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db");
+        let backup = dir.join("backup.db");
+
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // A device with two synced edits; capture a BACKUP at this point. The backup does NOT
+        // contain k3 (authored below, after the copy).
+        let cid;
+        {
+            let dev = CrsqlDb::open(&live).unwrap();
+            dev.conn()
+                .execute_batch("PRAGMA journal_mode=WAL;")
+                .unwrap();
+            make_kv(&dev);
+            cid = state::client_id(dev.conn()).unwrap();
+            for (k, v) in [("k1", "v1"), ("k2", "v2")] {
+                dev.conn()
+                    .execute(
+                        "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                        rusqlite::params![k, v],
+                    )
+                    .unwrap();
+                drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                    .await
+                    .unwrap();
+            }
+            // Faithful file backup: checkpoint the WAL into the main file, then copy.
+            dev.conn()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            std::fs::copy(&live, &backup).unwrap();
+
+            // The post-backup edit that exists ONLY on the relay after the restore.
+            dev.conn()
+                .execute("INSERT INTO kv(id,v) VALUES('k3','v3')", [])
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+            // Sanity: the relay holds our k3 (own-authored) at this point.
+            assert!(
+                relay_holds_kv_value(relay.as_ref(), &cipher, cid, "v3").await,
+                "precondition: the relay received our post-backup k3"
+            );
+        }
+
+        // RESTORE: overwrite the live DB with the pre-k3 backup and REOPEN (a fresh drain
+        // connection, exactly as a restore-then-launch opens). The watermarks roll back with
+        // the file; k3 is NOT present locally.
+        std::fs::copy(&backup, &live).unwrap();
+        let dev = CrsqlDb::open(&live).unwrap();
+        dev.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(
+            kv_get(dev.conn(), "k3"),
+            None,
+            "precondition: the restored (pre-backup) DB does not contain k3"
+        );
+
+        // Drain to convergence. The relay still holds k3 and re-serves it (rolled-back
+        // watermark), so an honest device MUST re-acquire its own post-backup row.
+        for _ in 0..5 {
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            kv_get(dev.conn(), "k3").as_deref(),
+            Some("v3"),
+            "the device must re-fetch its own post-backup change (k3) from the relay after a \
+             restore; the own-echo skip drops it permanently"
+        );
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read a single `kv` value by id, or `None` if absent — a tiny local test helper.
+    fn kv_get(conn: &Connection, id: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT v FROM kv WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// Count rows in `kv` — a tiny local test helper for the idempotency assertion.
+    fn kv_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn re_merging_own_already_local_changesets_is_idempotent_noop() {
+        // Companion to the restore test above: dropping the own-echo skip means a device now
+        // re-merges its OWN changesets whenever the relay re-serves them. When the rows are
+        // STILL local (the steady state) that re-merge MUST be a pure no-op — cr-sqlite merge
+        // is idempotent — so it introduces no duplicate rows, no tombstones, and no value
+        // changes. We force the re-serve by rolling the pull watermark back to 0 while the
+        // rows remain present, exactly the merge path a restore/backlog would exercise.
+        let dir = std::env::temp_dir().join(format!("yapstack-ownecho-idem-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db");
+
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        let dev = CrsqlDb::open(&live).unwrap();
+        dev.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        make_kv(&dev);
+        let cid = state::client_id(dev.conn()).unwrap();
+        for (k, v) in [("k1", "v1"), ("k2", "v2")] {
+            dev.conn()
+                .execute(
+                    "INSERT INTO kv(id,v) VALUES(?1,?2)",
+                    rusqlite::params![k, v],
+                )
+                .unwrap();
+            drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+                .await
+                .unwrap();
+        }
+        assert_eq!(kv_count(dev.conn()), 2, "precondition: two own rows are local");
+
+        // Force the relay to re-serve our OWN changesets on the next pull by rewinding the
+        // pull watermark; the rows are still local so the re-merge must be a no-op.
+        state::set_pull_watermark(dev.conn(), 0).unwrap();
+        let report = drain_once(dev.conn(), &cipher, relay.as_ref(), cid, sv, ev)
+            .await
+            .unwrap();
+
+        assert_eq!(kv_get(dev.conn(), "k1").as_deref(), Some("v1"));
+        assert_eq!(kv_get(dev.conn(), "k2").as_deref(), Some("v2"));
+        assert_eq!(
+            kv_count(dev.conn()),
+            2,
+            "re-merging own already-local changesets must not add or remove rows (idempotent)"
+        );
+        assert_eq!(
+            report.quarantined, 0,
+            "an own already-local changeset must merge cleanly, never quarantine"
         );
 
         drop(dev);

@@ -113,10 +113,13 @@ async fn drain_enqueue_push_idempotency() {
         .unwrap();
     let r1 = drain_once(conn, &c, &relay, client, sv, ev).await.unwrap();
     assert_eq!(r1.pushed, 1, "one outbox entry pushed");
-    assert_eq!(r1.applied, 0, "no foreign changes to apply");
+    // Own-authored changesets are merged like any other now (no own-echo skip); the relay
+    // re-serves our just-pushed k1 within the same drain and it merges idempotently — a
+    // harmless no-op on the already-local row, but it IS processed, so `applied` counts it.
+    assert_eq!(r1.applied, 1, "own changeset re-merged idempotently");
 
-    // Re-drain with no new writes: nothing to enqueue or push, and our own echo is
-    // skipped (idempotent).
+    // Re-drain with no new writes: nothing to enqueue or push, and the pull watermark has
+    // advanced past our own changeset, so there is nothing left to re-merge.
     let r2 = drain_once(conn, &c, &relay, client, sv, ev).await.unwrap();
     assert_eq!(r2.pushed, 0);
     assert_eq!(r2.applied, 0);
