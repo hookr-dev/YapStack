@@ -59,14 +59,14 @@ use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
 use yapstack_common::auth::{
-    DevicesResponse, LoginBeginRequest, LoginBeginResponse, LoginFinishRequest,
+    DeviceInfo, DevicesResponse, LoginBeginRequest, LoginBeginResponse, LoginFinishRequest,
     LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest, RosterEnvelope,
-    RosterUploadRequest, RosterUploadResponse, SignupRequest, TokenResponse,
+    RosterFetchResponse, RosterUploadRequest, RosterUploadResponse, SignupRequest, TokenResponse,
 };
 use yapstack_sync::crypto::ChangesetCipher;
 use yapstack_sync::transport::SyncTransport;
 use yapstack_sync::{
-    cascade, outbox, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
+    cascade, outbox, quarantine, schema, state, transport::HttpTransport, uniqueness, CrsqlDb,
     CRSQLITE_ENGINE_VERSION, SYNC_SCHEMA_VERSION,
 };
 
@@ -91,6 +91,11 @@ const KEYCHAIN_ACCOUNT_SESSION_KEY: &str = "session-key-v1";
 /// lose the id, mint a fresh one, and re-enrol as a phantom PENDING device (§7.5). This
 /// entry survives sign-out; only the session entry is cleared.
 const KEYCHAIN_ACCOUNT_IDENTITY: &str = "identity-v1";
+/// Account-name PREFIX (same service) for the per-account anchor entries (item 1). The full
+/// account name appends a SHA-256 of (server_url, email) — see [`anchor_account_name`]. These
+/// entries SURVIVE sign-out (only `sync_forget_account` clears them) and hold the tenant
+/// binding + §3.2-C3 / §7.4 anti-substitution baselines.
+const KEYCHAIN_ACCOUNT_ANCHOR_PREFIX: &str = "account-anchor-v1:";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 /// AAD domain for the password-wrapped vault key (CRYPTO_SPEC §4.2).
 const WRAP_VAULT_PW_DOMAIN: &[u8] = b"yapstack.wrap.vault.pw.v1";
@@ -246,6 +251,25 @@ impl DeviceIdentity {
             .try_into()
             .map_err(|_| "device_sk wrong length".to_string())
     }
+}
+
+/// Per-account anchor (item 1), held in its OWN keychain entry keyed by (server_url, email) so
+/// it SURVIVES sign-out — unlike the sealed session, which is deleted on sign-out. It records
+/// the account's tenant binding plus the two LOCKED anti-substitution baselines
+/// (`salt_enc_b64`, §3.2-C3; `roster_counter`, §7.4) so a routine sign-out → sign-in on the
+/// SAME install no longer reverts a known device to TOFU. Multiple accounts each get their own
+/// anchor entry; `sync_forget_account` is the ONLY path that clears one. NEVER stores key or
+/// token material — only the public tenant id, epoch, salt, and roster metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AccountAnchor {
+    tenant_id: Uuid,
+    epoch: u32,
+    #[serde(default)]
+    salt_enc_b64: Option<String>,
+    #[serde(default)]
+    roster_counter: i64,
+    #[serde(default)]
+    roster_fingerprint: Option<String>,
 }
 
 // ----- Credential storage backend (release = OS keychain; debug = local file) -----
@@ -1008,6 +1032,18 @@ fn store_session_wrapped(
     let _guard = session_store_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    store_session_wrapped_locked(ks, enc_path, s)
+}
+
+/// The body of [`store_session_wrapped`] WITHOUT taking `session_store_lock`. Split out (item 4)
+/// so [`update_session_wrapped`] can perform a read-modify-write of the sealed session while
+/// HOLDING the lock across the whole operation — the low-level writer must not re-acquire the
+/// (non-reentrant) lock. Callers MUST hold `session_store_lock`.
+fn store_session_wrapped_locked(
+    ks: &impl SessionKeyStore,
+    enc_path: &Path,
+    s: &Session,
+) -> Result<(), String> {
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
     // Reuse the existing wrapping key if present and valid; otherwise mint a fresh one. (A
     // corrupt existing entry would strand the new ciphertext, so we replace it.) The RECORDED
@@ -1051,6 +1087,28 @@ fn clear_session_wrapped(ks: &impl SessionKeyStore, enc_path: &Path) -> Result<(
     let _ = remove_session_blob(enc_path, DELETE_REASON_SIGN_OUT);
     let _ = ks.delete_key(DELETE_REASON_SIGN_OUT);
     Ok(())
+}
+
+/// Field-merge update of the sealed session (item 4). Re-loads the CURRENT persisted session
+/// UNDER `session_store_lock`, applies `f` to merge ONLY the caller-owned fields, and writes it
+/// back — all while holding the lock, so a concurrent drain token-refresh (its own
+/// load→rotate→store) cannot interleave a lost update. A command that captured the session at
+/// entry, went to the network, then wrote the WHOLE stale record back would clobber the
+/// drain's rotated `bearer`/`refresh_token`; merging under the lock re-reads them first.
+/// Returns the merged session. Errors if no session is signed in.
+fn update_session_wrapped<F: FnOnce(&mut Session)>(
+    ks: &impl SessionKeyStore,
+    enc_path: &Path,
+    f: F,
+) -> Result<Session, String> {
+    let _guard = session_store_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut s = load_session_wrapped(ks, enc_path)?
+        .ok_or_else(|| "not signed in".to_string())?;
+    f(&mut s);
+    store_session_wrapped_locked(ks, enc_path, &s)?;
+    Ok(s)
 }
 
 // DEBUG keeps the plaintext dev-file store UNCHANGED: the session is one JSON value under
@@ -1116,6 +1174,67 @@ fn load_identity_from_store() -> Result<Option<DeviceIdentity>, String> {
 fn store_identity_to_store(id: &DeviceIdentity) -> Result<(), String> {
     let json = serde_json::to_string(id).map_err(|e| e.to_string())?;
     store_set(KEYCHAIN_ACCOUNT_IDENTITY, &json)
+}
+
+// ----- Per-account anchor store (item 1) -----
+
+/// Keychain account name for the per-account anchor entry (item 1). Keyed by
+/// (server_url, email) via a SHA-256 digest so the (potentially long / punctuation-heavy)
+/// server URL + email map to a stable, fixed-width, credential-name-safe key that supports
+/// MULTIPLE accounts on one install. The email is lowercased first so a case-variant sign-in
+/// resolves to the SAME anchor.
+fn anchor_account_name(server_url: &str, email: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(server_url.as_bytes());
+    h.update([0u8]); // domain separator between the two fields
+    h.update(email.to_ascii_lowercase().as_bytes());
+    format!("{}{:x}", KEYCHAIN_ACCOUNT_ANCHOR_PREFIX, h.finalize())
+}
+
+/// Read the per-account anchor (survives sign-out). `None` when this account has never been
+/// anchored on this install (a fresh account, or a pre-item-1 install).
+fn load_account_anchor(server_url: &str, email: &str) -> Result<Option<AccountAnchor>, String> {
+    match store_get(&anchor_account_name(server_url, email))? {
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+/// Write/update the per-account anchor. Called at signup / login / recover / cutover so the
+/// anti-substitution baselines and tenant binding persist across sign-out.
+fn store_account_anchor(
+    server_url: &str,
+    email: &str,
+    anchor: &AccountAnchor,
+) -> Result<(), String> {
+    let json = serde_json::to_string(anchor).map_err(|e| e.to_string())?;
+    store_set(&anchor_account_name(server_url, email), &json)
+}
+
+/// Explicitly forget one account's anchor (the `sync_forget_account` command). This is the
+/// ONLY path that removes an anchor — routine sign-out (`clear_session`) MUST NOT.
+fn clear_account_anchor(server_url: &str, email: &str) -> Result<(), String> {
+    store_delete(&anchor_account_name(server_url, email), DELETE_REASON_SIGN_OUT)
+}
+
+/// Write/update the per-account anchor from a freshly-stored session (item 1). Called at
+/// signup / login / recover / enable so the tenant binding + §3.2-C3 / §7.4 baselines persist
+/// across sign-out.
+fn persist_account_anchor(s: &Session) -> Result<(), String> {
+    store_account_anchor(
+        &s.server_url,
+        &s.email,
+        &AccountAnchor {
+            tenant_id: s.tenant_id,
+            epoch: s.epoch,
+            salt_enc_b64: s.salt_enc_b64.clone(),
+            roster_counter: s.roster_counter,
+            roster_fingerprint: s.roster_fingerprint.clone(),
+        },
+    )
 }
 
 // ----- In-memory credential cache (T020) -----
@@ -1352,6 +1471,46 @@ fn store_session(s: &Session) -> Result<(), String> {
     g.session = Some(s.clone());
     g.loaded = true;
     Ok(())
+}
+
+/// Field-merge update of the CURRENT signed-in session (item 4), the cache-backed sibling of
+/// [`update_session_wrapped`]. Re-reads the persisted session (bypassing the in-memory cache so
+/// a token the drain rotated concurrently is observed), applies `f` to merge only the caller-
+/// owned fields, writes it back, and refreshes the cache in lock-step. Used by commands that
+/// mutate a NARROW field set after a network round-trip (e.g. `sync_approve_device` owns
+/// `{roster_counter, roster_fingerprint}`) so they can never clobber the drain-rotated
+/// `{bearer, refresh_token}`. Returns the merged session.
+fn update_session<F: FnOnce(&mut Session)>(f: F) -> Result<Session, String> {
+    let merged = {
+        let _guard = session_store_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Re-read from the BACKING STORE, not the cache: the drain persists a rotated token
+        // straight to the store, and the cache copy this command captured at entry is stale.
+        let mut s = load_session_from_store()?.ok_or_else(|| "not signed in".to_string())?;
+        f(&mut s);
+        store_session_to_store_locked(&s)?;
+        s
+    };
+    let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
+    g.session = Some(merged.clone());
+    g.loaded = true;
+    Ok(merged)
+}
+
+/// Write the session to the backing store while the caller already holds `session_store_lock`
+/// (item 4). In DEBUG the dev-file store takes no lock, so this equals [`store_session_to_store`];
+/// in RELEASE it routes to the no-lock [`store_session_wrapped_locked`] to avoid re-acquiring
+/// the non-reentrant lock inside [`update_session`].
+#[cfg(debug_assertions)]
+fn store_session_to_store_locked(s: &Session) -> Result<(), String> {
+    store_session_to_store(s)
+}
+
+#[cfg(not(debug_assertions))]
+fn store_session_to_store_locked(s: &Session) -> Result<(), String> {
+    let path = session_enc_path()?;
+    store_session_wrapped_locked(&KeychainSessionKeyStore, &path, s)
 }
 
 /// This device's fingerprint (§7.5.5) as presented in `SyncStatusDto.device_fingerprint`
@@ -2068,6 +2227,77 @@ enum CutoverFault {
 /// for the full sequence. Idempotent: a no-op (returns `Ok`) if the live DB is
 /// already CRR-prepared. On ANY failure the live DB is restored byte-identically and
 /// the verbatim error is returned; the app's DB pool is always left reopened.
+/// `_yapstack_sync_meta` key recording which TENANT the live DB's sync watermarks + outbox
+/// currently belong to (item 1). The watermarks in `state.rs` are tenant-agnostic, so without
+/// this a sign-out → sign-in as a DIFFERENT account would keep account A's stale watermark and
+/// silently zero-sync account B (and, worse, replay B's pulls against A's outbox). Compared to
+/// the signed-in `session.tenant_id` at every enable / boot; a mismatch resets the sync state.
+const K_BOUND_TENANT: &str = "bound_tenant_id";
+
+/// Reset the DB's sync state to a clean slate for a NEW account binding (item 1): a full
+/// re-pull and full re-push from zero plus an emptied outbox (so account A's un-acked
+/// ciphertext is never uploaded under account B's tenant AAD). Idempotent; safe to call
+/// repeatedly.
+fn reset_sync_state_for_new_binding(conn: &Connection) -> Result<(), String> {
+    state::set_pull_watermark(conn, 0).map_err(|e| e.to_string())?;
+    state::set_push_watermark(conn, 0).map_err(|e| e.to_string())?;
+    // The outbox table may not exist yet on a never-drained DB; ensure it, then empty it.
+    outbox::ensure_outbox_table(conn).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM _yapstack_outbox", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Bind the live DB to `session_tenant` and reset its sync state on an account SWITCH (item 1).
+/// Compares the DB's recorded [`K_BOUND_TENANT`] to the current session's tenant; on a mismatch
+/// (including a first-ever bind, or a DB last synced as a different account) it resets the
+/// watermarks + outbox and records the new binding. On a MATCH it is a no-op, so a routine
+/// re-enable / boot on the SAME account preserves the watermark (no wasteful full re-sync).
+///
+/// This is the item-1 reset the SPEC places in `sync_enable` and the boot drain-spawn path,
+/// OUTSIDE the `live_is_crr_prepared` idempotency gate — the staging-block reset inside
+/// `perform_cutover` is skipped on an already-CRR DB, so the account-switch reset must live
+/// here, keyed on the explicit session tenant.
+fn reconcile_account_binding(live_db: &Path, session_tenant: Uuid) -> Result<(), String> {
+    let db = CrsqlDb::open(live_db).map_err(|e| e.to_string())?;
+    let conn = db.conn();
+    state::ensure_meta_table(conn).map_err(|e| e.to_string())?;
+    let bound = state::get_meta(conn, K_BOUND_TENANT).map_err(|e| e.to_string())?;
+    if bound.as_deref() != Some(session_tenant.to_string().as_str()) {
+        tracing::info!(
+            "sync: live DB account binding changed (was {:?}, now {}) — resetting watermarks + outbox",
+            bound,
+            session_tenant
+        );
+        reset_sync_state_for_new_binding(conn)?;
+        state::set_meta(conn, K_BOUND_TENANT, &session_tenant.to_string())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Safety-net reset on the `perform_cutover` idempotency path (item 1): an already-CRR live DB
+/// short-circuits before the staging-block watermark reset. If it carries NO account binding —
+/// e.g. it was CRR-prepared by a build predating the per-account anchor — we cannot prove its
+/// watermarks belong to the current account, so reset them + empty the outbox. A device with a
+/// binding is left untouched here; `reconcile_account_binding` (called from `sync_enable` / boot
+/// with the explicit session tenant) then decides same-account-keep vs switch-reset.
+fn reset_watermarks_if_unbound(live_db: &Path) -> Result<(), String> {
+    let db = CrsqlDb::open(live_db).map_err(|e| e.to_string())?;
+    let conn = db.conn();
+    state::ensure_meta_table(conn).map_err(|e| e.to_string())?;
+    if state::get_meta(conn, K_BOUND_TENANT)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        tracing::info!(
+            "sync: already-CRR live DB has no account binding at cutover — resetting watermarks + outbox"
+        );
+        reset_sync_state_for_new_binding(conn)?;
+    }
+    Ok(())
+}
+
 fn perform_cutover(
     live_db: &Path,
     db_service: &crate::db_service::DbServiceState,
@@ -2083,6 +2313,11 @@ fn cutover_with_fault(
     // Step 1: idempotency gate. An already-CRR live DB just needs its legacy copy gone.
     if live_is_crr_prepared(live_db) {
         discard_legacy_sync_copy(live_db);
+        // Item 1: the staging-block watermark reset below is skipped on the idempotency path.
+        // If this already-CRR DB carries no account binding, reset its stale sync state so a
+        // re-enable can never silently zero-sync behind a stale watermark. (An account-bound
+        // DB is reconciled against the explicit session tenant in `sync_enable` / boot.)
+        reset_watermarks_if_unbound(live_db)?;
         return Ok(());
     }
 
@@ -2492,6 +2727,14 @@ fn kick_channel() -> &'static KickChannel {
 /// True while a drain's debouncer thread is live and willing to consume kicks.
 static KICK_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Ownership stamp for [`KICK_ARMED`] (item 2). Each debouncer claims a unique generation on
+/// entry and records it here; on exit it clears `KICK_ARMED` ONLY if it is still the owner
+/// (`KICK_GEN` unchanged). Without this, `sync_enable` spawning a NEW debouncer BEFORE joining
+/// the OLD one (`spawn_drain` then `prev.stop()`) let the stale debouncer's final store =false
+/// clobber the flag the live one set =true — permanently disarming `note_local_write` so every
+/// local-write push-kick was silently dropped.
+static KICK_GEN: AtomicU64 = AtomicU64::new(0);
+
 /// Nudge the drain to run a push-capturing cycle soon after a local write commits. Debounced
 /// (see [`KICK_DEBOUNCE`]): a burst of writes collapses to one wake once they quiesce, and a
 /// continuous stream (a live recording's segments) never settles so it rides the interval
@@ -2537,6 +2780,13 @@ fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHan
         .name("yapstack-sync-writekick".into())
         .spawn(move || {
             let ch = kick_channel();
+            // Claim a unique ownership generation for KICK_ARMED (item 2): become the current
+            // owner, then arm. A later-spawned debouncer overwrites KICK_GEN, so THIS thread's
+            // stale exit-store below is suppressed once it is no longer the owner.
+            // `fetch_add` already publishes this thread's ownership (KICK_GEN == prev + 1 ==
+            // my_gen); a follow-up `store(my_gen)` would clobber a newer debouncer that raced
+            // in between, so it is deliberately omitted.
+            let my_gen = KICK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
             // Drop any stale deadline a prior drain left behind, then arm.
             *ch.deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
             KICK_ARMED.store(true, Ordering::Release);
@@ -2566,7 +2816,11 @@ fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHan
                     }
                 }
             }
-            KICK_ARMED.store(false, Ordering::Release);
+            // Item 2: only the CURRENT owner disarms. If a newer debouncer has since claimed
+            // KICK_GEN, this stale thread leaves KICK_ARMED alone so the live one stays armed.
+            if KICK_GEN.load(Ordering::SeqCst) == my_gen {
+                KICK_ARMED.store(false, Ordering::Release);
+            }
         })
         .map_err(|e| e.to_string())?;
     Ok((shutdown, join))
@@ -3183,6 +3437,14 @@ pub fn start_drain_if_enabled(
     } else {
         discard_legacy_sync_copy(live_db);
     }
+    // Item 1: reconcile the DB's account binding OUTSIDE the CRR idempotency gate above — an
+    // account SWITCH since the last boot (or a DB that never recorded a binding) resets the
+    // watermarks + outbox before the drain starts, so the boot drain can never silently
+    // zero-sync a new account behind account A's stale watermark. Same-account boot is a no-op.
+    if let Err(e) = reconcile_account_binding(live_db, session.tenant_id) {
+        tracing::error!("sync: account-binding reconcile failed at boot; drain not started: {e}");
+        return;
+    }
     match spawn_drain(
         app.clone(),
         live_db.to_path_buf(),
@@ -3546,9 +3808,17 @@ fn spawn_drain(
                     break;
                 }
 
-                if report.applied + report.replayed > 0 {
-                    // Reinstate the stripped FK cascade + UNIQUE invariants deterministically
-                    // after a merge (R4/R5).
+                // Reinstate the stripped FK cascade + UNIQUE invariants deterministically after a
+                // merge (R4/R5) — but ONLY on a CONVERGED prefix. The maintenance passes reason
+                // over whole logical rows, so running them mid-pull (a page still to come) or with
+                // schema-gapped rows still parked in the pending-replay quarantine would see
+                // truncated rows as spurious collisions/orphans and tombstone genuine data. Gate
+                // on the pull having reached the relay tip AND no schema-gap replays outstanding.
+                // (A standing CRYPTO quarantine is NOT gated here: cascade's proven-delete keeps
+                // it safe, so maintenance must not be permanently disabled by one bad ciphertext.)
+                let converged = report.reached_tip
+                    && matches!(quarantine::pending_count(conn), Ok(0));
+                if report.applied + report.replayed > 0 && converged {
                     if let Err(e) = cascade::cascade_gc(conn) {
                         tracing::warn!("sync drain: cascade_gc: {e}");
                     }
@@ -3923,6 +4193,13 @@ fn spawn_audio_uploader(
                     }
                 }
                 publish_audio_lane(conn);
+                // Item 3 (DEFERRED quality follow-up): this outer-loop tail is a bare,
+                // uninterruptible sleep that does not re-check `stop`, so an idle sign-out's
+                // `DrainHandle::stop()` join can wait up to a full AUDIO_DRAIN_INTERVAL for this
+                // lane. That join no longer blocks the UI (sign-out is async + off-task, item 3),
+                // so this is a latency-quality nit, not a freeze. The green fix is the SSE lane's
+                // interruptible slice loop (sleep in <=250 ms slices, re-checking `stop`); left
+                // as a follow-up per the ratified spec to keep this change tightly scoped.
                 std::thread::sleep(AUDIO_DRAIN_INTERVAL);
             }
             tracing::info!("audio uploader stopped");
@@ -3944,15 +4221,10 @@ fn spawn_audio_uploader(
 /// is byte-identical to `kdf::recovery_key` (the vault-wrap key); block 2 (`[32..64]`)
 /// is the domain-separated `recovery_auth_key` sent to `/auth/recover`, mirroring the
 /// password path's auth/master split (§2.3) so the code's wrap key is never exposed as
-/// an auth token. Uses only the locked label + `hkdf::expand` primitive (no new crypto).
+/// an auth token. Delegates to the shared `kdf::recovery_split` primitive so this ceremony
+/// and the §13.7 KAT vectors can never drift (no local crypto).
 fn recovery_key_and_auth(recovery_bytes: &[u8; 20]) -> ([u8; 32], [u8; 32]) {
-    let okm =
-        yapstack_crypto::hkdf::expand(recovery_bytes, yapstack_crypto::kdf::RECOVERY_INFO, 64);
-    let mut wrap = [0u8; 32];
-    wrap.copy_from_slice(&okm[0..32]);
-    let mut auth = [0u8; 32];
-    auth.copy_from_slice(&okm[32..64]);
-    (wrap, auth)
+    yapstack_crypto::kdf::recovery_split(recovery_bytes)
 }
 
 /// Committing-envelope wrap of the vault key under `k_root` (master or recovery key),
@@ -4073,6 +4345,23 @@ fn verify_and_inspect_roster(
     this_client_id: Uuid,
     cached_counter: i64,
 ) -> Result<(u32, u64, bool, String), String> {
+    let (roster, fp) =
+        verify_roster_signed(device_list, signature_b64, vault_key, cached_counter)?;
+    let active = roster.devices.iter().any(|d| d.client_id == this_client_id);
+    Ok((roster.vault_key_epoch, roster.counter, active, fp))
+}
+
+/// The verification core (§7.5 step 2 + §7.4 client anti-rollback), returning the FULLY
+/// PARSED verified roster and its fingerprint. `verify_and_inspect_roster` is the
+/// self-membership summary over this; the approval path needs the whole verified
+/// membership so it can carry it forward (never re-deriving membership from the untrusted
+/// `GET /devices` index).
+fn verify_roster_signed(
+    device_list: Option<&serde_json::Value>,
+    signature_b64: Option<&str>,
+    vault_key: &[u8; 32],
+    cached_counter: i64,
+) -> Result<(SignedRoster, String), String> {
     let (Some(value), Some(sig_b64)) = (device_list, signature_b64) else {
         return Err("relay served no signed roster for this account".into());
     };
@@ -4097,9 +4386,51 @@ fn verify_and_inspect_roster(
             roster.counter
         ));
     }
-    let active = roster.devices.iter().any(|d| d.client_id == this_client_id);
     let fp = roster_fingerprint_from_canonical(&canonical);
-    Ok((roster.vault_key_epoch, roster.counter, active, fp))
+    Ok((roster, fp))
+}
+
+/// Build the NEW roster membership for an approval (§7.5 step 3), from the VERIFIED
+/// previous roster carried forward + the single fingerprint-verified target device.
+///
+/// The relay's `GET /devices` index is used ONLY to discover the pending target's public
+/// material; it is NEVER the membership source (a compromised relay can flip any row's
+/// advisory `status` to `active`, so folding on that value would sign a membership the
+/// vault-key holder never intended — the finding-#2 defect). Existing members are copied
+/// verbatim from the last VERIFIED roster (no v1 eviction: every prior member carries
+/// forward). If the relay now reports a DIFFERENT `ed25519_pub` for an existing member
+/// than the one in the last signed roster, we HARD-FAIL rather than sign over a key the
+/// owner never approved (possible relay key-substitution / tamper).
+fn build_roster_membership(
+    verified_prev: &[RosterDeviceEntry],
+    get_devices: &[DeviceInfo],
+    target: &DeviceInfo,
+) -> Result<Vec<RosterDeviceEntry>, String> {
+    let mut entries: Vec<RosterDeviceEntry> = Vec::with_capacity(verified_prev.len() + 1);
+    for prev in verified_prev {
+        // Tamper check: if the relay reports this member with a different key than the one
+        // the last verified roster bound, refuse to sign (§0 hostile-relay threat model).
+        if let Some(relay) = get_devices.iter().find(|d| d.client_id == prev.client_id) {
+            if relay.ed25519_pub != prev.ed25519_pub {
+                return Err(format!(
+                    "relay reports a different ed25519_pub for existing member {} than the \
+                     last signed roster — refusing to sign (possible tamper)",
+                    prev.client_id
+                ));
+            }
+        }
+        entries.push(prev.clone());
+    }
+    // Add the fingerprint-verified target (unless it is already a carried-forward member).
+    if !entries.iter().any(|e| e.client_id == target.client_id) {
+        entries.push(RosterDeviceEntry {
+            client_id: target.client_id,
+            ed25519_pub: target.ed25519_pub.clone(),
+            label: target.label.clone(),
+            added_at: target.added_at.clone(),
+        });
+    }
+    Ok(entries)
 }
 
 // ----- Two-round login state + HTTP helpers -----
@@ -4143,6 +4474,56 @@ async fn http_get_devices(session: &Session) -> Result<DevicesResponse, String> 
             .bearer_auth(&session.bearer),
     )
     .await
+}
+
+/// `GET /devices/roster` with the session bearer (§7.5) — the authoritative signed roster
+/// and its anti-rollback watermarks, used to re-anchor the counter before an approval.
+async fn http_get_roster(session: &Session) -> Result<RosterFetchResponse, String> {
+    let url = format!("{}/devices/roster", base_url(&session.server_url));
+    send_json(
+        reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(&session.bearer),
+    )
+    .await
+}
+
+/// Outcome of a `PUT /devices/roster` attempt. `Conflict` is the §7.4 anti-rollback 409
+/// (our counter was not newer than the stored one) — a re-anchor-and-retry signal, not a
+/// hard error.
+enum RosterPutOutcome {
+    Ok(RosterUploadResponse),
+    Conflict,
+}
+
+/// `PUT /devices/roster`, distinguishing the anti-rollback 409 from other failures so the
+/// caller can re-anchor and retry ONCE. Non-2xx-non-409 bodies are surfaced verbatim
+/// (never auto-routed or masked, per privacy posture).
+async fn http_put_roster(
+    session: &Session,
+    req: &RosterUploadRequest,
+) -> Result<RosterPutOutcome, String> {
+    let url = format!("{}/devices/roster", base_url(&session.server_url));
+    let resp = reqwest::Client::new()
+        .put(&url)
+        .bearer_auth(&session.bearer)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(RosterPutOutcome::Conflict);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("relay error {}: {}", status.as_u16(), body.trim()));
+    }
+    let parsed = resp
+        .json::<RosterUploadResponse>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(RosterPutOutcome::Ok(parsed))
 }
 
 /// The SINGLE SOURCE OF TRUTH for this install's device identity (§7.1) — used by signup,
@@ -4584,11 +4965,19 @@ pub async fn sync_enable(
 
     // A3 cutover: turn the LIVE yapstack.db INTO the CRR database (backup kept), so the
     // drain captures every UI write. Runs on a blocking thread (VACUUM/checkpoint/rename).
+    // Item 1: reconcile the DB's account binding on the SAME blocking task, OUTSIDE the
+    // `live_is_crr_prepared` idempotency gate — an account SWITCH (or first bind) resets the
+    // watermarks + outbox before the drain starts; a same-account re-enable is a no-op.
     {
         let live = db_path.clone();
-        tokio::task::spawn_blocking(move || perform_cutover(&live, &db_service))
-            .await
-            .map_err(|e| e.to_string())??;
+        let tenant = session.tenant_id;
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            perform_cutover(&live, &db_service)?;
+            reconcile_account_binding(&live, tenant)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     }
 
     // Deliverable A: start the drain on its dedicated thread — now on the LIVE CRR DB.
@@ -4603,30 +4992,57 @@ pub async fn sync_enable(
         session.tenant_id,
         session.client_id,
     )?;
-    {
+    // Install the new drain, then stop the previous one OFF the async task (item 3):
+    // `DrainHandle::stop()` JOINS background lanes, which must never block the Tauri event loop.
+    let prev = {
         let mut guard = runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?;
-        if let Some(mut prev) = guard.take() {
-            prev.stop();
-        }
+        let prev = guard.take();
         *guard = Some(handle);
+        prev
+    };
+    if let Some(mut prev) = prev {
+        tokio::task::spawn_blocking(move || prev.stop())
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     session.sync_enabled = true;
     store_session(&session)?;
+    // Item 1: refresh the per-account anchor (survives sign-out) with this account's current
+    // tenant binding + anti-substitution baselines.
+    persist_account_anchor(&session)?;
     Ok(build_status_dto(&session).await)
 }
 
+/// Sign out. ASYNC (item 3) so `DrainHandle::stop()` — which JOINS the audio/SSE/kick lanes —
+/// runs on a blocking pool thread, NEVER on the Tauri event loop; a synchronous command body
+/// would freeze the whole UI for as long as a lane takes to reach its stop check. The per-
+/// account anchor is deliberately NOT cleared (item 1): a routine sign-out preserves the
+/// account's anti-substitution baselines so the next sign-in stays a known device, not TOFU.
+/// `sync_forget_account` is the explicit path that clears an anchor.
 #[tauri::command]
 #[specta::specta]
-pub fn sync_sign_out(runtime: State<'_, SyncRuntimeState>) -> Result<(), String> {
-    if let Ok(mut guard) = runtime.lock() {
-        if let Some(mut handle) = guard.take() {
-            handle.stop();
-        }
+pub async fn sync_sign_out(runtime: State<'_, SyncRuntimeState>) -> Result<(), String> {
+    let handle = runtime.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut handle) = handle {
+        tokio::task::spawn_blocking(move || handle.stop())
+            .await
+            .map_err(|e| e.to_string())?;
     }
     clear_session()
+}
+
+/// Explicitly forget an account (item 1): clears its per-account anchor — the tenant binding
+/// and §3.2-C3 / §7.4 anti-substitution baselines that routine sign-out preserves. After this,
+/// the next sign-in for this account is treated as a first-time (TOFU) device. Distinct from
+/// `sync_sign_out`, which keeps the anchor. UI wiring (a "Forget this account" action) is out
+/// of prototype scope; the command + logic are implemented here and registered in lib.rs.
+#[tauri::command]
+#[specta::specta]
+pub fn sync_forget_account(server_url: String, email: String) -> Result<(), String> {
+    clear_account_anchor(&base_url(&server_url), &email)
 }
 
 /// S2 producer seam: enqueue every finalized audio part of `session_id` onto the durable
@@ -5291,6 +5707,8 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
         roster_fingerprint: Some(roster_fp),
     };
     store_session(&session)?;
+    // Item 1: anchor this account (survives sign-out) so a later sign-in stays a known device.
+    persist_account_anchor(&session)?;
 
     // The recovery code is displayed once and never persisted (§6.1). base32, ungrouped;
     // the UI groups it 8×4.
@@ -5320,18 +5738,24 @@ pub async fn sync_login_begin(
         .decode(resp.salt_enc.as_bytes())
         .map_err(|_| "relay salt_enc: invalid base64".to_string())?;
 
-    // §3.2-C3: on a known device, a changed salt is a tamper/downgrade signal.
-    let salt_mismatch = match load_session()? {
-        Some(s) if s.server_url == server_url && s.email.eq_ignore_ascii_case(&email) => {
-            match s.salt_enc_b64 {
-                Some(cached_b64) => B64
-                    .decode(cached_b64.as_bytes())
-                    .map(|cached| cached != served_salt)
-                    .unwrap_or(false),
-                None => false,
-            }
-        }
-        _ => false, // first-time device: TOFU-accept the served salt (§3.2).
+    // §3.2-C3: on a known device, a changed salt is a tamper/downgrade signal. Item 1: read the
+    // baseline salt from the PER-ACCOUNT ANCHOR (survives sign-out) first, falling back to the
+    // live session — so a routine sign-out no longer reverts a known device to silent TOFU.
+    let baseline_salt_b64 = load_account_anchor(&server_url, &email)?
+        .and_then(|a| a.salt_enc_b64)
+        .or_else(|| {
+            load_session()
+                .ok()
+                .flatten()
+                .filter(|s| s.server_url == server_url && s.email.eq_ignore_ascii_case(&email))
+                .and_then(|s| s.salt_enc_b64)
+        });
+    let salt_mismatch = match baseline_salt_b64 {
+        Some(cached_b64) => B64
+            .decode(cached_b64.as_bytes())
+            .map(|cached| cached != served_salt)
+            .unwrap_or(false),
+        None => false, // first-time device: TOFU-accept the served salt (§3.2).
     };
 
     *pending_login_cell()
@@ -5368,11 +5792,18 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
     let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
 
-    let cached_counter = load_session()?
-        .filter(|s| {
-            s.server_url == pending.server_url && s.email.eq_ignore_ascii_case(&pending.email)
+    // Item 1: the §7.4 anti-rollback floor comes from the PER-ACCOUNT ANCHOR (survives sign-out)
+    // first, falling back to the live session — so sign-out no longer resets a known device's
+    // counter baseline to -1 (which would silently accept a rolled-back roster).
+    let cached_counter = load_account_anchor(&pending.server_url, &pending.email)?
+        .map(|a| a.roster_counter)
+        .or_else(|| {
+            load_session().ok().flatten().and_then(|s| {
+                (s.server_url == pending.server_url
+                    && s.email.eq_ignore_ascii_case(&pending.email))
+                .then_some(s.roster_counter)
+            })
         })
-        .map(|s| s.roster_counter)
         .unwrap_or(-1);
 
     let url = format!("{}/auth/login/finish", pending.server_url);
@@ -5423,6 +5854,8 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
         roster_fingerprint: Some(roster_fp),
     };
     store_session(&session)?;
+    // Item 1: anchor this account so its §3.2-C3 salt + §7.4 counter baselines survive sign-out.
+    persist_account_anchor(&session)?;
     let _ = this_active; // active-vs-pending is surfaced via the roster in the status DTO.
     Ok(build_status_dto(&session).await)
 }
@@ -5468,9 +5901,16 @@ pub async fn sync_recover(
 
     let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
-    let cached_counter = load_session()?
-        .filter(|s| s.server_url == server_url && s.email.eq_ignore_ascii_case(&email))
-        .map(|s| s.roster_counter)
+    // Item 1: §7.4 anti-rollback floor from the per-account anchor (survives sign-out) first,
+    // falling back to the live session.
+    let cached_counter = load_account_anchor(&server_url, &email)?
+        .map(|a| a.roster_counter)
+        .or_else(|| {
+            load_session().ok().flatten().and_then(|s| {
+                (s.server_url == server_url && s.email.eq_ignore_ascii_case(&email))
+                    .then_some(s.roster_counter)
+            })
+        })
         .unwrap_or(-1);
 
     let (epoch, counter, _active, roster_fp) = verify_and_inspect_roster(
@@ -5501,6 +5941,8 @@ pub async fn sync_recover(
         roster_fingerprint: Some(roster_fp),
     };
     store_session(&session)?;
+    // Item 1: anchor this account so its baselines survive a subsequent sign-out.
+    persist_account_anchor(&session)?;
     Ok(build_status_dto(&session).await)
 }
 
@@ -5514,71 +5956,123 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
     let mut session = load_session()?.ok_or_else(|| "Sign in first.".to_string())?;
     let vault_key = session.vault_key()?;
 
-    let devices = http_get_devices(&session).await?;
+    // Re-anchor from the AUTHORITATIVE roster before signing (ends the cached-counter
+    // 409-lock): fetch + verify the current signed roster, then base the new counter on
+    // its VERIFIED counter, and carry its VERIFIED membership forward. A single bounded
+    // retry covers a concurrent approval that advanced the counter between our GET and PUT.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
 
-    // Locate the pending device by its out-of-band-verified fingerprint (§7.5 step 4).
-    let target = devices
-        .devices
-        .iter()
-        .find(|d| {
-            d.status == "pending"
-                && B64
-                    .decode(d.ed25519_pub.as_bytes())
-                    .map(|pk| device_fingerprint(&pk) == fingerprint)
-                    .unwrap_or(false)
-        })
-        .ok_or_else(|| "No pending device with that fingerprint.".to_string())?;
-    let target_id = target.client_id;
-
-    // New roster membership = every active device + this device + the approved one.
-    let mut entries: Vec<RosterDeviceEntry> = Vec::new();
-    let mut active_ids: Vec<Uuid> = Vec::new();
-    for d in &devices.devices {
-        let include =
-            d.status == "active" || d.client_id == target_id || d.client_id == session.client_id;
-        if include && !active_ids.contains(&d.client_id) {
-            entries.push(RosterDeviceEntry {
-                client_id: d.client_id,
-                ed25519_pub: d.ed25519_pub.clone(),
-                label: d.label.clone(),
-                added_at: d.added_at.clone(),
-            });
-            active_ids.push(d.client_id);
+        // (a) GET + (b) verify the authoritative roster (§7.5 step 2, §7.4 anti-rollback).
+        let fetched = http_get_roster(&session).await?;
+        let (prev_roster, prev_fp) = verify_roster_signed(
+            Some(&fetched.device_list),
+            Some(&fetched.signature),
+            &vault_key,
+            session.roster_counter,
+        )?;
+        // The anti-rollback counter MUST come from the SIGNATURE-BOUND value inside the
+        // verified canonical roster — never the untrusted plaintext `RosterFetchResponse.counter`
+        // (a hostile relay could inflate that field to force a counter jump that evicts a
+        // member on the next rollback check). Hard-fail if the plaintext field disagrees with
+        // the signed counter: that is tamper, so refuse to sign and surface.
+        let verified_counter = prev_roster.counter;
+        if fetched.counter as u64 != verified_counter {
+            return Err(
+                "roster counter mismatch: relay's plaintext counter disagrees with the \
+                 signed roster — refusing to sign (possible tamper)"
+                    .into(),
+            );
         }
-    }
+        // Re-anchor the cache to the verified authoritative state, ending the 409-lock even
+        // if we bail below (a stale cache is never carried past this point).
+        session.roster_counter = verified_counter as i64;
+        session.roster_fingerprint = Some(prev_fp);
 
-    let new_counter = session.roster_counter + 1;
-    let roster = SignedRoster {
-        version: 1,
-        tenant_id: session.tenant_id,
-        vault_key_epoch: session.epoch,
-        counter: new_counter as u64,
-        devices: entries,
-    };
-    let canonical = roster_canonical_bytes(&roster)?;
-    let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
-    let roster_fp = roster_fingerprint_from_canonical(&canonical);
-    let device_list_value =
-        serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        // (c) GET /devices ONLY to discover the pending target by its out-of-band-verified
+        // fingerprint (§7.5 step 4) — never as the membership source.
+        let devices = http_get_devices(&session).await?;
+        let target = devices
+            .devices
+            .iter()
+            .find(|d| {
+                d.status == "pending"
+                    && B64
+                        .decode(d.ed25519_pub.as_bytes())
+                        .map(|pk| device_fingerprint(&pk) == fingerprint)
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| "No pending device with that fingerprint.".to_string())?;
 
-    let url = format!("{}/devices/roster", base_url(&session.server_url));
-    let resp: RosterUploadResponse = send_json(
-        reqwest::Client::new()
-            .put(&url)
-            .bearer_auth(&session.bearer)
-            .json(&RosterUploadRequest {
+        // Membership = verified previous roster carried forward + the verified target,
+        // hard-failing on any relay-reported key substitution for an existing member (f).
+        let entries =
+            build_roster_membership(&prev_roster.devices, &devices.devices, target)?;
+        let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
+
+        // (d) new counter = verified (signature-bound) counter + 1.
+        let new_counter = verified_counter as i64 + 1;
+        let roster = SignedRoster {
+            version: 1,
+            tenant_id: session.tenant_id,
+            vault_key_epoch: session.epoch,
+            counter: new_counter as u64,
+            devices: entries,
+        };
+        let canonical = roster_canonical_bytes(&roster)?;
+        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
+        let roster_fp = roster_fingerprint_from_canonical(&canonical);
+        let device_list_value =
+            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+
+        let outcome = http_put_roster(
+            &session,
+            &RosterUploadRequest {
                 device_list: device_list_value,
                 signature: B64.encode(signature),
                 counter: new_counter,
                 vault_key_epoch: session.epoch as i64,
                 active_devices: active_ids,
-            }),
-    )
-    .await?;
+            },
+        )
+        .await?;
 
-    session.roster_counter = resp.counter;
-    session.roster_fingerprint = Some(roster_fp);
-    store_session(&session)?;
+        match outcome {
+            RosterPutOutcome::Ok(resp) => {
+                session.roster_counter = resp.counter;
+                session.roster_fingerprint = Some(roster_fp);
+                break;
+            }
+            // (e) A concurrent approval advanced the counter after our re-anchor. Retry
+            // ONCE — re-fetch/verify/rebuild — then give up (bounded, no spin).
+            RosterPutOutcome::Conflict if attempts < 2 => continue,
+            RosterPutOutcome::Conflict => {
+                return Err(
+                    "roster upload kept losing to a concurrent approval — please try again"
+                        .into(),
+                )
+            }
+        }
+    }
+
+    // Item 4: field-merge write. `sync_approve_device` OWNS only {roster_counter,
+    // roster_fingerprint}; it captured `session` at entry and then did two network round-trips,
+    // during which the drain may have rotated {bearer, refresh_token} and persisted them. A
+    // whole-record `store_session(&session)` would clobber those rotated tokens (→ next drain
+    // presents a spent refresh token → family revoked → AuthExpired). `update_session` re-reads
+    // the current session under the lock and merges only our two fields — the approved counter
+    // and fingerprint the loop already parked on the captured `session`.
+    let approved_counter = session.roster_counter;
+    let approved_fp = session.roster_fingerprint.clone();
+    let session = update_session(move |s| {
+        s.roster_counter = approved_counter;
+        s.roster_fingerprint = approved_fp;
+    })?;
+    // Refresh the per-account keychain anchor so the §7.4 counter floor advances with the
+    // approval; otherwise a later account-switch reset would revive the stale pre-approval
+    // counter as the anti-rollback floor.
+    persist_account_anchor(&session)?;
     Ok(build_status_dto(&session).await)
 }
 
@@ -5738,6 +6232,28 @@ mod tests {
     }
 
     #[test]
+    fn recovery_key_and_auth_matches_13_7_literal_vectors() {
+        // Pin this stack's ceremony split to the SAME LOCKED §13.7 literals the crypto-crate
+        // KAT asserts (input 000102..13), so the two stacks can never silently drift apart.
+        let rb: [u8; 20] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+        ];
+        let (wrap, auth) = recovery_key_and_auth(&rb);
+        let to_hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            to_hex(&wrap),
+            "39684df2364fab3f87645c80ad59c9eec298ea212c84f3fbb7c49f303f6557c5",
+            "recovery_key drifted from the LOCKED §13.7 vector"
+        );
+        assert_eq!(
+            to_hex(&auth),
+            "1e5ad1dbc106f5791bb28d514097f462fece2837b3b5a02b6708364d6655db8b",
+            "recovery_auth_key drifted from the LOCKED §13.7 vector"
+        );
+    }
+
+    #[test]
     fn roster_roundtrip_signs_and_verifies() {
         // A roster authored under a vault key verifies against that vault's roster pubkey,
         // and a different vault key's pubkey rejects it (§7.5 step 2).
@@ -5791,6 +6307,109 @@ mod tests {
         )
         .unwrap();
         assert!(!active2);
+    }
+
+    #[test]
+    fn build_roster_membership_carries_verified_prev_and_adds_target() {
+        // Finding #2 regression gate: the NEW roster's membership is authored from the
+        // VERIFIED previous roster carried forward + the single verified target — NOT from
+        // the relay's advisory `GET /devices` status. A relay-flipped extra "active" row
+        // must NOT be folded in; every prior member must carry forward with ITS OWN key.
+        let self_id = Uuid::from_u128(1);
+        let target_id = Uuid::from_u128(2);
+        let attacker_id = Uuid::from_u128(3);
+        let self_pub = B64.encode([0x11u8; 32]);
+        let target_pub = B64.encode([0x22u8; 32]);
+        let attacker_pub = B64.encode([0x33u8; 32]);
+
+        let verified_prev = vec![RosterDeviceEntry {
+            client_id: self_id,
+            ed25519_pub: self_pub.clone(),
+            label: "self".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let target = DeviceInfo {
+            client_id: target_id,
+            ed25519_pub: target_pub.clone(),
+            label: "target".into(),
+            status: "pending".into(),
+            added_at: "2026-02-01T00:00:00Z".into(),
+        };
+        // The relay index reports self (active), the target (pending), AND an attacker the
+        // relay has fraudulently flipped to "active".
+        let get_devices = vec![
+            DeviceInfo {
+                client_id: self_id,
+                ed25519_pub: self_pub.clone(),
+                label: "self".into(),
+                status: "active".into(),
+                added_at: "2026-01-01T00:00:00Z".into(),
+            },
+            target.clone(),
+            DeviceInfo {
+                client_id: attacker_id,
+                ed25519_pub: attacker_pub,
+                label: "attacker".into(),
+                status: "active".into(),
+                added_at: "2026-03-01T00:00:00Z".into(),
+            },
+        ];
+
+        let entries = build_roster_membership(&verified_prev, &get_devices, &target).unwrap();
+        let ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
+        assert_eq!(
+            ids,
+            vec![self_id, target_id],
+            "only the carried-forward verified member + the verified target are signed; \
+             the relay-flipped attacker is NOT folded in"
+        );
+        assert!(!ids.contains(&attacker_id));
+
+        // A target that is already a carried-forward member is not duplicated.
+        let entries2 = build_roster_membership(
+            &verified_prev,
+            &get_devices,
+            &DeviceInfo {
+                client_id: self_id,
+                ed25519_pub: self_pub.clone(),
+                label: "self".into(),
+                status: "active".into(),
+                added_at: "2026-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(entries2.len(), 1);
+    }
+
+    #[test]
+    fn build_roster_membership_hard_fails_on_member_pubkey_substitution() {
+        // Finding #2 (f): if the relay reports a DIFFERENT ed25519_pub for an existing
+        // verified member, refuse to sign — never carry the substituted key forward.
+        let self_id = Uuid::from_u128(1);
+        let target_id = Uuid::from_u128(2);
+        let verified_prev = vec![RosterDeviceEntry {
+            client_id: self_id,
+            ed25519_pub: B64.encode([0x11u8; 32]),
+            label: "self".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let target = DeviceInfo {
+            client_id: target_id,
+            ed25519_pub: B64.encode([0x22u8; 32]),
+            label: "target".into(),
+            status: "pending".into(),
+            added_at: "2026-02-01T00:00:00Z".into(),
+        };
+        // Relay reports self with a SUBSTITUTED key.
+        let get_devices = vec![DeviceInfo {
+            client_id: self_id,
+            ed25519_pub: B64.encode([0xEEu8; 32]),
+            label: "self".into(),
+            status: "active".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let err = build_roster_membership(&verified_prev, &get_devices, &target).unwrap_err();
+        assert!(err.contains("different ed25519_pub"), "got: {err}");
     }
 
     #[test]
@@ -6223,6 +6842,114 @@ mod tests {
         assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0);
     }
 
+    /// PROVING — signout-lifecycle #1 (CRITICAL): "Sign-out never resets DB sync state; a
+    /// second account then silently syncs nothing." RED on the current tree.
+    ///
+    /// Account A enables sync (the cutover zeroes the watermarks) and syncs for a while,
+    /// advancing pull/push to A's tenant tip. The user signs out and enables sync as account
+    /// B. `sync_enable` re-runs `perform_cutover`, but the idempotency gate
+    /// (`live_is_crr_prepared`, sync.rs:2084-2087) short-circuits to `Ok(())` BEFORE the
+    /// watermark reset that lives only in the staging-prep block (sync.rs:2155-2156); and
+    /// `clear_session` (sync.rs:1405-1416) writes NOTHING to the DB — no tenant identity is
+    /// persisted anywhere in the DB (state.rs keys are tenant-agnostic). So B's drain starts
+    /// with A's stale watermark: B's per-tenant `changeset_seq` starts at 1, so
+    /// `pull(since = 5000)` is empty forever and `read_local_changes_since(push_watermark)`
+    /// skips the whole pre-existing library — zero rows ever cross, behind a green panel.
+    ///
+    /// This asserts the DESIRED post-re-enable state (watermarks reset to 0). It FAILS today
+    /// because the second cutover returns early and never touches the watermarks.
+    #[test]
+    fn signout_then_reenable_on_new_account_leaves_stale_watermarks_unreset() {
+        let (_dir, path, svc) = cutover_fixture();
+
+        // Account A: the first enable runs the full cutover and zeroes the watermarks.
+        perform_cutover(&path, &svc).expect("account A enable-time cutover");
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            assert_eq!(state::pull_watermark(db.conn()).unwrap(), 0, "A starts clean");
+            assert_eq!(state::push_watermark(db.conn()).unwrap(), 0, "A starts clean");
+        }
+
+        // Account A syncs for months: the drain advances the watermarks to A's tenant tip.
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            state::set_pull_watermark(db.conn(), 5000).unwrap();
+            state::set_push_watermark(db.conn(), 4200).unwrap();
+        }
+
+        // The user signs out (clear_session touches nothing in the DB) and enables sync as a
+        // DIFFERENT account B. `sync_enable` re-runs the cutover on the same, already-CRR
+        // live DB → the idempotency gate returns Ok immediately.
+        perform_cutover(&path, &svc).expect("account B re-enable cutover (idempotency no-op)");
+
+        // A new account's drain MUST start from a clean slate. On the current tree the stale
+        // 5000/4200 survive, so account B silently syncs nothing in either direction.
+        let db = CrsqlDb::open(&path).unwrap();
+        assert_eq!(
+            state::pull_watermark(db.conn()).unwrap(),
+            0,
+            "re-enable on a new account must reset the pull watermark, else pull(since=stale) is empty forever"
+        );
+        assert_eq!(
+            state::push_watermark(db.conn()).unwrap(),
+            0,
+            "re-enable on a new account must reset the push watermark, else the local library is never uploaded"
+        );
+    }
+
+    /// Item 1 (fix): `reconcile_account_binding` — the tenant-keyed reset the SPEC places in
+    /// `sync_enable` / boot OUTSIDE the CRR idempotency gate. This exercises the real seam the
+    /// provided red test cannot (it drives `perform_cutover`, which has no session/tenant):
+    /// a SWITCH to a different tenant resets the watermarks + records the new binding, while a
+    /// re-enable on the SAME tenant PRESERVES the watermark (no wasteful full re-sync).
+    #[test]
+    fn reconcile_account_binding_resets_on_switch_and_preserves_same_account() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+
+        // First bind to A, then advance the watermarks as A syncs.
+        reconcile_account_binding(&path, tenant_a).expect("first bind to A");
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            state::set_pull_watermark(db.conn(), 5000).unwrap();
+            state::set_push_watermark(db.conn(), 4200).unwrap();
+        }
+
+        // Re-enable / re-boot on the SAME account A: the binding matches → NO reset.
+        reconcile_account_binding(&path, tenant_a).expect("same-account reconcile");
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            assert_eq!(
+                state::pull_watermark(db.conn()).unwrap(),
+                5000,
+                "same-account re-enable must PRESERVE the pull watermark"
+            );
+            assert_eq!(
+                state::push_watermark(db.conn()).unwrap(),
+                4200,
+                "same-account re-enable must PRESERVE the push watermark"
+            );
+        }
+
+        // Switch to a DIFFERENT account B: tenant mismatch → reset to a clean slate + rebind.
+        reconcile_account_binding(&path, tenant_b).expect("account switch A→B");
+        {
+            let db = CrsqlDb::open(&path).unwrap();
+            assert_eq!(
+                state::pull_watermark(db.conn()).unwrap(),
+                0,
+                "account switch must RESET the pull watermark"
+            );
+            assert_eq!(
+                state::push_watermark(db.conn()).unwrap(),
+                0,
+                "account switch must RESET the push watermark"
+            );
+        }
+    }
+
     #[test]
     fn already_enabled_non_crr_live_triggers_cutover() {
         // The drain-start decision: an enabled device whose live DB is not CRR must run
@@ -6297,6 +7024,142 @@ mod tests {
             svc.select("SELECT count(*) AS c FROM sessions", &[])
                 .unwrap()[0]["c"],
             serde_json::json!(2)
+        );
+    }
+
+    fn wal_path(db: &Path) -> PathBuf {
+        let mut s = db.as_os_str().to_owned();
+        s.push("-wal");
+        PathBuf::from(s)
+    }
+
+    /// PLAUSIBLE finding — "Cutover file swap is unguarded against open_managed writers".
+    ///
+    /// Makes the reviewer's race DETERMINISTIC (no sleep/thread timing): replays the exact
+    /// cutover file-op sequence and injects the real background-recording finalize call
+    /// (`crate::db::insert_audio_part_row`, db.rs:274 → open_managed → journal_mode=WAL) at
+    /// each unguarded point the finding names, then drives the cutover's own step-7
+    /// `reopen()` + step-8 oracle (`all_user_table_row_counts` + `PRAGMA integrity_check`)
+    /// and OBSERVES the end state. Pure observation — no hard assert on the corruption half,
+    /// which is exactly what "PLAUSIBLE" means; the eprintln lines carry the verdict.
+    ///
+    /// Deterministic fact this pins: `open_managed` DOES bypass the `swapping` gate (it
+    /// never consults `DbServiceState::swapping`) and DOES open the live path with CREATE
+    /// enabled. The open question the reviewer could not settle is whether the resulting
+    /// `-wal` survives to corrupt the swapped-in file — which this test measures directly.
+    #[test]
+    fn cutover_window_open_managed_writer_observed() {
+        let (_dir, live, svc) = cutover_fixture();
+        // A real recording DB carries session_audio_parts (created by a frontend
+        // tauri-plugin-sql migration, not the Rust chain) — reproduce that precondition so
+        // the injected finalize can COMMIT real frames (finding case (b)).
+        svc.execute(
+            "CREATE TABLE IF NOT EXISTS session_audio_parts (\
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, part_index INTEGER NOT NULL, \
+                file_path TEXT NOT NULL, format TEXT NOT NULL, duration_seconds REAL NOT NULL, \
+                sample_rate INTEGER NOT NULL, created_at TEXT NOT NULL, \
+                UNIQUE (session_id, part_index))",
+            &[],
+        )
+        .unwrap();
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let pre = all_user_table_row_counts(&live).unwrap();
+
+        let staging = cutover_staging_path(&live);
+        let backup = backup_db_path(&live);
+        remove_db_files(&staging);
+
+        // Cutover step 2: VACUUM INTO builds the compacted staging copy (different page
+        // layout, so any replayed foreign frame would land on a WRONG logical page).
+        {
+            let conn = Connection::open(&live).unwrap();
+            conn.execute("VACUUM INTO ?1", [staging.to_str().unwrap()])
+                .unwrap();
+        }
+
+        // Cutover step 4b/5: quiesce the pool + drop handles, then force-remove sidecars.
+        svc.close_for_swap().unwrap();
+        remove_sidecars(&live);
+        remove_sidecars(&staging);
+
+        let part = |idx: u32| crate::db::AudioPartRow {
+            session_id: "s1".into(),
+            part_index: idx,
+            file_path: "/tmp/p.wav".into(),
+            format: "wav",
+            duration_seconds: 1.0,
+            sample_rate: 16000,
+        };
+
+        // ---- WINDOW (b): finalize lands AFTER remove_sidecars(live), BEFORE the renames.
+        // The live path EXISTS, so open_managed opens the OLD file, journal_mode=WAL, and
+        // commits a row.
+        let ins_b = crate::db::insert_audio_part_row(&live, &part(0));
+        let wal = wal_path(&live);
+        eprintln!("CUTOVER-RACE (b): insert result = {ins_b:?}");
+        eprintln!(
+            "CUTOVER-RACE (b): -wal present immediately after finalize = {}",
+            wal.exists()
+        );
+        // Where did the row go? Read the OLD live file directly (open_managed just closed it).
+        let row_in_live: rusqlite::Result<i64> = {
+            let c = Connection::open(&live).unwrap();
+            c.query_row("SELECT count(*) FROM session_audio_parts", [], |r| r.get(0))
+        };
+        eprintln!("CUTOVER-RACE (b): session_audio_parts rows in OLD live file = {row_in_live:?}");
+
+        // Cutover step 6a/6b: the two renames. Neither touches a -wal.
+        std::fs::rename(&live, &backup).unwrap();
+        // ---- WINDOW (a): finalize lands BETWEEN the two renames — the live path does NOT
+        // exist, so open_managed CREATEs a fresh empty yapstack.db (+ -wal) and the INSERT
+        // fails ("no such table"). This is the finding's stray-empty-DB vector.
+        let ins_a = crate::db::insert_audio_part_row(&live, &part(1));
+        eprintln!("CUTOVER-RACE (a): live existed before finalize = false (renamed to backup)");
+        eprintln!("CUTOVER-RACE (a): insert result = {ins_a:?}");
+        eprintln!(
+            "CUTOVER-RACE (a): a fresh yapstack.db was CREATEd by open_managed = {}",
+            live.exists()
+        );
+        eprintln!(
+            "CUTOVER-RACE (a): stray -wal present after finalize (before staging rename) = {}",
+            wal.exists()
+        );
+        // The staging→live rename replaces whatever open_managed just created.
+        std::fs::rename(&staging, &live).unwrap();
+        eprintln!(
+            "CUTOVER-RACE (a): stray -wal present AFTER staging→live rename = {}",
+            wal.exists()
+        );
+
+        // Cutover step 7: reopen() opens yapstack.db; SQLite runs WAL recovery of any -wal.
+        let reopened = crate::db_service::DbService::open(&live).expect("reopen swapped-in DB");
+
+        // Cutover step 8 oracle: row-count compare + integrity check on the swapped-in DB.
+        let post = all_user_table_row_counts(&live);
+        let integrity: rusqlite::Result<String> = {
+            let c = Connection::open(&live).unwrap();
+            c.query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        };
+        let sessions = reopened.select("SELECT count(*) AS c FROM sessions", &[]);
+        eprintln!("CUTOVER-RACE OBSERVE: pre_counts  = {pre:?}");
+        eprintln!("CUTOVER-RACE OBSERVE: post_counts = {post:?}");
+        eprintln!("CUTOVER-RACE OBSERVE: integrity   = {integrity:?}");
+        eprintln!("CUTOVER-RACE OBSERVE: reopened sessions count = {sessions:?}");
+
+        // Verdict pin: the swapped-in DB must remain integral and count-preserved. If a
+        // foreign -wal HAD corrupted it, integrity_check != "ok" or the counts diverge.
+        // This asserts the OBSERVED reality (self-healing via last-connection checkpoint);
+        // it flips to a failure the moment a real corruption path is introduced.
+        assert_eq!(
+            integrity.as_deref(),
+            Ok("ok"),
+            "swapped-in DB integrity after the open_managed windows"
+        );
+        assert_eq!(
+            post.ok(),
+            Some(pre),
+            "swapped-in DB row counts preserved after the open_managed windows"
         );
     }
 
@@ -7246,6 +8109,113 @@ mod tests {
             // A fresh failure edge surfaces again (no permanent suppression).
             assert_eq!(read_log_step(&mut prev, true), ReadLogEdge::Failure);
         }
+
+        /// Item 4 (fix): the GREEN counterpart to `command_writeback_...` above — the same
+        /// concurrent interleaving driven through the ACTUAL fix, `update_session_wrapped`.
+        /// A command that owns only {roster_counter, roster_fingerprint} merges under the
+        /// store lock: it re-reads the session (observing the drain's rotated tokens) and
+        /// writes only its own fields, so the rotated {bearer, refresh_token} survive.
+        #[test]
+        fn update_session_wrapped_merges_owned_fields_over_rotated_tokens() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+
+            let mut base = sample_session();
+            base.bearer = "access0".into();
+            base.refresh_token = Some("refresh0".into());
+            base.roster_counter = 5;
+            store_session_wrapped(&ks, &path, &base).unwrap();
+
+            // The drain rotates tokens concurrently (load → rotate → store).
+            {
+                let mut drain = load_session_wrapped(&ks, &path).unwrap().unwrap();
+                drain.bearer = "access1".into();
+                drain.refresh_token = Some("refresh1".into());
+                store_session_wrapped(&ks, &path, &drain).unwrap();
+            }
+
+            // The command merges ONLY its roster fields — re-reading first, so it cannot
+            // clobber the rotated tokens.
+            let merged = update_session_wrapped(&ks, &path, |s| {
+                s.roster_counter = 6;
+                s.roster_fingerprint = Some("NEWFINGERPRINT00".into());
+            })
+            .unwrap();
+            assert_eq!(merged.roster_counter, 6, "command advanced its own field");
+            assert_eq!(
+                merged.refresh_token.as_deref(),
+                Some("refresh1"),
+                "merge preserved the drain's rotated refresh token"
+            );
+            assert_eq!(merged.bearer, "access1", "merge preserved the rotated access token");
+
+            let final_session = load_session_wrapped(&ks, &path).unwrap().unwrap();
+            assert_eq!(final_session.roster_counter, 6);
+            assert_eq!(final_session.refresh_token.as_deref(), Some("refresh1"));
+            assert_eq!(final_session.bearer, "access1");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Item 1 (fix): the GREEN counterpart to `signout_erases_...` — the per-account anchor
+        /// (the SPEC's home for the anti-substitution baselines) SURVIVES a routine sign-out,
+        /// so the next sign-in stays a KNOWN device instead of reverting to TOFU. Uses a unique
+        /// (server, email) so its keychain/dev-file entry cannot collide with other tests.
+        #[test]
+        fn account_anchor_survives_signout_keeping_c3_and_counter_baselines() {
+            let ks = FakeKeyStore::default();
+            let path = temp_enc_path();
+            let server = "https://anchor-survive-test.invalid";
+            let email = "known-device@example.test";
+            let real_salt = [0xABu8; 16];
+
+            // Anchor a KNOWN device (as signup/login/enable do) + store the sealed session.
+            store_account_anchor(
+                server,
+                email,
+                &AccountAnchor {
+                    tenant_id: Uuid::new_v4(),
+                    epoch: 0,
+                    salt_enc_b64: Some(B64.encode(real_salt)),
+                    roster_counter: 7,
+                    roster_fingerprint: Some("fp".into()),
+                },
+            )
+            .unwrap();
+            let mut known = sample_session();
+            known.server_url = server.into();
+            known.email = email.into();
+            store_session_wrapped(&ks, &path, &known).unwrap();
+
+            // Routine sign-out deletes the sealed session but MUST NOT touch the anchor.
+            clear_session_wrapped(&ks, &path).unwrap();
+            assert!(
+                load_session_wrapped(&ks, &path).unwrap().is_none(),
+                "the sealed session is gone after sign-out"
+            );
+
+            // The anchor survives with baselines intact → a known device on next sign-in.
+            let anchor = load_account_anchor(server, email)
+                .unwrap()
+                .expect("anchor survives sign-out (only sync_forget_account clears it)");
+            assert_eq!(anchor.roster_counter, 7, "§7.4 anti-rollback floor preserved");
+            let baseline = B64
+                .decode(anchor.salt_enc_b64.as_ref().unwrap().as_bytes())
+                .unwrap();
+            assert_eq!(baseline, real_salt, "§3.2-C3 salt baseline preserved");
+            let hostile = [0xCDu8; 16];
+            assert!(
+                baseline != hostile,
+                "a substituted salt would now be FLAGGED (C3), not silently TOFU-accepted"
+            );
+
+            // `sync_forget_account` is the explicit clear.
+            clear_account_anchor(server, email).unwrap();
+            assert!(
+                load_account_anchor(server, email).unwrap().is_none(),
+                "sync_forget_account clears the anchor"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     // ----- Typed relay connection probe (T025) -----
@@ -7561,11 +8531,91 @@ mod tests {
             );
         }
 
+        /// Serializes the two tests that mutate the process-global `KICK_ARMED`/kick channel
+        /// so they never race under cargo's in-binary parallel test execution.
+        static KICK_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Spin (bounded) until `KICK_ARMED` reads `want`, so the debouncer's entry-store is
+        /// observed before we proceed.
+        fn wait_kick_armed(want: bool) {
+            let t0 = Instant::now();
+            while KICK_ARMED.load(std::sync::atomic::Ordering::Acquire) != want
+                && t0.elapsed() < Duration::from_secs(2)
+            {
+                std::thread::yield_now();
+            }
+        }
+
+        /// PROVING — signout-lifecycle #3 (LOW, structural demo): "Re-enable permanently
+        /// disarms local-write kicks (KICK_ARMED cleared after re-arm)."
+        ///
+        /// `KICK_ARMED` is a process-global with no per-thread ownership: every debouncer
+        /// stores `true` on entry (sync.rs:2542) and `false` as its LAST statement
+        /// (sync.rs:2569). `sync_enable` spawns the NEW debouncer (inside `spawn_drain`,
+        /// sync.rs:4596) BEFORE it joins the OLD handle's debouncer (`prev.stop()`,
+        /// sync.rs:4610-4611). The store order is therefore new=true, then old=false — leaving
+        /// `KICK_ARMED == false` with a LIVE new debouncer, so `note_local_write`
+        /// (sync.rs:2499-2506) becomes a permanent no-op and every push-kick is dropped.
+        ///
+        /// This reproduces the exact ordering with the REAL `spawn_write_kick_debouncer` +
+        /// stop/join, then asserts the DESIRED invariant (a live debouncer stays armed). RED.
+        #[test]
+        fn stale_debouncer_shutdown_disarms_the_live_debouncer() {
+            use std::sync::atomic::Ordering;
+            let _serial = KICK_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            KICK_ARMED.store(false, Ordering::SeqCst);
+
+            // The OLD drain's debouncer — still alive in SyncRuntimeState (e.g. after a
+            // terminal refresh `break`). This is the thread `prev.stop()` will join.
+            let (old_shutdown, old_join) = spawn_write_kick_debouncer().unwrap();
+            wait_kick_armed(true);
+
+            // sync_enable runs `spawn_drain` FIRST → a NEW debouncer is spawned and arms.
+            let (new_shutdown, new_join) = spawn_write_kick_debouncer().unwrap();
+            wait_kick_armed(true);
+
+            // ...THEN `prev.stop()` joins the OLD debouncer, whose final statement stores
+            // KICK_ARMED = false.
+            old_shutdown.store(true, Ordering::SeqCst);
+            kick_channel().cv.notify_all();
+            old_join.join().unwrap();
+
+            // Capture the observable state: a LIVE (new) debouncer still exists, so the flag
+            // must be armed and a kick must register a deadline.
+            let armed_with_live_debouncer = KICK_ARMED.load(Ordering::Acquire);
+            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            note_local_write();
+            let kick_registered = kick_channel()
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+
+            // Tear down the still-live new debouncer and reset the globals for other tests.
+            new_shutdown.store(true, Ordering::SeqCst);
+            kick_channel().cv.notify_all();
+            new_join.join().unwrap();
+            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            KICK_ARMED.store(false, Ordering::SeqCst);
+
+            assert!(
+                armed_with_live_debouncer,
+                "a live debouncer must remain armed after a STALE debouncer shuts down"
+            );
+            assert!(
+                kick_registered,
+                "note_local_write must register a kick while a live debouncer exists"
+            );
+        }
+
         /// `note_local_write` is a cheap no-op when no drain (hence no debouncer) is armed —
         /// it must never panic or set a stray deadline that a later drain would over-fire on.
         #[test]
         fn note_local_write_is_noop_when_unarmed() {
+            let _serial = KICK_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             // KICK_ARMED starts false in a unit-test process (no debouncer thread).
+            KICK_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+            *kick_channel().deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
             note_local_write();
             assert_eq!(
                 *kick_channel().deadline.lock().unwrap(),

@@ -392,6 +392,7 @@ pub fn run() {
             sync::sync_enable,
             sync::sync_approve_device,
             sync::sync_sign_out,
+            sync::sync_forget_account,
             sync::audio_enqueue_session,
             sync::audio_retry_failed_uploads,
             sync::sync_retry_crypto_quarantine,

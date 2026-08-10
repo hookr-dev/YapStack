@@ -272,6 +272,21 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
 /// Inserts a `session_audio_parts` row. Uses INSERT OR IGNORE so a partial
 /// crash that leaves a row already inserted is recoverable on retry.
 pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
+    // Cutover guard: `open_managed` opens with CREATE, so a finalize racing the A3 CRR
+    // enable-cutover file-swap (live path momentarily absent between renames) would
+    // otherwise resurrect a stray empty `yapstack.db`. Precheck existence like the sibling
+    // read/reconcile callers and refuse rather than create; the finalize caller already
+    // logs the Err and relies on the FE refresh to recover the row.
+    if !db_path.exists() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!(
+                "insert_audio_part_row: {} does not exist (cutover swap window); \
+                 refusing to create a stray DB",
+                db_path.display()
+            )),
+        ));
+    }
     let managed = crate::db_service::open_managed(db_path)?;
     insert_audio_part_row_on(managed.conn(), row)
 }
