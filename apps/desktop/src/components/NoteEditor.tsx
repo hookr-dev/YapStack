@@ -365,7 +365,13 @@ export function NoteEditor({
       // THEIR content (e.g. an AI summary) and a reload is pending to show it. Our `html`
       // is stale — writing it would clobber the local write, and it is NOT a peer edit, so
       // the "another device" toast would also be wrong. Yield: skip the write and the toast.
-      if (useAppStore.getState().noteRefreshCounter !== localRefreshAtStart) {
+      // Session-scoped: only yield when the local write targeted THIS note — a
+      // save-to-notes on a different session must not make this editor drop its text.
+      const localRefreshStore = useAppStore.getState();
+      if (
+        localRefreshStore.noteRefreshCounter !== localRefreshAtStart &&
+        localRefreshStore.noteRefreshSessionId === id
+      ) {
         log.info(
           `note ${id}: a local write superseded this in-flight save; yielding to the reload (no clobber)`,
           "note-editor",

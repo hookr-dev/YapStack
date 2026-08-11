@@ -444,6 +444,28 @@ interface AppState {
 
   // Note refresh (for cross-component refresh signaling)
   noteRefreshCounter: number;
+  /**
+   * Session id the last `incrementNoteRefresh` recorded. A LOCAL note write (AI
+   * `save_to_notes`, the chat's save-to-notes, citation conversion) is announced
+   * by bumping the counter for its session; the sync path never bumps it (D4).
+   * NoteEditor's in-flight-save guard requires BOTH the counter to have moved AND
+   * this id to match its own session, so a note write on a DIFFERENT session can
+   * no longer make an unrelated editor drop its text.
+   */
+  noteRefreshSessionId: string | null;
+
+  /**
+   * Session-scoped local session-meta-write signal — the meta-level sibling of
+   * `noteRefreshCounter`. A LOCAL rename (the AI `update_title` tool via
+   * NoteDetailView.handleToolsExecuted, a dictation rename, etc.) bumps the
+   * counter and records its session; the sync path NEVER bumps it (mirror D4).
+   * SessionHeader's title save uses it to tell a same-machine rename from a
+   * genuine peer edit: when the row moved under an open title edit AND this
+   * signal shows a local write for that session, it yields instead of toasting
+   * "another device" and LWW-clobbering the local rename.
+   */
+  sessionMetaRefreshCounter: number;
+  sessionMetaRefreshSessionId: string | null;
 
   /**
    * Store-visible edit-in-progress signal (LIVE_SESSION_STATE.md D4 normative).
@@ -714,7 +736,9 @@ interface AppState {
   createManualNote: (title?: string) => Promise<void>;
 
   // Note refresh
-  incrementNoteRefresh: () => void;
+  incrementNoteRefresh: (sessionId: string) => void;
+  // Local session-meta write (rename etc.) signal; sync must never call this.
+  incrementSessionMetaRefresh: (sessionId: string) => void;
 
   // Audio playback
   setPlaybackTime: (time: number) => void;
@@ -1060,6 +1084,9 @@ function createAppStore() {
       backfillBoundarySeconds: null,
       sessionStopping: false,
       noteRefreshCounter: 0,
+      noteRefreshSessionId: null,
+      sessionMetaRefreshCounter: 0,
+      sessionMetaRefreshSessionId: null,
       editingSegmentId: null,
       setEditingSegmentId: (id: string | null) => {
         set({ editingSegmentId: id });
@@ -3224,9 +3251,24 @@ function createAppStore() {
         void get().refreshOpenViewSession();
       },
 
-      // Note refresh
-      incrementNoteRefresh: () =>
-        set((state) => ({ noteRefreshCounter: state.noteRefreshCounter + 1 })),
+      // Note refresh. Records the session so a note write on a DIFFERENT session
+      // can't make an unrelated open editor yield (session-scoping). The sync
+      // path must NEVER call this (D4): sync note content travels via
+      // `remoteNoteUpdate`, not this counter.
+      incrementNoteRefresh: (sessionId: string) =>
+        set((state) => ({
+          noteRefreshCounter: state.noteRefreshCounter + 1,
+          noteRefreshSessionId: sessionId,
+        })),
+      // Local session-meta write (e.g. AI `update_title`) signal. The sync path
+      // must NEVER call this — it distinguishes a same-machine rename from a peer
+      // edit in SessionHeader's title save (mirror the noteRefreshCounter/D4
+      // discipline).
+      incrementSessionMetaRefresh: (sessionId: string) =>
+        set((state) => ({
+          sessionMetaRefreshCounter: state.sessionMetaRefreshCounter + 1,
+          sessionMetaRefreshSessionId: sessionId,
+        })),
 
       // Audio playback
       setPlaybackTime: (time: number) => {

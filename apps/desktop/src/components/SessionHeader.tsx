@@ -248,6 +248,12 @@ export function SessionHeader({
   // The title as it stood when this edit began — the reference point for "did
   // the user actually change anything?" and "did the row move under the edit?".
   const titleEditBaseRef = useRef(session.title);
+  // `sessionMetaRefreshCounter` as it stood when this edit began. If it moves
+  // (and records THIS session) while the input is open, the row that changed
+  // under the edit came from a LOCAL same-machine rename (the AI `update_title`
+  // tool, a dictation rename), not a peer edit — see handleSaveTitle. Sync never
+  // bumps that counter (D4), so a genuine remote rename leaves this unchanged.
+  const sessionMetaRefreshAtEditStartRef = useRef(0);
   if (!isEditingTitle && session.title !== prevTitleRef.current) {
     prevTitleRef.current = session.title;
     setTitleText(session.title);
@@ -278,6 +284,28 @@ export function SessionHeader({
       // remote rename that landed during the edit. Same posture as the note
       // editor — LWW proceeds, but visibly (A3 / A1d).
       if (session.title !== base) {
+        // The row moved under the edit. Distinguish a LOCAL same-machine rename
+        // (the AI `update_title` tool via handleToolsExecuted, a dictation
+        // rename — each bumps sessionMetaRefreshCounter; the sync path never
+        // does, D4) from a genuine remote peer rename. On a local write the DB +
+        // viewSession already hold the new title, so re-asserting our stale draft
+        // would clobber it and the "another device" toast would be wrong. Yield:
+        // skip the write and the toast, adopt the row (mirror NoteEditor's guard).
+        const metaStore = useAppStore.getState();
+        if (
+          metaStore.sessionMetaRefreshCounter !==
+            sessionMetaRefreshAtEditStartRef.current &&
+          metaStore.sessionMetaRefreshSessionId === session.id
+        ) {
+          log.info(
+            `session ${session.id}: a local rename superseded this title edit; yielding (no clobber)`,
+            "session-header",
+          );
+          setTitleText(session.title);
+          prevTitleRef.current = session.title;
+          setIsEditingTitle(false);
+          return;
+        }
         log.warn(
           `session ${session.id}: remote rename landed during title edit; local version wins (LWW)`,
           "session-header",
@@ -336,6 +364,8 @@ export function SessionHeader({
               if (!isRecording) {
                 setTitleText(session.title);
                 titleEditBaseRef.current = session.title;
+                sessionMetaRefreshAtEditStartRef.current =
+                  useAppStore.getState().sessionMetaRefreshCounter;
                 setIsEditingTitle(true);
               }
             }}

@@ -77,7 +77,12 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useAppStore.setState({ noteEditingSessionId: null, remoteNoteUpdate: null });
+  useAppStore.setState({
+    noteEditingSessionId: null,
+    remoteNoteUpdate: null,
+    noteRefreshCounter: 0,
+    noteRefreshSessionId: null,
+  });
 });
 
 afterEach(() => cleanup());
@@ -241,11 +246,10 @@ describe("NoteEditor — a local note-write (e.g. AI summarize) must not be clob
     );
 
     // The AI `save_to_notes` tool writes the summary and NoteDetailView.handleToolsExecuted
-    // bumps noteRefreshCounter (incrementNoteRefresh). Model exactly that: the DB now holds
-    // the summary, and the local-write signal is raised, THEN our parked read resolves.
-    useAppStore.setState((s) => ({
-      noteRefreshCounter: s.noteRefreshCounter + 1,
-    }));
+    // bumps the refresh signal (incrementNoteRefresh(sessionId)). Model exactly that: the DB
+    // now holds the summary, and the SESSION-SCOPED local-write signal is raised for THIS
+    // session, THEN our parked read resolves.
+    useAppStore.getState().incrementNoteRefresh("s1");
     persistRead.resolve({ content: "<p>AI SUMMARY</p>" });
     await new Promise((r) => setTimeout(r, 0));
     await Promise.resolve();
@@ -258,6 +262,50 @@ describe("NoteEditor — a local note-write (e.g. AI summarize) must not be clob
     );
     expect(toast.info).not.toHaveBeenCalledWith(
       expect.stringContaining("another device"),
+    );
+  });
+
+  it("does NOT yield when the local write targeted a DIFFERENT session (session-scoping)", async () => {
+    // The parked in-flight read resolves to the SAME content we loaded, so the
+    // only thing that could make this editor drop its text is the refresh signal.
+    const persistRead = deferred<{ content: string } | null>();
+    let loaded = false;
+    getNoteMock.mockImplementation(() => {
+      if (!loaded) {
+        loaded = true;
+        return Promise.resolve({ content: "<p>original</p>" });
+      }
+      return persistRead.promise;
+    });
+    saveNoteMock.mockResolvedValue(undefined);
+
+    render(
+      <TooltipProvider>
+        <NoteEditor sessionId="s1" refreshKey={0} />
+      </TooltipProvider>,
+    );
+    await screen.findByText("original");
+
+    await typeInEditor("my real edit", "s1");
+    fireEvent.blur(editorDom());
+    await waitFor(() =>
+      expect(getNoteMock.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
+
+    // A save-to-notes happened on a DIFFERENT session while this save was in
+    // flight: the counter moves but records "other", not "s1". This editor must
+    // NOT treat that as its own note being superseded — its save must proceed.
+    useAppStore.getState().incrementNoteRefresh("other");
+    persistRead.resolve({ content: "<p>original</p>" });
+    await new Promise((r) => setTimeout(r, 0));
+    await Promise.resolve();
+
+    // On the pre-fix (session-blind) guard this yielded and the edit was dropped.
+    await waitFor(() =>
+      expect(saveNoteMock).toHaveBeenCalledWith(
+        "s1",
+        expect.stringContaining("my real edit"),
+      ),
     );
   });
 });

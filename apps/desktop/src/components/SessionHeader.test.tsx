@@ -102,6 +102,8 @@ beforeEach(() => {
     sessionFolderMap: {},
     toggleSessionFolder: vi.fn(),
     removeSessionFromAllFolders: vi.fn(),
+    sessionMetaRefreshCounter: 0,
+    sessionMetaRefreshSessionId: null,
   });
 });
 
@@ -221,6 +223,67 @@ describe("SessionHeader — title edit vs. remote rename (sync-UX A3)", () => {
       ),
     );
     expect(toast.info).not.toHaveBeenCalled();
+  });
+});
+
+// Pattern B (local-write misattribution): a LOCAL same-machine rename (the AI
+// `update_title` tool via handleToolsExecuted, a dictation rename) moves the row
+// under an open title edit exactly like a remote rename would, but it announces
+// itself by bumping sessionMetaRefreshCounter for that session — the sync path
+// never does. The title save must yield to it (no clobber, no "another device"
+// toast), while a genuine remote rename (no bump) still toasts + LWW-wins.
+describe("SessionHeader — title edit vs. LOCAL rename (misattribution)", () => {
+  it("yields to a local session-meta rename: no clobber, no 'another device' toast", async () => {
+    const { rerender } = render(
+      <SessionHeader session={makeSession({ title: "Old title" })} />,
+    );
+    await userEvent.dblClick(screen.getByText("Old title"));
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My draft");
+
+    // A LOCAL AI `update_title` runs: NoteDetailView.handleToolsExecuted bumps the
+    // session-scoped meta signal for THIS session and reloads the row to the AI's
+    // title. Model exactly that: raise the signal, then the row prop moves.
+    useAppStore.getState().incrementSessionMetaRefresh("session-1");
+    rerender(<SessionHeader session={makeSession({ title: "AI Title" })} />);
+
+    fireEvent.blur(screen.getByRole("textbox"));
+
+    // FAILS on the pre-fix (session-blind) logic: it LWW-clobbers the AI rename
+    // with "My draft" and toasts "another device". The fix yields to the local
+    // write — no write, no toast, and the AI title survives.
+    await waitFor(() => expect(screen.getByText("AI Title")).toBeTruthy());
+    expect(updateSessionTitleMock).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("another device"),
+    );
+  });
+
+  it("still toasts + LWW-wins for a genuine remote rename (no local bump)", async () => {
+    // Same shape, but NO sessionMetaRefresh bump — this is a peer edit that
+    // arrived via sync, which never bumps the counter.
+    const { rerender } = render(
+      <SessionHeader session={makeSession({ title: "Old title" })} />,
+    );
+    await userEvent.dblClick(screen.getByText("Old title"));
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My draft");
+
+    rerender(<SessionHeader session={makeSession({ title: "Peer title" })} />);
+
+    fireEvent.blur(screen.getByRole("textbox"));
+
+    await waitFor(() =>
+      expect(updateSessionTitleMock).toHaveBeenCalledWith(
+        "session-1",
+        "My draft",
+      ),
+    );
+    expect(toast.info).toHaveBeenCalledWith(
+      "Title updated on another device — your version was saved",
+    );
   });
 });
 
