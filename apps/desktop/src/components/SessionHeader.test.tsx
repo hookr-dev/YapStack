@@ -258,6 +258,11 @@ describe("SessionHeader — title edit vs. LOCAL rename (misattribution)", () =>
     expect(toast.info).not.toHaveBeenCalledWith(
       expect.stringContaining("another device"),
     );
+    // The yield now INFORMS the user their draft was replaced by the local write
+    // (previously silent) — red-green for the follow-up toast.
+    expect(toast.info).toHaveBeenCalledWith(
+      expect.stringContaining("your edit was replaced"),
+    );
   });
 
   it("still toasts + LWW-wins for a genuine remote rename (no local bump)", async () => {

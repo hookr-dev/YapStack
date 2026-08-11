@@ -301,6 +301,7 @@ export function SessionHeader({
             `session ${session.id}: a local rename superseded this title edit; yielding (no clobber)`,
             "session-header",
           );
+          toast.info("Title was changed here by another action — your edit was replaced");
           setTitleText(session.title);
           prevTitleRef.current = session.title;
           setIsEditingTitle(false);

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock db.ts to prevent Tauri import chain
 vi.mock("@/lib/db", () => ({
@@ -35,8 +35,10 @@ vi.mock("@/lib/ai", async (importOriginal) => {
 import {
   convertCitationsToSegmentRefs,
   getRegisteredTools,
+  executeTool,
 } from "./ai-tools";
 import type { DbSegment } from "./db";
+import { useAppStore } from "@/stores/appStore";
 
 function makeSegment(overrides: Partial<DbSegment> & { id: string }): DbSegment {
   return {
@@ -121,3 +123,39 @@ describe("getRegisteredTools", () => {
   });
 });
 
+
+describe("local-write refresh signals are emitted by the tool itself (atomic with the write)", () => {
+  const sctx = {
+    scope: "session",
+    sessionId: "s1",
+    currentTitle: "Old",
+    currentNote: null,
+    isPinned: false,
+  } as const;
+
+  beforeEach(() => {
+    useAppStore.setState({
+      noteRefreshCounter: 0,
+      noteRefreshSessionId: null,
+      sessionMetaRefreshCounter: 0,
+      sessionMetaRefreshSessionId: null,
+    });
+  });
+
+  // Fix for the atomic-bump residual: the signal must originate AT the write
+  // (in the tool, no await between) — not post-hoc in handleToolsExecuted — so an
+  // open editor's in-flight save yields instead of clobbering the AI write.
+  it("update_title bumps the session-meta signal for its session", async () => {
+    const before = useAppStore.getState().sessionMetaRefreshCounter;
+    await executeTool("update_title", { title: "New Title" }, sctx);
+    expect(useAppStore.getState().sessionMetaRefreshCounter).toBeGreaterThan(before);
+    expect(useAppStore.getState().sessionMetaRefreshSessionId).toBe("s1");
+  });
+
+  it("save_to_notes bumps the note-refresh signal for its session", async () => {
+    const before = useAppStore.getState().noteRefreshCounter;
+    await executeTool("save_to_notes", { content: "summary", mode: "replace" }, sctx);
+    expect(useAppStore.getState().noteRefreshCounter).toBeGreaterThan(before);
+    expect(useAppStore.getState().noteRefreshSessionId).toBe("s1");
+  });
+});

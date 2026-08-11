@@ -503,10 +503,6 @@ export function NoteDetailView() {
   const setIsPlaying = useAppStore((s) => s.setIsPlaying);
   const noteRefreshCounter = useAppStore((s) => s.noteRefreshCounter);
   const loadSessions = useAppStore((s) => s.loadSessions);
-  const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
-  const incrementSessionMetaRefresh = useAppStore(
-    (s) => s.incrementSessionMetaRefresh,
-  );
   const activeSessionParts = useAppStore((s) => s.activeSessionParts);
   const viewSessionParts = useAppStore((s) => s.viewSessionParts);
   const resumeSession = useAppStore((s) => s.resumeSession);
@@ -562,16 +558,12 @@ export function NoteDetailView() {
   const handleToolsExecuted = useCallback(
     async (names: string[]) => {
       if (!selectedSessionId) return;
-      // Known low-severity follow-on (OUT OF SCOPE here): the DB write inside the
-      // tool and the refresh-signal bump below aren't a single atomic step, so a
-      // save racing the exact window between them can still slip through. Left for
-      // a dedicated pass on the chat tool-exec→refresh timing.
+      // Note: the local-write refresh signals (incrementNoteRefresh /
+      // incrementSessionMetaRefresh) are bumped by the tools THEMSELVES adjacent
+      // to their DB write (see ai-tools.ts), so an open editor's in-flight save
+      // yields atomically; this callback only refreshes VIEW state afterward.
       const effects = getToolEffects(names);
       if (effects.has("session-meta")) {
-        // LOCAL session-meta write (e.g. the AI `update_title` tool): announce it
-        // so SessionHeader's title save can tell this same-machine rename from a
-        // peer edit and not misattribute/clobber it. Sync never bumps this (D4).
-        incrementSessionMetaRefresh(selectedSessionId);
         await loadSessions();
         const refreshed = await getSession(selectedSessionId);
         // Post-await recheck (commit-after-navigation): the user may have opened
@@ -584,9 +576,6 @@ export function NoteDetailView() {
           useAppStore.setState({ viewSession: refreshed });
         }
       }
-      if (effects.has("notes")) {
-        incrementNoteRefresh(selectedSessionId);
-      }
       if (effects.has("organization")) {
         await Promise.all([loadSessionFolders(), loadSessionTags(), loadTags()]);
       }
@@ -597,8 +586,6 @@ export function NoteDetailView() {
     [
       selectedSessionId,
       loadSessions,
-      incrementNoteRefresh,
-      incrementSessionMetaRefresh,
       loadSessionFolders,
       loadSessionTags,
       loadTags,

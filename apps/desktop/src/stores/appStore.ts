@@ -1049,7 +1049,11 @@ function groupBySession<T extends { session_id: string }>(
  * wrong session. Each call captures the token it stamped at entry and bails
  * after its awaits if a newer open has since superseded it.
  */
-let openSessionRequestSeq = 0;
+// Monotonic navigation sequence: bumped by EVERY view-navigation commit
+// (openSession, navigateTo, deleteSession). An async openSession stamps it at
+// entry and drops its now-stale reads if any navigation superseded it during the
+// await — so a slow open can't clobber a later open, a navigateTo, or a delete.
+let navRequestSeq = 0;
 
 function createAppStore() {
   return create<AppState>()(
@@ -1873,6 +1877,9 @@ function createAppStore() {
       },
 
       openSession: async (id: string) => {
+        // Stamp this open as the latest navigation (covers the active-session
+        // early return below too, so it supersedes any in-flight open).
+        const requestSeq = ++navRequestSeq;
         const { activeSessionId } = get();
 
         if (id === activeSessionId) {
@@ -1883,20 +1890,16 @@ function createAppStore() {
           return;
         }
 
-        // Stamp this open as the latest in-flight request; a newer open (below)
-        // supersedes it and this call must not commit its now-stale reads.
-        const requestSeq = ++openSessionRequestSeq;
-
         try {
           const [session, segments, parts] = await Promise.all([
             getSession(id),
             getSessionSegments(id),
             listSessionAudioParts(id),
           ]);
-          // Post-await recheck (commit-after-navigation): a later openSession
-          // has taken over — its selection wins, so drop these reads rather than
-          // clobbering the newer view with an out-of-order resolution.
-          if (openSessionRequestSeq !== requestSeq) return;
+          // Post-await recheck (commit-after-navigation): a later navigation
+          // (open, navigateTo, or delete) has taken over — its selection wins,
+          // so drop these reads rather than clobbering the newer view.
+          if (navRequestSeq !== requestSeq) return;
           set({
             currentView: "note-detail",
             selectedSessionId: id,
@@ -1914,6 +1917,10 @@ function createAppStore() {
 
         // Can't delete active recording session
         if (id === activeSessionId) return;
+
+        // A delete of the open session navigates to the list below; supersede any
+        // in-flight openSession so its late reads can't re-open a deleted row.
+        navRequestSeq++;
 
         try {
           // Read part paths *before* the cascade deletes them. Without this
@@ -1984,6 +1991,7 @@ function createAppStore() {
       },
 
       navigateTo: (view, sessionId) => {
+        navRequestSeq++; // supersede any in-flight openSession
         set({
           currentView: view,
           selectedSessionId: sessionId ?? null,

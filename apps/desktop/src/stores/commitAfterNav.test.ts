@@ -137,6 +137,24 @@ describe("openSession — out-of-order commit (Pattern D)", () => {
     expect(useAppStore.getState().selectedSessionId).toBe("A");
     expect(useAppStore.getState().viewSession?.id).toBe("A");
   });
+
+  // Residual closed: the seq token is now shared with navigateTo, so a competing
+  // navigation during the open's parked read supersedes the stale open.
+  it("lets a navigateTo during the open's await win (open does not re-open)", async () => {
+    const aRead = deferred<DbSession>();
+    dbMocks.getSession.mockImplementation((id: string) =>
+      id === "A" ? aRead.promise : Promise.resolve(session(id)),
+    );
+    const openA = useAppStore.getState().openSession("A");
+    // User navigates to the note list while A's reads are in flight.
+    useAppStore.getState().navigateTo("note-list", undefined);
+    expect(useAppStore.getState().currentView).toBe("note-list");
+    // A's parked read resolves LAST — must NOT re-open note-detail/A.
+    aRead.resolve(session("A"));
+    await openA;
+    expect(useAppStore.getState().currentView).toBe("note-list");
+    expect(useAppStore.getState().selectedSessionId).toBe(null);
+  });
 });
 
 describe("markSessionCompleted — navigate-away during getSession (Pattern D)", () => {
