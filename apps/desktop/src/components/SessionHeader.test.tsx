@@ -223,3 +223,60 @@ describe("SessionHeader — title edit vs. remote rename (sync-UX A3)", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 });
+
+// Pattern D (commit-after-navigation): handleSaveTitle refreshes viewSession
+// AFTER updateSessionTitle + getSession resolve. If the user opened a different
+// session during that async gap, committing the renamed row would show the wrong
+// session's title. The post-await selectedSessionId===session.id recheck prevents it.
+describe("SessionHeader — title save vs. navigate-away (commit-after-navigation)", () => {
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it("does not commit the renamed row after the user navigated to another session", async () => {
+    const sentinel = makeSession({ id: "session-1", title: "sentinel view" });
+    useAppStore.setState({ selectedSessionId: "session-1", viewSession: sentinel });
+    const rowRead = deferred<DbSession>();
+    getSessionMock.mockReturnValue(rowRead.promise);
+
+    render(<SessionHeader session={makeSession({ title: "Old title" })} />);
+    await userEvent.dblClick(screen.getByText("Old title"));
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My new title");
+    fireEvent.blur(input);
+
+    // Let updateSessionTitle + loadSessions settle so we're parked on getSession.
+    await waitFor(() => expect(getSessionMock).toHaveBeenCalled());
+    await flush();
+
+    // User opens a different session while getSession is in flight.
+    useAppStore.setState({ selectedSessionId: "other-session" });
+
+    rowRead.resolve(makeSession({ id: "session-1", title: "My new title" }));
+    await flush();
+
+    // The open view is another session; the renamed row must NOT be committed.
+    expect(useAppStore.getState().viewSession).toBe(sentinel);
+  });
+
+  it("commits the renamed row when the view has not moved", async () => {
+    useAppStore.setState({ selectedSessionId: "session-1", viewSession: null });
+    const renamed = makeSession({ id: "session-1", title: "My new title" });
+    getSessionMock.mockResolvedValue(renamed);
+
+    render(<SessionHeader session={makeSession({ title: "Old title" })} />);
+    await userEvent.dblClick(screen.getByText("Old title"));
+    const input = screen.getByRole("textbox");
+    await userEvent.clear(input);
+    await userEvent.type(input, "My new title");
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(useAppStore.getState().viewSession).toBe(renamed),
+    );
+  });
+});

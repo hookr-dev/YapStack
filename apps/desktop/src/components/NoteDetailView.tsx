@@ -563,7 +563,13 @@ export function NoteDetailView() {
       if (effects.has("session-meta")) {
         await loadSessions();
         const refreshed = await getSession(selectedSessionId);
-        if (refreshed) {
+        // Post-await recheck (commit-after-navigation): the user may have opened
+        // a different session while these reads were in flight — don't commit
+        // this row's meta over the now-open view.
+        if (
+          refreshed &&
+          useAppStore.getState().selectedSessionId === selectedSessionId
+        ) {
           useAppStore.setState({ viewSession: refreshed });
         }
       }

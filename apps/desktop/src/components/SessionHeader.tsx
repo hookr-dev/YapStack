@@ -287,9 +287,12 @@ export function SessionHeader({
       await updateSessionTitle(session.id, trimmed);
       prevTitleRef.current = trimmed;
       await loadSessions();
-      // Refresh viewSession so the header re-renders with the new title
+      // Refresh viewSession so the header re-renders with the new title.
       const updated = await getSession(session.id);
-      if (updated) {
+      // Post-await recheck (commit-after-navigation): the user may have opened a
+      // different session while updateSessionTitle + getSession were in flight —
+      // don't overwrite the now-open view with this row.
+      if (updated && useAppStore.getState().selectedSessionId === session.id) {
         useAppStore.setState({ viewSession: updated });
       }
     }

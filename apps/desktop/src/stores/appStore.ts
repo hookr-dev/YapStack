@@ -1017,6 +1017,16 @@ function groupBySession<T extends { session_id: string }>(
   return map;
 }
 
+/**
+ * Monotonic "latest open request" token. openSession fans out through several
+ * awaited reads before it commits the note-detail view; two overlapping opens
+ * (a fast double-click across rows, or a slow first read resolving after a
+ * later one) would otherwise let whichever read finishes LAST win — showing the
+ * wrong session. Each call captures the token it stamped at entry and bails
+ * after its awaits if a newer open has since superseded it.
+ */
+let openSessionRequestSeq = 0;
+
 function createAppStore() {
   return create<AppState>()(
     persist(
@@ -1358,6 +1368,12 @@ function createAppStore() {
         // If we already have this session active, skip
         if (get().activeSessionId === sessionId) return;
 
+        // Snapshot the selection at entry. Recovery restoring the ACTIVE session
+        // state always runs; the forced view navigation below is boot-time
+        // convenience and must not stomp a session the user opened during the
+        // async gap (commit-after-navigation).
+        const selectedAtStart = get().selectedSessionId;
+
         try {
           const [segments, session, parts] = await Promise.all([
             getSessionSegments(sessionId),
@@ -1379,7 +1395,7 @@ function createAppStore() {
             currentInsightId: get().settings.insights.defaultInsightId,
           });
 
-          if (session) {
+          if (session && get().selectedSessionId === selectedAtStart) {
             set({
               selectedSessionId: sessionId,
               viewSession: session,
@@ -1840,12 +1856,20 @@ function createAppStore() {
           return;
         }
 
+        // Stamp this open as the latest in-flight request; a newer open (below)
+        // supersedes it and this call must not commit its now-stale reads.
+        const requestSeq = ++openSessionRequestSeq;
+
         try {
           const [session, segments, parts] = await Promise.all([
             getSession(id),
             getSessionSegments(id),
             listSessionAudioParts(id),
           ]);
+          // Post-await recheck (commit-after-navigation): a later openSession
+          // has taken over — its selection wins, so drop these reads rather than
+          // clobbering the newer view with an out-of-order resolution.
+          if (openSessionRequestSeq !== requestSeq) return;
           set({
             currentView: "note-detail",
             selectedSessionId: id,
@@ -1918,7 +1942,10 @@ function createAppStore() {
           set({ sessions });
           if (get().selectedSessionId === id) {
             const row = await getSession(id);
-            if (row) set({ viewSession: row });
+            // Post-await recheck (commit-after-navigation): the user may have
+            // navigated to another session while getSession was in flight —
+            // don't overwrite the now-open view with this row.
+            if (row && get().selectedSessionId === id) set({ viewSession: row });
           }
         } catch (e) {
           reportDbFailure(
@@ -3323,12 +3350,22 @@ function createAppStore() {
       },
 
       createManualNote: async (title?: string) => {
+        // Snapshot the selection at entry. Creating a manual note SHOULD jump to
+        // it — but only if the user hasn't navigated elsewhere while the create +
+        // reads were in flight; otherwise we'd yank them off the row they chose.
+        const selectedAtStart = get().selectedSessionId;
         try {
           const sessionId = crypto.randomUUID();
           await dbCreateManualSession(sessionId, title || "Untitled Note");
           trackManualNoteCreated();
           const sessions = await listSessions();
           const session = await getSession(sessionId);
+          // The refreshed list is always safe to commit; the navigation is gated
+          // on the selection being unchanged since entry (commit-after-nav).
+          if (get().selectedSessionId !== selectedAtStart) {
+            set({ sessions });
+            return;
+          }
           set({
             sessions,
             currentView: "note-detail",
