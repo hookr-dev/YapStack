@@ -209,3 +209,55 @@ describe("NoteEditor — a failed note save must surface to the user", () => {
     await waitFor(() => expect(toast.error).toHaveBeenCalled());
   });
 });
+
+describe("NoteEditor — a local note-write (e.g. AI summarize) must not be clobbered", () => {
+  it("yields to a local write instead of overwriting it and mislabeling it a peer edit", async () => {
+    // First getNote = the initial load; the SECOND (the in-flight persistIfChanged's
+    // read) is parked so we can inject the local AI write before the save decides.
+    const persistRead = deferred<{ content: string } | null>();
+    let loaded = false;
+    getNoteMock.mockImplementation(() => {
+      if (!loaded) {
+        loaded = true;
+        return Promise.resolve({ content: "<p>original</p>" });
+      }
+      return persistRead.promise;
+    });
+    saveNoteMock.mockResolvedValue(undefined);
+
+    render(
+      <TooltipProvider>
+        <NoteEditor sessionId="s1" refreshKey={0} />
+      </TooltipProvider>,
+    );
+    await screen.findByText("original");
+
+    // User types an unsaved edit, then blurs → persistIfChanged captures the refresh
+    // counter and parks on getNote(s1).
+    await typeInEditor("stale edit", "s1");
+    fireEvent.blur(editorDom());
+    await waitFor(() =>
+      expect(getNoteMock.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
+
+    // The AI `save_to_notes` tool writes the summary and NoteDetailView.handleToolsExecuted
+    // bumps noteRefreshCounter (incrementNoteRefresh). Model exactly that: the DB now holds
+    // the summary, and the local-write signal is raised, THEN our parked read resolves.
+    useAppStore.setState((s) => ({
+      noteRefreshCounter: s.noteRefreshCounter + 1,
+    }));
+    persistRead.resolve({ content: "<p>AI SUMMARY</p>" });
+    await new Promise((r) => setTimeout(r, 0));
+    await Promise.resolve();
+
+    // FAILS on the unmodified tree: persistIfChanged writes the editor's stale edit over
+    // the summary and toasts "another device". The fix yields to the pending reload.
+    expect(saveNoteMock).not.toHaveBeenCalledWith(
+      "s1",
+      expect.stringContaining("stale edit"),
+    );
+    expect(toast.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("another device"),
+    );
+  });
+});

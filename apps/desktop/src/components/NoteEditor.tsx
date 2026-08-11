@@ -348,6 +348,11 @@ export function NoteEditor({
   const persistIfChanged = useCallback(async (html: string): Promise<boolean> => {
     const id = sessionIdRef.current;
     const gen = loadGenRef.current;
+    // A LOCAL writer of this note (the AI `save_to_notes` tool, the chat's
+    // save-to-notes, the citation conversion) announces itself by bumping
+    // `noteRefreshCounter` (the sync path never does — D4). Captured here so we can
+    // tell a same-machine local write apart from a genuine peer edit below.
+    const localRefreshAtStart = useAppStore.getState().noteRefreshCounter;
     if (html === docBaseline.current) return false; // (a)
     // The editor has moved on (session switched, or content reloaded) since this
     // save was issued: the write to `id` is still correct for `id`, but its
@@ -356,6 +361,17 @@ export function NoteEditor({
       sessionIdRef.current !== id || loadGenRef.current !== gen;
     try {
       const stored = await getNote(id);
+      // A local writer touched this note while our save was in flight: the DB now holds
+      // THEIR content (e.g. an AI summary) and a reload is pending to show it. Our `html`
+      // is stale — writing it would clobber the local write, and it is NOT a peer edit, so
+      // the "another device" toast would also be wrong. Yield: skip the write and the toast.
+      if (useAppStore.getState().noteRefreshCounter !== localRefreshAtStart) {
+        log.info(
+          `note ${id}: a local write superseded this in-flight save; yielding to the reload (no clobber)`,
+          "note-editor",
+        );
+        return false;
+      }
       if (!editorMovedOn()) {
         if (stored === null && lastSavedContent.current !== "") {
           // (b, delete variant) — the row we loaded is gone; this save recreates it.
