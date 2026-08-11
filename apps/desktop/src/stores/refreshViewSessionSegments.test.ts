@@ -131,3 +131,75 @@ describe("refreshViewSessionSegments — stale-commit race after a session switc
     expect(useAppStore.getState().viewSessionSegments).toEqual(B_SEGS);
   });
 });
+
+/** Flush queued microtasks + a real macrotask so drain-scheduled reloads settle. */
+async function flush() {
+  await new Promise((r) => setTimeout(r, 0));
+}
+
+const NEW_SEGS = [segment("a-seg-edited", "A")];
+
+describe("refreshViewSessionSegments — edit-in-progress guard (editingSegmentId)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbReads.getSessionSegments.mockResolvedValue(NEW_SEGS);
+    dbReads.getSession.mockImplementation((id: string) =>
+      Promise.resolve(session(id)),
+    );
+    dbReads.listSessionAudioParts.mockResolvedValue([]);
+  });
+
+  // A user has a segment open in the contentEditable (editingSegmentId set) when
+  // the replace_in_transcript AI tool finishes and fires a transcript refresh.
+  // The fresh (AI-edited) segment set must NOT replace the array underneath the
+  // open edit — that swap remounts the bubble and drops the in-progress text.
+  it("defers instead of committing while a segment is being edited", async () => {
+    useAppStore.setState({
+      selectedSessionId: "A",
+      activeSessionId: null,
+      viewSession: session("A"),
+      viewSessionSegments: A_SEGS,
+      viewSessionParts: [],
+      editingSegmentId: "a-seg",
+      noteEditingSessionId: null,
+      pendingViewRefresh: false,
+    });
+
+    await useAppStore.getState().refreshViewSessionSegments();
+
+    // Pre-fix: the refresh commits NEW_SEGS unconditionally, clobbering the
+    // in-progress edit → this assertion FAILS on the unmodified tree.
+    expect(useAppStore.getState().viewSessionSegments).toBe(A_SEGS);
+    // The skip is remembered so the batch is not silently lost (B5).
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+  });
+
+  // The active (live) session routes through activeSessionSegments, and
+  // refreshOpenViewSession early-returns for it — so the drain MUST re-run
+  // refreshViewSessionSegments, otherwise the deferred batch never lands.
+  it("drains the deferred refresh onto the active view when the edit closes", async () => {
+    useAppStore.setState({
+      selectedSessionId: "A",
+      activeSessionId: "A",
+      viewSession: session("A"),
+      activeSessionSegments: A_SEGS,
+      viewSessionSegments: [],
+      viewSessionParts: [],
+      editingSegmentId: "a-seg",
+      noteEditingSessionId: null,
+      pendingViewRefresh: false,
+    });
+
+    // (1) A concurrent refresh arrives mid-edit → deferred, active view untouched.
+    await useAppStore.getState().refreshViewSessionSegments();
+    expect(useAppStore.getState().activeSessionSegments).toBe(A_SEGS);
+    expect(useAppStore.getState().pendingViewRefresh).toBe(true);
+
+    // (2) The edit window closes → the guard-clear drains the skipped refresh.
+    useAppStore.getState().setEditingSegmentId(null);
+    await flush();
+
+    expect(useAppStore.getState().activeSessionSegments).toEqual(NEW_SEGS);
+    expect(useAppStore.getState().pendingViewRefresh).toBe(false);
+  });
+});

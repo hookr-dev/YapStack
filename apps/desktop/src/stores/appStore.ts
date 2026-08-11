@@ -3047,6 +3047,19 @@ function createAppStore() {
           // onto a view that is now B pairs a B header with an A transcript.
           const now = get();
           if (now.selectedSessionId !== selectedSessionId) return;
+          // Edit-in-progress guard — mirror refreshOpenViewSession's
+          // editingSegmentId skip. A concurrent transcript refresh (e.g. the
+          // replace_in_transcript AI tool's post-run reload) must not replace
+          // the segment array while the user has a segment open in the
+          // contentEditable: the swap remounts the bubble and drops the
+          // in-progress edit. Defer via pendingViewRefresh and let the drain
+          // re-run this reload when the guard clears (B5). editSegmentText
+          // holds editingSegmentId across its OWN reload too, so that reload
+          // also defers here and is likewise recovered by the drain.
+          if (now.editingSegmentId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
           // When the selected session is the live one, NoteDetailView reads
           // from activeSessionSegments — refresh that array so context-menu
           // edits/deletes/hides take effect immediately during recording.
@@ -3174,6 +3187,13 @@ function createAppStore() {
         if (!pendingViewRefresh) return;
         if (editingSegmentId || noteEditingSessionId) return;
         set({ pendingViewRefresh: false });
+        // Segment-only reloads (a transcript edit refresh) defer through the
+        // same flag, so the drain must re-run BOTH. refreshOpenViewSession
+        // early-returns for the active session and cannot restore its
+        // segments — only refreshViewSessionSegments writes activeSessionSegments
+        // — so run it too. For a non-active view both re-read the same rows and
+        // converge; the extra read is the price of one flag covering both paths.
+        void get().refreshViewSessionSegments();
         void get().refreshOpenViewSession();
       },
 
