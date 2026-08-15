@@ -318,6 +318,13 @@ export function NoteEditor({
   // stale HTML back into the in-memory baselines — that would corrupt the
   // baselines the load just set and reject legitimate sync-downs afterwards.
   const loadGenRef = useRef(0);
+  // Which session's stored content has actually been applied to this editor.
+  // Until the first load for a session lands, the baselines describe NOTHING
+  // (docBaseline is "" while an empty TipTap doc serializes as "<p></p>"), so
+  // the editor reads as dirty without any user edit — a save fired in that
+  // window would overwrite the stored row with an empty document and
+  // misattribute the diff to "another device". No load applied → no save.
+  const loadedSessionRef = useRef<string | null>(null);
   // Live editor handle for the unmount flush and the failed-save backoff retry,
   // both of which run outside the render/`useEditor` closure.
   const editorRef = useRef<Editor | null>(null);
@@ -347,6 +354,11 @@ export function NoteEditor({
    */
   const persistIfChanged = useCallback(async (html: string): Promise<boolean> => {
     const id = sessionIdRef.current;
+    // Never save a document we haven't loaded: pre-load the baselines are
+    // uninitialized and the "dirty" signal is spurious (see loadedSessionRef).
+    // Also refuses a save that would land on a session whose content is not
+    // the one on screen (sessionId swapped, new load still in flight).
+    if (loadedSessionRef.current !== id) return false;
     const gen = loadGenRef.current;
     // A LOCAL writer of this note (the AI `save_to_notes` tool, the chat's
     // save-to-notes, the citation conversion) announces itself by bumping
@@ -590,6 +602,7 @@ export function NoteEditor({
         }
       }
       applyContent(content);
+      loadedSessionRef.current = sessionId;
     }
     load();
     return () => {
