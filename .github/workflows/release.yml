@@ -28,7 +28,7 @@ jobs:
     env:
       APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install cmake
         run: brew install cmake
@@ -145,7 +145,7 @@ jobs:
       # GitHub evaluates a step's `if:` BEFORE applying that step's own `env:`.
       WINDOWS_SIGN_CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Check cmake
         # windows-latest ships cmake in the runner image; the sidecar's
