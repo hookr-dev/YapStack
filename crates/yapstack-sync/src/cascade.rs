@@ -78,7 +78,13 @@ fn proven_deleted_pks(parent: &str, ppk: &str) -> String {
 /// CRR triggers, so they become synced tombstones. Runs in one transaction.
 pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
     // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    //
+    // `BEGIN IMMEDIATE`, not a deferred `BEGIN`: every statement below READS
+    // (`proven_deleted_pks` scans the clock tables) before it WRITES, so a deferred
+    // transaction has to upgrade read→write, and in WAL a lost upgrade race returns
+    // `SQLITE_BUSY_SNAPSHOT` — which the busy handler does NOT retry, so it fails outright
+    // regardless of `busy_timeout` (same rationale as `quarantine::merge_changeset`).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut stats = CascadeStats::default();
     for (child, fk, parent, ppk, _nullable) in CASCADE_DELETE {
         // Cascade a delete only when the parent is PROVEN deleted — never on mere

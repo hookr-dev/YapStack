@@ -23,6 +23,7 @@ import {
   PenLine,
   ChevronDown,
   ChevronRight,
+  Loader2,
 } from "lucide-react";
 import { useCreateSession } from "@/hooks/useCreateSession";
 import { RecordingBeacon } from "@/components/RecordingBeacon";
@@ -53,7 +54,7 @@ export function AppSidebar() {
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
   const dictationEnabled = useAppStore((s) => s.settings.dictation.enabled);
   const dictationHistory = useAppStore((s) => s.dictationHistory);
-  const { canCreate, handleNew } = useCreateSession();
+  const { canCreate, creatingSession, handleNew } = useCreateSession();
 
   const [dictationOpen, setDictationOpen] = useState(true);
   const recentDictations = useMemo(() => dictationHistory.slice(0, 5), [dictationHistory]);
@@ -93,10 +94,16 @@ export function AppSidebar() {
                 disabled={!canCreate}
                 onClick={() => handleNew()}
               >
-                <Plus className="h-3.5 w-3.5" />
+                {creatingSession ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>New session</TooltipContent>
+            <TooltipContent>
+              {creatingSession ? "Starting session…" : "New session"}
+            </TooltipContent>
           </Tooltip>
           <BackfillDropdown
             availableSeconds={availableSeconds}

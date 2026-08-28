@@ -441,6 +441,16 @@ interface AppState {
   // event fires. Lets the UI show a pulsing "Finalizing…" state immediately
   // while the engine drains the current chunk + finalizes the WAV.
   sessionStopping: boolean;
+  /**
+   * True for the whole of `createAndStartSession`. The action's first act is a DB
+   * write, and while the sync drain is working through a backlog that write can wait
+   * out the entire write-lock retry budget (`db-backend.ts`) — long enough that a
+   * button with no busy state looks broken and invites a second click that would race
+   * a second session row. Every entry point (sidebar, global shortcut, tray) goes
+   * through the same action, so this single flag both single-flights it and drives the
+   * spinner. Always cleared in a `finally`.
+   */
+  creatingSession: boolean;
 
   // Note refresh (for cross-component refresh signaling)
   noteRefreshCounter: number;
@@ -825,6 +835,43 @@ function reportDbFailure(
 }
 
 /**
+ * Transient SQLite write-lock contention — the same two verbatim strings
+ * `db-backend.ts` retries ("database is locked" / "database table is locked")
+ * before it finally gives up and rejects. Matched on the message because Tauri
+ * rejects a Rust `Err(String)` with the bare string, not a typed error.
+ */
+function isDatabaseBusyError(error: unknown): boolean {
+  const msg = commandErrorMessage(error).toLowerCase();
+  return msg.includes("database is locked") || msg.includes("database table is locked");
+}
+
+/**
+ * The one failure seam for starting a session, shared by all three entry points
+ * (sidebar button, global shortcut, tray) because they all go through
+ * `createAndStartSession`.
+ *
+ * Lock contention gets a plain-language sentence instead of the raw SQLite one:
+ * "database is locked" is true but useless to the user, and the honest advice is
+ * simply to wait for the sync drain to catch up. Anything else keeps the honest
+ * detail (`reportDbFailure`) — a schema or engine error is not something waiting
+ * fixes. Both seams still log the raw error to devtools + the rolling log file.
+ * The shared toast `id` dedupes a burst of retries into one line.
+ */
+function reportSessionStartFailure(error: unknown): void {
+  if (isDatabaseBusyError(error)) {
+    logDbFailure("createAndStartSession", error);
+    toast.error(
+      "Couldn't start a session — the database is busy syncing. Try again in a moment.",
+      { id: "create-session-failed" },
+    );
+    return;
+  }
+  reportDbFailure("createAndStartSession", "Couldn't start a session", error, {
+    id: "create-session-failed",
+  });
+}
+
+/**
  * Cleans up audio files given a pre-fetched list of part paths. Caller
  * must read the paths *before* dropping the session row, since the
  * cascade on `sessions` delete also nukes `session_audio_parts`. Falls
@@ -1087,6 +1134,7 @@ function createAppStore() {
       backfillActive: false,
       backfillBoundarySeconds: null,
       sessionStopping: false,
+      creatingSession: false,
       noteRefreshCounter: 0,
       noteRefreshSessionId: null,
       sessionMetaRefreshCounter: 0,
@@ -1612,101 +1660,123 @@ function createAppStore() {
         set({ sessionTagMap: map });
       },
 
+      /**
+       * Starts a recording session. Never rejects: this is the single seam every
+       * entry point (sidebar button, global shortcut, tray menu) funnels through,
+       * and two of those three are fire-and-forget event handlers with nowhere to
+       * put a rejection — the shortcut path used to reject unhandled and show the
+       * user nothing at all. Failures are surfaced by `reportSessionStartFailure`.
+       */
       createAndStartSession: async (backfillSeconds?: number, trigger?: string) => {
-        const { settings, enginePhase, captureStatus } = get();
+        // Single-flight. The opening `dbCreateSession` can block for the whole
+        // write-lock retry budget while the sync drain catches up, so without this
+        // a second click (or the shortcut fired twice) would race a second row.
+        if (get().creatingSession) return;
+        set({ creatingSession: true });
 
-        if (enginePhase !== "ready") {
-          throw new Error("Engine is not ready");
-        }
-        if (captureStatus?.state !== "Capturing") {
-          throw new Error("Audio capture is not active");
-        }
-
-        const sessionId = crypto.randomUUID();
-
-        // Attribute the recording to THIS device (LIVE_SESSION_STATE D2); null when
-        // sync is not configured → single-device semantics unchanged.
-        await dbCreateSession(
-          sessionId,
-          settings.captureSource,
-          get().syncStatus?.deviceFingerprint ?? null,
-        );
-
-        const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
-        const vocabHints = buildVocabularyHints(freshFolders, freshTags);
-
-        const config: LiveTranscriptionConfig = {
-          silence_duration_ms: settings.silenceDurationMs,
-          max_chunk_seconds: settings.maxChunkSeconds,
-          backfill_seconds: backfillSeconds ?? 0,
-          source: settings.captureSource,
-          mix_config:
-            settings.captureSource === "Mixed" ? settings.mixConfig : null,
-          language: settings.language,
-          prompt_context_chars: settings.promptContextChars,
-          prompt_decay_silence_seconds:
-            settings.promptDecaySilenceSeconds > 0
-              ? settings.promptDecaySilenceSeconds
-              : null,
-          session_id: sessionId,
-          audio_save_location: settings.audioSaveLocation,
-          audio_export_format: settings.audioExportFormat,
-          mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-          diarization:
-            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
-          vocabulary_hints: vocabHints,
-          source_kind: "session",
-        };
-
-        // Pre-set `backfillActive` before the await so any `backfill-complete`
-        // event emitted by the spawned live task during the await transitions
-        // it cleanly to false. If we set it post-await instead, a fast or
-        // empty-branch backfill-complete could fire before our set, the
-        // listener would clear it to false, and our subsequent set would
-        // overwrite it back to true — leaving the UI affordance stuck on.
         const requestedBackfill = (backfillSeconds ?? 0) > 0;
-        if (requestedBackfill) {
-          set({ backfillActive: true });
-        }
+        try {
+          const { settings, enginePhase, captureStatus } = get();
 
-        const result = await commands.startLiveTranscription(config);
-        if (result.status === "error") {
-          // Clean up the DB row we just created
-          await dbDeleteSession(sessionId).catch(() => {});
+          if (enginePhase !== "ready") {
+            throw new Error("Engine is not ready");
+          }
+          if (captureStatus?.state !== "Capturing") {
+            throw new Error("Audio capture is not active");
+          }
+
+          const sessionId = crypto.randomUUID();
+
+          // Attribute the recording to THIS device (LIVE_SESSION_STATE D2); null when
+          // sync is not configured → single-device semantics unchanged.
+          await dbCreateSession(
+            sessionId,
+            settings.captureSource,
+            get().syncStatus?.deviceFingerprint ?? null,
+          );
+
+          const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
+          const vocabHints = buildVocabularyHints(freshFolders, freshTags);
+
+          const config: LiveTranscriptionConfig = {
+            silence_duration_ms: settings.silenceDurationMs,
+            max_chunk_seconds: settings.maxChunkSeconds,
+            backfill_seconds: backfillSeconds ?? 0,
+            source: settings.captureSource,
+            mix_config:
+              settings.captureSource === "Mixed" ? settings.mixConfig : null,
+            language: settings.language,
+            prompt_context_chars: settings.promptContextChars,
+            prompt_decay_silence_seconds:
+              settings.promptDecaySilenceSeconds > 0
+                ? settings.promptDecaySilenceSeconds
+                : null,
+            session_id: sessionId,
+            audio_save_location: settings.audioSaveLocation,
+            audio_export_format: settings.audioExportFormat,
+            mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
+            diarization:
+              settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+            vocabulary_hints: vocabHints,
+            source_kind: "session",
+          };
+
+          // Pre-set `backfillActive` before the await so any `backfill-complete`
+          // event emitted by the spawned live task during the await transitions
+          // it cleanly to false. If we set it post-await instead, a fast or
+          // empty-branch backfill-complete could fire before our set, the
+          // listener would clear it to false, and our subsequent set would
+          // overwrite it back to true — leaving the UI affordance stuck on.
+          if (requestedBackfill) {
+            set({ backfillActive: true });
+          }
+
+          const result = await commands.startLiveTranscription(config);
+          if (result.status === "error") {
+            // Clean up the DB row we just created
+            await dbDeleteSession(sessionId).catch(() => {});
+            throw new Error(commandErrorMessage(result.error));
+          }
+
+          trackSessionCreated({
+            source: settings.captureSource,
+            backfill_seconds: backfillSeconds ?? 0,
+            trigger: trigger ?? "unknown",
+          });
+
+          // Note: `backfillActive` deliberately omitted — the pre-await set
+          // above plus the `backfill-complete` listener are the source of
+          // truth. Re-asserting it here would re-introduce the race.
+          set({
+            activeSessionId: sessionId,
+            activeSessionSegments: [],
+            activeSessionParts: [],
+            activeSessionStartTime: result.data.effective_start_epoch_ms,
+            liveTranscriptionActive: true,
+            livePhase: "Running",
+            currentView: "note-detail",
+            selectedSessionId: sessionId,
+            // Initialize Current Insight from the persisted Default at session
+            // start. See `recoverActiveSession` for the same pattern.
+            currentInsightId: get().settings.insights.defaultInsightId,
+            // backfillActive intentionally omitted — pre-set before the await
+            // (and listener-driven thereafter) so a fast `backfill-complete`
+            // event arriving during the await isn't overwritten back to true.
+            backfillBoundarySeconds: null,
+          });
+
+          // Reload sidebar
+          const sessions = await listSessions();
+          set({ sessions });
+        } catch (e) {
+          // Covers the error-status branch above AND a throwing
+          // `startLiveTranscription`, so the "Processing prior audio" affordance
+          // can't stay stuck on after a failed start.
           if (requestedBackfill) set({ backfillActive: false });
-          throw new Error(commandErrorMessage(result.error));
+          reportSessionStartFailure(e);
+        } finally {
+          set({ creatingSession: false });
         }
-
-        trackSessionCreated({
-          source: settings.captureSource,
-          backfill_seconds: backfillSeconds ?? 0,
-          trigger: trigger ?? "unknown",
-        });
-
-        // Note: `backfillActive` deliberately omitted — the pre-await set
-        // above plus the `backfill-complete` listener are the source of
-        // truth. Re-asserting it here would re-introduce the race.
-        set({
-          activeSessionId: sessionId,
-          activeSessionSegments: [],
-          activeSessionParts: [],
-          activeSessionStartTime: result.data.effective_start_epoch_ms,
-          liveTranscriptionActive: true,
-          livePhase: "Running",
-          currentView: "note-detail",
-          selectedSessionId: sessionId,
-          // Initialize Current Insight from the persisted Default at session
-          // start. See `recoverActiveSession` for the same pattern.
-          currentInsightId: get().settings.insights.defaultInsightId,
-          // backfillActive intentionally omitted — pre-set before the await
-          // (and listener-driven thereafter) so a fast `backfill-complete`
-          // event arriving during the await isn't overwritten back to true.
-          backfillBoundarySeconds: null,
-        });
-
-        // Reload sidebar
-        const sessions = await listSessions();
-        set({ sessions });
       },
 
       resumeSession: async (sessionId: string) => {

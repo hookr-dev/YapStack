@@ -34,6 +34,21 @@ const { segmentDbMocks } = vi.hoisted(() => ({
   },
 }));
 
+/**
+ * Session-start DB helpers. Kept apart from `segmentDbMocks` because the suite-wide
+ * `beforeEach` rejects everything in that group, and the busy-flag tests need a
+ * controllable resolve as well as a reject.
+ */
+const { sessionDbMocks } = vi.hoisted(() => ({
+  sessionDbMocks: {
+    createSession: vi.fn(),
+    deleteSession: vi.fn(),
+    listSessions: vi.fn(),
+    listFolders: vi.fn(),
+    listTags: vi.fn(),
+  },
+}));
+
 const { logMock } = vi.hoisted(() => ({
   logMock: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
@@ -64,7 +79,7 @@ vi.mock("@/lib/logger", () => ({
 }));
 vi.mock("@/lib/db", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/db")>();
-  return { ...actual, ...segmentDbMocks };
+  return { ...actual, ...segmentDbMocks, ...sessionDbMocks };
 });
 
 import { useAppStore } from "./appStore";
@@ -175,5 +190,123 @@ describe("segment DB failures are surfaced, not swallowed", () => {
 
     expect(toastMock.error).not.toHaveBeenCalled();
     expect(logMock.error).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Starting a session (the live sync-drain bug).
+ *
+ * `createAndStartSession`'s first act is a DB write, which can wait out the whole
+ * write-lock retry budget while the sync drain catches up. Before this the button had
+ * no busy state (it just looked dead), the global-shortcut path had no catch at all
+ * (unhandled rejection, user sees nothing), and the tray path only console.error'd.
+ * These pin the two halves of the fix: a single-flighting `creatingSession` flag, and
+ * one friendly toast reached from every entry point because the catch lives in the
+ * action itself.
+ */
+const BUSY_TOAST =
+  "Couldn't start a session — the database is busy syncing. Try again in a moment.";
+
+describe("createAndStartSession surfaces failures and marks itself busy", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    sessionDbMocks.createSession.mockResolvedValue(undefined);
+    sessionDbMocks.deleteSession.mockResolvedValue(undefined);
+    sessionDbMocks.listSessions.mockResolvedValue([]);
+    sessionDbMocks.listFolders.mockResolvedValue([]);
+    sessionDbMocks.listTags.mockResolvedValue([]);
+    // Preconditions the action guards on — without these it fails before the DB write.
+    useAppStore.setState({
+      enginePhase: "ready",
+      captureStatus: {
+        state: "Capturing",
+        mic_active: true,
+        system_audio_active: false,
+        error_message: null,
+      },
+      activeSessionId: null,
+      creatingSession: false,
+    });
+  });
+
+  it("holds `creatingSession` for the duration of the opening DB write", async () => {
+    let releaseWrite = () => {};
+    sessionDbMocks.createSession.mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseWrite = () => resolve();
+      }),
+    );
+
+    const pending = useAppStore.getState().createAndStartSession();
+    // The flag has to be visible synchronously — that is the whole point: the
+    // button shows a spinner instead of looking dead for the length of the drain.
+    expect(useAppStore.getState().creatingSession).toBe(true);
+
+    releaseWrite();
+    await pending;
+    expect(useAppStore.getState().creatingSession).toBe(false);
+  });
+
+  it("single-flights: a second click while the write is stuck is a no-op", async () => {
+    let releaseWrite = () => {};
+    sessionDbMocks.createSession.mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseWrite = () => resolve();
+      }),
+    );
+
+    const first = useAppStore.getState().createAndStartSession();
+    await useAppStore.getState().createAndStartSession();
+
+    expect(sessionDbMocks.createSession).toHaveBeenCalledTimes(1);
+    releaseWrite();
+    await first;
+  });
+
+  it("turns write-lock contention into a plain-language toast, not raw SQLite", async () => {
+    sessionDbMocks.createSession.mockRejectedValue("database is locked");
+
+    await useAppStore.getState().createAndStartSession();
+
+    expect(toastMock.error).toHaveBeenCalledWith(BUSY_TOAST, {
+      id: "create-session-failed",
+    });
+    // The raw message still reaches the db-scoped log seam.
+    expect(logMock.error).toHaveBeenCalledWith(
+      "createAndStartSession failed: database is locked",
+      "db",
+    );
+  });
+
+  it("keeps the honest detail for a failure that waiting will not fix", async () => {
+    sessionDbMocks.createSession.mockRejectedValue({
+      kind: "Sqlite",
+      message: "no such column: recording_device_id",
+    });
+
+    await useAppStore.getState().createAndStartSession();
+
+    expect(toastMock.error).toHaveBeenCalledWith(
+      "Couldn't start a session: no such column: recording_device_id",
+      { id: "create-session-failed" },
+    );
+  });
+
+  it("never rejects — the shortcut and tray paths fire and forget", async () => {
+    sessionDbMocks.createSession.mockRejectedValue("database is locked");
+
+    await expect(
+      useAppStore.getState().createAndStartSession(0, "shortcut"),
+    ).resolves.toBeUndefined();
+  });
+
+  it("clears `creatingSession` and the backfill affordance after a failure", async () => {
+    sessionDbMocks.createSession.mockRejectedValue("database is locked");
+
+    await useAppStore.getState().createAndStartSession(30, "tray");
+
+    expect(useAppStore.getState().creatingSession).toBe(false);
+    expect(useAppStore.getState().backfillActive).toBe(false);
   });
 });

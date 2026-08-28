@@ -1907,8 +1907,23 @@ fn read_journal(live_db: &Path) -> Option<CutoverJournal> {
 }
 
 /// Remove the cutover journal (its absence tells the next boot there is nothing to do).
+///
+/// Non-fatal, but never silent: an undeletable journal (a Windows sharing violation, a
+/// read-only attribute) makes EVERY subsequent boot re-enter recovery. Recovery is
+/// idempotent on the healthy states — journal present + live present is a "nothing to
+/// restore" info branch — so the loop is harmless, and this warning is its only
+/// observable symptom.
 fn remove_journal(live_db: &Path) {
-    let _ = std::fs::remove_file(cutover_journal_path(live_db));
+    let path = cutover_journal_path(live_db);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            "sync: could not remove the cutover journal {}: {e} — every boot will re-enter \
+             (idempotent) cutover recovery until it is gone",
+            path.display()
+        ),
+    }
     fsync_live_dir(live_db);
 }
 
@@ -1945,10 +1960,38 @@ fn copy_into_live(src: &Path, live: &Path) -> std::io::Result<()> {
     let tmp = PathBuf::from(tmp_os);
     let _ = std::fs::remove_file(&tmp);
     std::fs::copy(src, &tmp)?;
+    // `std::fs::copy` reproduces the SOURCE's permission bits, including the Windows
+    // read-only attribute. `fsync_file` (and every later DB write) opens for WRITE, so a
+    // read-only backup would make this restore fail with ACCESS_DENIED on every boot.
+    // Clear it on the temp copy before the fsync + rename.
+    clear_readonly(&tmp)?;
     fsync_file(&tmp)?;
     std::fs::rename(&tmp, live)?;
     fsync_live_dir(live);
     Ok(())
+}
+
+/// Make `path` writable by its OWNER, undoing a read-only attribute that a
+/// `std::fs::copy` carried over from its source. Split per platform deliberately:
+/// `Permissions::set_readonly(false)` is the only way to drop the Windows attribute, but
+/// on unix it would widen the DB to world-writable, so there we add just the owner bit.
+fn clear_readonly(path: &Path) -> std::io::Result<()> {
+    let perms = std::fs::metadata(path)?.permissions();
+    if !perms.readonly() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms.mode() | 0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = perms;
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)
+    }
 }
 
 /// Move `src` (a scratch staging file, safe to consume) INTO the live path atomically.
@@ -1959,11 +2002,49 @@ fn rename_into_live(src: &Path, live: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// True if any cutover recovery artifact is present beside the live DB.
+/// Tri-state file presence. `Path::exists()` collapses a metadata ERROR into `false`,
+/// which is the dangerous answer here: a live DB that is PRESENT but momentarily
+/// unreadable (a Windows AV/indexer lock, an access-denied ACL) would read as MISSING
+/// and be "recovered" over with a stale backup. Recovery must take NO destructive action
+/// on `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Probe `p` with `try_exists`, mapping (and logging) a metadata error to `Unknown`.
+fn presence(p: &Path) -> Presence {
+    match p.try_exists() {
+        Ok(true) => Presence::Present,
+        Ok(false) => Presence::Absent,
+        Err(e) => {
+            tracing::error!(
+                "sync recovery: cannot determine whether {} exists: {e} — treating its state as INDETERMINATE",
+                p.display()
+            );
+            Presence::Unknown
+        }
+    }
+}
+
+/// True if `p` is definitely there (an indeterminate probe is NOT a usable copy).
+fn definitely_present(p: &Path) -> bool {
+    presence(p) == Presence::Present
+}
+
+/// True if any cutover recovery artifact is present beside the live DB. An
+/// indeterminate probe counts as PRESENT: this only ever gates the F1.4 refusal, and
+/// refusing a cutover is the non-destructive answer.
 fn recovery_artifacts_present(live_db: &Path) -> bool {
-    cutover_journal_path(live_db).exists()
-        || backup_db_path(live_db).exists()
-        || cutover_staging_path(live_db).exists()
+    [
+        cutover_journal_path(live_db),
+        backup_db_path(live_db),
+        cutover_staging_path(live_db),
+    ]
+    .iter()
+    .any(|p| presence(p) != Presence::Absent)
 }
 
 /// True if the live DB holds zero rows in every SYNC table — the signature of a
@@ -2008,13 +2089,34 @@ fn live_has_no_user_rows(live_db: &Path) -> bool {
 /// ```
 ///
 /// In every branch the journal is removed at the end (the only thing deleted).
+///
+/// One state is outside the table: the live path cannot be PROBED at all (a metadata
+/// error). That is indeterminate, not missing, so recovery does nothing whatsoever —
+/// including leaving the journal in place for the next boot.
 pub fn recover_interrupted_cutover(live_db: &Path) {
     let backup = backup_db_path(live_db);
     let staging = cutover_staging_path(live_db);
 
+    let live = presence(live_db);
+    if live == Presence::Unknown {
+        tracing::error!(
+            "sync recovery: the live DB at {} could not be probed — taking NO recovery action \
+             (a present-but-locked DB must never be replaced by a backup); the journal is kept \
+             for the next boot",
+            live_db.display()
+        );
+        return;
+    }
+
     match read_journal(live_db) {
         Some(journal) => {
-            recover_from_journal(live_db, &backup, &staging, &journal);
+            recover_from_journal(
+                live_db,
+                &backup,
+                &staging,
+                &journal,
+                live == Presence::Present,
+            );
             // The interrupted cutover is resolved: the journal is the ONLY thing deleted.
             remove_journal(live_db);
         }
@@ -2022,11 +2124,11 @@ pub fn recover_interrupted_cutover(live_db: &Path) {
             // No journal. The only dangerous no-journal state is a MISSING live while a
             // recovery copy exists (e.g. the journal write itself was lost). NEVER let the
             // app proceed to create an empty live — restore the best available copy.
-            if !live_db.exists() {
-                if backup.exists() {
-                    let _ = copy_into_live(&backup, live_db); // keep the backup (kept forever)
-                } else if staging.exists() {
-                    let _ = rename_into_live(&staging, live_db); // staging is the only copy
+            if live == Presence::Absent {
+                if definitely_present(&backup) {
+                    restore_or_report(&backup, live_db, copy_into_live); // keep the backup
+                } else if definitely_present(&staging) {
+                    restore_or_report(&staging, live_db, rename_into_live); // the only copy
                 }
                 // else: genuinely fresh (no data anywhere) — nothing to recover.
             }
@@ -2035,16 +2137,22 @@ pub fn recover_interrupted_cutover(live_db: &Path) {
 }
 
 /// The journal-driven half of [`recover_interrupted_cutover`]. See its decision table.
-fn recover_from_journal(live_db: &Path, backup: &Path, staging: &Path, journal: &CutoverJournal) {
+fn recover_from_journal(
+    live_db: &Path,
+    backup: &Path,
+    staging: &Path,
+    journal: &CutoverJournal,
+    live_present: bool,
+) {
     // "staging valid": it exists AND its user-table row counts match the pre-swap marker.
-    let staging_valid = staging.exists()
+    let staging_valid = definitely_present(staging)
         && all_user_table_row_counts(staging)
             .map(|c| c == journal.pre_counts)
             .unwrap_or(false);
 
     match journal.phase {
         // First rename never confirmed AND the original is still at live → nothing to do.
-        CutoverPhase::SwapStarted if live_db.exists() => {
+        CutoverPhase::SwapStarted if live_present => {
             tracing::info!(
                 "sync recovery: interrupted cutover (SwapStarted) — live DB intact, nothing to restore"
             );
@@ -2052,19 +2160,19 @@ fn recover_from_journal(live_db: &Path, backup: &Path, staging: &Path, journal: 
         // SwapStarted-with-live-missing (crash before the phase advance) OR BackupMoved:
         // the first rename landed; the second did not confirm.
         CutoverPhase::SwapStarted | CutoverPhase::BackupMoved => {
-            if live_db.exists() {
+            if live_present {
                 // BackupMoved but live present → the second rename actually completed.
                 tracing::info!(
                     "sync recovery: interrupted cutover — swap already completed; keeping backup"
                 );
             } else if staging_valid {
                 tracing::warn!("sync recovery: completing interrupted cutover (staging→live)");
-                let _ = rename_into_live(staging, live_db);
-            } else if backup.exists() {
+                restore_or_report(staging, live_db, rename_into_live);
+            } else if definitely_present(backup) {
                 tracing::warn!(
                     "sync recovery: staging missing/invalid — rolling interrupted cutover back (backup→live)"
                 );
-                let _ = copy_into_live(backup, live_db);
+                restore_or_report(backup, live_db, copy_into_live);
             } else {
                 tracing::error!(
                     "sync recovery: interrupted cutover with no usable copy of the live DB — leaving disk as-is"
@@ -2073,50 +2181,81 @@ fn recover_from_journal(live_db: &Path, backup: &Path, staging: &Path, journal: 
         }
         // Second rename confirmed; only verify/cleanup remained.
         CutoverPhase::SwapCompleted => {
-            if live_db.exists() {
+            if live_present {
                 tracing::info!("sync recovery: interrupted cutover (SwapCompleted) — live present, keeping backup");
-            } else if backup.exists() {
+            } else if definitely_present(backup) {
                 tracing::warn!("sync recovery: live vanished post-swap — restoring backup→live");
-                let _ = copy_into_live(backup, live_db);
+                restore_or_report(backup, live_db, copy_into_live);
             } else if staging_valid {
-                let _ = rename_into_live(staging, live_db);
+                restore_or_report(staging, live_db, rename_into_live);
             }
         }
     }
 }
 
-/// True once the live DB is itself CRR-prepared at the current schema version (the
-/// idempotency gate). Inspected via a read-only connection — extension-less reads on
-/// a CRR DB are safe (A1 spike) and never create/mutate anything.
-fn live_is_crr_prepared(live_db: &Path) -> bool {
-    if !live_db.exists() {
-        return false;
+/// Run a restore (`copy_into_live` / `rename_into_live`) and, on failure, say LOUDLY
+/// which path still holds the user's data. These call sites used to swallow the error
+/// with `let _ =`, so a Windows sharing violation or a read-only source left the live
+/// DB missing with no trace of why.
+fn restore_or_report(src: &Path, live_db: &Path, restore: fn(&Path, &Path) -> std::io::Result<()>) {
+    if let Err(e) = restore(src, live_db) {
+        tracing::error!(
+            "sync recovery: CRITICAL — restoring {} → {} failed: {e}; your data is intact at \
+             {} and nothing was deleted",
+            src.display(),
+            live_db.display(),
+            src.display()
+        );
     }
-    let Ok(conn) = Connection::open_with_flags(
+}
+
+/// `Ok(true)` once the live DB is itself CRR-prepared at the current schema version (the
+/// idempotency gate); `Ok(false)` when the probe POSITIVELY establishes it is not.
+/// Inspected via a read-only connection — extension-less reads on a CRR DB are safe (A1
+/// spike) and never create/mutate anything.
+///
+/// `Err(cause)` means the probe could not answer at all (metadata error, open failure,
+/// busy timeout, unreadable file). That is NOT `false`: answering `false` there would run
+/// a full cutover — swapping the file and zeroing the sync watermarks — on a DB that may
+/// already be prepared and is merely locked. Every caller must refuse to act on `Err`.
+fn live_is_crr_prepared(live_db: &Path) -> Result<bool, String> {
+    match live_db.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(e) => return Err(format!("cannot stat {}: {e}", live_db.display())),
+    }
+    let conn = Connection::open_with_flags(
         live_db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ) else {
-        return false;
-    };
+    )
+    .map_err(|e| format!("cannot open {} read-only: {e}", live_db.display()))?;
     let _ = conn.busy_timeout(AD_HOC_BUSY_TIMEOUT);
-    let clock: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions__crsql_clock'",
-            [],
+    // A missing table is the answer "not prepared" (QueryReturnedNoRows); ANY other
+    // sqlite error (busy, not-a-database, I/O) leaves the question open.
+    let has_table = |name: &str| -> Result<bool, String> {
+        match conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
             |_| Ok(()),
-        )
-        .is_ok();
-    if !clock {
-        return false;
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(format!("probing {} for `{name}`: {e}", live_db.display())),
+        }
+    };
+    if !has_table("sessions__crsql_clock")? || !has_table("_yapstack_sync_prep")? {
+        return Ok(false);
     }
-    let ver: Option<i64> = conn
-        .query_row(
-            "SELECT schema_version FROM _yapstack_sync_prep LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    ver.unwrap_or(0) == SYNC_SCHEMA_VERSION as i64
+    let ver: i64 = match conn.query_row(
+        "SELECT schema_version FROM _yapstack_sync_prep LIMIT 1",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+        Err(e) => return Err(format!("reading the sync-prep schema version: {e}")),
+    };
+    Ok(ver == SYNC_SCHEMA_VERSION as i64)
 }
 
 /// Per-table row counts for every synced table (read-only). Used to assert the swap
@@ -2293,13 +2432,25 @@ fn cutover_with_fault(
     fault: CutoverFault,
 ) -> Result<(), String> {
     // Step 1: idempotency gate. An already-CRR live DB just needs its legacy copy gone.
-    if live_is_crr_prepared(live_db) {
-        discard_legacy_sync_copy(live_db);
-        // Item 1: the staging-block watermark reset below is skipped on the idempotency path, but
-        // `reconcile_account_binding` runs immediately after `perform_cutover` on BOTH production
-        // paths (`sync_enable`, `start_drain_if_enabled`) and resets+binds on any tenant mismatch
-        // — including a missing (None) binding — so no separate unbound-reset is needed here.
-        return Ok(());
+    // An INDETERMINATE probe refuses outright: re-running the cutover would swap the file
+    // and zero the watermarks on a DB we cannot prove needs it.
+    match live_is_crr_prepared(live_db) {
+        Ok(true) => {
+            discard_legacy_sync_copy(live_db);
+            // Item 1: the staging-block watermark reset below is skipped on the idempotency path, but
+            // `reconcile_account_binding` runs immediately after `perform_cutover` on BOTH production
+            // paths (`sync_enable`, `start_drain_if_enabled`) and resets+binds on any tenant mismatch
+            // — including a missing (None) binding — so no separate unbound-reset is needed here.
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return Err(format!(
+                "cutover refused: could not determine whether the live database is already \
+                 sync-prepared ({e}). It may be locked by another program (antivirus, a backup \
+                 agent); close it and try again."
+            ))
+        }
     }
 
     // F1.4 empty-live guard (belt-and-suspenders on top of boot recovery): refuse to cut
@@ -2546,17 +2697,44 @@ fn rollback_to_backup(
     // Move the (now-CRR) failed live aside, then restore the byte-identical backup.
     let failed = live_db.with_file_name("yapstack.db.crr-cutover-failed");
     remove_db_files(&failed);
-    let _ = std::fs::rename(live_db, &failed);
+    let moved_aside = std::fs::rename(live_db, &failed).is_ok();
     remove_sidecars(live_db);
-    if let Err(e) = std::fs::rename(backup, live_db) {
-        tracing::error!(
-            "sync: CRITICAL — cutover rollback could not restore the backup {} → {}: {e}; \
-             the pre-sync data is intact at the backup path",
-            backup.display(),
-            live_db.display()
-        );
+    match std::fs::rename(backup, live_db) {
+        // Only NOW is the scratch copy redundant: the pre-sync original is back at the
+        // live path. Deleting it before this point would delete the only current copy.
+        Ok(()) => remove_db_files(&failed),
+        Err(e) => {
+            // Documented Windows failure mode (a sharing violation on the live path). The
+            // scratch we just moved aside is the user's CURRENT data — never delete it.
+            // Put it back at the live path if we can; otherwise leave it where it is and
+            // name the exact path that holds it.
+            if moved_aside && std::fs::rename(&failed, live_db).is_ok() {
+                tracing::error!(
+                    "sync: CRITICAL — cutover rollback could not restore the backup {} → {}: {e}; \
+                     the post-cutover DB was moved back into place at {} and the pre-sync data is \
+                     intact at the backup path — nothing was deleted",
+                    backup.display(),
+                    live_db.display(),
+                    live_db.display()
+                );
+            } else {
+                tracing::error!(
+                    "sync: CRITICAL — cutover rollback could not restore the backup {} → {}: {e}; \
+                     your data is intact at {} (pre-sync) and {} (post-cutover) — nothing was \
+                     deleted; restore one of them over {} manually",
+                    backup.display(),
+                    live_db.display(),
+                    backup.display(),
+                    if moved_aside {
+                        failed.display()
+                    } else {
+                        live_db.display()
+                    },
+                    live_db.display()
+                );
+            }
+        }
     }
-    remove_db_files(&failed);
     // The interrupted cutover is resolved (rolled back); drop the journal so the next
     // boot does not attempt recovery on a state we already restored.
     remove_journal(live_db);
@@ -3380,6 +3558,34 @@ fn applied_event_for(report: &outbox::DrainReport) -> Option<SyncAppliedEvent> {
     })
 }
 
+/// Minimum wall-clock gap between MID-CYCLE [`SYNC_APPLIED_EVENT`] emissions.
+const APPLIED_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Mid-cycle progress reporter for `drain_once_with_progress`. A catch-up merges the WHOLE
+/// relay backlog inside one drain cycle, so the end-of-cycle emit below only fires after the
+/// entire backlog has landed — minutes during which the UI shows nothing of what already
+/// merged. This emits the same event as rows land, throttled to one per
+/// [`APPLIED_PROGRESS_INTERVAL`] (the store debounces on top). `quarantined`/`replayed` are 0
+/// because neither is known until the cycle ends; the end-of-cycle emit carries the real
+/// totals. Runs on the drain thread between merge transactions, so it must stay cheap.
+fn applied_progress_emitter(app: &tauri::AppHandle) -> impl FnMut(u64) + '_ {
+    let mut last = Instant::now();
+    move |applied| {
+        if last.elapsed() < APPLIED_PROGRESS_INTERVAL {
+            return;
+        }
+        last = Instant::now();
+        let ev = SyncAppliedEvent {
+            applied: applied as usize,
+            quarantined: 0,
+            replayed: 0,
+        };
+        if let Err(e) = app.emit(SYNC_APPLIED_EVENT, ev) {
+            tracing::warn!("sync drain: progress emit {SYNC_APPLIED_EVENT} failed: {e}");
+        }
+    }
+}
+
 /// Boot-time hook (called from the Tauri `setup` closure): if the keychain holds an
 /// enabled session, ensure the live DB is CRR-prepared (running the one-time A3
 /// cutover if this device was enabled under the old copy architecture — the owner's
@@ -3409,14 +3615,26 @@ pub fn start_drain_if_enabled(
     // Already-enabled migration (A3): if this device is enabled but the live DB is not
     // yet CRR (old copy architecture, or enabled before this build), run the cutover
     // ONCE now — same backup + rollback discipline as the Enable button.
-    if !live_is_crr_prepared(live_db) {
-        tracing::info!("sync: enabled device with a non-CRR live DB — running one-time A3 cutover");
-        if let Err(e) = perform_cutover(live_db, db_service) {
-            tracing::error!("sync: auto-cutover failed at boot; drain not started: {e}");
+    match live_is_crr_prepared(live_db) {
+        Ok(false) => {
+            tracing::info!(
+                "sync: enabled device with a non-CRR live DB — running one-time A3 cutover"
+            );
+            if let Err(e) = perform_cutover(live_db, db_service) {
+                tracing::error!("sync: auto-cutover failed at boot; drain not started: {e}");
+                return;
+            }
+        }
+        Ok(true) => discard_legacy_sync_copy(live_db),
+        // Indeterminate: never auto-cut over on a probe error (it would swap the file and
+        // zero the watermarks on a DB that may already be prepared and merely locked).
+        Err(e) => {
+            tracing::error!(
+                "sync: could not determine whether the live DB is sync-prepared ({e}); \
+                 auto-cutover skipped and drain not started"
+            );
             return;
         }
-    } else {
-        discard_legacy_sync_copy(live_db);
     }
     // Item 1: reconcile the DB's account binding OUTSIDE the CRR idempotency gate above — an
     // account SWITCH since the last boot (or a DB that never recorded a binding) resets the
@@ -3718,8 +3936,11 @@ fn spawn_drain(
                 // transport error rides on the report rather than aborting the cycle. Only a
                 // cycle-fatal LOCAL (sqlite/replay) fault returns `Err` — never crash the
                 // thread on it; count it toward the failing threshold and retry next cycle.
+                let mut on_applied = applied_progress_emitter(&app);
                 let mut report =
-                    match rt.block_on(outbox::drain_once(conn, &cipher, &transport, client_id, sv, ev)) {
+                    match rt.block_on(outbox::drain_once_with_progress(
+                        conn, &cipher, &transport, client_id, sv, ev, &mut on_applied,
+                    )) {
                         Ok(r) => r,
                         Err(e) => {
                             let msg = e.to_string();
@@ -3739,8 +3960,14 @@ fn spawn_drain(
                     match rt.block_on(refresh_access_token()) {
                         Ok(new_access) => {
                             transport.set_bearer(&new_access);
-                            report = match rt.block_on(outbox::drain_once(
-                                conn, &cipher, &transport, client_id, sv, ev,
+                            report = match rt.block_on(outbox::drain_once_with_progress(
+                                conn,
+                                &cipher,
+                                &transport,
+                                client_id,
+                                sv,
+                                ev,
+                                &mut on_applied,
                             )) {
                                 Ok(r) => r,
                                 Err(e) => {
@@ -6472,6 +6699,12 @@ mod tests {
 
     // ----- A3 enable-time CRR cutover -----
 
+    /// Test shorthand for the CRR idempotency probe: in a tempdir fixture the probe must
+    /// always be CONCLUSIVE, so an indeterminate answer is itself a test failure.
+    fn crr_prepared(live_db: &Path) -> bool {
+        live_is_crr_prepared(live_db).expect("CRR probe must be conclusive on a test fixture")
+    }
+
     /// Build a populated NON-CRR live DB (real schema + FTS-backed segments) served by
     /// a `DbService`, returning the temp dir (kept alive), its path, and the service.
     fn cutover_fixture() -> (
@@ -6577,12 +6810,12 @@ mod tests {
             "fresh migration chain must NOT carry speaker_id"
         );
 
-        assert!(!live_is_crr_prepared(&path));
+        assert!(!crr_prepared(&path));
         let pre = synced_table_row_counts(&path).unwrap();
 
         perform_cutover(&path, &svc).expect("fresh-chain cutover must succeed");
 
-        assert!(live_is_crr_prepared(&path), "live DB is now CRR");
+        assert!(crr_prepared(&path), "live DB is now CRR");
         assert!(backup_db_path(&path).exists(), "pre-sync backup kept");
         assert_eq!(
             synced_table_row_counts(&path).unwrap(),
@@ -6639,7 +6872,7 @@ mod tests {
 
         let pre = synced_table_row_counts(&path).unwrap();
         perform_cutover(&path, &svc).expect("dev-DB (14-col) cutover must succeed");
-        assert!(live_is_crr_prepared(&path));
+        assert!(crr_prepared(&path));
         assert_eq!(
             synced_table_row_counts(&path).unwrap(),
             pre,
@@ -6816,13 +7049,13 @@ mod tests {
     #[test]
     fn cutover_full_sequence_preserves_data_fts_and_prepares_crr() {
         let (_dir, path, svc) = cutover_fixture();
-        assert!(!live_is_crr_prepared(&path), "starts non-CRR");
+        assert!(!crr_prepared(&path), "starts non-CRR");
         let pre = synced_table_row_counts(&path).unwrap();
 
         perform_cutover(&path, &svc).expect("cutover");
 
         // Live DB is now CRR-prepared; the backup escape hatch exists.
-        assert!(live_is_crr_prepared(&path), "live DB is now CRR");
+        assert!(crr_prepared(&path), "live DB is now CRR");
         assert!(backup_db_path(&path).exists(), "pre-sync backup kept");
 
         // Row counts intact.
@@ -6850,7 +7083,7 @@ mod tests {
 
         // Second run is a no-op (idempotency gate) — no error, still CRR.
         perform_cutover(&path, &svc).expect("second cutover is a no-op");
-        assert!(live_is_crr_prepared(&path));
+        assert!(crr_prepared(&path));
     }
 
     #[test]
@@ -6934,13 +7167,10 @@ mod tests {
         // The drain-start decision: an enabled device whose live DB is not CRR must run
         // the cutover once. This asserts that exact guard + its effect.
         let (_dir, path, svc) = cutover_fixture();
-        assert!(
-            !live_is_crr_prepared(&path),
-            "enabled-but-non-CRR: needs cutover"
-        );
+        assert!(!crr_prepared(&path), "enabled-but-non-CRR: needs cutover");
         perform_cutover(&path, &svc).expect("auto-cutover");
         assert!(
-            live_is_crr_prepared(&path),
+            crr_prepared(&path),
             "after auto-cutover the guard is satisfied (no re-run)"
         );
         assert!(backup_db_path(&path).exists());
@@ -6962,7 +7192,7 @@ mod tests {
             !backup_db_path(&path).exists(),
             "no backup on pre-close failure"
         );
-        assert!(!live_is_crr_prepared(&path), "live DB still non-CRR");
+        assert!(!crr_prepared(&path), "live DB still non-CRR");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -6989,10 +7219,7 @@ mod tests {
         assert!(err.contains("after rename"));
         // The backup was renamed back to live; live is the original, non-CRR.
         assert!(!backup_db_path(&path).exists(), "backup restored into live");
-        assert!(
-            !live_is_crr_prepared(&path),
-            "rolled back to non-CRR original"
-        );
+        assert!(!crr_prepared(&path), "rolled back to non-CRR original");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -7192,7 +7419,7 @@ mod tests {
             "no data loss across the recovered swap"
         );
         assert!(
-            live_is_crr_prepared(&path),
+            crr_prepared(&path),
             "recovery completed the swap: live is the CRR DB"
         );
 
@@ -7304,6 +7531,114 @@ mod tests {
         );
     }
 
+    // ----- Windows-hostile file semantics: never delete the only copy -----
+
+    /// Rollback with an UNRESTORABLE backup (the documented Windows sharing-violation
+    /// mode, reproduced portably here by an absent backup so the `rename` fails). The
+    /// scratch copy holding the CURRENT live DB must be preserved — it is put back at the
+    /// live path. The pre-fix code deleted it unconditionally and let `reopen()` recreate
+    /// an EMPTY database over the user's library.
+    #[test]
+    fn rollback_with_an_unrestorable_backup_preserves_the_live_db() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup = backup_db_path(&path);
+        assert!(!backup.exists(), "no backup: the restore rename MUST fail");
+        let failed = path.with_file_name("yapstack.db.crr-cutover-failed");
+
+        rollback_to_backup(&path, &backup, &svc);
+
+        assert!(path.exists(), "the only copy of the data still exists");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the moved-aside live DB was put back verbatim, not deleted"
+        );
+        assert!(
+            !failed.exists(),
+            "the scratch is consumed only by a SUCCESSFUL rename-back"
+        );
+        assert_eq!(
+            svc.select("SELECT count(*) AS c FROM sessions", &[])
+                .unwrap()[0]["c"],
+            serde_json::json!(2),
+            "the reopened pool sees the real library, not a fresh empty DB"
+        );
+    }
+
+    /// Same failure, harsher: the scratch path is BLOCKED (a directory in the way) so the
+    /// live DB cannot even be moved aside, and the backup restore fails too. Nothing may
+    /// be deleted — the live path keeps the user's data.
+    #[test]
+    fn rollback_never_deletes_the_live_db_when_the_scratch_move_also_fails() {
+        let (_dir, path, svc) = cutover_fixture();
+        svc.close_for_swap().unwrap();
+        svc.reopen().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup = backup_db_path(&path); // absent → the restore rename fails
+        let failed = path.with_file_name("yapstack.db.crr-cutover-failed");
+        std::fs::create_dir(&failed).unwrap(); // rename(file → dir) fails everywhere
+
+        rollback_to_backup(&path, &backup, &svc);
+
+        assert!(path.exists(), "live DB left in place");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "and left verbatim");
+        assert!(failed.is_dir(), "the blocker was not consumed");
+    }
+
+    /// A live path whose existence cannot be DETERMINED (here a self-referencing symlink:
+    /// `stat` fails with ELOOP, so `Path::exists()` reports "missing" while `try_exists`
+    /// errors) must make recovery do NOTHING. The pre-fix code read it as missing and
+    /// copied a stale backup over it, then dropped the journal.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_nothing_when_the_live_probe_is_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("yapstack.db");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert!(path.try_exists().is_err(), "fixture is indeterminate");
+        assert!(!path.exists(), "…which `exists()` would call MISSING");
+
+        let backup = backup_db_path(&path);
+        std::fs::write(&backup, b"STALE-BACKUP").unwrap();
+        test_journal(&path, CutoverPhase::BackupMoved, Vec::new());
+
+        recover_interrupted_cutover(&path);
+
+        assert!(
+            std::fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the indeterminate live entry was NOT replaced by the stale backup"
+        );
+        assert!(
+            cutover_journal_path(&path).exists(),
+            "the journal is kept so the next boot can retry"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"STALE-BACKUP");
+    }
+
+    /// `std::fs::copy` reproduces the source's read-only attribute, and the restore then
+    /// fsyncs through a WRITE handle — ACCESS_DENIED on Windows, EACCES on unix — so a
+    /// read-only backup would fail to restore on every boot. The copy must clear it.
+    #[cfg(unix)]
+    #[test]
+    fn copy_into_live_clears_a_read_only_source_attribute() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("yapstack.db.pre-sync-backup");
+        let live = dir.path().join("yapstack.db");
+        std::fs::write(&src, b"backup-bytes").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_into_live(&src, &live).expect("a read-only backup must still restore");
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"backup-bytes");
+        let mode = std::fs::metadata(&live).unwrap().permissions().mode();
+        assert_eq!(mode & 0o200, 0o200, "the restored live DB must be writable");
+        assert_eq!(mode & 0o022, 0, "…for the OWNER only, not the world");
+    }
+
     /// F1.4 empty-live guard: refuse to cut over a freshly-created empty live DB while
     /// recovery artifacts are present (rather than enshrining the empty DB).
     #[test]
@@ -7313,12 +7648,12 @@ mod tests {
         let svc = std::sync::Arc::new(crate::db_service::DbService::open(&path).unwrap());
         // A leftover recovery artifact beside a fresh, empty live DB.
         std::fs::write(backup_db_path(&path), b"pretend-prior-backup").unwrap();
-        assert!(!live_is_crr_prepared(&path));
+        assert!(!crr_prepared(&path));
 
         let err = perform_cutover(&path, &svc).expect_err("must refuse an empty live");
         assert!(err.contains("cutover refused"), "{err}");
         // The empty live was NOT turned into a CRR DB.
-        assert!(!live_is_crr_prepared(&path));
+        assert!(!crr_prepared(&path));
     }
 
     /// F1.3 stale-backup preservation: a pre-existing backup is MOVED aside (timestamped),
@@ -7345,7 +7680,7 @@ mod tests {
             b"PRIOR-BACKUP-KEEP-ME",
             "the old backup was preserved verbatim, not deleted"
         );
-        assert!(live_is_crr_prepared(&path), "cutover still completed");
+        assert!(crr_prepared(&path), "cutover still completed");
     }
 
     /// End-to-end identity lifecycle against the REAL backing store (OS keychain in release,

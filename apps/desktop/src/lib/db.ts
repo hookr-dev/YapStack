@@ -1,5 +1,6 @@
 import Database, { type DbConnection } from "./db-backend";
 import { log } from "./logger";
+import { commands } from "./tauri";
 import { stripHtml } from "./utils";
 import { enqueueAudioForDictation } from "./sync";
 
@@ -226,37 +227,175 @@ export interface DbChatMessage {
 
 // --- Singleton ---
 
-let dbInstance: DbConnection | null = null;
+/**
+ * The connection handle. Resolves as soon as the Rust-side pool adapter is
+ * available; it carries NO dependency on {@link ensureRuntimeSchema}.
+ */
+let connectionPromise: Promise<DbConnection> | null = null;
 
-async function getDb(): Promise<DbConnection> {
-  if (!dbInstance) {
-    dbInstance = await Database.load("sqlite:yapstack.db");
-    await ensureRuntimeSchema(dbInstance);
+/**
+ * Single-flight runtime schema patch. Previously the connection was published
+ * into the module singleton BEFORE `ensureRuntimeSchema` resolved, so two
+ * concurrent first callers either ran the ~25-statement patch pass twice or
+ * skipped the gate entirely. One shared promise makes both impossible.
+ */
+let schemaPatchPromise: Promise<void> | null = null;
+
+async function getConnection(): Promise<DbConnection> {
+  if (!connectionPromise) {
+    connectionPromise = Database.load("sqlite:yapstack.db");
   }
-  return dbInstance;
+  return await connectionPromise;
+}
+
+function startSchemaPatch(): Promise<void> {
+  if (!schemaPatchPromise) {
+    schemaPatchPromise = (async () => {
+      const db = await getConnection();
+      await waitForBackendReady();
+      await ensureRuntimeSchema(db);
+    })().catch((err) => {
+      // ensureRuntimeSchema is internally per-statement-tolerant, so a rejection
+      // here means the whole pass aborted. Never let it poison the shared promise
+      // (an unawaited rejection would surface as an unhandledrejection).
+      log.error(
+        `ensureRuntimeSchema aborted: ${err instanceof Error ? err.message : String(err)}`,
+        "db",
+      );
+    });
+  }
+  return schemaPatchPromise;
+}
+
+/**
+ * Read handle. Does NOT await the runtime schema patch: the patch is a
+ * ~25-statement WRITE pass that can sit behind the sync drain's write lock for
+ * seconds, and gating first reads on it rendered the library blank on boot.
+ * The patch is kicked off here (fire-and-forget) so it still runs promptly.
+ *
+ * Use {@link getPatchedDb} for every write, and for the reads that genuinely
+ * depend on something this patch creates (FTS tables, and the belt-and-suspenders
+ * CREATEs for `session_audio_parts` / `chat_context_settings` on dev DBs whose
+ * `_sqlx_migrations` history is misaligned).
+ */
+async function getDb(): Promise<DbConnection> {
+  const db = await getConnection();
+  void startSchemaPatch();
+  return db;
+}
+
+/** Connection + a guarantee that the runtime schema patch pass has completed. */
+async function getPatchedDb(): Promise<DbConnection> {
+  const db = await getConnection();
+  await startSchemaPatch();
+  return db;
+}
+
+/**
+ * Poll the builder-managed `backend_ready` flag before touching the schema.
+ * Tauri builds config-declared webview windows BEFORE running the setup hook, so
+ * a fast frontend boot can invoke `db_execute`/`db_select` while `db_service` is
+ * still unmanaged — surfacing as "state not managed for field 'service'". That
+ * made every schema probe fail (and every ALTER get re-attempted) on each boot.
+ *
+ * `backend_ready` is managed on the BUILDER chain, so it answers from the very
+ * first invoke; a THROW therefore means there is no Tauri invoke layer at all
+ * (vitest, plain-browser dev) rather than "not ready yet" — we stop polling in
+ * that case instead of burning the whole timeout.
+ */
+const BACKEND_READY_TIMEOUT_MS = 15_000;
+const BACKEND_READY_POLL_MS = 50;
+const BACKEND_READY_MAX_THROWS = 3;
+
+async function waitForBackendReady(): Promise<void> {
+  const start = Date.now();
+  let consecutiveThrows = 0;
+  for (;;) {
+    try {
+      if (await commands.backendReady()) return;
+      consecutiveThrows = 0;
+    } catch {
+      if (++consecutiveThrows >= BACKEND_READY_MAX_THROWS) return;
+    }
+    if (Date.now() - start > BACKEND_READY_TIMEOUT_MS) {
+      log.warn(
+        "backend_ready timed out before the runtime schema patch; applying anyway",
+        "db",
+      );
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, BACKEND_READY_POLL_MS));
+  }
+}
+
+/**
+ * Tri-state schema probe result. `null` means the probe ITSELF failed, which is
+ * emphatically not the same as a negative answer — see {@link addColumnIfMissing}.
+ */
+type SchemaProbe = boolean | null;
+
+/** One line per app run, not one per failed probe (there are ~9 of them). */
+let schemaProbeFailureLogged = false;
+
+function noteProbeFailure(what: string, err: unknown): null {
+  if (!schemaProbeFailureLogged) {
+    schemaProbeFailureLogged = true;
+    log.warn(
+      `ensureRuntimeSchema: schema probe failed (${what}); skipping runtime schema patches this run: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      "db",
+    );
+  }
+  return null;
 }
 
 /**
  * True if `table` is cr-sqlite CRR-tracked, detected by the presence of its clock
  * shadow table `<table>__crsql_clock` (the same signal the Rust side uses,
- * `schema::is_crr`). If the probe itself fails we return `false` so the caller falls
- * back to the plain non-CRR ALTER path rather than skipping a needed column.
+ * `schema::is_crr`). `null` when the probe itself failed — the caller must NOT
+ * fall through to the bare ALTER path on an unknown answer.
  */
-async function isCrrTracked(db: DbConnection, table: string): Promise<boolean> {
+async function isCrrTracked(db: DbConnection, table: string): Promise<SchemaProbe> {
   try {
     const rows = await db.select<{ n: number }[]>(
       "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name = $1",
       [`${table}__crsql_clock`],
     );
     return (rows[0]?.n ?? 0) > 0;
-  } catch {
-    return false;
+  } catch (err) {
+    return noteProbeFailure(`crsql clock probe for ${table}`, err);
+  }
+}
+
+/**
+ * Whether `table` already has `column`. `null` when unknown — either the probe
+ * failed, or the table itself doesn't exist (`pragma_table_info` on a missing
+ * table returns zero rows rather than erroring, and ALTERing it would be wrong).
+ *
+ * `table` is interpolated because a pragma table-valued function takes its
+ * argument in the FROM clause; every call site passes a hardcoded literal.
+ */
+async function hasColumn(
+  db: DbConnection,
+  table: string,
+  column: string,
+): Promise<SchemaProbe> {
+  try {
+    const rows = await db.select<{ name: string }[]>(
+      `SELECT name FROM pragma_table_info('${table}')`,
+    );
+    if (rows.length === 0) return null;
+    return rows.some((r) => r.name === column);
+  } catch (err) {
+    return noteProbeFailure(`table_info probe for ${table}`, err);
   }
 }
 
 /**
  * Apply one runtime `ALTER TABLE <table> ADD COLUMN` — but ONLY on a non-CRR
- * (pre-sync) DB. On a sync-enabled (cr-sqlite CRR) DB the Rust boot self-heal owns
+ * (pre-sync) DB, and ONLY when a SUCCESSFUL probe positively reports the column
+ * absent. On a sync-enabled (cr-sqlite CRR) DB the Rust boot self-heal owns
  * schema evolution: it adds the column through the crsql alter dance so the column
  * is CRR-tracked. A bare ALTER here would RACE that self-heal, and — since we cannot
  * rely on cr-sqlite rejecting a bare `ADD COLUMN` on a CRR table (unverified) — an
@@ -265,29 +404,35 @@ async function isCrrTracked(db: DbConnection, table: string): Promise<boolean> {
  * CRR-tracked we skip the bare ALTER entirely and let the Rust path own it (logged at
  * debug/info, not error — this is the correct, expected branch on a synced DB).
  *
- * On a non-CRR DB the bare ALTER is correct and expected to no-op once the column
- * exists ("duplicate column name" is the silent idempotent case). Every OTHER rejection
- * there is logged loudly (devtools `console.error` + the backend `log.error` seam)
- * instead of vanishing.
+ * An UNKNOWN probe result (`null`) also skips: treating a probe error as "not CRR"
+ * / "column missing" is what produced the per-boot ALTER storm — a whole pass of
+ * ALTERs for columns that already existed, each one a rejected write in the Rust
+ * writer log. A skipped patch is retried on the next launch; a wrong ALTER is not
+ * free.
  */
 async function addColumnIfMissing(
   db: DbConnection,
   table: string,
-  sql: string,
+  column: string,
+  columnType: string,
 ): Promise<void> {
-  if (await isCrrTracked(db, table)) {
+  const sql = `ALTER TABLE ${table} ADD COLUMN ${column} ${columnType}`;
+  const crr = await isCrrTracked(db, table);
+  if (crr === null) return; // probe failed — retry next launch rather than guess
+  if (crr) {
     log.info(
       `ensureRuntimeSchema: ${table} is CRR-tracked; deferring ADD COLUMN to the Rust boot self-heal (skipping bare ALTER): ${sql}`,
       "db",
     );
     return;
   }
+  if ((await hasColumn(db, table, column)) !== false) return;
   try {
     await db.execute(sql);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (/duplicate column name/i.test(message)) {
-      return; // expected idempotent no-op: the column already exists on a non-CRR DB
+      return; // raced another patcher; the column exists, which is all we wanted
     }
     console.error(`ensureRuntimeSchema: runtime ALTER failed: ${sql}: ${message}`);
     log.error(
@@ -313,18 +458,14 @@ async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
   // (apply_out_of_band_alters via the crsql alter dance), which CRR-tracks the new
   // column. Issuing a bare ALTER on a CRR table would race that self-heal and risk an
   // un-CRR-tracked column that quarantines incoming changes forever.
-  await addColumnIfMissing(db, "segments", "ALTER TABLE segments ADD COLUMN speaker_id INTEGER");
-  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT");
+  await addColumnIfMissing(db, "segments", "speaker_id", "INTEGER");
+  await addColumnIfMissing(db, "chat_messages", "tool_calls", "TEXT");
   // v14: per-LLM-response shape for tool replay.
-  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN send_id TEXT");
-  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN sequence INTEGER");
-  await addColumnIfMissing(
-    db,
-    "chat_messages",
-    "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT",
-  );
-  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN observation TEXT");
-  await addColumnIfMissing(db, "chat_messages", "ALTER TABLE chat_messages ADD COLUMN status TEXT");
+  await addColumnIfMissing(db, "chat_messages", "send_id", "TEXT");
+  await addColumnIfMissing(db, "chat_messages", "sequence", "INTEGER");
+  await addColumnIfMissing(db, "chat_messages", "tool_call_id", "TEXT");
+  await addColumnIfMissing(db, "chat_messages", "observation", "TEXT");
+  await addColumnIfMissing(db, "chat_messages", "status", "TEXT");
   // Backfill legacy rows so they have a self-consistent send group.
   await db
     .execute("UPDATE chat_messages SET send_id = id WHERE send_id IS NULL")
@@ -475,9 +616,17 @@ async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
          ON session_audio_parts(session_id, part_index)`,
     )
     .catch(() => {});
-  // Backfill: every existing session with a wav_file_path becomes
-  // part_index=0. INSERT OR IGNORE makes this safe to re-run; the
-  // (session_id, part_index) UNIQUE constraint short-circuits duplicates.
+  // Backfill: every existing session with a wav_file_path becomes part_index=0.
+  //
+  // The NOT EXISTS guard is what makes this idempotent — `INSERT OR IGNORE` is
+  // NOT enough. Each run mints a fresh `randomblob` PK, so OR IGNORE can only
+  // short-circuit on the (session_id, part_index) UNIQUE — and the CRR sync
+  // migration deliberately STRIPS every non-PK UNIQUE (yapstack-sync
+  // `schema.rs`; the dropped constraint is re-enforced app-side by
+  // `uniqueness::dedup_audio_parts`). On a synced DB that made this statement
+  // mint N duplicate parts on EVERY launch, which then synced and were
+  // tombstoned — the relay-bloat bug.
+  //
   // Wrapped in catch() because pre-v5 DBs don't have wav_file_path yet —
   // they have no audio to backfill anyway.
   await db
@@ -496,7 +645,11 @@ async function ensureRuntimeSchema(db: DbConnection): Promise<void> {
          48000,
          COALESCE(updated_at, created_at)
        FROM sessions
-       WHERE wav_file_path IS NOT NULL`,
+       WHERE wav_file_path IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM session_audio_parts p
+           WHERE p.session_id = sessions.id AND p.part_index = 0
+         )`,
     )
     .catch(() => {});
 
@@ -527,7 +680,7 @@ export async function createSession(
   source: string,
   recordingDeviceId: string | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // `recording_device_id` stamps the recorder's fingerprint (LIVE_SESSION_STATE D2);
   // NULL when sync is not configured, degrading to today's single-device semantics.
   await db.execute(
@@ -540,7 +693,7 @@ export async function updateSessionTitle(
   id: string,
   title: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE sessions SET title = $1, updated_at = datetime('now') WHERE id = $2",
     [title, id],
@@ -558,7 +711,7 @@ export async function completeSession(
   id: string,
   fallbackDurationSeconds: number = 0,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `UPDATE sessions
      SET status = 'completed',
@@ -585,7 +738,7 @@ export async function markSessionRecording(
   id: string,
   recordingDeviceId: string | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // Re-attribute the session to whoever resumed it (LIVE_SESSION_STATE D2): the
   // resuming device stamps its own fingerprint. NULL when sync is not configured.
   await db.execute(
@@ -610,7 +763,7 @@ export async function markSessionRecording(
  * arriving segment is dropped in the interim.
  */
 export async function markSessionCompleted(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE sessions SET status = 'completed', updated_at = datetime('now') WHERE id = $1",
     [id],
@@ -618,7 +771,7 @@ export async function markSessionCompleted(id: string): Promise<void> {
 }
 
 export async function deleteSession(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute("DELETE FROM sessions WHERE id = $1", [id]);
 }
 
@@ -649,7 +802,7 @@ export async function getSessionsByIds(ids: string[]): Promise<DbSession[]> {
 }
 
 export async function deleteAllSessions(): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // CASCADE handles child tables: segments, notes (→ note_versions),
   // chat_messages, session_folders
   await db.execute("DELETE FROM sessions");
@@ -658,7 +811,7 @@ export async function deleteAllSessions(): Promise<void> {
 // --- Pin operations ---
 
 export async function togglePin(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ is_pinned: number }[]>(
     "SELECT is_pinned FROM sessions WHERE id = $1",
     [id],
@@ -689,7 +842,7 @@ export async function createFolder(
   color: string | null = null,
   description: string | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "INSERT INTO folders (id, name, parent_id, icon, color, description) VALUES ($1, $2, $3, $4, $5, $6)",
     [id, name, parentId, icon, color, description],
@@ -700,7 +853,7 @@ export async function updateFolder(
   id: string,
   updates: { name?: string; icon?: string | null; color?: string | null; description?: string | null },
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const setClauses: string[] = [];
   const params: unknown[] = [];
   let paramIdx = 1;
@@ -734,7 +887,7 @@ export async function updateFolder(
 }
 
 export async function deleteFolder(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // Clean up chat messages for this folder context
   await db.execute(
     "DELETE FROM chat_messages WHERE context_key = $1",
@@ -748,7 +901,7 @@ export async function updateFolderParent(
   folderId: string,
   newParentId: string | null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE folders SET parent_id = $1, updated_at = datetime('now') WHERE id = $2",
     [newParentId, folderId],
@@ -768,8 +921,10 @@ export async function addSessionToFolder(
   sessionId: string,
   folderId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
+    // OR IGNORE is load-bearing on the composite PRIMARY KEY, which the CRR
+    // migration preserves (unlike non-PK UNIQUEs — see the audio-parts backfill).
     "INSERT OR IGNORE INTO session_folders (session_id, folder_id) VALUES ($1, $2)",
     [sessionId, folderId],
   );
@@ -779,7 +934,7 @@ export async function removeSessionFromFolder(
   sessionId: string,
   folderId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM session_folders WHERE session_id = $1 AND folder_id = $2",
     [sessionId, folderId],
@@ -789,7 +944,7 @@ export async function removeSessionFromFolder(
 export async function removeSessionFromAllFolders(
   sessionId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM session_folders WHERE session_id = $1",
     [sessionId],
@@ -810,7 +965,7 @@ export async function createTag(
   name: string,
   color: string | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "INSERT INTO tags (id, name, color) VALUES ($1, $2, $3)",
     [id, name, color],
@@ -832,7 +987,7 @@ export async function getTagByName(name: string): Promise<DbTag | null> {
 }
 
 export async function deleteTag(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute("DELETE FROM tags WHERE id = $1", [id]);
 }
 
@@ -842,8 +997,10 @@ export async function addSessionTag(
   source: "manual" | "auto" | "ai" = "manual",
   confidence: number | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
+    // Same as session_folders: the (session_id, tag_id) PRIMARY KEY survives the
+    // CRR migration, so OR IGNORE really does short-circuit the duplicate here.
     "INSERT OR IGNORE INTO session_tags (session_id, tag_id, source, confidence) VALUES ($1, $2, $3, $4)",
     [sessionId, tagId, source, confidence],
   );
@@ -853,7 +1010,7 @@ export async function removeSessionTag(
   sessionId: string,
   tagId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM session_tags WHERE session_id = $1 AND tag_id = $2",
     [sessionId, tagId],
@@ -887,7 +1044,7 @@ export async function getSessionTagRows(
 // --- Segment CRUD ---
 
 export async function insertSegment(segment: DbSegment): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, confidence, chunk_index, speaker_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -921,7 +1078,7 @@ export async function updateSegmentText(
   id: string,
   newText: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // Preserve original text on first edit
   await db.execute(
     `UPDATE segments
@@ -934,7 +1091,7 @@ export async function updateSegmentText(
 }
 
 export async function softDeleteSegment(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE segments SET deleted_at = datetime('now') WHERE id = $1",
     [id],
@@ -942,7 +1099,7 @@ export async function softDeleteSegment(id: string): Promise<void> {
 }
 
 export async function toggleSegmentHidden(id: string): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE segments SET hidden = CASE WHEN hidden = 0 THEN 1 ELSE 0 END WHERE id = $1",
     [id],
@@ -951,7 +1108,7 @@ export async function toggleSegmentHidden(id: string): Promise<void> {
 
 export async function softDeleteSegments(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
-  const db = await getDb();
+  const db = await getPatchedDb();
   const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
   await db.execute(
     `UPDATE segments SET deleted_at = datetime('now') WHERE id IN (${placeholders})`,
@@ -964,7 +1121,7 @@ export async function setSegmentsHidden(
   hidden: boolean,
 ): Promise<void> {
   if (ids.length === 0) return;
-  const db = await getDb();
+  const db = await getPatchedDb();
   const placeholders = ids.map((_, i) => `$${i + 2}`).join(",");
   await db.execute(
     `UPDATE segments SET hidden = $1 WHERE id IN (${placeholders})`,
@@ -987,7 +1144,7 @@ export async function saveNote(
   sessionId: string,
   content: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const existing = await getNote(sessionId);
   if (existing) {
     await db.execute(
@@ -1007,7 +1164,7 @@ export async function createNoteVersion(
   noteId: string,
   content: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const id = crypto.randomUUID();
   await db.execute(
     "INSERT INTO note_versions (id, note_id, content) VALUES ($1, $2, $3)",
@@ -1070,7 +1227,7 @@ export async function searchSegments(
 ): Promise<SearchResult[]> {
   const match = toFts5Match(query);
   if (!match) return [];
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<
     {
       session_id: string;
@@ -1113,7 +1270,7 @@ export async function searchNotes(
 ): Promise<SearchResult[]> {
   const match = toFts5Match(query);
   if (!match) return [];
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<
     { session_id: string; content: string; title: string }[]
   >(
@@ -1139,7 +1296,7 @@ export async function searchSessionsByTitle(
 ): Promise<SearchResult[]> {
   const match = toFts5Match(query);
   if (!match) return [];
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ id: string; title: string }[]>(
     `SELECT s.id AS id, s.title AS title
      FROM sessions_fts
@@ -1175,7 +1332,7 @@ export async function searchDictations(
 ): Promise<DictationSearchResult[]> {
   const match = toFts5Match(query);
   if (!match) return [];
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<
     {
       id: string;
@@ -1215,7 +1372,7 @@ export async function searchDictations(
 export async function reorderFolders(
   updates: { id: string; sort_order: number }[],
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   for (const { id, sort_order } of updates) {
     await db.execute(
       "UPDATE folders SET sort_order = $1, updated_at = datetime('now') WHERE id = $2",
@@ -1229,7 +1386,7 @@ export async function reorderFolders(
 export async function listSessionAudioParts(
   sessionId: string,
 ): Promise<DbAudioPart[]> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   return await db.select<DbAudioPart[]>(
     "SELECT * FROM session_audio_parts WHERE session_id = $1 ORDER BY part_index ASC",
     [sessionId],
@@ -1241,7 +1398,7 @@ export async function listSessionAudioParts(
  * bulk-delete flows to avoid an N+1 of `listSessionAudioParts` per session.
  */
 export async function listAllAudioPartPaths(): Promise<string[]> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ file_path: string }[]>(
     "SELECT file_path FROM session_audio_parts",
   );
@@ -1249,7 +1406,7 @@ export async function listAllAudioPartPaths(): Promise<string[]> {
 }
 
 export async function insertAudioPart(part: DbAudioPart): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `INSERT INTO session_audio_parts (
        id, session_id, part_index, file_path, format,
@@ -1274,7 +1431,7 @@ export async function insertAudioPart(part: DbAudioPart): Promise<void> {
  * Segment offset base.
  */
 export async function nextAudioPartIndex(sessionId: string): Promise<number> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ count: number }[]>(
     "SELECT COUNT(*) AS count FROM session_audio_parts WHERE session_id = $1",
     [sessionId],
@@ -1287,7 +1444,7 @@ export async function nextAudioPartIndex(sessionId: string): Promise<number> {
  * `offset_base_seconds` for resumed Segments so their offsets stay continuous.
  */
 export async function sumAudioPartsDuration(sessionId: string): Promise<number> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ total: number | null }[]>(
     "SELECT SUM(duration_seconds) AS total FROM session_audio_parts WHERE session_id = $1",
     [sessionId],
@@ -1301,7 +1458,7 @@ export async function createManualSession(
   id: string,
   title: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "INSERT INTO sessions (id, title, source, status, session_type) VALUES ($1, $2, 'MicOnly', 'completed', 'manual')",
     [id, title],
@@ -1311,7 +1468,7 @@ export async function createManualSession(
 // --- Chat messages ---
 
 export async function insertChatMessage(msg: DbChatMessage): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `INSERT INTO chat_messages
        (id, context_key, session_id, role, content, action, tool_calls,
@@ -1337,7 +1494,7 @@ export async function insertChatMessage(msg: DbChatMessage): Promise<void> {
 export async function getChatMessages(
   contextKey: string,
 ): Promise<DbChatMessage[]> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   // (send_id, sequence) is the load-bearing order. Fall back to created_at
   // for legacy pre-v14 rows where sequence is NULL — COALESCE so nulls sort
   // first within their send group, matching insertion order.
@@ -1354,7 +1511,7 @@ export async function updateChatMessageContent(
   content: string,
   toolCalls: string | null = null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE chat_messages SET content = $1, tool_calls = $2 WHERE id = $3",
     [content, toolCalls, id],
@@ -1364,7 +1521,7 @@ export async function updateChatMessageContent(
 export async function deleteChatMessages(
   contextKey: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM chat_messages WHERE context_key = $1",
     [contextKey],
@@ -1407,7 +1564,7 @@ export async function markToolCallsAsUndone(
   callIds: string[],
 ): Promise<void> {
   if (callIds.length === 0) return;
-  const db = await getDb();
+  const db = await getPatchedDb();
 
   // 1. Rewrite tool result rows for the undone calls.
   const undoneContent = "(undone by user)";
@@ -1468,7 +1625,7 @@ export async function markToolCallsAsUndone(
 export async function getChatContextProfileId(
   contextKey: string,
 ): Promise<string | null> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   const rows = await db.select<{ profile_id: string | null }[]>(
     "SELECT profile_id FROM chat_context_settings WHERE context_key = $1 LIMIT 1",
     [contextKey],
@@ -1485,7 +1642,7 @@ export async function setChatContextProfileId(
   contextKey: string,
   profileId: string | null,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `INSERT INTO chat_context_settings (context_key, profile_id, updated_at)
      VALUES ($1, $2, $3)
@@ -1500,7 +1657,7 @@ export async function setChatContextProfileId(
 export async function clearChatContextProfile(
   contextKey: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM chat_context_settings WHERE context_key = $1",
     [contextKey],
@@ -1520,7 +1677,7 @@ export async function clearChatContextProfile(
 export async function clearChatContextProfilesByProfileId(
   profileId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "DELETE FROM chat_context_settings WHERE profile_id = $1",
     [profileId],
@@ -1547,7 +1704,7 @@ export interface DbDictationHistory {
 export async function insertDictationHistory(
   entry: Omit<DbDictationHistory, "created_at">,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     `INSERT INTO dictation_history (id, slot_id, slot_name, input_text, output_text, ai_enabled, ai_prompt, output_action, wav_file_path, wav_duration_seconds, session_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
@@ -1596,12 +1753,12 @@ export async function getDictationHistoryEntry(
 export async function deleteDictationHistoryEntry(
   id: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute("DELETE FROM dictation_history WHERE id = $1", [id]);
 }
 
 export async function clearDictationHistory(): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute("DELETE FROM dictation_history");
 }
 
@@ -1609,7 +1766,7 @@ export async function updateDictationHistorySessionId(
   id: string,
   sessionId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE dictation_history SET session_id = $1 WHERE id = $2",
     [sessionId, id],
@@ -1621,7 +1778,7 @@ export async function updateDictationHistorySessionId(
 export async function clearDictationSessionLink(
   sessionId: string,
 ): Promise<void> {
-  const db = await getDb();
+  const db = await getPatchedDb();
   await db.execute(
     "UPDATE dictation_history SET session_id = NULL WHERE session_id = $1",
     [sessionId],

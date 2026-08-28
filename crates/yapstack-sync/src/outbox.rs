@@ -22,6 +22,18 @@ use yapstack_common::sync::{PushChange, PushRequest, MAX_PUSH_BYTES, MAX_PUSH_CH
 const PULL_LIMIT: i64 = 500;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// Catch-up pacing: merged changesets between two [`PULL_PACE_SLEEP`] pauses.
+///
+/// SQLite has no write-lock FAIRNESS. Back-to-back `BEGIN IMMEDIATE` merges let the drain
+/// re-take the file lock ahead of an app connection that is already parked in its busy
+/// handler, so during a multi-page catch-up the UI's writer can lose every retry and stall
+/// for its whole `busy_timeout` budget. `yield_now` does NOT fix this: it only reschedules
+/// this task on the drain's own runtime and never leaves the lock free in wall-clock time.
+/// A real sleep does. ~20 ms per 32 changesets is well under 5% added latency on a backlog
+/// whose per-changeset merge is itself milliseconds.
+const PULL_PACE_EVERY: usize = 32;
+const PULL_PACE_SLEEP: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Max rows captured into a single outbox entry (chunk) before flushing, independent of
 /// byte size. Bounds the worst-case entry count and keeps each entry cheap to decrypt.
 const CHUNK_ROWS: usize = 5_000;
@@ -708,6 +720,38 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
     schema_version: i32,
     engine_version: i32,
 ) -> Result<DrainReport, SyncError> {
+    drain_once_with_progress(
+        conn,
+        cipher,
+        transport,
+        client_id,
+        schema_version,
+        engine_version,
+        &mut |_| {},
+    )
+    .await
+}
+
+/// [`drain_once`] with a mid-cycle progress reporter.
+///
+/// `on_applied` is called after each merged changeset with the RUNNING count of rows applied
+/// so far this cycle. A catch-up drains the whole relay backlog inside ONE cycle, so a caller
+/// that only observes the returned [`DrainReport`] cannot show progress until the entire
+/// backlog has landed (minutes). This callback lets it report progressively; it is invoked on
+/// the drain's own thread between merge transactions, so it must be cheap and must never touch
+/// the sync connection.
+// One extra parameter beyond `drain_once`'s already-long session tuple; a struct would not aid
+// clarity here.
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_once_with_progress<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    transport: &T,
+    client_id: uuid::Uuid,
+    schema_version: i32,
+    engine_version: i32,
+    on_applied: &mut dyn FnMut(u64),
+) -> Result<DrainReport, SyncError> {
     let mut report = DrainReport::default();
 
     // PUSH direction: capture fresh local writes, then upload the outbox. A failure in EITHER
@@ -731,7 +775,7 @@ pub async fn drain_once<T: SyncTransport + ?Sized>(
 
     // PULL direction: always attempted, even when push failed. A transport/pull error rides
     // on `pull_error`; whatever it managed to apply before failing is retained (F1).
-    if let Err(e) = pull_direction(conn, cipher, transport, &mut report).await {
+    if let Err(e) = pull_direction(conn, cipher, transport, &mut report, on_applied).await {
         report.pull_error = Some(e);
     }
 
@@ -898,7 +942,7 @@ async fn push_direction<T: SyncTransport + ?Sized>(
 }
 
 /// Pull new changesets, decrypt, and merge them IN COMMIT ORDER, advancing the pull
-/// watermark only past changesets that were fully merged. The pull half of one
+/// watermark once per fully-consumed page. The pull half of one
 /// [`drain_once`] cycle; its error is captured into `DrainReport::pull_error` so a download
 /// failure cannot mask push progress. Own-authored changesets are merged like any other
 /// (cr-sqlite merge is idempotent → a no-op when the row is already local, and a genuine
@@ -922,7 +966,9 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
     cipher: &ChangesetCipher,
     transport: &T,
     report: &mut DrainReport,
+    on_applied: &mut dyn FnMut(u64),
 ) -> Result<(), SyncError> {
+    let mut merged_since_pause = 0usize;
     loop {
         let since = state::pull_watermark(conn)?;
         let resp = transport.pull(since, PULL_LIMIT).await?;
@@ -959,32 +1005,48 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
                         "pulled changeset could not be decrypted/decoded; quarantined and \
                          advanced past it (durable, surfaced as a warning, retryable)"
                     );
-                    // PROCESSED — advance the watermark PAST the quarantined seq (R12).
-                    state::set_pull_watermark(conn, pc.changeset_seq)?;
+                    // PROCESSED — the page-end watermark write below advances PAST this
+                    // quarantined seq (R12) exactly as a per-changeset write did: `next_seq`
+                    // is never behind the last seq in the page, so a quarantined changeset
+                    // still counts as consumed and can never wedge the backlog.
                     tokio::task::yield_now().await;
                     continue;
                 }
             };
-            // Merge THIS changeset in its own transaction (merge_changeset BEGIN..COMMIT),
-            // then persist the watermark and yield BEFORE touching the next one. Item 1(a):
-            // each changeset is a bounded merge transaction whose write lock is RELEASED at
-            // its COMMIT, and the watermark only advances after that commit — so a concurrent
+            // Merge THIS changeset in its own transaction (merge_changeset BEGIN..COMMIT), then
+            // yield BEFORE touching the next one. Item 1(a): each changeset is a bounded merge
+            // transaction whose write lock is RELEASED at its COMMIT — so a concurrent
             // db_service writer (the frontend) can win the lock between changesets instead of
-            // being starved for the whole page, and a crash mid-backlog resumes from exactly
-            // the last committed changeset. Item 1: an undecryptable changeset above no longer
-            // halts here — it is quarantined and the watermark advanced past it — so this merge
-            // path only ever sees changesets it CAN apply.
+            // being starved for the whole page. Item 1: an undecryptable changeset above no
+            // longer halts here — it is quarantined and advanced past — so this merge path only
+            // ever sees changesets it CAN apply.
             let (a, q) = merge_changeset(conn, &cs)?;
             report.applied += a;
             report.quarantined += q;
-            state::set_pull_watermark(conn, pc.changeset_seq)?;
+            on_applied(report.applied as u64);
             // Cooperative yield point between batches. On the drain's single-thread runtime
             // this hands the executor a scheduling point between write transactions rather
             // than monopolising it across a long backlog page.
             tokio::task::yield_now().await;
+            // ...but a yield never leaves the SQLite write lock free in WALL-CLOCK time, and
+            // SQLite grants the lock to whoever asks first, not to whoever waited longest.
+            // Pause for real every PULL_PACE_EVERY merges so a parked app writer gets an
+            // uncontended window instead of losing every busy-handler retry for the whole
+            // catch-up.
+            merged_since_pause += 1;
+            if merged_since_pause >= PULL_PACE_EVERY {
+                merged_since_pause = 0;
+                tokio::time::sleep(PULL_PACE_SLEEP).await;
+            }
         }
-        // Whole page consumed cleanly — advance to the relay's reported next_seq (>= last_good;
-        // covers a trailing run with no merge to move the watermark, e.g. quarantined seqs).
+        // Whole page consumed — advance the DURABLE watermark ONCE, to the relay's reported
+        // next_seq (>= the last seq in the page, so it also covers a trailing run with no merge
+        // to move it, e.g. quarantined seqs). Batching this per PAGE rather than per CHANGESET
+        // halves the write-lock acquisitions of a catch-up (the watermark write is its own
+        // autocommit transaction). Safe because a crash mid-page only costs a RE-PULL of that
+        // page: cr-sqlite merges are idempotent (re-applying a landed change is a no-op) and
+        // re-quarantining is `INSERT OR IGNORE`, so replaying a partial page converges to the
+        // same state.
         state::set_pull_watermark(conn, resp.next_seq)?;
         if !resp.has_more {
             break;
@@ -2031,6 +2093,86 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "changeset {k} merged");
         }
+    }
+
+    /// [`MockRelay`] with a forced page size, so a small backlog spans several pull pages.
+    struct Paged {
+        inner: Arc<MockRelay>,
+        page: i64,
+    }
+
+    #[async_trait]
+    impl SyncTransport for Paged {
+        async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
+            self.inner.push(r).await
+        }
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            self.inner.pull(since, limit.min(self.page)).await
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            self.inner.completeness().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_batches_the_watermark_per_page_and_reports_progress() {
+        // The DURABLE watermark advances once per fully-consumed PAGE, not once per changeset
+        // (halving a catch-up's write-lock acquisitions), and the progress callback fires per
+        // merged changeset so a caller can render a long catch-up progressively instead of
+        // waiting for the whole backlog. Observed from an INDEPENDENT connection, so the
+        // watermark we assert on is exactly what a concurrent reader sees.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        let ca = state::client_id(a.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        publish_three(&a, relay.as_ref(), &cipher, ca).await;
+
+        let dir = std::env::temp_dir().join(format!("yapstack-pull-page-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.db");
+        let b = CrsqlDb::open(&path).unwrap();
+        b.conn().execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        make_kv(&b);
+        let cb = state::client_id(b.conn()).unwrap();
+        let probe = Connection::open(&path).unwrap();
+
+        // (rows applied so far, watermark VISIBLE to the probe at that moment).
+        let mut seen: Vec<(u64, i64)> = Vec::new();
+        let paged = Paged {
+            inner: relay.clone(),
+            page: 2,
+        };
+        let report = drain_once_with_progress(b.conn(), &cipher, &paged, cb, sv, ev, &mut |n| {
+            seen.push((n, state::pull_watermark(&probe).unwrap()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(seen.len(), 3, "one progress report per merged changeset");
+        assert!(
+            seen.windows(2).all(|w| w[0].0 < w[1].0),
+            "the reported applied count is a RUNNING total: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().unwrap().0 as usize,
+            report.applied,
+            "the final progress report matches the cycle total"
+        );
+        assert_eq!(
+            seen.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+            vec![0, 0, 2],
+            "the durable watermark moves only at each PAGE end (page 1 = seqs 1-2, page 2 = 3)"
+        );
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            3,
+            "still caught up to the relay tip"
+        );
+        drop(probe);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

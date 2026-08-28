@@ -27,7 +27,13 @@ pub struct UniquenessStats {
 /// Enforce all three dropped uniqueness constraints. One transaction.
 pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncError> {
     // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    //
+    // `BEGIN IMMEDIATE`, not a deferred `BEGIN`: each dedup pass READS (the proven-column
+    // clock joins, and `dedup_tags` first SELECTs its loser→winner pairs) before it WRITES, so
+    // a deferred transaction has to upgrade read→write, and in WAL a lost upgrade race returns
+    // `SQLITE_BUSY_SNAPSHOT` — which the busy handler does NOT retry, so it fails outright
+    // regardless of `busy_timeout` (same rationale as `quarantine::merge_changeset`).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let stats = UniquenessStats {
         notes_removed: dedup_notes(&tx)?,
         tags_merged: dedup_tags(&tx)?,
