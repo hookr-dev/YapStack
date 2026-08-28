@@ -1,8 +1,14 @@
 mod commands;
 mod db;
+mod db_service;
 mod device_broker;
 mod logging;
 mod system_volume;
+// YapStack Sync (Gate 5B, T010b). Behind the off-by-default `sync` feature so
+// the default build never links the vendored cr-sqlite CRR engine (nightly +
+// panic=abort). See src/sync.rs for the isolation rationale.
+#[cfg(feature = "sync")]
+mod sync;
 
 const WINDOW_MAIN: &str = "main";
 #[cfg(target_os = "macos")]
@@ -267,6 +273,11 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
 }
 
 pub fn run() {
+    // The sync ceremony commands (T010e) are registered ONLY when the off-by-default
+    // `sync` feature is on — the module and its deps (cr-sqlite/yapstack-crypto) exist
+    // only there. `collect_commands!` cannot `#[cfg]` individual entries, so the builder
+    // is constructed per-feature; the base command list is identical in both branches.
+    #[cfg(not(feature = "sync"))]
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -281,6 +292,7 @@ pub fn run() {
             commands::audio::peek_capture_energy,
             commands::capture::delete_session_wav,
             commands::capture::delete_audio_files,
+            commands::capture::audio_files_exist,
             commands::transcription::get_available_models,
             commands::transcription::download_model,
             commands::transcription::delete_model,
@@ -315,6 +327,81 @@ pub fn run() {
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
             commands::logs::log_frontend,
+            db_service::db_execute,
+            db_service::db_select,
+            commands::export::write_text_file,
+        ]);
+    #[cfg(feature = "sync")]
+    let specta_builder =
+        tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
+            commands::health_check,
+            commands::backend_ready,
+            commands::audio::list_audio_devices,
+            commands::audio::get_default_input_device,
+            commands::audio::start_capture,
+            commands::audio::stop_capture,
+            commands::audio::get_capture_status,
+            commands::audio::check_system_audio_permission,
+            commands::audio::get_buffer_info,
+            commands::audio::peek_capture_energy,
+            commands::capture::delete_session_wav,
+            commands::capture::delete_audio_files,
+            commands::capture::audio_files_exist,
+            commands::transcription::get_available_models,
+            commands::transcription::download_model,
+            commands::transcription::delete_model,
+            commands::transcription::init_transcription_client,
+            commands::transcription::shutdown_transcription_client,
+            commands::transcription::get_transcription_status,
+            commands::transcription::get_engine_catalogue,
+            commands::transcription::get_parakeet_models,
+            commands::transcription::get_recommended_parakeet_variant,
+            commands::transcription::download_parakeet_model,
+            commands::transcription::delete_parakeet_model,
+            commands::transcription::get_sortformer_status,
+            commands::transcription::download_sortformer_model,
+            commands::transcription::delete_sortformer_model,
+            commands::live_transcription::start_live_transcription,
+            commands::live_transcription::stop_live_transcription,
+            commands::live_transcription::get_live_transcription_status,
+            commands::live_transcription::update_vocabulary_hints,
+            commands::dictation::clipboard_paste,
+            commands::system_volume::apply_volume_duck,
+            commands::system_volume::restore_volume,
+            commands::permissions::check_screen_capture_permission,
+            commands::permissions::request_screen_capture_permission,
+            commands::get_autostart_enabled,
+            commands::set_autostart_enabled,
+            commands::show_overlay_panel,
+            commands::hide_overlay_panel,
+            commands::get_cursor_position,
+            commands::set_overlay_ignore_cursor_events,
+            commands::logs::get_recent_logs,
+            commands::logs::clear_logs,
+            commands::logs::get_log_dir,
+            commands::logs::reveal_log_dir,
+            commands::logs::log_frontend,
+            db_service::db_execute,
+            db_service::db_select,
+            sync::sync_probe,
+            sync::sync_status,
+            sync::sync_signup,
+            sync::sync_login_begin,
+            sync::sync_login_finish,
+            sync::sync_recover,
+            sync::sync_enable,
+            sync::sync_approve_device,
+            sync::sync_sign_out,
+            sync::sync_forget_account,
+            sync::audio_enqueue_session,
+            sync::audio_retry_failed_uploads,
+            sync::sync_retry_crypto_quarantine,
+            sync::audio_enqueue_dictation,
+            sync::audio_prepare_part,
+            sync::audio_cancel_part,
+            sync::audio_release_part,
+            sync::audio_cache_stats,
+            sync::audio_cache_clear,
             commands::export::write_text_file,
         ]);
 
@@ -379,12 +466,12 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_http::init())
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:yapstack.db", db::migrations())
-                .build(),
-        );
+        .plugin(tauri_plugin_http::init());
+    // NOTE: tauri-plugin-sql was removed (Option A′ stage 2). The app's live
+    // `yapstack.db` is now served by the repo-owned `db_service` command backend
+    // (see `db_service::db_execute` / `db_select`), which owns a cr-sqlite-capable
+    // connection pool and runs the migration list in-repo. The service and its
+    // startup migrations are created in `setup`, before `backend_ready` is set.
 
     // Only init Aptabase when the key was provided at compile time (prod builds)
     if let Some(key) = option_env!("APTABASE_KEY") {
@@ -544,8 +631,11 @@ pub fn run() {
 
             // Initialise tracing → stderr + rotating file + UI ring buffer.
             // Must happen before other state registration so those log lines
-            // are captured. The WorkerGuard is managed so the non-blocking
-            // file writer survives for the lifetime of the app.
+            // are captured. The WorkerGuard is managed so the non-blocking file
+            // writer survives for the lifetime of the app. `logging::init` also
+            // installs the R7 crash-durable panic hook, which fsyncs the ring
+            // buffer + the panic to `yapstack-panic.log` — so a `panic=abort`
+            // (where the non-blocking tail is lost) still leaves evidence.
             let log_dir = app
                 .path()
                 .app_log_dir()
@@ -575,12 +665,116 @@ pub fn run() {
                 .map(|p| p.join("yapstack.db"))
                 .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
 
+            // Fresh-install durability (R7): the OLD tauri-plugin-sql created
+            // the app-data / config directories implicitly before opening the
+            // DB. We now own the DB open (`db_service`), and SQLite CANNOT
+            // create intermediate directories — so on a CLEAN install (no
+            // pre-existing %APPDATA% / %LOCALAPPDATA% dirs, e.g. after an
+            // uninstall + app-data wipe) `Connection::open(yapstack.db)` fails
+            // with SQLITE_CANTOPEN. Under the release profile's `panic=abort`
+            // the old `.expect()` on that failure aborted the whole app, leaving
+            // no log evidence. Every prior Windows round masked this because it
+            // was an UPGRADE install (the dirs already existed). Create every
+            // app-owned directory up front, before anything opens a file inside
+            // it. (`db_service` also create_dir_all's the DB parent defensively
+            // for every open path; this is the earliest, coarsest guarantee.)
+            std::fs::create_dir_all(&app_data_dir).ok();
+            if let Some(config_dir) = db_path.parent() {
+                std::fs::create_dir_all(config_dir).ok();
+            }
+
             // Manage every command dependency BEFORE the db/filesystem sweeps
             // below: the webviews load concurrently with this hook, and a
             // command invoked before its state is managed fails with
             // "state not managed". (The frontend additionally gates on
             // `backend_ready`, set at the end of setup.)
             app.manage(Arc::new(db_path.clone()) as DbPath);
+
+            // R6 item 4(c): resolve the credential-store home (SESSION_STORE_DIR) and warm
+            // the credential cache FIRST — before `recover_interrupted_cutover` and
+            // `DbService::open`. `session_enc_path()` falls back to `std::env::temp_dir()`
+            // until SESSION_STORE_DIR is set, so ANY session read that raced ahead of the old
+            // init point (line ~692) resolved the sealed `sync-session.enc` to the temp dir at
+            // boot while sign-in wrote it under the config dir — a write/read PATH MISMATCH
+            // that reads as "signed out on every restart". Setting it here makes the boot-read
+            // and sign-in-write paths provably identical, and emits the once-per-boot session
+            // trace (which logs the RESOLVED path + backend outcome) at the earliest safe point.
+            #[cfg(feature = "sync")]
+            match app.path().app_config_dir() {
+                Ok(config_dir) => sync::init_credential_store(&config_dir),
+                // R10 fix 2: NEVER silently skip credential-store init. Leaving SESSION_STORE_DIR
+                // unset makes release session resolution hard-ERROR (no %TEMP% fallback) rather
+                // than sealing the real session under a temp dir — but that must be LOUD so the
+                // root cause (app_config_dir unresolved) is visible instead of a silent
+                // signed-out-forever. Fail-safe: the store stays uninitialized (the error path),
+                // it is NOT redirected to a temp fallback.
+                Err(e) => {
+                    tracing::error!(
+                        "sync: app_config_dir() failed ({e}); credential store left UNINITIALIZED — session reads will degrade and sign-in will fail loudly rather than write to %TEMP%"
+                    );
+                }
+            }
+
+            // F1.2: recover any CRR cutover that was interrupted by a crash/kill
+            // BEFORE opening the DB. `DbService::open` would otherwise CREATE an empty
+            // `yapstack.db` over a mid-swap state (live renamed to backup, staging not
+            // yet swapped in) and the auto-cutover would then destroy the leftovers —
+            // silent total data loss. Recovery reads the durable cutover journal and
+            // completes or rolls back the swap deterministically, so `open` below always
+            // sees the real data (or a genuinely fresh install). Sync-feature-only: a
+            // cutover (and thus a journal) can only exist under the `sync` feature.
+            #[cfg(feature = "sync")]
+            sync::recover_interrupted_cutover(&db_path);
+
+            // Repo-owned DB command backend (Option A′ stage 2). Opening the
+            // service runs the in-repo migration list on its writer connection
+            // BEFORE any `db_execute`/`db_select` command can be served, and
+            // before `backend_ready` unblocks the frontend. Migration continuity
+            // with the removed tauri-plugin-sql is preserved via the existing
+            // `_sqlx_migrations` bookkeeping (see `db_service::run_migrations`).
+            // Graceful open (R7): if the DB still cannot be opened after the
+            // dir-creation above (genuine disk/permission failure, corruption),
+            // do NOT `.expect()` — a panic here aborts under release
+            // `panic=abort` and, worse, leaves no diagnosis. Log the concrete
+            // path + error (blocking writer → durable) and return a graceful
+            // setup error, which fails the Tauri build path cleanly (the
+            // top-level `unwrap_or_else` prints and exits(1)) instead of an
+            // evidence-free abort.
+            let db_service: db_service::DbServiceState = match db_service::DbService::open(&db_path) {
+                Ok(svc) => Arc::new(svc),
+                Err(e) => {
+                    tracing::error!(
+                        db_path = %db_path.display(),
+                        "fatal: failed to open the local database: {e}"
+                    );
+                    return Err(Box::new(std::io::Error::other(format!(
+                        "failed to open the local database at {}: {e}",
+                        db_path.display()
+                    ))));
+                }
+            };
+            app.manage(db_service.clone());
+
+            // YapStack Sync runtime (deliverable A): manage the drain handle and,
+            // if the keychain holds an enabled session, start the encrypted
+            // push/pull drain on its own dedicated single-thread runtime. No-op
+            // when signed out. Entirely behind the `sync` cargo feature.
+            #[cfg(feature = "sync")]
+            {
+                // Credential store home + cache warm-up already ran above (before the DB open),
+                // so `sync_status` never re-reads the keychain per call (T020) AND the sealed
+                // session path is deterministic before any read (R6 item 4c).
+                app.manage(sync::cred_cache_handle());
+                let sync_runtime: sync::SyncRuntimeState =
+                    Arc::new(StdMutex::new(None));
+                app.manage(sync_runtime.clone());
+                sync::start_drain_if_enabled(
+                    &app.handle().clone(),
+                    &db_path,
+                    &sync_runtime,
+                    &db_service,
+                );
+            }
 
             let model_manager = ModelManager::new(app_data_dir.clone());
             app.manage(
@@ -600,7 +794,18 @@ pub fn run() {
             app.manage(Arc::new(commands::transcription::DictationOwnsMic::new())
                 as commands::transcription::DictationOwnsMicState);
 
-            db::ensure_runtime_schema(&db_path);
+            // LIVE_SESSION_STATE.md D1-final / D7: the boot orphan sweep is owner-scoped by
+            // this device's `device_fingerprint`. Sourced from the credential cache warmed by
+            // `init_credential_store` above (line ~690, which R6 hoisted to precede this
+            // sweep), so the read is cheap and non-blocking — a public hash only, never key
+            // material. `None` when sync is unconfigured / identity unloadable (sweep then
+            // touches nothing on a CRR-prepared DB — never guesses) or the `sync` feature is
+            // off (single-device semantics).
+            #[cfg(feature = "sync")]
+            let me = sync::current_device_fingerprint();
+            #[cfg(not(feature = "sync"))]
+            let me: Option<String> = None;
+            db::ensure_runtime_schema(&db_path, me.as_deref());
 
             // Seed the trusted-audio-dirs set from existing parts rows + the
             // default audio dir, then sweep those dirs for orphan files left
@@ -921,6 +1126,67 @@ mod tests {
 
         assert!(!is_allowed_audio_path(&base, &outside));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R7 fresh-install boot regression: run the setup-equivalent boot sequence
+    /// against a COMPLETELY EMPTY temp tree — no app-data, config, or log dirs
+    /// exist — and assert a clean startup with a usable, empty DB. This is the
+    /// test that would have caught the fresh-Windows-install crash: the app-data
+    /// / config dir is absent, SQLite cannot create it, and (before the fix) the
+    /// DB open aborted the app under release `panic=abort`.
+    ///
+    /// AppHandle-bound steps (`logging::init`, `sync::start_drain_if_enabled`)
+    /// and process-global steps (`sync::init_credential_store`, which only READS
+    /// and returns "signed out" on a missing store) cannot be driven without a
+    /// live Tauri app, so their fresh-state safety is asserted by construction;
+    /// the load-bearing crash — directory-less DB open + migrations — is proven
+    /// here directly.
+    #[test]
+    fn fresh_install_boot_sequence_on_empty_tree() {
+        // A pristine root standing in for a machine with NOTHING under the app's
+        // %APPDATA%/%LOCALAPPDATA% (post uninstall + wipe). The three app-owned
+        // dirs are named but do NOT exist yet.
+        let root = test_temp_dir();
+        let app_data_dir = root.join("app-data");
+        let config_dir = root.join("config");
+        let log_dir = root.join("logs");
+        for d in [&app_data_dir, &config_dir, &log_dir] {
+            assert!(!d.exists(), "precondition: {} must be absent", d.display());
+        }
+
+        // Step 1 — setup's up-front directory creation (mirrors lib.rs setup).
+        std::fs::create_dir_all(&log_dir).ok();
+        std::fs::create_dir_all(&app_data_dir).ok();
+        std::fs::create_dir_all(&config_dir).ok();
+
+        // Step 2 — resolve the DB path exactly as setup does.
+        let db_path = config_dir.join("yapstack.db");
+
+        // Step 3 — interrupted-cutover recovery runs BEFORE the DB open. On an
+        // empty tree there is no journal and no live DB: it must be a clean
+        // no-op and must NOT panic. (Sync-feature-only, like setup.)
+        #[cfg(feature = "sync")]
+        sync::recover_interrupted_cutover(&db_path);
+
+        // Step 4 — open the repo-owned DB service (runs migrations on a truly
+        // fresh DB). This is the exact call that crashed a clean install.
+        let db_service =
+            db_service::DbService::open(&db_path).expect("fresh-install DB open must succeed");
+        assert!(db_path.exists(), "DB file created on the fresh tree");
+
+        // Step 5 — the DB is migrated, usable, and empty.
+        let rows = db_service
+            .select("SELECT COUNT(*) AS c FROM sessions", &[])
+            .expect("query the fresh empty DB");
+        assert_eq!(rows[0]["c"], serde_json::json!(0), "fresh DB is empty");
+
+        // Every app-owned directory now exists — nothing in the boot path
+        // assumed pre-existing state.
+        for d in [&app_data_dir, &config_dir, &log_dir] {
+            assert!(d.exists(), "{} must exist after boot", d.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

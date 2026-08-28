@@ -28,6 +28,7 @@ import { trackUpdateInstallStarted, trackUpdateInstallFailed } from "@/lib/analy
 export function GeneralTab() {
   const theme = useAppStore((s) => s.settings.theme);
   const showRecordingIndicator = useAppStore((s) => s.settings.showRecordingIndicator);
+  const analyticsEnabled = useAppStore((s) => s.settings.analyticsEnabled);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const clearAllSessions = useAppStore((s) => s.clearAllSessions);
   const isRecording = useAppStore((s) => s.liveTranscriptionActive);
@@ -279,6 +280,27 @@ export function GeneralTab() {
           <PlayCircle className="h-3.5 w-3.5" />
           Replay
         </Button>
+      </div>
+
+      <Separator />
+
+      {/* Analytics */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="space-y-0.5">
+          <Label className="text-xs">Share anonymous usage analytics</Label>
+          <p className="text-[10px] text-muted-foreground">
+            Anonymous product events only — never transcripts, audio, note
+            content, or file names. Turning this off stops new events
+            immediately; events already queued this session may still be sent
+            within about a minute. This choice stays on this device and is never
+            synced.
+          </p>
+        </div>
+        <Switch
+          size="sm"
+          checked={analyticsEnabled}
+          onCheckedChange={(checked) => updateSettings({ analyticsEnabled: checked })}
+        />
       </div>
 
       <Separator />

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "yapstack-server"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "YapStack blind relay (World B): a store-and-fan-out server that sees only ciphertext. Auth per CRYPTO_SPEC §3, RLS metadata isolation, and the entitlements seam wiring. It never runs the CRDT engine, never decrypts, and makes zero outbound calls."
+
+[[bin]]
+name = "yapstack-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yapstack-common = { path = "../yapstack-common" }
+yapstack-crypto = { path = "../yapstack-crypto" }
+yapstack-entitlements = { path = "../yapstack-entitlements" }
+axum = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+futures-util = { workspace = true }
+ed25519-dalek = "2"
+zeroize = "1"
+# Audio D8: the single outbound call the relay makes — a metadata-only HEAD to object
+# storage to confirm a blob object exists before reporting `already_exists` (never bytes,
+# never plaintext). Same 0.12 rustls stack the desktop sync runtime uses.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

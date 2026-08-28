@@ -21,6 +21,7 @@ export function makeSession(overrides: Partial<DbSession> = {}): DbSession {
     pinned_at: null,
     session_type: "transcription",
     sort_order: 0,
+    recording_device_id: null,
     ...overrides,
   };
 }

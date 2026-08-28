@@ -1,0 +1,970 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Gate 4 (T008) integration tests against a LIVE Postgres. `#[ignore]`-gated because
+//! the CI-check environment has no Postgres (sqlx runtime queries, no compile-time
+//! `DATABASE_URL`). Run locally:
+//!
+//! ```text
+//! createdb yapstack_test
+//! DATABASE_URL=postgres://localhost/yapstack_test cargo test -p yapstack-server -- --ignored
+//! ```
+//!
+//! T009 review targets exercised here: commit-ordered `changeset_seq` monotonicity +
+//! gap-freeness UNDER CONCURRENCY, push idempotency, completeness math + per-client
+//! tails (A3), the choke-point 429, admin Ed25519 verify + replay rejection, and audio
+//! ciphertext-hash dedup.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tower::ServiceExt;
+use uuid::Uuid;
+use yapstack_server::{build_router, AppState, Config};
+
+// --------------------------------------------------------------------- harness
+
+fn admin_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[42u8; 32])
+}
+
+async fn setup(with_admin: bool) -> AppState {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for --ignored tests");
+    let pool = yapstack_server::db::connect(&url).await.unwrap();
+    yapstack_server::db::migrate(&pool).await.unwrap();
+    let mut toml = format!(
+        "database_url = \"{url}\"\njwt_secret = \"test-secret\"\nserver_pepper = \"test-pepper\"\n"
+    );
+    if with_admin {
+        let pk = B64.encode(admin_signing_key().verifying_key().to_bytes());
+        toml.push_str(&format!(
+            "\n[limits]\nadmin_public_key = \"ed25519:{pk}\"\nhelp_url = \"https://example.test/upgrade\"\n"
+        ));
+    }
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    AppState::new(pool, cfg)
+}
+
+async fn body_json(resp: axum::response::Response) -> Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn signup_body(email: &str) -> Value {
+    let salt_enc = [0x22u8; 16];
+    let auth_key = {
+        let stretch = yapstack_crypto::kdf::client_stretch(b"pw", &salt_enc).unwrap();
+        let (auth, _m) = yapstack_crypto::kdf::split_keys(&stretch);
+        B64.encode(auth)
+    };
+    let wrapped = B64.encode([0x01u8; 73]);
+    let vault_key = [0x33u8; 32];
+    let client_id = Uuid::new_v4();
+    let sk = yapstack_crypto::sign::roster_signing_key(&vault_key);
+    let roster = json!({ "version": 1, "counter": 0, "vault_key_epoch": 0 });
+    let sig = yapstack_crypto::sign::sign_roster(&vault_key, roster.to_string().as_bytes());
+    json!({
+        "email": email, "auth_key": auth_key, "salt_enc": B64.encode(salt_enc),
+        // Required by SignupRequest since T010d (recovery-code auth path). This suite
+        // never exercises /auth/recover, so any well-formed opaque value suffices; the
+        // server only ever second-hashes it. Matches the auth_flow.rs fixture shape.
+        "recovery_auth_key": B64.encode([0x5au8; 20]),
+        "wrapped_vault_key_password": wrapped, "wrapped_vault_key_recovery": wrapped,
+        "device_list": {
+            "device_list": roster, "signature": B64.encode(sig),
+            "counter": 0, "vault_key_epoch": 0, "client_id": client_id,
+            "ed25519_pub": B64.encode(sk.verifying_key().to_bytes()), "label": "d"
+        }
+    })
+}
+
+/// Signup and return `(access_token, tenant_id)`.
+async fn signup(app: &axum::Router) -> (String, Uuid) {
+    let email = format!("t-{}@example.com", Uuid::new_v4());
+    let resp = post(app, "/auth/signup", None, signup_body(&email)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    (
+        v["access_token"].as_str().unwrap().to_string(),
+        v["tenant_id"].as_str().unwrap().parse().unwrap(),
+    )
+}
+
+async fn post(
+    app: &axum::Router,
+    path: &str,
+    bearer: Option<&str>,
+    body: Value,
+) -> axum::response::Response {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = bearer {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    app.clone()
+        .oneshot(b.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn get(app: &axum::Router, path: &str, bearer: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn change(client_id: Uuid, client_seq: i64, payload: &[u8]) -> Value {
+    json!({
+        "client_id": client_id, "client_seq": client_seq,
+        "ciphertext": B64.encode(payload), "schema_version": 22, "engine_version": 16003
+    })
+}
+
+// --------------------------------------------------------------------- tests
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn push_assigns_dense_seqs_and_is_idempotent() {
+    let app = build_router(setup(false).await);
+    let (tok, _tenant) = signup(&app).await;
+    let dev = Uuid::new_v4();
+
+    let batch = json!({ "changes": [change(dev, 1, b"a"), change(dev, 2, b"bb")] });
+    let resp = post(&app, "/sync/push", Some(&tok), batch.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["acks"][0]["changeset_seq"], 1);
+    assert_eq!(v["acks"][1]["changeset_seq"], 2);
+    assert_eq!(v["max_changeset_seq"], 2);
+
+    // Re-push the SAME (client_id, client_seq) pairs → original seqs, deduplicated.
+    let resp = post(&app, "/sync/push", Some(&tok), batch).await;
+    let v = body_json(resp).await;
+    assert_eq!(v["acks"][0]["changeset_seq"], 1);
+    assert_eq!(v["acks"][0]["deduplicated"], true);
+    assert_eq!(
+        v["max_changeset_seq"], 2,
+        "no new seqs consumed on a dup re-push"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn push_rejects_seq_regression_but_allows_identical_retry() {
+    // G3 — the idempotency branch must distinguish a benign retry from a counter REGRESSION.
+    // Same (client_id, client_seq) with IDENTICAL ciphertext is a retry (dedup ack, 200). The
+    // SAME pair with DIFFERENT ciphertext can only be a client whose counter regressed (a DB
+    // restore) re-minting a reused seq over new content — silently deduplicating it would
+    // swallow that write (the confirmed bug), so it must fail loudly with a 409.
+    let app = build_router(setup(false).await);
+    let (tok, _t) = signup(&app).await;
+    let dev = Uuid::new_v4();
+
+    let first = json!({ "changes": [change(dev, 1, b"original-content")] });
+    let resp = post(&app, "/sync/push", Some(&tok), first.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["acks"][0]["deduplicated"], false);
+
+    // Benign idempotent retry: same pair, IDENTICAL ciphertext → dedup ack, 200.
+    let resp = post(&app, "/sync/push", Some(&tok), first).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["acks"][0]["deduplicated"], true);
+
+    // Counter regression: same pair, DIFFERENT ciphertext → 409, never a silent dedup.
+    let regressed = json!({ "changes": [change(dev, 1, b"different-after-restore")] });
+    let resp = post(&app, "/sync/push", Some(&tok), regressed).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a reused seq carrying different content must 409, not silently deduplicate"
+    );
+
+    // The rejection did not consume a seq or store anything new: the relay still holds exactly
+    // the one original changeset.
+    let v = body_json(get(&app, "/sync/completeness", &tok).await).await;
+    assert_eq!(v["max_changeset_seq"], 1);
+    assert_eq!(v["count"], 1);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn concurrent_pushes_are_gap_free_and_monotonic() {
+    let app = build_router(setup(false).await);
+    let (tok, _tenant) = signup(&app).await;
+
+    // 20 devices each push one change concurrently.
+    let mut handles = Vec::new();
+    for i in 0..20u32 {
+        let app = app.clone();
+        let tok = tok.clone();
+        handles.push(tokio::spawn(async move {
+            let dev = Uuid::new_v4();
+            let batch = json!({ "changes": [change(dev, 1, &i.to_le_bytes())] });
+            let resp = post(&app, "/sync/push", Some(&tok), batch).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let resp = get(&app, "/sync/completeness", &tok).await;
+    let v = body_json(resp).await;
+    assert_eq!(v["max_changeset_seq"], 20);
+    assert_eq!(v["count"], 20);
+    assert_eq!(v["contiguous"], true, "dense, gap-free under concurrency");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn completeness_reports_contiguous_and_client_tails() {
+    let app = build_router(setup(false).await);
+    let (tok, _t) = signup(&app).await;
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    post(
+        &app,
+        "/sync/push",
+        Some(&tok),
+        json!({ "changes": [change(a, 1, b"x"), change(a, 2, b"y")] }),
+    )
+    .await;
+    post(
+        &app,
+        "/sync/push",
+        Some(&tok),
+        json!({ "changes": [change(b, 1, b"z")] }),
+    )
+    .await;
+
+    let v = body_json(get(&app, "/sync/completeness", &tok).await).await;
+    assert_eq!(v["max_changeset_seq"], 3);
+    assert_eq!(v["contiguous"], true);
+    // A3: per-client tails let a device detect a silently-dropped stream tail.
+    let tails = v["per_client"].as_array().unwrap();
+    let tail_a = tails
+        .iter()
+        .find(|t| t["client_id"] == a.to_string())
+        .unwrap();
+    assert_eq!(tail_a["max_client_seq"], 2);
+
+    // Pull returns dense ciphertext in commit order.
+    let v = body_json(get(&app, "/sync/pull?since=0&limit=10", &tok).await).await;
+    assert_eq!(v["changes"].as_array().unwrap().len(), 3);
+    assert_eq!(v["changes"][0]["changeset_seq"], 1);
+    assert_eq!(v["has_more"], false);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn choke_point_returns_429_quota_exceeded() {
+    let app = build_router(setup(true).await);
+    let (tok, tenant) = signup(&app).await;
+
+    // Push a tiny upload cap via the signed admin endpoint.
+    admin_put_limits(
+        &app,
+        tenant,
+        json!({
+            "plan": "test",
+            "storage_bytes": { "limit": 0, "unlimited": true },
+            "upload_bytes_period": { "limit": 4, "unlimited": false },
+            "share_count": { "limit": 0, "unlimited": true },
+            "device_count": { "limit": 0, "unlimited": true },
+            "state": "active"
+        }),
+    )
+    .await;
+
+    // 8 bytes > 4-byte cap → 429 with the published quota_exceeded shape.
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok),
+        json!({ "changes": [change(Uuid::new_v4(), 1, b"12345678")] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let v = body_json(resp).await;
+    assert_eq!(v["code"], "quota_exceeded");
+    assert_eq!(v["resource"], "upload_bytes_period");
+    assert_eq!(v["limit"], 4);
+    assert_eq!(v["help_url"], "https://example.test/upgrade");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn admin_signature_and_replay_are_enforced() {
+    let app = build_router(setup(true).await);
+    let (_tok, tenant) = signup(&app).await;
+    let body = json!({
+        "plan": "pro",
+        "storage_bytes": { "limit": 1000, "unlimited": false },
+        "upload_bytes_period": { "limit": 1000, "unlimited": false },
+        "share_count": { "limit": 5, "unlimited": false },
+        "device_count": { "limit": 5, "unlimited": false },
+        "state": "active"
+    });
+
+    // A bad signature is rejected.
+    let path = format!("/admin/v1/tenants/{tenant}/limits");
+    let resp = admin_request(
+        &app,
+        "PUT",
+        &path,
+        &body.to_string(),
+        Some("bad-nonce"),
+        Some(&[0u8; 64]),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A valid signature is accepted...
+    let resp = admin_put_limits(&app, tenant, body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // ...and StoredLimits now reads what admin wrote (usage GET works, signed).
+    let usage_path = format!("/admin/v1/tenants/{tenant}/usage");
+    let resp = admin_request(&app, "GET", &usage_path, "", None, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn admin_nonce_replay_is_rejected() {
+    let app = build_router(setup(true).await);
+    let (_tok, tenant) = signup(&app).await;
+    let body = json!({
+        "plan": "pro",
+        "storage_bytes": { "limit": 1, "unlimited": true },
+        "upload_bytes_period": { "limit": 1, "unlimited": true },
+        "share_count": { "limit": 1, "unlimited": true },
+        "device_count": { "limit": 1, "unlimited": true },
+        "state": "active"
+    })
+    .to_string();
+    let path = format!("/admin/v1/tenants/{tenant}/limits");
+    let nonce = format!("nonce-{}", Uuid::new_v4());
+
+    let (ts, sig) = sign_admin("PUT", &path, &body, &nonce);
+    let first = admin_request_raw(&app, "PUT", &path, &body, &nonce, ts, &sig).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    // Exact same signed request replayed → rejected on the single-use nonce.
+    let replay = admin_request_raw(&app, "PUT", &path, &body, &nonce, ts, &sig).await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn audio_presign_d8_refcount_and_dead_put_never_false_done() {
+    // Audio round-trip D6/D8. Storage points at a REFUSED port (127.0.0.1:1) so the D8
+    // existence HEAD deterministically resolves to "object absent" — modelling a world
+    // where no PUT has landed yet. The invariants proven WITHOUT MinIO:
+    //   (1) a novel hash → a fresh upload_url (not already_exists);
+    //   (2) a distinct part with the SAME content, while the object is still absent →
+    //       still a fresh upload_url AND refcount ends at 2 (mapping-count invariant, D8);
+    //   (3) re-presigning the SAME part after a dead PUT → a FRESH upload_url (never a
+    //       false already_exists/`done`) and the refcount is NOT inflated (idempotent).
+    //   (4) the choke meters the new blob EXACTLY ONCE across all of the above.
+    let base = setup(false).await;
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let cfg = Config::from_toml_str(&format!(
+        "database_url = \"{url}\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n\n\
+         [storage]\nendpoint = \"http://127.0.0.1:1\"\nregion = \"us-east-1\"\n\
+         bucket = \"yap\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\n"
+    ))
+    .unwrap();
+    let state = AppState::new(base.pool.clone(), cfg);
+    let pool = state.pool.clone();
+    let app = build_router(state);
+    let (tok, tenant) = signup(&app).await;
+
+    let sha = "a".repeat(64);
+    let hash_bytes = hex::decode(&sha).unwrap();
+    let sess = Uuid::new_v4();
+    let part1 = Uuid::new_v4();
+    let part2 = Uuid::new_v4();
+    let size = 1024u64;
+
+    let presign = |part: Uuid| {
+        let (app, tok, sha, sess) = (app.clone(), tok.clone(), sha.clone(), sess);
+        async move {
+            body_json(
+                post(
+                    &app,
+                    &format!(
+                        "/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"
+                    ),
+                    Some(&tok),
+                    json!({}),
+                )
+                .await,
+            )
+            .await
+        }
+    };
+
+    // (1) novel hash → fresh upload_url.
+    let v = presign(part1).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "novel blob is not already_exists"
+    );
+    assert!(v["upload_url"].is_string(), "novel blob gets an upload_url");
+
+    // (2) distinct part, same content, object still absent → upload_url + refcount 2.
+    let v = presign(part2).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "object is absent (dead/unmade PUT) → never a phantom already_exists"
+    );
+    assert!(v["upload_url"].is_string());
+    assert_eq!(
+        refcount(&pool, tenant, &hash_bytes).await,
+        2,
+        "two distinct-part mappings → refcount 2"
+    );
+
+    // (3) dead-PUT retry on the SAME part → fresh upload_url, refcount unchanged (no double count).
+    let v = presign(part1).await;
+    assert_eq!(
+        v["already_exists"], false,
+        "a dead-PUT re-presign must return a fresh upload_url, not a false done"
+    );
+    assert!(v["upload_url"].is_string());
+    assert_eq!(
+        refcount(&pool, tenant, &hash_bytes).await,
+        2,
+        "a same-part idempotent retry must not inflate the refcount"
+    );
+
+    // (4) the choke metered the blob's declared size EXACTLY ONCE (first presign only).
+    assert_eq!(
+        storage_used(&pool, tenant).await,
+        size as i64,
+        "new blob metered once; D8 re-presigns and dedup mappings meter nothing"
+    );
+}
+
+/// MinIO-gated: `already_exists` is reported ONLY when the object is actually present.
+/// Requires a reachable object store — set `S3_ENDPOINT` (+ optional `S3_BUCKET`,
+/// `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`) to the deploy stack's MinIO. When unset
+/// the test is skipped (returns early) rather than failing.
+#[tokio::test]
+#[ignore = "requires a live Postgres AND a reachable MinIO (S3_ENDPOINT)"]
+async fn audio_presign_reports_already_exists_only_when_object_present() {
+    let Some((cfg_toml, endpoint, bucket, ak, sk, region)) = minio_env() else {
+        eprintln!("SKIP: S3_ENDPOINT unset — no reachable object store");
+        return;
+    };
+    let base = setup(false).await;
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let cfg = Config::from_toml_str(&format!(
+        "database_url = \"{url}\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n{cfg_toml}"
+    ))
+    .unwrap();
+    let app = build_router(AppState::new(base.pool.clone(), cfg));
+    let (tok, tenant) = signup(&app).await;
+
+    // A no-plaintext canary: the plaintext WAV carries a known marker; assert the stored
+    // OBJECT bytes never contain it (extends the DB no-plaintext grep to object storage).
+    let marker = b"YAPSTACK-CANARY-PLAINTEXT-MARKER";
+    let mut plaintext = b"RIFF....WAVE".to_vec();
+    plaintext.extend_from_slice(marker);
+    // Seal a real audio blob under a throwaway vault key so the ciphertext is genuine.
+    let vault = [0x24u8; 32];
+    let id = yapstack_crypto::audio_stream::AudioIdentity {
+        tenant_id: *tenant.as_bytes(),
+        session_id: [0x22; 16],
+        part_id: [0x33; 16],
+        epoch: 0,
+    };
+    let mut blob = Vec::new();
+    yapstack_crypto::audio_stream::seal_blob(&vault, &id, &plaintext[..], &mut blob).unwrap();
+    assert!(
+        !contains(&blob, marker),
+        "sealed blob must not contain the plaintext marker"
+    );
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&blob));
+
+    let sess = Uuid::new_v4();
+    let part = Uuid::new_v4();
+    let size = blob.len() as u64;
+
+    // First presign → upload_url (object absent).
+    let v = body_json(
+        post(
+            &app,
+            &format!("/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"),
+            Some(&tok),
+            json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(v["already_exists"], false);
+    let put_url = v["upload_url"].as_str().unwrap().to_string();
+    let object_key = v["object_key"].as_str().unwrap().to_string();
+
+    // PUT the ciphertext directly to object storage (content-length pinned).
+    let client = reqwest::Client::new();
+    let put = client
+        .put(&put_url)
+        .header("content-length", size)
+        .body(blob.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        put.status().is_success(),
+        "direct PUT to MinIO failed: {}",
+        put.status()
+    );
+
+    // Re-presign the SAME part now that the object exists → already_exists, no upload_url.
+    let v = body_json(
+        post(
+            &app,
+            &format!("/audio/presign?sha256={sha}&size={size}&part_id={part}&session_id={sess}"),
+            Some(&tok),
+            json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(v["already_exists"], true, "present object → already_exists");
+    assert!(v["upload_url"].is_null());
+
+    // No-plaintext canary against the STORED object bytes.
+    let get_url = format!(
+        "{}/{}/{}",
+        endpoint.trim_end_matches('/'),
+        bucket,
+        object_key
+    );
+    let _ = (ak, sk, region); // creds are baked into the presign; the raw GET here is dev-only
+                              // Fetch via a fresh presigned GET through the relay (302 → storage) so creds are correct.
+    let resp = get(&app, &format!("/audio/part/{part}"), &tok).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let obj = client
+        .get(&loc)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(
+        !contains(&obj, marker),
+        "MinIO object bytes must not contain the plaintext marker (no-plaintext canary)"
+    );
+    assert_eq!(
+        &obj[..],
+        &blob[..],
+        "stored object is the exact ciphertext blob"
+    );
+    let _ = get_url;
+}
+
+/// Read the refcount for a hash as the tenant (RLS-scoped).
+async fn refcount(pool: &sqlx::PgPool, tenant: Uuid, hash: &[u8]) -> i64 {
+    let mut tx = yapstack_server::db::begin_tenant_tx(pool, tenant)
+        .await
+        .unwrap();
+    let (rc,): (i64,) = sqlx::query_as(
+        "SELECT refcount FROM audio_blobs WHERE workspace_id = $1 AND ciphertext_sha256 = $2",
+    )
+    .bind(tenant)
+    .bind(hash)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    rc
+}
+
+/// Read the metered storage_bytes for the tenant.
+async fn storage_used(pool: &sqlx::PgPool, tenant: Uuid) -> i64 {
+    let mut tx = yapstack_server::db::begin_tenant_tx(pool, tenant)
+        .await
+        .unwrap();
+    let (used,): (i64,) =
+        sqlx::query_as("SELECT coalesce(storage_bytes, 0) FROM tenant_usage WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap()
+            .unwrap_or((0,));
+    tx.commit().await.unwrap();
+    used
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// MinIO connection from env, or `None` to skip. Returns a `[storage]` TOML block plus the
+/// individual fields for the raw canary GET.
+fn minio_env() -> Option<(String, String, String, String, String, String)> {
+    let endpoint = std::env::var("S3_ENDPOINT").ok()?;
+    let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "yapstack".into());
+    let ak = std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let sk = std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let toml = format!(
+        "\n[storage]\nendpoint = \"{endpoint}\"\nregion = \"{region}\"\n\
+         bucket = \"{bucket}\"\naccess_key_id = \"{ak}\"\nsecret_access_key = \"{sk}\"\n"
+    );
+    Some((toml, endpoint, bucket, ak, sk, region))
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn cross_tenant_reads_are_denied_at_the_api() {
+    // §15 row 5 (Gap 3 / audit R5) — NEGATIVE cross-tenant isolation at the API surface, not
+    // just in-schema. Two independent signups mint two workspaces; neither JWT can read the
+    // other's changesets through /sync/pull or /sync/completeness, and — because the tenant is
+    // taken ONLY from the validated JWT (never request-shaped) — a push authenticated as B can
+    // only ever land in B's workspace, so A's served data never contains B's blob (and vice
+    // versa). This proves RLS DENIES cross-tenant reads at the API, the blind-relay tenancy
+    // guarantee.
+    let app = build_router(setup(false).await);
+    let (tok_a, tenant_a) = signup(&app).await;
+    let (tok_b, tenant_b) = signup(&app).await;
+    assert_ne!(
+        tenant_a, tenant_b,
+        "separate emails → separate workspaces (distinct tenants)"
+    );
+
+    // A pushes two distinctive blobs into A's workspace.
+    let dev_a = Uuid::new_v4();
+    let a_blob1 = b"A-SECRET-BLOB-alpha".to_vec();
+    let a_blob2 = b"A-SECRET-BLOB-bravo".to_vec();
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok_a),
+        json!({ "changes": [change(dev_a, 1, &a_blob1), change(dev_a, 2, &a_blob2)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A sees its own two changesets.
+    let va = body_json(get(&app, "/sync/completeness", &tok_a).await).await;
+    assert_eq!(va["count"], 2);
+    assert_eq!(va["max_changeset_seq"], 2);
+
+    // THE LOAD-BEARING NEGATIVE ASSERTION: B's JWT reads ZERO of A's blobs.
+    let vb_pull = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_b).await).await;
+    assert_eq!(
+        vb_pull["changes"].as_array().unwrap().len(),
+        0,
+        "tenant B must not read tenant A's changesets (RLS denies cross-tenant reads at the API)"
+    );
+    let vb = body_json(get(&app, "/sync/completeness", &tok_b).await).await;
+    assert_eq!(
+        vb["count"], 0,
+        "B's completeness reveals none of A's changesets"
+    );
+    assert_eq!(vb["max_changeset_seq"], 0);
+    assert!(
+        vb["per_client"].as_array().unwrap().is_empty(),
+        "B sees none of A's per-client tails"
+    );
+
+    // B pushes its own blob (authenticated as B → lands in B's workspace; there is no
+    // request field that could target A — the tenant comes from the JWT alone).
+    let dev_b = Uuid::new_v4();
+    let b_blob = b"B-SECRET-BLOB-charlie".to_vec();
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok_b),
+        json!({ "changes": [change(dev_b, 1, &b_blob)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // B's seq starts at 1 in ITS OWN workspace — a per-tenant sequence, not a shared global
+    // counter (further evidence the workspaces are isolated).
+    let vb2 = body_json(get(&app, "/sync/completeness", &tok_b).await).await;
+    assert_eq!(vb2["count"], 1);
+    assert_eq!(vb2["max_changeset_seq"], 1);
+
+    // AND THE MIRROR: A reads ZERO of B's blobs after B pushed.
+    let va_pull = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_a).await).await;
+    let a_changes = va_pull["changes"].as_array().unwrap();
+    assert_eq!(
+        a_changes.len(),
+        2,
+        "A still sees only its own two changesets"
+    );
+    for ch in a_changes {
+        let raw = B64.decode(ch["ciphertext"].as_str().unwrap()).unwrap();
+        assert_ne!(raw, b_blob, "A must never receive B's ciphertext");
+    }
+    let va2 = body_json(get(&app, "/sync/completeness", &tok_a).await).await;
+    assert_eq!(va2["count"], 2, "B's push did not leak into A's workspace");
+
+    // B's own pull returns EXACTLY its one blob and none of A's — the isolation is total.
+    let vb_pull2 = body_json(get(&app, "/sync/pull?since=0&limit=100", &tok_b).await).await;
+    let b_changes = vb_pull2["changes"].as_array().unwrap();
+    assert_eq!(b_changes.len(), 1, "B sees only its own one changeset");
+    let b_ct = B64
+        .decode(b_changes[0]["ciphertext"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(b_ct, b_blob);
+    for ch in b_changes {
+        let raw = B64.decode(ch["ciphertext"].as_str().unwrap()).unwrap();
+        assert_ne!(raw, a_blob1, "A's blob must never reach B");
+        assert_ne!(raw, a_blob2, "A's blob must never reach B");
+    }
+}
+
+/// Build a REAL client-side-encrypted changeset blob whose PLAINTEXT payload contains
+/// `sentinel`, mirroring the production two-envelope structure (a committing-wrapped random
+/// data key `||` a standard-sealed payload, per CRYPTO_SPEC §4/§5 and `ChangesetCipher`). The
+/// relay stores only these opaque bytes; the sentinel exists solely in the pre-encryption
+/// plaintext and MUST therefore never appear anywhere in the server's stored bytes.
+fn encrypt_canary_changeset(
+    vault_key: &[u8; 32],
+    tenant: Uuid,
+    client_id: Uuid,
+    client_seq: i64,
+    sentinel: &str,
+) -> Vec<u8> {
+    use rand::RngCore;
+    use yapstack_crypto::aead::{lp, seal_committing, seal_standard};
+    use yapstack_crypto::{DOMAIN_CHANGESET, VERSION};
+
+    let mut rng = rand::thread_rng();
+    let mut data_key = [0u8; 32];
+    let mut n_wrap = [0u8; 24];
+    let mut n_ct = [0u8; 24];
+    rng.fill_bytes(&mut data_key);
+    rng.fill_bytes(&mut n_wrap);
+    rng.fill_bytes(&mut n_ct);
+
+    // Wrap the per-changeset data key under the vault key (committing envelope, §4.2).
+    let wrap_aad = lp(&[&[VERSION], b"yapstack.wrap.data.v1", &0u32.to_be_bytes()]);
+    let wrapped = seal_committing(vault_key, &n_wrap, &data_key, &wrap_aad).unwrap();
+
+    // Seal the sentinel-bearing payload under the data key (standard envelope, §5.2 AAD).
+    let cs_aad = lp(&[
+        &[VERSION],
+        DOMAIN_CHANGESET,
+        tenant.as_bytes(),
+        client_id.as_bytes(),
+        &(client_seq as u64).to_be_bytes(),
+        &22u32.to_be_bytes(),
+        &16003u32.to_be_bytes(),
+    ]);
+    let plaintext = format!("changeset payload :: {sentinel} :: end").into_bytes();
+    let sealed = seal_standard(&data_key, &n_ct, &plaintext, &cs_aad).unwrap();
+
+    let mut blob = wrapped;
+    blob.extend_from_slice(&sealed);
+    // Sanity: the distinctive sentinel is in the plaintext but NOT in the ciphertext we push.
+    assert!(
+        !blob
+            .windows(sentinel.len())
+            .any(|w| w == sentinel.as_bytes()),
+        "encryption must not leave the sentinel in the pushed ciphertext"
+    );
+    blob
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn plaintext_sentinel_never_appears_in_stored_server_bytes() {
+    // §15 row 3 (Gap 4 / audit R3) — AUTOMATED no-plaintext regression gate, replacing the
+    // manual sweep. Push a changeset whose PLAINTEXT carries a distinctive random canary, then
+    // scan EVERY user-table column of the relay DB (bytea rendered via both encode(...,'escape')
+    // and encode(...,'hex'); everything else cast ::text) for the canary. The relay is a blind
+    // store: it must contain ZERO occurrences. This test FAILS if anyone ever stores plaintext
+    // server-side.
+    //
+    // Log half: capturing the server's tracing output inside this in-process oneshot-router
+    // harness is not feasible (tracing writes to a process-global subscriber, not a per-test
+    // sink). The log path stays covered by the standing tracing review (no content/URL/token
+    // is ever logged — verified in T009/T012/T012c). The DB half — the durable, most dangerous
+    // surface — is what this gate asserts automatically, honestly.
+    let state = setup(false).await;
+    let pool = state.pool.clone();
+    let app = build_router(state);
+    let (tok, tenant) = signup(&app).await;
+
+    let sentinel = format!("YAPSTACK_PLAINTEXT_CANARY_{}", Uuid::new_v4().simple());
+    let vault_key = [0x33u8; 32]; // matches the wrapped_vault_key fixture shape; value irrelevant to the relay
+    let dev = Uuid::new_v4();
+    let blob = encrypt_canary_changeset(&vault_key, tenant, dev, 1, &sentinel);
+
+    let resp = post(
+        &app,
+        "/sync/push",
+        Some(&tok),
+        json!({ "changes": [change(dev, 1, &blob)] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "canary changeset accepted");
+
+    // Scan under the tenant's RLS context so we can actually SEE the stored row (FORCE RLS
+    // otherwise hides it). The canary is THIS tenant's plaintext, so its only possible
+    // resting places are this tenant's rows (visible here) or a non-RLS table (visible
+    // regardless) — this context is complete for the canary.
+    let mut tx = yapstack_server::db::begin_tenant_tx(&pool, tenant)
+        .await
+        .unwrap();
+
+    // POSITIVE CONTROL: the scan actually reaches the stored ciphertext bytes. If this fails
+    // the sweep would be vacuous, so we assert it explicitly.
+    let blob_hex = hex::encode(&blob);
+    let seen: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM changesets WHERE position($1 in encode(ciphertext,'hex')) > 0",
+    )
+    .bind(&blob_hex)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        seen, 1,
+        "positive control: the pushed ciphertext must be visible to the scan (non-vacuous)"
+    );
+
+    // Enumerate every column of every base table in the public schema.
+    let cols: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.table_name, c.column_name, c.data_type \
+         FROM information_schema.columns c \
+         JOIN information_schema.tables t \
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+         WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' \
+         ORDER BY c.table_name, c.ordinal_position",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        cols.len() > 10,
+        "sanity: the sweep enumerated the relay's columns ({} found)",
+        cols.len()
+    );
+
+    let sentinel_hex = hex::encode(sentinel.as_bytes());
+    let mut hits: Vec<String> = Vec::new();
+    for (table, col, dtype) in &cols {
+        // Defensive: identifiers come from our own schema, but never interpolate a name that
+        // could break quoting.
+        if table.contains('"') || col.contains('"') {
+            continue;
+        }
+        let n: i64 = if dtype == "bytea" {
+            // Search the raw byte rendering (escape) for the ASCII canary AND the hex
+            // rendering for its hex form — catches plaintext however a bug might store it.
+            let sql = format!(
+                "SELECT count(*) FROM public.\"{table}\" \
+                 WHERE position($1 in encode(\"{col}\",'escape')) > 0 \
+                    OR position($2 in encode(\"{col}\",'hex')) > 0"
+            );
+            sqlx::query_scalar(&sql)
+                .bind(&sentinel)
+                .bind(&sentinel_hex)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        } else {
+            let sql = format!(
+                "SELECT count(*) FROM public.\"{table}\" WHERE position($1 in \"{col}\"::text) > 0"
+            );
+            sqlx::query_scalar(&sql)
+                .bind(&sentinel)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        };
+        if n > 0 {
+            hits.push(format!("{table}.{col} ({dtype}) = {n} row(s)"));
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "PLAINTEXT LEAK: the canary '{sentinel}' was found server-side in {hits:?} — the relay \
+         must never store plaintext"
+    );
+}
+
+// ----------------------------------------------------------------- admin helpers
+
+fn sign_admin(method: &str, path: &str, body: &str, nonce: &str) -> (i64, [u8; 64]) {
+    let ts = chrono::Utc::now().timestamp();
+    let body_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    let msg = format!("{ts}\n{nonce}\n{method}\n{path}\n{body_hash}");
+    let sig = admin_signing_key().sign(msg.as_bytes()).to_bytes();
+    (ts, sig)
+}
+
+async fn admin_put_limits(
+    app: &axum::Router,
+    tenant: Uuid,
+    body: Value,
+) -> axum::response::Response {
+    let path = format!("/admin/v1/tenants/{tenant}/limits");
+    admin_request(app, "PUT", &path, &body.to_string(), None, None).await
+}
+
+/// Sign correctly unless an explicit override nonce/sig is supplied (for negative tests).
+async fn admin_request(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: &str,
+    override_nonce: Option<&str>,
+    override_sig: Option<&[u8; 64]>,
+) -> axum::response::Response {
+    let nonce = override_nonce
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("nonce-{}", Uuid::new_v4()));
+    let (ts, good_sig) = sign_admin(method, path, body, &nonce);
+    let sig = override_sig.copied().unwrap_or(good_sig);
+    admin_request_raw(app, method, path, body, &nonce, ts, &sig).await
+}
+
+async fn admin_request_raw(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: &str,
+    nonce: &str,
+    ts: i64,
+    sig: &[u8; 64],
+) -> axum::response::Response {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-yapstack-timestamp", ts.to_string())
+        .header("x-yapstack-nonce", nonce)
+        .header("x-yapstack-signature", B64.encode(sig))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}

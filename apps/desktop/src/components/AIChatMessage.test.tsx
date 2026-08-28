@@ -7,7 +7,7 @@ import type { ChatMessage } from "@/lib/ai";
 import type { DbSegment } from "@/lib/db";
 
 vi.mock("@/lib/db", () => ({}));
-vi.mock("@tauri-apps/plugin-sql", () => ({ default: { load: vi.fn() } }));
+vi.mock("@/lib/db-backend", () => ({ default: { load: vi.fn() } }));
 
 // Mock ReactMarkdown: passes children to custom `p` component as an array
 // of strings (matching how real ReactMarkdown works). The leading empty string

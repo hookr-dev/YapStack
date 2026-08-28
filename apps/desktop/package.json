@@ -48,7 +48,6 @@
     "@tauri-apps/plugin-http": "^2.5.9",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-process": "^2",
-    "@tauri-apps/plugin-sql": "^2.4.0",
     "@tauri-apps/plugin-updater": "^2",
     "@tiptap/core": "^3.22.5",
     "@tiptap/extension-bubble-menu": "^3.22.5",

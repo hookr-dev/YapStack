@@ -21,8 +21,10 @@ tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-# Used by `db::ensure_runtime_schema` to perform a single direct ALTER TABLE
-# at startup (out-of-band of tauri-plugin-sql's migration list).
+# Backs the repo-owned `db_service` command pool (Option A′ stage 2) that
+# replaced tauri-plugin-sql, plus `db`'s ad-hoc startup writers. `bundled`
+# pins the SQLite build. Same 0.32 that yapstack-sync uses, so the
+# `rusqlite::Connection` type unifies across the `sync` feature boundary.
 rusqlite = { version = "0.32", features = ["bundled"] }
 hound = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
@@ -30,12 +32,11 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+specta = { version = "=2.0.0-rc.22", features = ["derive", "serde_json"] }
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 tokio = { workspace = true }
 futures-util = { workspace = true }
-tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-global-shortcut = "2"
@@ -62,13 +63,69 @@ silero = "0.2"
 # pulls in CPU, disk, and OS-wide process enumeration we don't use.
 memory-stats = "1"
 
+# --- YapStack Sync (Gate 5B, T010b) ---------------------------------------
+# All optional and gated behind the off-by-default `sync` feature. Enabling it
+# links the vendored cr-sqlite CRR engine (via yapstack-sync), which requires the
+# pinned nightly-2023-10-05 toolchain and inherits panic=abort. The default
+# desktop debug build never pulls these, so it is unaffected by either hazard —
+# this is the deliberate isolation of the panic=abort/eh_personality shadow.
+yapstack-sync = { path = "../../../crates/yapstack-sync", optional = true }
+yapstack-crypto = { path = "../../../crates/yapstack-crypto", optional = true }
+keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+rand = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+uuid = { version = "1", features = ["serde", "v4"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# Device fingerprint (SHA-256(ed25519_pub)[..10] → base32, CRYPTO_SPEC §7.5.5) and
+# recovery-code base32 decode (§6.1). `ed25519-dalek` mints the per-install device
+# identity keypair (§7.1); the vault-derived roster signing key lives in yapstack-crypto.
+sha2 = { workspace = true, optional = true }
+data-encoding = { version = "2", optional = true }
+ed25519-dalek = { version = "2", optional = true }
+
+[features]
+# Off by default. See the sync deps block above and src/sync.rs for why.
+sync = [
+    "dep:yapstack-sync",
+    "dep:yapstack-crypto",
+    "dep:keyring",
+    "dep:rand",
+    "dep:base64",
+    "dep:uuid",
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:data-encoding",
+    "dep:ed25519-dalek",
+    # Windows-only credential shim (R5); a no-op reference on non-Windows targets, where the
+    # optional dep is not present.
+    "dep:windows-sys",
+    # Unix-only free-space probe for the audio-fetch disk precheck (S3 auto-fetch); a no-op
+    # reference on Windows, where GetDiskFreeSpaceExW (windows-sys) covers it instead.
+    "dep:libc",
+]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[target."cfg(target_os = \"windows\")".dependencies]
+# Windows credential shim (R5). `keyring` 3.x's Windows backend hardcodes
+# `Persist: CRED_PERSIST_ENTERPRISE` (keyring-3.6.3/src/windows.rs:246), which can fail to
+# survive logoff on some account/domain configurations — silently killing the owner's session
+# across app restarts. We write the wrap-key + identity entries DIRECTLY via
+# CredWriteW/CredReadW/CredDeleteW with `CRED_PERSIST_LOCAL_MACHINE`, keeping `keyring` for the
+# macOS `apple-native` path. Same `windows-sys` 0.60 + feature set `keyring` already pulls
+# (keyring-3.6.3/Cargo.toml:200), so cargo deduplicates — no new distinct crate build. Optional
+# and gated into the `sync` feature; absent on non-Windows targets.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    # GetDiskFreeSpaceExW for the audio-fetch disk precheck (S3 auto-fetch). Feature-add on
+    # the dep we already build — no new crate (PM dependency decision).
+    "Win32_Storage_FileSystem",
+], optional = true }
 # WASAPI FFI for the dictation volume duck (IAudioEndpointVolume on the
 # default render endpoint). Same crate/version tauri and yapstack-audio
 # already pull on Windows, so Cargo deduplicates the build.
-[target."cfg(target_os = \"windows\")".dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -77,6 +134,12 @@ windows = { version = "0.61", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
 ] }
+
+# Unix free-space probe (statvfs) for the audio-fetch disk precheck. rust-lang's `libc` is
+# already in the transitive tree; a direct unix-only optional dep is the lowest possible
+# supply-chain surface (PM dependency decision — no new third-party crate).
+[target."cfg(unix)".dependencies]
+libc = { version = "0.2", optional = true }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }

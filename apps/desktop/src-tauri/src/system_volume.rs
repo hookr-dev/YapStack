@@ -449,7 +449,7 @@ mod tests {
         fn with_devices(devices: &[(DeviceId, f32)], default: DeviceId) -> Self {
             let mut volumes = HashMap::new();
             for (id, vol) in devices {
-                volumes.insert(id.clone(), *vol);
+                volumes.insert(*id, *vol);
             }
             Self {
                 default: Mutex::new(default),
@@ -478,7 +478,7 @@ mod tests {
 
     impl SystemOutputVolume for MockController {
         fn default_device(&self) -> Result<DeviceId, VolumeError> {
-            Ok(self.default.lock().unwrap().clone())
+            Ok(*self.default.lock().unwrap())
         }
         fn get(&self, device: &DeviceId) -> Result<f32, VolumeError> {
             self.volumes
@@ -495,7 +495,7 @@ mod tests {
             self.volumes
                 .lock()
                 .unwrap()
-                .insert(device.clone(), level.clamp(0.0, 1.0));
+                .insert(*device, level.clamp(0.0, 1.0));
             Ok(())
         }
     }

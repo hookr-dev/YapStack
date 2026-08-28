@@ -41,6 +41,7 @@ export const EditableSegment = memo(forwardRef<
   ref,
 ) {
   const editSegmentText = useAppStore((s) => s.editSegmentText);
+  const setEditingSegmentId = useAppStore((s) => s.setEditingSegmentId);
   const deleteSegment = useAppStore((s) => s.deleteSegment);
   const toggleSegmentHidden = useAppStore((s) => s.toggleSegmentHidden);
   const toggleSegmentSelected = useAppStore((s) => s.toggleSegmentSelected);
@@ -62,6 +63,19 @@ export const EditableSegment = memo(forwardRef<
     }
   }, [isEditing]);
 
+  // Safety net (LIVE_SESSION_STATE.md D4 "Edit-in-progress under live refresh"): never
+  // leave a stuck edit-in-progress guard if this segment unmounts mid-edit (session
+  // switch, list replacement). A stuck `editingSegmentId` would suppress every future
+  // `refreshOpenViewSession` forever. `getState` in the cleanup avoids a stale closure and
+  // clears only when the guard still points at THIS segment.
+  useEffect(() => {
+    return () => {
+      if (useAppStore.getState().editingSegmentId === segment.id) {
+        useAppStore.getState().setEditingSegmentId(null);
+      }
+    };
+  }, [segment.id]);
+
   const text = segment.text.trim();
   if (!text) return null;
 
@@ -72,18 +86,37 @@ export const EditableSegment = memo(forwardRef<
   const isLowConfidence = segment.confidence < 0.5;
   const isEdited = segment.edited_at != null;
 
+  // Clear the D4 edit-in-progress guard, but only while it still points at THIS segment:
+  // a committing blur hands the guard to `editSegmentText`, which owns and clears it across
+  // its async write, so we must not stomp that here.
+  const clearEditGuard = () => {
+    if (useAppStore.getState().editingSegmentId === segment.id) {
+      setEditingSegmentId(null);
+    }
+  };
+
   const handleSave = () => {
     if (!bubbleRef.current) return;
     const trimmed = (bubbleRef.current.textContent ?? "").trim();
+    setIsEditing(false);
     if (trimmed && trimmed !== segment.text) {
+      // `editSegmentText` re-sets the guard and clears it in its `finally`, spanning the
+      // async DB write + segment reload — leave it set here; clearing now would re-open the
+      // refresh-clobber window mid-write.
       editSegmentText(segment.id, trimmed);
       trackSegmentEdited();
+    } else {
+      // No committed change: close the guard so the next applied batch can refresh.
+      clearEditGuard();
     }
-    setIsEditing(false);
   };
 
   const handleStartEdit = () => {
     setIsEditing(true);
+    // Open the guard for the WHOLE edit window (LIVE_SESSION_STATE.md D4 normative), not
+    // just `editSegmentText`'s async save: from the moment editing opens, a debounced
+    // `sync://applied` refresh must not remount/overwrite this segment's contentEditable.
+    setEditingSegmentId(segment.id);
   };
 
   // Shift-click extends the native text selection on mousedown, *before*
@@ -139,6 +172,8 @@ export const EditableSegment = memo(forwardRef<
         bubbleRef.current.textContent = segment.text;
       }
       setIsEditing(false);
+      // Cancel: no write competes, so close the guard immediately.
+      clearEditGuard();
     }
   };
 

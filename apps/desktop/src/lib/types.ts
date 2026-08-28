@@ -115,6 +115,21 @@ async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Batch existence probe for audio part files. Returns a `Vec<bool>` parallel
+ * to `paths`: `true` when the file both lives under a trusted audio directory
+ * and is present on disk, `false` otherwise. Infallible — a bad path is
+ * reported as `false`, never an error, so one absent file can't blank the
+ * whole batch.
+ *
+ * This is how the note view learns that a session's part metadata synced from
+ * another device but its audio bytes did not, so it can render an honest
+ * "audio is on <other device>" state instead of a play control that silently
+ * no-ops. Audio files themselves are NOT synced in this release.
+ */
+async audioFilesExist(paths: string[]) : Promise<boolean[]> {
+    return await TAURI_INVOKE("audio_files_exist", { paths });
+},
 async getAvailableModels() : Promise<Result<ModelInfoDto[], CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_available_models") };
@@ -478,6 +493,296 @@ async logFrontend(level: FrontendLogLevel, module: string | null, message: strin
 }
 },
 /**
+ * `db.execute(sql, params)` — write path. Rejects on SQL error so the
+ * frontend's `.catch()` on idempotent runtime patches keeps working.
+ */
+async dbExecute(query: string, values: JsonValue[]) : Promise<Result<DbExecuteResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("db_execute", { query, values }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * `db.select(sql, params)` — read path. Returns rows as JSON objects.
+ */
+async dbSelect(query: string, values: JsonValue[]) : Promise<Result<(Partial<{ [key in string]: JsonValue }>)[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("db_select", { query, values }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Typed relay connection probe (T025). Returns a TYPED result the UI branches on:
+ * `Unreachable` / `TlsError` / `NotARelay` are distinct classes, and a version gap is
+ * advisory metadata on SUCCESS — never a failure. 5s request budget; the app version is
+ * read the same way as `commands::health_check` (`env!("CARGO_PKG_VERSION")`, kept in
+ * lockstep with tauri.conf.json by the build).
+ */
+async syncProbe(serverUrl: string) : Promise<Result<RelayProbeOk, RelayProbeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_probe", { serverUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async syncStatus() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create the account (§3.2 signup). Derives auth+master keys from the password, mints a
+ * random vault key and a CSPRNG recovery code, wraps the vault key under BOTH the master
+ * key and the recovery key (committing envelopes, §4.2/§6.2), authors the epoch-0 signed
+ * roster (§7.5 first-device self-enrollment), and POSTs the verifier inputs + wraps +
+ * roster. Returns the one-time recovery code (for forced capture) + this device's
+ * fingerprint. NEVER sends the password / master_key / vault_key / recovery code.
+ */
+async syncSignup(req: SignupArgs) : Promise<Result<SignupResultDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_signup", { req }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Round 1 of two-round login (§3.2): fetch `salt_enc`, run the §3.2-C3 known-device
+ * salt-mismatch check (a changed salt for an established account = hostile-relay signal),
+ * and cache the round-1 state for `sync_login_finish`.
+ */
+async syncLoginBegin(serverUrl: string, email: string) : Promise<Result<LoginBeginResultDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_login_begin", { serverUrl, email }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Round 2 of login (§3.2): derive `auth_key`, present this device's Ed25519 pubkey +
+ * client_id (so an unknown device enrolls PENDING, §7.5 step 1), authenticate, unwrap the
+ * vault key, VERIFY the served roster signature (§7.5 step 2), and store the session. A
+ * device not yet in the roster is PENDING and surfaces as such (needs approval).
+ */
+async syncLoginFinish(password: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_login_finish", { password }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Recover access with the base32 recovery code (§6.2) when the password is lost:
+ * authenticate via `recovery_auth_key`, receive `wrapped_vault_key_recovery`, unwrap the
+ * vault key with the recovery key, verify the roster, and store the session (vault key →
+ * keychain). The raw recovery code and recovery key never leave this process.
+ */
+async syncRecover(serverUrl: string, email: string, recoveryCode: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_recover", { serverUrl, email, recoveryCode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async syncEnable() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_enable") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Approve a pending device (§7.5 step 3/4). The human has already compared the
+ * fingerprint OUT-OF-BAND in the UI (DeviceApprovalDialog); this existing active device
+ * re-verifies the fingerprint matches a real pending device, adds it to the roster,
+ * bumps the monotonic counter, re-signs with the vault-derived roster key, and uploads.
+ */
+async syncApproveDevice(fingerprint: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_approve_device", { fingerprint }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Sign out. ASYNC (item 3) so `DrainHandle::stop()` — which JOINS the audio/SSE/kick lanes —
+ * runs on a blocking pool thread, NEVER on the Tauri event loop; a synchronous command body
+ * would freeze the whole UI for as long as a lane takes to reach its stop check. The per-
+ * account anchor is deliberately NOT cleared (item 1): a routine sign-out preserves the
+ * account's anti-substitution baselines so the next sign-in stays a known device, not TOFU.
+ * `sync_forget_account` is the explicit path that clears an anchor.
+ */
+async syncSignOut() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_sign_out") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Explicitly forget an account (item 1): clears its per-account anchor — the tenant binding
+ * and §3.2-C3 / §7.4 anti-substitution baselines that routine sign-out preserves. After this,
+ * the next sign-in for this account is treated as a first-time (TOFU) device. Distinct from
+ * `sync_sign_out`, which keeps the anchor. UI wiring (a "Forget this account" action) is out
+ * of prototype scope; the command + logic are implemented here and registered in lib.rs.
+ */
+async syncForgetAccount(serverUrl: string, email: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_forget_account", { serverUrl, email }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S2 producer seam: enqueue every finalized audio part of `session_id` onto the durable
+ * upload queue at NORMAL priority (jumps ahead of the LOW-priority backfill). Called
+ * FIRE-AND-FORGET from the frontend on session finalize — recording is never blocked by
+ * this, and the durable queue survives a restart. Idempotent (INSERT-OR-IGNORE by
+ * `part_id`), so a re-finalize or an overlap with the backfill walk never double-uploads.
+ * A no-op when sync is not enabled on this device (nothing drains the queue yet; the
+ * backfill walk will re-enqueue on next enable). Opens a lightweight plain connection to
+ * the live DB and only ever writes the local, non-CRR queue table.
+ */
+async audioEnqueueSession(sessionId: string) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_enqueue_session", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S2 manual-retry seam for the Sync panel: re-arm every `failed` audio-upload entry so the
+ * uploader picks them up on its next cycle (D9 — failed entries retry on app start PLUS
+ * manual retry). Returns the number re-armed. No-op when sync is disabled.
+ */
+async audioRetryFailedUploads() : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_retry_failed_uploads") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Item 1 manual retry seam for the Sync panel's crypto-quarantine warning row. Re-attempts
+ * decryption of EVERY quarantined changeset under the CURRENT vault key + epoch — the
+ * key-epoch recovery path: a device that pulled peer writes before its key was reconciled can
+ * drain the "unreadable" backlog once the right key arrives. Recovered changesets merge (their
+ * original clock intact, so cr-sqlite LWW converges) and leave the quarantine; genuinely
+ * corrupt/tampered ones stay flagged as a durable tamper signal, never dropped. Opens the LIVE
+ * CRR DB (same DB the drain quarantines into) with the CRR engine registered so the recovered
+ * merges apply. Returns the number recovered. No-op when sync is disabled.
+ */
+async syncRetryCryptoQuarantine() : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_retry_crypto_quarantine") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S3 dictation fold-in — FIRE-AND-FORGET enqueue of a saved dictation's WAV onto the upload
+ * queue (NORMAL priority). Dictation audio has no `session_audio_parts` row; the part
+ * identity IS the `dictation_history.id` (self-referential AAD `session_id`, matching the
+ * backfill walk + fetch path). Idempotent (INSERT-OR-IGNORE by part_id). No-op when sync is
+ * off. Returns 1 if newly enqueued, else 0.
+ */
+async audioEnqueueDictation(dictationId: string) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_enqueue_dictation", { dictationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * S3 fetch-on-demand entry point (polled per missing part). Resolves D2 order, joins the
+ * single in-flight fetch (starting it on the first call), and returns the current state.
+ * `high_priority` (default false) puts the part in the queue's HIGH class — the session
+ * view the user is looking at passes true so its ordered parts start ahead of queued
+ * background dictation prefetches; a poll of an already-QUEUED normal part with
+ * `high_priority` promotes it in place (FETCH POLISH item 5).
+ */
+async audioPreparePart(partId: string, highPriority: boolean | null) : Promise<Result<AudioPreparePartDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_prepare_part", { partId, highPriority }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel an in-flight fetch AND clear the part's slot (the user-facing X / retry-reset
+ * seam: a subsequent `audio_prepare_part` starts a fresh download). Also purges a queued,
+ * not-yet-started entry.
+ */
+async audioCancelPart(partId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cancel_part", { partId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate-away semantics (auto-fetch S3.5): drop the part ONLY if it is still waiting in
+ * the admission queue; an in-flight download is left to complete into the cache (bounded
+ * by the global cap), so reopening the session finds it cached or nearly there. Returns
+ * whether a queued entry was dropped.
+ */
+async audioReleasePart(partId: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_release_part", { partId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Total bytes + file count of this device's audio-fetch cache (decrypt temps excluded).
+ */
+async audioCacheStats() : Promise<Result<AudioCacheStatsDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cache_stats") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Clear the audio-fetch cache: deletes settled cache files ONLY — never the fetch-tmp of
+ * in-flight downloads (a sibling dir this command doesn't touch), never in-cache-dir
+ * decrypt temps, and never a file whose part has a live fetch slot (in-flight or
+ * unobserved-terminal — the simplest rule that can't corrupt a running fetch). Source
+ * audio is untouched by construction (the cache dir only ever holds fetched copies).
+ * Returns the remaining footprint (what the skips kept).
+ */
+async audioCacheClear() : Promise<Result<AudioCacheStatsDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("audio_cache_clear") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Write UTF-8 `contents` to `path`.
  *
  * Trusted-renderer boundary: `path` comes from the frontend save dialog and
@@ -506,6 +811,10 @@ async writeTextFile(path: string, contents: string) : Promise<Result<null, Comma
 
 /** user-defined types **/
 
+/**
+ * Fetched-audio cache footprint for the sync panel row ("Fetched audio: N MB — Clear").
+ */
+export type AudioCacheStatsDto = { bytes: number; files: number }
 export type AudioDeviceInfoDto = { id: string | null; name: string; device_type: DeviceTypeDto; is_default: boolean }
 /**
  * Typed surface for the audio finalize format. Lowercase serde tags match
@@ -515,6 +824,60 @@ export type AudioDeviceInfoDto = { id: string | null; name: string; device_type:
  * a `"wav" | "mp3"` discriminated union instead of `string | null`.
  */
 export type AudioExportFormatDto = "wav" | "mp3"
+/**
+ * Player-facing fetch state for one part (polled). Distinct honest states, never silent.
+ */
+export type AudioPreparePartDto =
+/**
+ * The decrypted audio is in the local cache (or was already local) — `path` is a
+ * trusted absolute path the `audio-stream://` protocol serves.
+ */
+{ state: "ready"; path: string } |
+/**
+ * A download is in flight; `received`/`total` (bytes) drive the "Fetching N%" bar
+ * (`total == 0` = not yet known).
+ */
+{ state: "fetching"; received: number; total: number } |
+/**
+ * Admitted but not yet started — the global concurrency cap (2) is busy and this part
+ * waits in the FIFO admission queue. The player renders "waiting".
+ */
+{ state: "queued" } |
+/**
+ * The relay has no blob for this part (source device hasn't uploaded it) — the
+ * honest "audio is on <device>" state. NOT a stable terminal anymore: the slot is
+ * cleared so the player's 30s re-probe re-attempts, and the fetch starts by itself
+ * once the source device's upload lands.
+ */
+{ state: "not_on_server" } |
+/**
+ * The cache volume positively reported insufficient space (disk precheck) — `needed`
+ * bytes is the full clean-disk budget for the "Not enough disk space (need ~X)" copy.
+ * Slot cleared, so a retry after freeing space starts fresh.
+ */
+{ state: "no_space"; needed: number } |
+/**
+ * Can't reach the sync server (relay unreachable).
+ */
+{ state: "unreachable" } |
+/**
+ * The relay rejected the bearer (HTTP 401) mid-fetch. Distinct from a generic error:
+ * the drain refreshes the token on its own cycle, so the player shows "Sync session
+ * expired — reconnecting…" and simply re-probes; the slot is cleared so the re-probe
+ * re-attempts with the freshly-persisted bearer (self-healing, no user action).
+ */
+{ state: "auth_expired" } |
+/**
+ * The blob failed to decrypt/verify — a tamper signal (logged at warn server-side of the
+ * fetch worker). Distinct copy: "audio failed verification". Sticky until the user
+ * explicitly retries (the bar's Retry clears the slot via `audio_cancel_part`) — a
+ * tamper signal must never auto-retry.
+ */
+{ state: "verification_failed" } |
+/**
+ * Any other fetch/IO fault, surfaced verbatim (never auto-routed).
+ */
+{ state: "error"; message: string }
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
@@ -527,6 +890,15 @@ export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; sy
  * Auto-generated TypeScript types via specta.
  */
 export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
+/**
+ * The write path's affected-row signal — the only success-side answer a
+ * `db_execute` returns. (It once mirrored tauri-plugin-sql's `QueryResult`; that
+ * plugin is gone, and `last_insert_id` went with it: every table in this schema
+ * has a TEXT UUID primary key, so `last_insert_rowid()` only ever yielded an
+ * implicit rowid no caller can use.)
+ */
+export type DbExecuteResult = { rowsAffected: number }
+export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**
  * Engine capabilities + supported languages for the cascading UI in Settings.
@@ -543,6 +915,7 @@ export type EngineKindDto = "Whisper" | "Parakeet"
  */
 export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
+export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Routing identity of a live-transcription runtime. `Session` is the
  * long-running recording flow that writes session audio parts; `Dictation`
@@ -692,6 +1065,10 @@ export type LogEntry = { ts_ms: number; level: LogLevel; target: string; message
  * typed union instead of an unchecked string.
  */
 export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
+/**
+ * `sync_login_begin` result (mirrors `LoginBeginResult` in `lib/sync.ts`).
+ */
+export type LoginBeginResultDto = { saltMismatch: boolean }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
@@ -705,6 +1082,43 @@ export type ParakeetVariantDto = "TdtV3" |
  */
 "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
+/**
+ * Typed probe failure classes (mirrors `RelayProbeError` in `lib/sync.ts`). Serialized
+ * tagged on `kind` (kebab-case) so TS can discriminate. Every variant carries the
+ * verbatim `raw` detail — errors are surfaced to the user, never swallowed.
+ */
+export type RelayProbeError =
+/**
+ * DNS failure / connection refused / timeout (5s budget), or TLS that could not be
+ * distinguished from a plain connect failure.
+ */
+{ kind: "unreachable"; raw: string } |
+/**
+ * TLS certificate or handshake failure.
+ */
+{ kind: "tls-error"; raw: string } |
+/**
+ * An HTTP response arrived but this is not a YapStack relay: non-2xx status, or a 2xx
+ * whose body is missing the `protocol_version` + `engine_version` sentinel.
+ */
+{ kind: "not-a-relay"; raw: string }
+/**
+ * `sync_probe` success payload (mirrors `RelayProbeOk` in `lib/sync.ts`).
+ */
+export type RelayProbeOk = { engineVersion: string; protocolVersion: number;
+/**
+ * Elapsed from request start to response head, milliseconds.
+ */
+latencyMs: number;
+/**
+ * The URL actually probed after normalization, so the UI can echo/persist it.
+ */
+normalizedUrl: string;
+/**
+ * Populated ONLY when this client is older than the relay's published minimum.
+ * Advisory — the probe still succeeds ("update this app", never blocking, §0.3).
+ */
+versionAdvisory: VersionAdvisory | null }
 export type ResumeConfig = {
 /**
  * The index of the new part being recorded — equals the count of
@@ -719,9 +1133,85 @@ part_index: number;
 offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
+/**
+ * Args for `sync_signup` (mirrors `SignupRequest` in `lib/sync.ts`).
+ */
+export type SignupArgs = { serverUrl: string; email: string; password: string }
+/**
+ * One-time `sync_signup` result (mirrors `SignupResult` in `lib/sync.ts`).
+ */
+export type SignupResultDto = { recoveryCode: string; deviceFingerprint: string }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
+export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null; billingUrl: string | null;
+/**
+ * T024 push progress. Unacked outbox entries still to push (0 == up to date).
+ */
+pendingEntries: number;
+/**
+ * Total ciphertext bytes of those unacked entries (base64 upload is ~4/3 of this).
+ */
+pendingBytes: number;
+/**
+ * Entries acked since the current drain thread started (cumulative this session).
+ */
+ackedThisSession: number;
+/**
+ * RFC3339 of the last time the outbox fully drained with the relay reachable;
+ * null before the first successful drain. The panel renders it relative to now.
+ */
+lastSuccess: string | null;
+/**
+ * R12: changesets this device is still behind the last-known relay tip on the PULL side
+ * (0 when caught up or the tip is unknown). Drives the "catching up (N to go)" copy. A
+ * device is honestly "up to date" only when this is 0 AND the outbox is empty.
+ */
+pullBehind: number;
+/**
+ * Item 1: DURABLE count of crypto-quarantined changesets (peer writes pulled but not
+ * decryptable). Non-zero => the sync panel shows a persistent, non-dismissable warning
+ * row ("N unreadable changeset(s)") with a Retry affordance. Shown INDEPENDENTLY of the
+ * up-to-date state: a caught-up device can still carry unreadable changesets. A potential
+ * tamper/corruption signal — never auto-dismissed.
+ */
+cryptoQuarantined: number;
+/**
+ * S2 — audio upload lane (DISTINCT from changeset sync). Blobs (recordings) still to
+ * seal+upload to the relay across both priorities (0 == every local recording is backed
+ * up). Surfaced under the "audio-upload" label in the panel; never merged with the
+ * changeset backlog.
+ */
+audioUploadOutstanding: number;
+/**
+ * Of `audio_upload_outstanding`, the low-priority backfill of the existing library (D9).
+ */
+audioBackfillOutstanding: number;
+/**
+ * Audio blobs the uploader marked `failed` (needs attention; app-start + manual retry).
+ */
+audioUploadFailed: number;
+/**
+ * Cumulative recordings the relay confirms it holds for this device.
+ */
+audioUploadedTotal: number;
+/**
+ * Whether the one-time idempotent backfill walk has completed on this device (D9).
+ */
+audioBackfillComplete: boolean }
 export type TranscriptionStatusDto = { initialized: boolean }
+/**
+ * Advisory that this client is behind the relay's published minimum (mirrors
+ * `RelayVersionAdvisory` in `lib/sync.ts`). Rides on probe SUCCESS, never a failure.
+ */
+export type VersionAdvisory = {
+/**
+ * Minimum client version the relay publishes.
+ */
+minClientVersion: string;
+/**
+ * Verbatim human-readable advisory line.
+ */
+raw: string }
 
 /** tauri-specta globals **/
 

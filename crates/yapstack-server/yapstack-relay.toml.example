@@ -1,0 +1,46 @@
+# yapstack-relay.toml — example configuration for the YapStack blind relay.
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copy to `yapstack-relay.toml` and edit. Point the server at it with
+# YAPSTACK_RELAY_CONFIG=/path/to/yapstack-relay.toml (defaults to ./yapstack-relay.toml).
+#
+# The relay makes ZERO outbound calls. Nothing in this file can point it at a remote
+# service; `billing_url` below is only a passive string echoed to clients.
+
+bind_addr = "0.0.0.0:8080"
+
+# Connect as the NON-OWNER `yapstack_app` role (created by migration 0001) so RLS can
+# never be bypassed.
+database_url = "postgres://yapstack_app@localhost/yapstack"
+
+# REQUIRED. HS256 signing secret for access/refresh JWTs. Use a long random value.
+jwt_secret = "CHANGE-ME-to-a-long-random-secret"
+
+# REQUIRED. Pepper for the login decoy-salt (CRYPTO_SPEC §3.2) so account existence
+# is unobservable. Use a long random value.
+server_pepper = "CHANGE-ME-to-a-long-random-pepper"
+
+[sync]
+protocol_version = 1
+min_client_version = "1.0.0"
+engine_version = "0.16.3"
+# billing_url = "https://yapstack.cloud/billing"   # hosted only; self-host omits it
+
+# --------------------------------------------------------------------------------
+# [limits] is OPTIONAL and ABSENT by default.
+#
+#   absent  => TenantLimitSource = AllowAll (everything Unlimited), admin API disabled.
+#              This is the self-host default: self-host is always the max tier.
+#   present => TenantLimitSource = StoredLimits (reads tenant_limits rows), admin API
+#              enabled (the control plane pushes limits; T008 wires the endpoint).
+#
+# Uncomment to run in hosted mode:
+#
+# [limits]
+# admin_public_key = "ed25519:<base64-public-key>"
+#
+# [limits.default]                       # applied to a tenant with NO tenant_limits row
+# storage_bytes       = 3221225472       # any field left out resolves to Unlimited
+# upload_bytes_period = 1073741824
+# share_count         = 3
+# device_count        = 5

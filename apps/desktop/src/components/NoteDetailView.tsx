@@ -1,17 +1,55 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Play, X, RefreshCw, AlertTriangle, MoreHorizontal, CheckCircle2 } from "lucide-react";
 import { useAppStore } from "@/stores/appStore";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { commands } from "@/lib/tauri";
+import {
+  clampMonotonicPercent,
+  isFetchRestart,
+  deriveTrackFetch,
+  formatTrackFetchLabel,
+  formatNoSpace,
+  nextPollDelayMs,
+  syncCommands,
+  AUTH_EXPIRED_FETCH_COPY,
+  type AudioPartPrepare,
+  type TrackFetch,
+} from "@/lib/sync";
 import { SessionHeader } from "@/components/SessionHeader";
 import { ChatView } from "@/components/ChatView";
 import { NoteEditor } from "@/components/NoteEditor";
 import { FloatingChatBar } from "@/components/FloatingChatBar";
 import { AIContextProvider } from "@/components/AIContextProvider";
-import { AudioPlayer } from "@/components/AudioPlayer";
+import { AudioPlayer, AUDIO_ROW_CLASS } from "@/components/AudioPlayer";
 import {
   ResizablePanelGroup,
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { canResumeSession, getSession } from "@/lib/db";
+import {
+  canResumeSession,
+  getSession,
+  isRecordingStale,
+  type DbSession,
+  type DbSegment,
+  type DbAudioPart,
+} from "@/lib/db";
 import type { AudioPart } from "@/components/AudioPlayer";
 import {
   createSessionSources,
@@ -27,6 +65,424 @@ import { AutoTagSuggestions } from "@/components/AutoTagSuggestions";
 /** Build a URL for the custom audio-stream:// protocol registered in Rust. */
 function audioStreamUrl(filePath: string): string {
   return convertFileSrc(filePath, "audio-stream");
+}
+
+/**
+ * Remote-live selection predicate (LIVE_SESSION_STATE.md D3): a `recording` session
+ * owned by ANOTHER device — read-only follow-along. Pure so the branch selection is
+ * unit-testable without mounting the view. NULL `myFingerprint` (sync off / pre-
+ * enrollment) makes this always false, preserving single-device behavior. For this
+ * slice any non-mine truthy-owner `recording` row qualifies; slice 4 splits fresh
+ * ("Live") vs stale ("Interrupted") via `isRecordingStale`.
+ */
+export function isRemoteLiveSession(
+  session: Pick<DbSession, "status" | "recording_device_id">,
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+): boolean {
+  const owner = session.recording_device_id;
+  return (
+    !isActiveSession &&
+    session.status === "recording" &&
+    !!owner &&
+    // D7: with no fingerprint (sync off / pre-enrollment) every D3 comparison is
+    // false → single-device behavior, never a remote-live branch.
+    !!myFingerprint &&
+    owner !== myFingerprint
+  );
+}
+
+/** Render branch for a non-active `recording` row. `null` = not a remote-recording
+ *  row (single-device fallback). */
+export type RemoteRecordingView = "remote-live" | "interrupted" | null;
+
+/**
+ * Render-branch selection for the remote-recording lifecycle (LIVE_SESSION_STATE.md
+ * §Lifecycle state machine, slice 4). Covers **all** non-active `recording` rows so
+ * the "Start speaking" fallback is never reached for them:
+ *   - fresh foreign owner → `"remote-live"` (● Live follow-along),
+ *   - everything else (stale-foreign, own-crashed, legacy-NULL) → `"interrupted"`.
+ * Sync off / pre-enrollment (`myFingerprint` NULL) → `null`: D7 keeps single-device
+ * behavior unchanged (no comparison can be truthy without a fingerprint).
+ *
+ * Staleness is derived from `segments` (heartbeat = max `segments.created_at`), so
+ * once the D4 live refresh reloads the open session's segments the selection
+ * **recomputes** — a resuming session flips `"interrupted"` back to `"remote-live"`
+ * on the next applied batch. Pure so both directions are unit-testable unmounted.
+ */
+export function selectRemoteRecordingView(
+  session: Pick<DbSession, "status" | "recording_device_id" | "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+  nowMs: number = Date.now(),
+): RemoteRecordingView {
+  if (isActiveSession || session.status !== "recording" || !myFingerprint) {
+    return null;
+  }
+  const owner = session.recording_device_id;
+  const foreign = !!owner && owner !== myFingerprint;
+  const stale = isRecordingStale(session, segments, nowMs);
+  return foreign && !stale ? "remote-live" : "interrupted";
+}
+
+/**
+ * Escape-hatch visibility (LIVE_SESSION_STATE.md resolved Q1): the "Mark completed"
+ * action is shown **only** for a `{status:'recording', foreign owner, stale}` row —
+ * i.e. a dead device's stranded session OR a same-hardware re-pair orphan (the new
+ * fingerprint makes this device's own old rows foreign-to-self; foreign+stale is the
+ * whole condition, so re-pair is covered naturally). Own-crashed and legacy-NULL
+ * rows are finalized by the owner-only boot sweep (D6), so they never expose the
+ * hatch; a fresh-live foreign row is structurally excluded by `!stale`. Pure so the
+ * visibility matrix is unit-testable unmounted.
+ */
+export function canMarkSessionCompleted(
+  session: Pick<DbSession, "status" | "recording_device_id" | "created_at">,
+  segments: Pick<DbSegment, "created_at">[],
+  isActiveSession: boolean,
+  myFingerprint: string | null,
+  nowMs: number = Date.now(),
+): boolean {
+  if (isActiveSession || session.status !== "recording" || !myFingerprint) {
+    return false;
+  }
+  const owner = session.recording_device_id;
+  const foreign = !!owner && owner !== myFingerprint;
+  return foreign && isRecordingStale(session, segments, nowMs);
+}
+
+export interface AudioAvailability {
+  /** Parts to hand to `<AudioPlayer>`, in original order. Empty when the track
+   *  is unavailable and the honest "audio is on <device>" state renders. */
+  playableParts: AudioPart[];
+  /** True when at least one expected part's file is absent on this device —
+   *  the sync case where the metadata arrived but the audio bytes did not. */
+  unavailable: boolean;
+}
+
+/**
+ * All-or-nothing audio availability selection (v1). `exists[i]` is the on-disk
+ * presence of `parts[i]` as reported by the `audio_files_exist` command; `null`
+ * (or a length mismatch) means "not checked yet" — we stay optimistic so a
+ * local session's player renders immediately on mount rather than flashing an
+ * unavailable state.
+ *
+ * When every part is present the full ordered list plays. When ANY part is
+ * missing we withhold the player entirely instead of compressing the timeline:
+ * transcript timestamp clicks seek by GLOBAL time (a cumulative offset across
+ * the full part list), so playing a subset would mis-seek every click. In the
+ * sync scenario a session's parts are either all-local (recorded here) or
+ * all-foreign (synced from a peer, no bytes), so all-or-nothing is the honest
+ * common case; a rare genuinely-mixed session degrades to the unavailable
+ * state rather than to silent mis-seeking. Pure so the branch is unit-testable.
+ */
+export function selectAudioAvailability(
+  parts: AudioPart[],
+  exists: boolean[] | null,
+): AudioAvailability {
+  if (parts.length === 0) {
+    return { playableParts: [], unavailable: false };
+  }
+  // Optimistic while the async check is unresolved or shape-mismatched.
+  if (exists === null || exists.length !== parts.length) {
+    return { playableParts: parts, unavailable: false };
+  }
+  const allPresent = exists.every(Boolean);
+  return allPresent
+    ? { playableParts: parts, unavailable: false }
+    : { playableParts: [], unavailable: true };
+}
+
+/**
+ * Assemble the ordered player parts from the raw part rows, this device's on-disk presence
+ * (`presentFlags`, aligned to `rawParts`; `null` = optimistic/unchecked), and any fetched
+ * cache paths (`cacheByPart`, part id → decrypted cache file). A part's src resolves in D2
+ * order: locally present → `file_path` (same-device fast path); else fetched → the cache
+ * path; else `""` (unresolved). `allPlayable` is the all-or-nothing gate — every part must
+ * resolve before the timeline (which seeks by global time) is honest. Pure & unit-testable.
+ */
+export function assembleTrack(
+  rawParts: DbAudioPart[],
+  presentFlags: boolean[] | null,
+  cacheByPart: Record<string, string>,
+  toStreamUrl: (filePath: string) => string,
+): { parts: AudioPart[]; allPlayable: boolean } {
+  const aligned = presentFlags && presentFlags.length === rawParts.length ? presentFlags : null;
+  const parts = rawParts.map((p, i) => {
+    const present = aligned ? aligned[i] !== false : true;
+    const cache = cacheByPart[p.id];
+    const src = present
+      ? toStreamUrl(p.file_path)
+      : cache
+        ? toStreamUrl(cache)
+        : "";
+    return { src, duration: p.duration_seconds };
+  });
+  const allPlayable = rawParts.length > 0 && parts.every((pp) => pp.src !== "");
+  return { parts, allPlayable };
+}
+
+/**
+ * Lifecycle of the on-disk presence probe for ONE track's part files.
+ *
+ * The critical property is that `resolved` is STICKY: a re-probe (the window-focus
+ * re-check, which exists so copying a file over is noticed) leaves the held flags in
+ * place until a new RESULT arrives. Clearing them mid-probe used to unmount the player,
+ * empty `missingPartIds`, tear the poll effect down — which releases the queued parts —
+ * and restart progress at 0, all from a click into another app and back.
+ *
+ * `probing` therefore means only "first probe for this track, nothing held yet", and
+ * `unknown` means the probe cannot answer at all (older backend without the command), in
+ * which case we stay optimistic exactly as before and let playback surface the truth.
+ */
+export type PresenceProbe =
+  | { status: "probing" }
+  | { status: "resolved"; flags: boolean[] }
+  | { status: "unknown" };
+
+/** How long a fetch-bar state must survive before it may replace what is on screen. A
+ *  cache hit or an already-local part resolves well inside this, so its transient
+ *  "Fetching…" frame never reaches the user. */
+const FETCH_LABEL_DEBOUNCE_MS = 150;
+
+/**
+ * Display transform for the fetch bar — what the user SEES, as opposed to what the poll
+ * currently knows. Three jobs:
+ *
+ *  1. A `pending` track (probe or first prepare tick still in flight) holds the frame
+ *     already on screen rather than guessing.
+ *  2. A change of KIND waits `FETCH_LABEL_DEBOUNCE_MS` before it lands, so a state that
+ *     resolves faster than that never flashes. Same-kind updates (progress ticks) apply
+ *     immediately — live progress must stay live.
+ *  3. The rendered percent is ratcheted non-decreasing for the lifetime of one fetch
+ *     session (`sessionKey`); a new session resets the floor because a genuinely fresh
+ *     download does start over at 0.
+ */
+function useTrackFetchDisplay(
+  track: TrackFetch | null,
+  sessionKey: string,
+): TrackFetch | null {
+  const [shown, setShown] = useState<TrackFetch | null>(null);
+  const shownRef = useRef<TrackFetch | null>(null);
+  const peakRef = useRef(0);
+  const sessionRef = useRef(sessionKey);
+
+  useEffect(() => {
+    if (sessionRef.current !== sessionKey) {
+      sessionRef.current = sessionKey;
+      peakRef.current = 0;
+    }
+    if (track === null) {
+      shownRef.current = null;
+      setShown(null);
+      return;
+    }
+    if (track.kind === "pending") return; // hold the previous frame
+
+    const prev = shownRef.current;
+    let next = track;
+    if (track.kind === "fetching") {
+      // Release the ratchet on a genuine restart, so a re-queued part re-downloads
+      // behind a bar that moves rather than one frozen at its old high-water mark.
+      if (isFetchRestart(peakRef.current, track, prev?.kind === "fetching")) {
+        peakRef.current = 0;
+      }
+      const percent = clampMonotonicPercent(peakRef.current, track.percent);
+      peakRef.current = percent;
+      next = { ...track, percent };
+    }
+    if (prev && prev.kind === next.kind) {
+      shownRef.current = next;
+      setShown(next);
+      return;
+    }
+    const timer = setTimeout(() => {
+      shownRef.current = next;
+      setShown(next);
+    }, FETCH_LABEL_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [track, sessionKey]);
+
+  return shown;
+}
+
+/**
+ * The inert stand-in for the audio row: correct height, no affordance, no claim. Rendered
+ * while the presence probe for a freshly-opened track has not answered yet, and while the
+ * fetch bar is holding for a state to settle. Reserving the space is the whole point —
+ * rendering the player optimistically (and yanking it away a tick later) is what made the
+ * open of a synced session flicker.
+ */
+function AudioRowPlaceholder() {
+  return (
+    <div
+      className={`${AUDIO_ROW_CLASS} text-muted-foreground`}
+      data-audio-row="placeholder"
+      aria-hidden="true"
+    />
+  );
+}
+
+/**
+ * The honest missing-audio bar for a synced session whose bytes are not on this device (S3).
+ * With auto-fetch (S3.5) the happy path never needs a click: the bar shows queued/fetching
+ * progress with a cancel X. Renders one of: the classic disabled "audio is on <device>"
+ * (sync off — nothing to fetch); a re-start affordance (only reachable after the user
+ * cancelled); "Waiting to fetch…" (admission-queued); "Fetching [part K of M —] N%" with
+ * cancel; or a terminal error / on-device / no-space state with Retry where a retry can
+ * help. Never silent. Pure presentational — all wiring is passed in.
+ */
+function AudioFetchBar({
+  deviceLabel,
+  syncEnabled,
+  active,
+  track,
+  onFetch,
+  onCancel,
+  onRetry,
+}: {
+  deviceLabel: string;
+  syncEnabled: boolean;
+  /** Auto-fetch armed (or manually re-started) — false only after a user cancel. */
+  active: boolean;
+  track: TrackFetch | null;
+  onFetch: () => void;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  // Same shell (and therefore the same height) as the player and the placeholder, so any
+  // of these states can replace any other without moving the transcript underneath.
+  const barCls = `${AUDIO_ROW_CLASS} text-muted-foreground`;
+
+  // Sync off (or no relay): the audio can only be fetched via sync — stay honest & disabled.
+  if (!syncEnabled) {
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Audio is not on this device">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel}</span>
+      </div>
+    );
+  }
+
+  // Only reachable after an explicit user cancel (auto-fetch is otherwise always armed):
+  // offer to start it again.
+  if (!active) {
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" onClick={onFetch} aria-label="Fetch and play audio" title="Fetch audio from sync">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel} — click to fetch</span>
+      </div>
+    );
+  }
+
+  // Armed, but nothing has settled yet (`pending`, or a kind change still inside the
+  // display debounce). Hold the space; do NOT fall through to the click-to-fetch copy,
+  // which would tell the user the fetch had stopped when it is starting.
+  if (!track || track.kind === "pending") return <AudioRowPlaceholder />;
+
+  if (track.kind === "queued") {
+    return (
+      <div className={barCls}>
+        <span className="min-w-[14ch] whitespace-nowrap text-xs">Waiting to fetch…</span>
+        {/* Indeterminate: the wait is real work (a permit is held by another download),
+            so the track must not read as a dead grey rule. Same sweep primitive the
+            command palette uses for its own unknown-duration work. */}
+        <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
+          <div className="h-full w-1/3 animate-command-loading rounded-full bg-primary/40" />
+        </div>
+        <Button variant="ghost" size="icon-xs" onClick={onCancel} aria-label="Cancel fetch" title="Cancel">
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
+  if (track.kind === "fetching") {
+    return (
+      <div className={barCls}>
+        {/* Reserve the label's widest form up front. The copy changes on every tick
+            ("Fetching…" → "… 7%" → "… 100%"), and a shrink-to-fit span shoves the
+            progress bar sideways each time. `tabular-nums` holds the digits steady;
+            the min-width holds the phrase steady. */}
+        <span
+          className={`whitespace-nowrap text-xs tabular-nums ${
+            track.totalParts > 1 ? "min-w-[27ch]" : "min-w-[14ch]"
+          }`}
+        >
+          {formatTrackFetchLabel(track)}
+        </span>
+        <div className="h-1 flex-1 overflow-hidden rounded bg-muted">
+          <div className="h-full bg-primary transition-[width]" style={{ width: `${track.percent}%` }} />
+        </div>
+        <Button variant="ghost" size="icon-xs" onClick={onCancel} aria-label="Cancel fetch" title="Cancel">
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
+  if (track.kind === "on_device") {
+    // The server doesn't (fully) hold the track yet; the poll re-probes every 30s and the
+    // fetch self-starts when the source device's upload lands.
+    return (
+      <div className={barCls}>
+        <Button variant="ghost" size="icon-xs" disabled aria-label="Audio unavailable" title="Not yet backed up to sync — retries automatically">
+          <Play className="h-4 w-4" />
+        </Button>
+        <span className="text-xs">Audio is on {deviceLabel}</span>
+      </div>
+    );
+  }
+
+  if (track.kind === "auth_expired") {
+    // Self-healing: the drain refreshes the bearer and the poll re-probes on the slow
+    // cadence — no user action, so no Retry affordance.
+    return (
+      <div className={barCls}>
+        <AlertTriangle className="h-4 w-4 text-amber-500" />
+        <span className="text-xs">{AUTH_EXPIRED_FETCH_COPY}</span>
+      </div>
+    );
+  }
+
+  if (track.kind === "verification_failed") {
+    // Sticky tamper signal — never auto-retried — but a transient epoch divergence (e.g.
+    // a vault-key rotation racing the fetch) deserves an in-session escape hatch: Retry
+    // clears the slot (cancel) and re-prepares a fresh download.
+    return (
+      <div className={barCls}>
+        <AlertTriangle className="h-4 w-4 text-amber-500" />
+        <span className="min-w-0 flex-1 truncate text-xs">Audio failed verification</span>
+        <Button variant="ghost" size="icon-xs" onClick={onRetry} aria-label="Retry fetch" title="Retry">
+          <RefreshCw className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
+  // ready shouldn't reach here (the player renders instead) — guard for exhaustiveness.
+  if (track.kind === "ready") return null;
+
+  // no_space / unreachable / error → surface verbatim + offer retry.
+  const message =
+    track.kind === "unreachable"
+      ? "Can't reach sync server"
+      : track.kind === "no_space"
+        ? formatNoSpace(track.needed)
+        : track.message;
+  return (
+    <div className={barCls}>
+      <AlertTriangle className="h-4 w-4 text-amber-500" />
+      <span className="min-w-0 flex-1 truncate text-xs" title={message}>{message}</span>
+      <Button variant="ghost" size="icon-xs" onClick={onRetry} aria-label="Retry fetch" title="Retry">
+        <RefreshCw className="h-4 w-4" />
+      </Button>
+    </div>
+  );
 }
 
 export function NoteDetailView() {
@@ -47,14 +503,19 @@ export function NoteDetailView() {
   const setIsPlaying = useAppStore((s) => s.setIsPlaying);
   const noteRefreshCounter = useAppStore((s) => s.noteRefreshCounter);
   const loadSessions = useAppStore((s) => s.loadSessions);
-  const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
   const activeSessionParts = useAppStore((s) => s.activeSessionParts);
   const viewSessionParts = useAppStore((s) => s.viewSessionParts);
   const resumeSession = useAppStore((s) => s.resumeSession);
   const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
   const sessionStopping = useAppStore((s) => s.sessionStopping);
+  const syncStatus = useAppStore((s) => s.syncStatus);
+  const navigateTo = useAppStore((s) => s.navigateTo);
+  const markSessionCompleted = useAppStore((s) => s.markSessionCompleted);
+  // Escape-hatch confirm dialog (Q1). Component-local; hooks stay unconditional.
+  const [markCompletedOpen, setMarkCompletedOpen] = useState(false);
 
   const isActiveSession = selectedSessionId === activeSessionId;
+  const myFingerprint = syncStatus?.deviceFingerprint ?? null;
 
   const {
     suggestions,
@@ -97,16 +558,23 @@ export function NoteDetailView() {
   const handleToolsExecuted = useCallback(
     async (names: string[]) => {
       if (!selectedSessionId) return;
+      // Note: the local-write refresh signals (incrementNoteRefresh /
+      // incrementSessionMetaRefresh) are bumped by the tools THEMSELVES adjacent
+      // to their DB write (see ai-tools.ts), so an open editor's in-flight save
+      // yields atomically; this callback only refreshes VIEW state afterward.
       const effects = getToolEffects(names);
       if (effects.has("session-meta")) {
         await loadSessions();
         const refreshed = await getSession(selectedSessionId);
-        if (refreshed) {
+        // Post-await recheck (commit-after-navigation): the user may have opened
+        // a different session while these reads were in flight — don't commit
+        // this row's meta over the now-open view.
+        if (
+          refreshed &&
+          useAppStore.getState().selectedSessionId === selectedSessionId
+        ) {
           useAppStore.setState({ viewSession: refreshed });
         }
-      }
-      if (effects.has("notes")) {
-        incrementNoteRefresh();
       }
       if (effects.has("organization")) {
         await Promise.all([loadSessionFolders(), loadSessionTags(), loadTags()]);
@@ -118,7 +586,6 @@ export function NoteDetailView() {
     [
       selectedSessionId,
       loadSessions,
-      incrementNoteRefresh,
       loadSessionFolders,
       loadSessionTags,
       loadTags,
@@ -149,6 +616,228 @@ export function NoteDetailView() {
     [setPlaybackTime],
   );
 
+  // Audio-file presence check (honest player). `session_audio_parts.file_path`
+  // is the RECORDING device's absolute path, synced verbatim; on a peer device
+  // that file is absent because audio bytes are NOT synced in this release —
+  // only metadata. Probe existence off the render path (resolves post-mount)
+  // and re-check when the parts change (session switch / D4 reload replaces the
+  // parts array) or the window regains focus (the user may have copied the
+  // file over).
+  const partPaths = useMemo(
+    () =>
+      (isActiveSession ? activeSessionParts : viewSessionParts).map(
+        (p) => p.file_path,
+      ),
+    [isActiveSession, activeSessionParts, viewSessionParts],
+  );
+  // Identity-independent key: the D4 live refresh replaces `viewSessionParts` with a NEW
+  // array of the SAME paths several times a minute. Keying the probe on array identity
+  // restarted it (and everything downstream of it) each time; keying on the paths
+  // themselves means only a genuinely different track restarts anything.
+  const partsKey = partPaths.join(" ");
+  const partPathsRef = useRef(partPaths);
+  partPathsRef.current = partPaths;
+  const [probe, setProbe] = useState<PresenceProbe>({ status: "probing" });
+  useEffect(() => {
+    const paths = partPathsRef.current;
+    if (paths.length === 0) {
+      setProbe({ status: "unknown" });
+      return;
+    }
+    let cancelled = false;
+    // New track: whatever we held describes DIFFERENT files, so it must go. Until the
+    // first result lands the row is the inert placeholder — not an optimistic player
+    // that gets yanked, and not a fetch bar for a fetch we do not know is needed.
+    setProbe({ status: "probing" });
+    const check = () => {
+      // Deliberately does NOT flip back to `probing`: a re-probe holds the last result
+      // so the player stays mounted, `missingPartIds` stays stable, the poll effect is
+      // not torn down (which would release the queued parts), and progress is not reset.
+      commands
+        .audioFilesExist(paths)
+        .then((res) => {
+          if (cancelled) return;
+          setProbe(
+            Array.isArray(res) && res.length === paths.length
+              ? { status: "resolved", flags: res }
+              : { status: "unknown" },
+          );
+        })
+        .catch(() => {
+          // Command unavailable (older backend) → stay optimistic; the player's own
+          // play-error toast still catches a genuinely missing file when the user hits
+          // play. A result we already hold outranks a failed re-probe.
+          if (!cancelled) {
+            setProbe((prev) => (prev.status === "resolved" ? prev : { status: "unknown" }));
+          }
+        });
+    };
+    check();
+    window.addEventListener("focus", check);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", check);
+    };
+    // Keyed on the joined paths (via the ref above), not on `partPaths`' array identity.
+  }, [partsKey]);
+  /** Last RESOLVED presence result, or `null` when we have none (probing / unsupported). */
+  const partsExist: boolean[] | null =
+    probe.status === "resolved" ? probe.flags : null;
+  /** First probe for this track still in flight — nothing may be claimed about the audio. */
+  const presenceUnresolved = probe.status === "probing";
+
+  // ---- S3.5 auto-fetch playback ----
+  // When a synced session's audio is missing locally, fetching starts BY ITSELF the moment
+  // the session opens (owner directive — no click gate): GET → decrypt-to-cache → player,
+  // with progress + cancel. Single-flight + the global cap (2) + FIFO admission live in
+  // Rust; here we POLL `audio_prepare_part` per missing part IN part_index ORDER (the
+  // submission order IS the queue order) and aggregate to one honest track state. A
+  // remote-LIVE session (foreign `recording`) is excluded — its parts are still growing —
+  // but the arm predicate re-evaluates when the D4 live-refresh flips it to `completed`
+  // (session.status is part of `remoteLive` below), so the fetch then fires unprompted.
+  const rawParts = useMemo(
+    () => (isActiveSession ? activeSessionParts : viewSessionParts),
+    [isActiveSession, activeSessionParts, viewSessionParts],
+  );
+  const syncEnabled = !!syncStatus?.syncEnabled;
+  const remoteLive = session
+    ? isRemoteLiveSession(session, isActiveSession, myFingerprint)
+    : false;
+  const missingPartIds = useMemo(() => {
+    if (!partsExist || partsExist.length !== rawParts.length) return [];
+    return rawParts.filter((_, i) => partsExist[i] === false).map((p) => p.id);
+  }, [rawParts, partsExist]);
+  const [prepareStates, setPrepareStates] = useState<Record<string, AudioPartPrepare>>({});
+  // Set ONLY by the user's explicit cancel (X): auto-fetch must not re-arm right after a
+  // cancel. Reset on track change and by the manual re-start affordance.
+  const [fetchSuppressed, setFetchSuppressed] = useState(false);
+  const [fetchNonce, setFetchNonce] = useState(0);
+  // A stable key for the missing-set so effects/handlers don't churn on array identity.
+  const missingKey = missingPartIds.join(",");
+  const missingRef = useRef(missingPartIds);
+  missingRef.current = missingPartIds;
+
+  // Reset the fetch flow whenever the track changes (session switch / parts reload).
+  useEffect(() => {
+    setFetchSuppressed(false);
+    setPrepareStates({});
+  }, [missingKey]);
+
+  // The auto-arm predicate (deliverable: session open + sync on + missing parts + not
+  // remote-live, minus an explicit user cancel).
+  const fetchArmed =
+    syncEnabled && !remoteLive && missingPartIds.length > 0 && !fetchSuppressed;
+
+  // Poll while armed: submit/poll every missing part in order, re-arm per the derived
+  // track state (600ms while queued/fetching, 30s while the server lacks a blob — the
+  // still-uploading re-probe; stop on ready/terminals). On unmount (or disarm) drop the
+  // QUEUED parts only — an in-flight download completes into the cache, so reopening the
+  // session re-submits idempotently (cache hits short-circuit in Rust).
+  useEffect(() => {
+    if (!fetchArmed) return;
+    const ids = missingRef.current;
+    if (ids.length === 0) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      const next: Record<string, AudioPartPrepare> = {};
+      // Sequential, ordered submission: part_index order = FIFO admission order in Rust.
+      for (const id of ids) {
+        // Cancel/navigate-away between parts must not re-submit the remaining
+        // ones: the single in-flight prepare is left to land in cache, but every
+        // still-queued part stops here.
+        if (cancelled) return;
+        try {
+          // highPriority: the session the user is LOOKING AT outranks background
+          // dictation prefetches in the global fetch queue (promotes if already queued).
+          const st = await syncCommands.prepareAudioPart(id, { highPriority: true });
+          // IPC boundary: never trust the shape blindly (an older backend or a bad
+          // serialization must degrade to an honest error, not a render crash).
+          next[id] =
+            st && typeof st === "object" && "state" in st
+              ? st
+              : { state: "error", message: "invalid prepare response" };
+        } catch (e) {
+          next[id] = { state: "error", message: String(e) };
+        }
+      }
+      if (cancelled) return;
+      setPrepareStates(next);
+      const delay = nextPollDelayMs(deriveTrackFetch(ids.map((id) => next[id])));
+      if (delay !== null) timer = setTimeout(() => void tick(), delay);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      // Navigate-away: cancel queued (never-started) parts; leave in-flight ones to land.
+      ids.forEach((id) => void syncCommands.releaseAudioPart(id).catch(() => {}));
+    };
+  }, [fetchArmed, missingKey, fetchNonce]);
+
+  const startFetch = useCallback(() => {
+    setPrepareStates({});
+    setFetchSuppressed(false);
+    setFetchNonce((n) => n + 1);
+  }, []);
+  const cancelFetch = useCallback(() => {
+    missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
+    setFetchSuppressed(true);
+    setPrepareStates({});
+  }, []);
+  const retryFetch = useCallback(() => {
+    missingRef.current.forEach((id) => void syncCommands.cancelAudioPart(id));
+    setPrepareStates({});
+    setFetchSuppressed(false);
+    setFetchNonce((n) => n + 1);
+  }, []);
+
+  const cacheByPart = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const [id, st] of Object.entries(prepareStates)) {
+      if (st.state === "ready") out[id] = st.path;
+    }
+    return out;
+  }, [prepareStates]);
+
+  // D2-ordered assembly: local file_path for present parts, fetched cache path for the rest.
+  const assembled = assembleTrack(rawParts, partsExist, cacheByPart, audioStreamUrl);
+  const partsForPlayer: AudioPart[] = assembled.parts;
+  const hasAudio = rawParts.length > 0;
+  // Aggregate fetch state across the MISSING parts (all-or-nothing: the timeline seeks by
+  // global time, so every part must resolve before we render the player). Memoized so the
+  // display hook below sees a stable identity between polls.
+  const trackFetch: TrackFetch | null = useMemo(() => {
+    if (!fetchArmed || missingPartIds.length === 0) return null;
+    // A part we have not heard back about yet is UNKNOWN, not "fetching". Defaulting it
+    // to a synthetic fetching state announced "Fetching…" before the very first prepare
+    // call returned, so a cache hit or a 404 flashed a download that never happened —
+    // and it recurred on every re-start/retry, which clear `prepareStates`.
+    const states = missingPartIds.map((id) => prepareStates[id]);
+    if (states.some((st) => st === undefined)) return { kind: "pending" };
+    return deriveTrackFetch(states as AudioPartPrepare[]);
+  }, [fetchArmed, missingPartIds, prepareStates]);
+  // One fetch session = one missing-set + one (re)start. Its identity resets the
+  // monotonic progress floor; nothing else may.
+  const displayTrack = useTrackFetchDisplay(trackFetch, `${missingKey}#${fetchNonce}`);
+  // `audioPlayable` = every part has a resolved src (local or freshly fetched). When parts
+  // are missing and not (yet) fetched we render the honest fetch/unavailable bar and withhold
+  // every playback affordance (transcript-timestamp seeking included). An unresolved probe
+  // is not a licence to seek either — we do not yet know the bytes are here.
+  const audioPlayable = hasAudio && assembled.allPlayable && !presenceUnresolved;
+  const audioMissing =
+    hasAudio && !presenceUnresolved && missingPartIds.length > 0 && !assembled.allPlayable;
+  // Did this track ever show the fetch bar? If so, the player that eventually replaces it
+  // is an ARRIVAL and gets the standard view transition; a player that was there from the
+  // first paint gets nothing (it would double up with the view's own entrance).
+  const fetchBarShownRef = useRef(false);
+  useEffect(() => {
+    fetchBarShownRef.current = false;
+  }, [partsKey]);
+  useEffect(() => {
+    if (audioMissing) fetchBarShownRef.current = true;
+  }, [audioMissing]);
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -159,13 +848,10 @@ export function NoteDetailView() {
   const isEditable = isActiveSession || session.status === "completed";
   const isManual = session.session_type === "manual";
   const isTranscription = !isManual;
-  const partsForPlayer: AudioPart[] = (
-    isActiveSession ? activeSessionParts : viewSessionParts
-  ).map((p) => ({
-    src: audioStreamUrl(p.file_path),
-    duration: p.duration_seconds,
-  }));
-  const hasAudio = partsForPlayer.length > 0;
+  const audioDeviceLabel =
+    syncStatus?.roster.find(
+      (r) => r.fingerprint === session.recording_device_id,
+    )?.label ?? "another device";
 
   const chatBar = selectedSessionId ? (
     <AIContextProvider
@@ -239,9 +925,28 @@ export function NoteDetailView() {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} segments={segments} />
-        {hasAudio && (
+        {hasAudio && presenceUnresolved ? (
+          // The presence probe for this track has not answered. Reserve the row rather
+          // than rendering the player (which would be yanked away a tick later if the
+          // bytes turn out to be on the other device) or the fetch bar (which would
+          // claim a fetch we do not know is needed).
+          <AudioRowPlaceholder />
+        ) : audioMissing ? (
+          // Metadata synced from another device but the audio bytes did not. S3: offer
+          // fetch-on-demand (progress + cancel) instead of a dead disabled control.
+          <AudioFetchBar
+            deviceLabel={audioDeviceLabel}
+            syncEnabled={syncEnabled}
+            active={fetchArmed}
+            track={displayTrack}
+            onFetch={startFetch}
+            onCancel={cancelFetch}
+            onRetry={retryFetch}
+          />
+        ) : hasAudio ? (
           <AudioPlayer
             parts={partsForPlayer}
+            className={fetchBarShownRef.current ? "view-enter" : undefined}
             onTimeUpdate={setPlaybackTime}
             onPlayStateChange={setIsPlaying}
             onResume={
@@ -255,7 +960,7 @@ export function NoteDetailView() {
                 : undefined
             }
           />
-        )}
+        ) : null}
         <ResizablePanelGroup orientation="horizontal" className="flex-1">
           <ResizablePanel defaultSize="40%" minSize="20%">
             <div className="flex flex-col h-full min-h-0">
@@ -263,19 +968,171 @@ export function NoteDetailView() {
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 isEditable={isEditable}
-                currentPlaybackTime={hasAudio ? playbackTime : undefined}
-                onTimestampClick={hasAudio ? handleSeek : undefined}
+                currentPlaybackTime={audioPlayable ? playbackTime : undefined}
+                onTimestampClick={audioPlayable ? handleSeek : undefined}
               />
             </div>
           </ResizablePanel>
           <ResizableHandle />
           <ResizablePanel defaultSize="60%" minSize="25%">
             <div className="relative flex flex-col h-full min-h-0 pb-24">
-              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={hasAudio ? handleSeek : undefined} />
+              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={audioPlayable ? handleSeek : undefined} />
               {chatBar}
             </div>
           </ResizablePanel>
         </ResizablePanelGroup>
+      </div>
+    );
+  }
+
+  // Remote-recording lifecycle (LIVE_SESSION_STATE.md §state machine): a non-active
+  // `recording` row rendered on this device. Read-only in every case — record/resume/
+  // edit/delete, the notes editor, and the chat bar are all withheld. Fresh foreign
+  // owner → "● Live on <label>" follow-along (D3); every other non-active recording
+  // row (stale-foreign, own-crashed, legacy-NULL) → "Interrupted" (D5, no live pulse).
+  // Staleness derives from `segments`, which the D4 live refresh reloads — so a
+  // resuming foreign session flips Interrupted → Live on the next applied batch.
+  const owner = session.recording_device_id;
+  const remoteView = selectRemoteRecordingView(
+    session,
+    segments,
+    isActiveSession,
+    myFingerprint,
+  );
+  const ownerLabel =
+    syncStatus?.roster.find((r) => r.fingerprint === owner)?.label ??
+    "another device";
+
+  if (remoteView === "remote-live") {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
+        <div className="flex items-center justify-between border-b px-4 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <button
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted"
+              onClick={() => navigateTo("note-list")}
+              aria-label="Back to notes"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <span className="truncate text-sm font-medium">
+              {session.title || "Untitled"}
+            </span>
+          </div>
+          <div
+            className="flex shrink-0 items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400"
+            aria-live="polite"
+          >
+            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>Live on {ownerLabel}</span>
+          </div>
+        </div>
+        {segments.length > 0 ? (
+          <ChatView
+            sessionId={selectedSessionId ?? undefined}
+            segments={segments}
+            initialScrollToBottom
+          />
+        ) : (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">
+              Waiting for {ownerLabel} to start speaking…
+            </p>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Interrupted (D5): a non-active `recording` row whose heartbeat has gone stale, or
+  // an own-crashed / legacy-NULL row. Read-only, visually distinct from Live (static
+  // amber badge, no pulse). The "Mark completed" escape hatch (Q1) appears in the
+  // overflow menu ONLY for a foreign+stale row — a dead device's stranded session or a
+  // same-hardware re-pair orphan; own-crashed & legacy-NULL rows are finalized by the
+  // owner-only boot sweep instead.
+  if (remoteView === "interrupted") {
+    const isForeign = !!owner && owner !== myFingerprint;
+    const badgeLabel = isForeign ? `Interrupted on ${ownerLabel}` : "Interrupted";
+    const showMarkCompleted = canMarkSessionCompleted(
+      session,
+      segments,
+      isActiveSession,
+      myFingerprint,
+    );
+    return (
+      <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
+        <div className="flex items-center justify-between border-b px-4 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <button
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted"
+              onClick={() => navigateTo("note-list")}
+              aria-label="Back to notes"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <span className="truncate text-sm font-medium">
+              {session.title || "Untitled"}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <div
+              className="flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-600 dark:text-amber-400"
+              aria-live="polite"
+            >
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              <span>{badgeLabel}</span>
+            </div>
+            {showMarkCompleted && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Session actions"
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={() => setMarkCompletedOpen(true)}>
+                    <CheckCircle2 />
+                    Mark completed
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </div>
+        </div>
+        {segments.length > 0 ? (
+          <ChatView
+            sessionId={selectedSessionId ?? undefined}
+            segments={segments}
+          />
+        ) : (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">
+              No transcript was captured before this session was interrupted.
+            </p>
+          </div>
+        )}
+        <AlertDialog open={markCompletedOpen} onOpenChange={setMarkCompletedOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Mark session completed?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This session appears interrupted on {ownerLabel}. Mark it completed?
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => markSessionCompleted(session.id)}
+              >
+                Mark completed
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     );
   }

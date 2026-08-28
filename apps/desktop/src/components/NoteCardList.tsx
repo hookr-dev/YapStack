@@ -11,7 +11,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { Plus, Rewind, ChevronRight, Inbox, Folder, Pin } from "lucide-react";
+import { Plus, Rewind, ChevronRight, Inbox, Folder, Pin, Loader2 } from "lucide-react";
 import { useCreateSession } from "@/hooks/useCreateSession";
 import { groupSessionsByDay } from "@/lib/utils";
 import { getFolderPath, getDescendantIds } from "@/lib/folder-tree";
@@ -32,7 +32,11 @@ export function NoteCardList() {
       s.bufferInfo?.system?.available_seconds ?? 0,
     ),
   );
-  const { canCreate, handleNew } = useCreateSession();
+  const { canCreate, creatingSession, handleNew } = useCreateSession();
+  // `canCreate` goes false for the duration of a start, so the empty state keys its
+  // copy and its affordances off both flags — otherwise a start that is waiting on
+  // the DB would flip the page to "Waiting for engine…", which isn't what's happening.
+  const canShowCreate = canCreate || creatingSession;
 
   const breadcrumbs = useMemo(() => {
     if (listFilter.type !== "folder" || !listFilter.folderId) return null;
@@ -171,20 +175,24 @@ export function NoteCardList() {
               ? "No pinned notes"
               : listFilter.type === "folder"
                 ? "No notes in this folder"
-                : canCreate
+                : canShowCreate
                   ? "Start a new session to begin transcribing"
                   : "Waiting for engine and audio capture to be ready..."}
           </p>
-          {canCreate && listFilter.type === "all" && (
+          {canShowCreate && listFilter.type === "all" && (
             <div className="flex items-center gap-2">
-              <Button onClick={() => handleNew()} size="sm">
-                <Plus className="mr-2 h-4 w-4" />
-                New Session
+              <Button onClick={() => handleNew()} size="sm" disabled={!canCreate}>
+                {creatingSession ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Plus className="mr-2 h-4 w-4" />
+                )}
+                {creatingSession ? "Starting…" : "New Session"}
               </Button>
               {availableSeconds > 0 && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button size="sm" variant="outline">
+                    <Button size="sm" variant="outline" disabled={!canCreate}>
                       <Rewind className="mr-2 h-4 w-4" />
                       Rewind ({formatBackfillSeconds(availableSeconds)})
                     </Button>

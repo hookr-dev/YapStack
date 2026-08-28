@@ -1,7 +1,22 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/tauri";
 import { commandErrorMessage } from "@/lib/command-error";
+import { log } from "@/lib/logger";
+
+/** Backend event fired by the sync drain after it merges peer changes (R6 item 2). */
+const SYNC_APPLIED_EVENT = "sync://applied";
+/** Collapse a burst of merge events into one coarse refresh (1.5s). */
+const SYNC_APPLIED_DEBOUNCE_MS = 1500;
+/**
+ * Ceiling on the trailing debounce (C1). A continuously-arriving remote stream
+ * (a peer recording live, a long backlog drained in small batches) resets the
+ * trailing timer on every event and would starve the refresh indefinitely — the
+ * UI would sit stale for as long as the peer keeps writing. The max-wait fires
+ * at most this long after the FIRST event of a burst, regardless of activity.
+ */
+const SYNC_APPLIED_MAX_WAIT_MS = 3000;
 
 /**
  * Poll the builder-managed `backend_ready` flag until the Rust setup hook
@@ -48,11 +63,13 @@ import {
   createSession as dbCreateSession,
   updateSessionTitle,
   completeSession,
+  markSessionCompleted as dbMarkSessionCompleted,
   markSessionRecording as dbMarkSessionRecording,
   deleteSession as dbDeleteSession,
   listSessions,
   getSession,
   getSessionSegments,
+  getNote,
   insertSegment,
   deleteAllSessions,
   togglePin as dbTogglePin,
@@ -86,6 +103,7 @@ import {
   addSessionTag as dbAddSessionTag,
   removeSessionTag as dbRemoveSessionTag,
   getTagByName,
+  isRecordingStale,
 } from "@/lib/db";
 import type { DbDictationHistory, DbTag } from "@/lib/db";
 import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNode } from "@/lib/folder-tree";
@@ -101,6 +119,14 @@ import {
 } from "@/lib/insights";
 import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
+import {
+  DEFAULT_SYNC_SERVER_URL,
+  enqueueAudioForSession,
+  syncCommands,
+  type RelayConnState,
+  type RelayProbeError,
+  type SyncStatus,
+} from "@/lib/sync";
 import {
   migrateLegacyAISettings,
   type LegacyAISettings,
@@ -121,6 +147,7 @@ import {
   trackEngineError,
   trackSettingChanged,
   trackSessionMovedToFolder,
+  setAnalyticsEnabled,
 } from "@/lib/analytics";
 
 export type ThemeMode = "light" | "dark" | "system";
@@ -273,6 +300,27 @@ export interface OnboardingState {
   completedFlows: Record<string, string>; // flowId → ISO timestamp
 }
 
+/**
+ * Persisted sync slice (YAPSTACK_SYNC §14). Deliberately holds NO secrets: the
+ * vault key and auth tokens live in the OS keychain (Rust side), never here.
+ * Only the non-sensitive handles the UI needs to render connection state are
+ * persisted — the server URL, whether sync is enabled, the last-seen changeset
+ * cursor, and this device's public fingerprint. Everything else is fetched live
+ * via `syncCommands.status()`.
+ */
+export interface SyncConfig {
+  /** Relay base URL — default hosted, or a pasted self-host URL. */
+  serverUrl: string;
+  /** True once crr_migrate has run and the user opted into sync. */
+  syncEnabled: boolean;
+  /** Signed-in account email (non-secret), null when signed out. */
+  email: string | null;
+  /** Last-seen server changeset_seq watermark (dense cursor, arch §7). */
+  lastChangesetSeq: number;
+  /** This device's public fingerprint (base32 4×4), null before enrollment. */
+  deviceFingerprint: string | null;
+}
+
 export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
@@ -304,6 +352,10 @@ export interface Settings {
   /** Live insights — overlay-driven LLM extractions on a cadence trigger. */
   insights: InsightsSettings;
   showRecordingIndicator: boolean;
+  /// Opt out of anonymous usage analytics. Default true (ON), matching the
+  /// behavior before the toggle existed. Device-local by design: consent is
+  /// per-machine and must never travel over sync (sync-policy.ts).
+  analyticsEnabled: boolean;
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
   /// Restored as soon as recording ends. Only ever lowers — never raises.
@@ -389,9 +441,89 @@ interface AppState {
   // event fires. Lets the UI show a pulsing "Finalizing…" state immediately
   // while the engine drains the current chunk + finalizes the WAV.
   sessionStopping: boolean;
+  /**
+   * True for the whole of `createAndStartSession`. The action's first act is a DB
+   * write, and while the sync drain is working through a backlog that write can wait
+   * out the entire write-lock retry budget (`db-backend.ts`) — long enough that a
+   * button with no busy state looks broken and invites a second click that would race
+   * a second session row. Every entry point (sidebar, global shortcut, tray) goes
+   * through the same action, so this single flag both single-flights it and drives the
+   * spinner. Always cleared in a `finally`.
+   */
+  creatingSession: boolean;
 
   // Note refresh (for cross-component refresh signaling)
   noteRefreshCounter: number;
+  /**
+   * Session id the last `incrementNoteRefresh` recorded. A LOCAL note write (AI
+   * `save_to_notes`, the chat's save-to-notes, citation conversion) is announced
+   * by bumping the counter for its session; the sync path never bumps it (D4).
+   * NoteEditor's in-flight-save guard requires BOTH the counter to have moved AND
+   * this id to match its own session, so a note write on a DIFFERENT session can
+   * no longer make an unrelated editor drop its text.
+   */
+  noteRefreshSessionId: string | null;
+
+  /**
+   * Session-scoped local session-meta-write signal — the meta-level sibling of
+   * `noteRefreshCounter`. A LOCAL rename (the AI `update_title` tool via
+   * NoteDetailView.handleToolsExecuted, a dictation rename, etc.) bumps the
+   * counter and records its session; the sync path NEVER bumps it (mirror D4).
+   * SessionHeader's title save uses it to tell a same-machine rename from a
+   * genuine peer edit: when the row moved under an open title edit AND this
+   * signal shows a local write for that session, it yields instead of toasting
+   * "another device" and LWW-clobbering the local rename.
+   */
+  sessionMetaRefreshCounter: number;
+  sessionMetaRefreshSessionId: string | null;
+
+  /**
+   * Store-visible edit-in-progress signal (LIVE_SESSION_STATE.md D4 normative).
+   * The segment editor is uncontrolled (contentEditable holds in-flight text in the
+   * DOM), so the sync-applied live refresh must consult a store signal to avoid
+   * clobbering an open edit. Currently set for the duration of an in-flight
+   * `editSegmentText` save; the D4 refresh skips reloading the open session's
+   * segments while it is non-null. Slice 4 / a follow-up can additionally set it on
+   * `EditableSegment` focus/blur to cover the whole open-edit window.
+   */
+  editingSegmentId: string | null;
+  setEditingSegmentId: (id: string | null) => void;
+
+  /**
+   * Store-visible note-edit-in-progress signal — the note-level sibling of
+   * `editingSegmentId` (sync-UX A1b). `notes.content` is ONE last-writer-wins
+   * cell, so a sync-down that replaced the editor's content mid-edit would
+   * destroy unsaved keystrokes. NoteEditor opens the window on a keystroke and
+   * closes it once the debounced save has flushed and typing has gone idle (or
+   * immediately on blur / unmount). While it is set for the open session the
+   * sync refresh does not touch that session's note content.
+   */
+  noteEditingSessionId: string | null;
+  setNoteEditingSessionId: (id: string | null) => void;
+
+  /**
+   * Note content published by the sync refresh for the OPEN session (A1c).
+   * NoteEditor applies it in place when its editing window is closed. This is
+   * deliberately NOT `noteRefreshCounter`: D4 normative says sync must never
+   * bump that counter (it re-runs the load effect for any mounted editor and
+   * would discard an open edit). `seq` makes each publication distinguishable.
+   */
+  remoteNoteUpdate: { sessionId: string; content: string; seq: number } | null;
+
+  /**
+   * A refresh that a guard skipped, waiting to be drained (B5). Without this,
+   * a sync batch that lands while an edit window is open is simply dropped and
+   * the surface stays stale until the NEXT remote write happens to arrive.
+   */
+  pendingViewRefresh: boolean;
+
+  /**
+   * Monotonic count of committed sync-applied coarse refreshes. Surfaces that
+   * own their own DB reads (chat messages) subscribe to this instead of
+   * re-listening to the Tauri event, so they refresh on exactly the batches the
+   * store already committed.
+   */
+  syncAppliedSeq: number;
 
   // Audio playback
   playbackTime: number;
@@ -428,6 +560,31 @@ interface AppState {
 
   // Settings (persisted)
   settings: Settings;
+
+  // Sync (config persisted; live status + connection health runtime-only).
+  // See lib/sync.ts.
+  syncConfig: SyncConfig;
+  syncStatus: SyncStatus | null;
+  /** Probe-derived relay connection health — a SEPARATE axis from sync phase
+   *  (§1b). Runtime-only and never latched/persisted: recomputed from live
+   *  probes so a stale "unreachable" can't linger (plan §3). */
+  relayConn: RelayConnState;
+  setSyncConfig: (partial: Partial<SyncConfig>) => void;
+  setSyncStatus: (status: SyncStatus | null) => void;
+  /** Fetch live sync/auth status from the Rust runtime. Surfaces connection
+   *  errors verbatim into `syncStatus.lastError` — never auto-routes or falls
+   *  back (repo posture: the user fixes a broken connection). */
+  refreshSyncStatus: () => Promise<void>;
+  /** Probe `url` (the Test-connection button and the one-shot blur/paste in
+   *  T027 both call this). Single-flight via a monotonic token: a stale
+   *  response from a superseded probe is discarded. On success auto-persists
+   *  `syncConfig.serverUrl = normalizedUrl` — but ONLY when signed out (a
+   *  signed-in URL is locked; changing it is an explicit sign-out flow). */
+  probeRelay: (url: string) => Promise<void>;
+  /** Return connection health to `idle` and bump the probe token so any
+   *  in-flight probe's response is discarded (cancel-on-edit). Called when the
+   *  user edits the URL field. Re-probing the same URL twice is cheap + safe. */
+  resetProbe: () => void;
 
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
@@ -466,11 +623,19 @@ interface AppState {
   autoSetup: () => Promise<void>;
   loadSessions: () => Promise<void>;
   loadFolders: () => Promise<void>;
+  /**
+   * Subscribe to the backend `sync://applied` event (R6 item 2): the sync drain merged
+   * peer changes into the DB but nothing told the UI, so pulled sessions/notes/folders
+   * only appeared after an app restart. On each event we debounce, then refresh the coarse
+   * views (sessions / folders / tags and their maps). Returns an unlisten function.
+   */
+  startSyncAppliedRefresh: () => Promise<() => void>;
   createAndStartSession: (backfillSeconds?: number, trigger?: string) => Promise<void>;
   resumeSession: (sessionId: string) => Promise<void>;
   stopActiveSession: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  markSessionCompleted: (id: string) => Promise<void>;
   navigateTo: (
     view: "note-list" | "note-detail" | "settings",
     sessionId?: string,
@@ -478,11 +643,12 @@ interface AppState {
   /**
    * One-shot signal from anywhere in the app to land the user on a specific
    * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSection
-   * on mount, then cleared. Single-value rather than a queue — only the most
-   * recent intent matters. Cleared after consumption.
+   * on mount, then cleared. `"sync"` (from the ambient sidebar glyph) opens the
+   * Sync tab and is cleared by SettingsPanel itself. Single-value rather than a
+   * queue — only the most recent intent matters. Cleared after consumption.
    */
-  settingsRequest: "ai-add-connection" | null;
-  setSettingsRequest: (request: "ai-add-connection" | null) => void;
+  settingsRequest: "ai-add-connection" | "sync" | null;
+  setSettingsRequest: (request: "ai-add-connection" | "sync" | null) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
   /**
@@ -548,6 +714,16 @@ interface AppState {
   showHiddenSegments: boolean;
   setShowHiddenSegments: (show: boolean) => void;
   refreshViewSessionSegments: () => Promise<void>;
+  /** D4 live refresh: reload the open non-active session's row + segments + parts
+   *  on a sync-applied batch, skipping while an edit is in progress and never
+   *  bumping noteRefreshCounter (LIVE_SESSION_STATE.md Gap 2). */
+  refreshOpenViewSession: () => Promise<void>;
+  /** One batched commit of every coarse list read plus the open-view refresh —
+   *  the body of the debounced `sync://applied` handler (C2). */
+  syncAppliedCoarseRefresh: () => Promise<void>;
+  /** Run a refresh that an edit guard previously skipped (B5). No-op when no
+   *  refresh is pending or a guard is still open. */
+  drainPendingViewRefresh: () => void;
 
   // Segment multi-selection (ephemeral; not persisted). Reset on session change.
   selectedSegmentIds: Set<string>;
@@ -570,7 +746,9 @@ interface AppState {
   createManualNote: (title?: string) => Promise<void>;
 
   // Note refresh
-  incrementNoteRefresh: () => void;
+  incrementNoteRefresh: (sessionId: string) => void;
+  // Local session-meta write (rename etc.) signal; sync must never call this.
+  incrementSessionMetaRefresh: (sessionId: string) => void;
 
   // Audio playback
   setPlaybackTime: (time: number) => void;
@@ -596,8 +774,101 @@ interface AppState {
  */
 let segmentQueueTail: Promise<void> = Promise.resolve();
 let lastSessionsRefreshTime = 0;
+
+/**
+ * Monotonic single-flight token for relay probes. Each `probeRelay` bumps it;
+ * a resolving/rejecting probe whose token no longer matches the latest is stale
+ * (the user re-fired or edited the field) and its result is discarded.
+ * `resetProbe` bumps it too, cancelling any in-flight probe.
+ */
+let relayProbeToken = 0;
 function enqueueSegmentWork(fn: () => Promise<void>): void {
   segmentQueueTail = segmentQueueTail.then(fn, fn);
+}
+
+/**
+ * How much of the underlying error we put in a toast. Long enough for a real
+ * SQLite message ("UNIQUE constraint failed: segments.id", "database is
+ * locked", "no such column: hidden") without turning the toast into a wall.
+ */
+const DB_ERROR_TOAST_DETAIL_MAX = 120;
+
+/**
+ * Record a failed DB operation and hand back its message.
+ *
+ * Every store action that touches the DB used to end in
+ * `console.error(...) + toast.error("Failed to …")`, which threw away the one
+ * thing a support session needs: WHY. Two seams, deliberately both:
+ *   - `console.error` keeps the raw value (stack, cause) in devtools;
+ *   - `log.error(..., "db")` forwards a scoped line to the Rust `tracing`
+ *     subscriber, so it lands in the rolling daily log file and the LogsPanel
+ *     even when devtools was never opened — which is the case on a user's
+ *     machine. Same seam `db.ts`'s runtime-schema patcher already uses.
+ *
+ * PII contract: log the operation name and the error only. Never the row
+ * content being written (transcript text, note titles).
+ */
+function logDbFailure(op: string, error: unknown): string {
+  const detail = commandErrorMessage(error);
+  console.error(`${op} failed:`, error);
+  log.error(`${op} failed: ${detail}`, "db");
+  return detail;
+}
+
+/**
+ * [`logDbFailure`] plus an honest toast: the user-facing sentence with the
+ * underlying error appended, so a screenshot alone is diagnosable.
+ * `options` passes through to sonner (e.g. a dedupe `id` on hot paths).
+ */
+function reportDbFailure(
+  op: string,
+  userMessage: string,
+  error: unknown,
+  options?: { id: string },
+): void {
+  const detail = logDbFailure(op, error);
+  const shown =
+    detail.length > DB_ERROR_TOAST_DETAIL_MAX
+      ? `${detail.slice(0, DB_ERROR_TOAST_DETAIL_MAX - 1)}…`
+      : detail;
+  toast.error(shown ? `${userMessage}: ${shown}` : userMessage, options);
+}
+
+/**
+ * Transient SQLite write-lock contention — the same two verbatim strings
+ * `db-backend.ts` retries ("database is locked" / "database table is locked")
+ * before it finally gives up and rejects. Matched on the message because Tauri
+ * rejects a Rust `Err(String)` with the bare string, not a typed error.
+ */
+function isDatabaseBusyError(error: unknown): boolean {
+  const msg = commandErrorMessage(error).toLowerCase();
+  return msg.includes("database is locked") || msg.includes("database table is locked");
+}
+
+/**
+ * The one failure seam for starting a session, shared by all three entry points
+ * (sidebar button, global shortcut, tray) because they all go through
+ * `createAndStartSession`.
+ *
+ * Lock contention gets a plain-language sentence instead of the raw SQLite one:
+ * "database is locked" is true but useless to the user, and the honest advice is
+ * simply to wait for the sync drain to catch up. Anything else keeps the honest
+ * detail (`reportDbFailure`) — a schema or engine error is not something waiting
+ * fixes. Both seams still log the raw error to devtools + the rolling log file.
+ * The shared toast `id` dedupes a burst of retries into one line.
+ */
+function reportSessionStartFailure(error: unknown): void {
+  if (isDatabaseBusyError(error)) {
+    logDbFailure("createAndStartSession", error);
+    toast.error(
+      "Couldn't start a session — the database is busy syncing. Try again in a moment.",
+      { id: "create-session-failed" },
+    );
+    return;
+  }
+  reportDbFailure("createAndStartSession", "Couldn't start a session", error, {
+    id: "create-session-failed",
+  });
 }
 
 /**
@@ -658,9 +929,45 @@ const defaultSettings: Settings = {
   dictation: DEFAULT_DICTATION_SETTINGS,
   insights: DEFAULT_INSIGHTS_SETTINGS,
   showRecordingIndicator: true,
+  analyticsEnabled: true,
   dictationDuckEnabled: false,
   dictationDuckAmount: 0.8,
   onboarding: { completedFlows: {} },
+};
+
+const defaultSyncConfig: SyncConfig = {
+  serverUrl: DEFAULT_SYNC_SERVER_URL,
+  syncEnabled: false,
+  email: null,
+  lastChangesetSeq: 0,
+  deviceFingerprint: null,
+};
+
+/** Zero-value snapshot the status-fetch error path spreads over when there is no
+ *  previous status to carry forward. Must stay EXHAUSTIVE over `SyncStatus`: every
+ *  field added here is one the error snapshot can no longer silently drop. */
+const EMPTY_SYNC_STATUS: SyncStatus = {
+  phase: "disconnected",
+  serverUrl: "",
+  email: null,
+  deviceFingerprint: null,
+  roster: [],
+  vaultKeyEpoch: null,
+  rosterFingerprint: null,
+  syncEnabled: false,
+  lastError: null,
+  billingUrl: null,
+  pendingEntries: 0,
+  pendingBytes: 0,
+  ackedThisSession: 0,
+  lastSuccess: null,
+  pullBehind: 0,
+  cryptoQuarantined: 0,
+  audioUploadOutstanding: 0,
+  audioBackfillOutstanding: 0,
+  audioUploadFailed: 0,
+  audioUploadedTotal: 0,
+  audioBackfillComplete: false,
 };
 
 function updateSessionFolderMap(
@@ -702,6 +1009,99 @@ function deriveFolderState(folders: DbFolder[]) {
   };
 }
 
+function shallowEqualRow<T extends object>(a: T, b: T): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const k of aKeys) {
+    if (
+      (a as Record<string, unknown>)[k] !== (b as Record<string, unknown>)[k]
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Diff-merge a freshly-read row list into the one already in the store (C3).
+ *
+ * A sync-applied reload re-reads whole tables, so a wholesale array replacement
+ * hands React a brand-new object for EVERY row — every card in the list is a new
+ * prop identity, memoization is defeated and the whole list visibly jolts even
+ * when a single remote row changed. Keeping the previous object for rows whose
+ * columns are byte-identical means only the rows that actually changed re-render,
+ * and an entirely unchanged read returns the PREVIOUS array (reference-equal), so
+ * zustand subscribers don't even see a state change.
+ */
+function mergeRowsById<T extends { id: string }>(prev: T[], next: T[]): T[] {
+  if (prev.length === 0) return next;
+  const prevById = new Map(prev.map((r) => [r.id, r]));
+  let identical = prev.length === next.length;
+  const merged = next.map((row, i) => {
+    const old = prevById.get(row.id);
+    const kept = old !== undefined && shallowEqualRow(old, row) ? old : row;
+    if (identical && prev[i] !== kept) identical = false;
+    return kept;
+  });
+  return identical ? prev : merged;
+}
+
+/**
+ * Reset a folder filter that points at a folder which no longer exists (B4).
+ * A remote delete of the folder the user is currently browsing otherwise leaves
+ * the list stranded on a dead id: no breadcrumb, no sessions, no way back except
+ * clicking another filter.
+ */
+function reconcileListFilter(
+  filter: ListFilter,
+  folders: DbFolder[],
+): ListFilter {
+  if (filter.type !== "folder" || !filter.folderId) return filter;
+  return folders.some((f) => f.id === filter.folderId)
+    ? filter
+    : { type: "all" };
+}
+
+/** Folder-list patch shared by `loadFolders` and the batched sync refresh. */
+function folderPatch(
+  state: { folders: DbFolder[]; listFilter: ListFilter },
+  next: DbFolder[],
+) {
+  const folders = mergeRowsById(state.folders, next);
+  const listFilter = reconcileListFilter(state.listFilter, folders);
+  // Identity-stable read: the derived tree/maps still describe `folders`, so
+  // rebuilding them would remount the sidebar for nothing.
+  if (folders === state.folders) return { listFilter };
+  return { folders, listFilter, ...deriveFolderState(folders) };
+}
+
+function groupBySession<T extends { session_id: string }>(
+  rows: T[],
+  pick: (row: T) => string,
+): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  for (const row of rows) {
+    if (!map[row.session_id]) map[row.session_id] = [];
+    map[row.session_id].push(pick(row));
+  }
+  return map;
+}
+
+/**
+ * Monotonic "latest open request" token. openSession fans out through several
+ * awaited reads before it commits the note-detail view; two overlapping opens
+ * (a fast double-click across rows, or a slow first read resolving after a
+ * later one) would otherwise let whichever read finishes LAST win — showing the
+ * wrong session. Each call captures the token it stamped at entry and bails
+ * after its awaits if a newer open has since superseded it.
+ */
+// Monotonic navigation sequence: bumped by EVERY view-navigation commit
+// (openSession, navigateTo, deleteSession). An async openSession stamps it at
+// entry and drops its now-stale reads if any navigation superseded it during the
+// await — so a slow open can't clobber a later open, a navigateTo, or a delete.
+let navRequestSeq = 0;
+
 function createAppStore() {
   return create<AppState>()(
     persist(
@@ -734,7 +1134,26 @@ function createAppStore() {
       backfillActive: false,
       backfillBoundarySeconds: null,
       sessionStopping: false,
+      creatingSession: false,
       noteRefreshCounter: 0,
+      noteRefreshSessionId: null,
+      sessionMetaRefreshCounter: 0,
+      sessionMetaRefreshSessionId: null,
+      editingSegmentId: null,
+      setEditingSegmentId: (id: string | null) => {
+        set({ editingSegmentId: id });
+        // Closing an edit window is the catch-up point for any refresh the
+        // guard skipped (B5).
+        if (id === null) get().drainPendingViewRefresh();
+      },
+      noteEditingSessionId: null,
+      setNoteEditingSessionId: (id: string | null) => {
+        set({ noteEditingSessionId: id });
+        if (id === null) get().drainPendingViewRefresh();
+      },
+      remoteNoteUpdate: null,
+      pendingViewRefresh: false,
+      syncAppliedSeq: 0,
       playbackTime: 0,
       isPlaying: false,
       tags: [],
@@ -751,6 +1170,9 @@ function createAppStore() {
       updateAvailable: null,
       updateDismissedVersion: null,
       settings: defaultSettings,
+      syncConfig: defaultSyncConfig,
+      syncStatus: null,
+      relayConn: { kind: "idle" },
       devices: [],
       models: [],
       engineCatalogue: [],
@@ -795,6 +1217,14 @@ function createAppStore() {
               await completeSession(capturedSessionId, durationSeconds).catch((e) => {
                 console.error("Failed to complete session:", e);
               });
+
+              // S2 audio round-trip: enqueue this session's finalized part(s) for
+              // background upload to the relay (server-completeness invariant). The
+              // part rows landed above (insert_audio_part_row / onSessionPartReady, same
+              // queue), so they are visible now. Fire-and-forget — recording is never
+              // blocked, the durable queue survives restart, and on a no-sync build the
+              // command is simply absent and the call is swallowed.
+              enqueueAudioForSession(capturedSessionId);
 
               set({
                 activeSessionId: null,
@@ -970,8 +1400,12 @@ function createAppStore() {
               );
               return;
             }
-            console.error("Failed to persist live segment:", e);
-            toast.error("Failed to save transcript segment", { id: "segment-write-error" });
+            reportDbFailure(
+              "onLiveSegment/persist",
+              "Failed to save transcript segment",
+              e,
+              { id: "segment-write-error" },
+            );
           }
         });
       },
@@ -1013,6 +1447,12 @@ function createAppStore() {
         // If we already have this session active, skip
         if (get().activeSessionId === sessionId) return;
 
+        // Snapshot the selection at entry. Recovery restoring the ACTIVE session
+        // state always runs; the forced view navigation below is boot-time
+        // convenience and must not stomp a session the user opened during the
+        // async gap (commit-after-navigation).
+        const selectedAtStart = get().selectedSessionId;
+
         try {
           const [segments, session, parts] = await Promise.all([
             getSessionSegments(sessionId),
@@ -1034,7 +1474,7 @@ function createAppStore() {
             currentInsightId: get().settings.insights.defaultInsightId,
           });
 
-          if (session) {
+          if (session && get().selectedSessionId === selectedAtStart) {
             set({
               selectedSessionId: sessionId,
               viewSession: session,
@@ -1052,16 +1492,98 @@ function createAppStore() {
       loadSessions: async () => {
         try {
           const sessions = await listSessions();
-          set({ sessions });
+          // Diff-merge (C3): unchanged rows keep their object identity so a
+          // sync-applied reload doesn't remount every card in the list.
+          set({ sessions: mergeRowsById(get().sessions, sessions) });
         } catch (e) {
           console.error("Failed to load sessions:", e);
         }
       },
 
+      startSyncAppliedRefresh: async () => {
+        // Debounce so a long pulled backlog (many rapid `sync://applied` events) triggers a
+        // SINGLE coarse refresh instead of thrashing the UI. Coarse-only by design (v1): no
+        // fine-grained per-row invalidation — reload the whole session/folder/tag views.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let maxTimer: ReturnType<typeof setTimeout> | undefined;
+        const fire = () => {
+          if (timer) clearTimeout(timer);
+          if (maxTimer) clearTimeout(maxTimer);
+          timer = undefined;
+          maxTimer = undefined;
+          void get().syncAppliedCoarseRefresh();
+        };
+        const coarseRefresh = () => {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(fire, SYNC_APPLIED_DEBOUNCE_MS);
+          // C1: trailing debounce with a max-wait ceiling. The ceiling is armed
+          // by the first event of a burst and is NOT reset by later ones, so a
+          // peer that writes continuously can't starve the refresh.
+          if (!maxTimer) maxTimer = setTimeout(fire, SYNC_APPLIED_MAX_WAIT_MS);
+        };
+        const unlisten = await listen(SYNC_APPLIED_EVENT, coarseRefresh);
+        return () => {
+          if (timer) clearTimeout(timer);
+          if (maxTimer) clearTimeout(maxTimer);
+          unlisten();
+        };
+      },
+
+      /**
+       * One coarse refresh of every list surface a merged batch can touch,
+       * committed as a SINGLE set() (C2). Six independent commits produced six
+       * renders per batch — folders arriving a frame before the sessions that
+       * live in them made the list visibly reshuffle. Reads run concurrently and
+       * land together, so the UI moves once, consistently.
+       */
+      syncAppliedCoarseRefresh: async () => {
+        try {
+          const [
+            sessions,
+            folders,
+            sessionFolderRows,
+            tags,
+            sessionTagRows,
+            dictation,
+          ] = await Promise.all([
+            listSessions(),
+            listFolders(),
+            listAllSessionFolders(),
+            listTags(),
+            listAllSessionTags(),
+            // B1: dictation history is a synced table too — without this the
+            // dictation list stayed on whatever it read at boot.
+            listDictationHistory(),
+          ]);
+          const state = get();
+          set({
+            sessions: mergeRowsById(state.sessions, sessions),
+            ...folderPatch(state, folders),
+            sessionFolderMap: groupBySession(
+              sessionFolderRows,
+              (r) => r.folder_id,
+            ),
+            tags: mergeRowsById(state.tags, tags),
+            sessionTagMap: groupBySession(sessionTagRows, (r) => r.tag_id),
+            dictationHistory: mergeRowsById(state.dictationHistory, dictation),
+            syncAppliedSeq: state.syncAppliedSeq + 1,
+          });
+        } catch (e) {
+          console.error("Failed to refresh views after sync:", e);
+        }
+        // D4 (Gap 2): live-refresh the OPEN non-active session's row + segments +
+        // parts so a remote-live follow-along fills as rows merge (no manual
+        // reopen). Its own commit: it re-checks the open session after its reads
+        // and can navigate away (remote delete), which must not be entangled with
+        // the list commit above. The local active session reads from
+        // activeSessionSegments and is skipped inside.
+        await get().refreshOpenViewSession();
+      },
+
       loadFolders: async () => {
         try {
           const folders = await listFolders();
-          set({ folders, ...deriveFolderState(folders) });
+          set(folderPatch(get(), folders));
         } catch (e) {
           console.error("Failed to load folders:", e);
         }
@@ -1070,12 +1592,7 @@ function createAppStore() {
       loadSessionFolders: async () => {
         try {
           const rows = await listAllSessionFolders();
-          const map: Record<string, string[]> = {};
-          for (const row of rows) {
-            if (!map[row.session_id]) map[row.session_id] = [];
-            map[row.session_id].push(row.folder_id);
-          }
-          set({ sessionFolderMap: map });
+          set({ sessionFolderMap: groupBySession(rows, (r) => r.folder_id) });
         } catch (e) {
           console.error("Failed to load session folders:", e);
         }
@@ -1084,7 +1601,7 @@ function createAppStore() {
       loadTags: async () => {
         try {
           const tags = await listTags();
-          set({ tags });
+          set({ tags: mergeRowsById(get().tags, tags) });
         } catch (e) {
           console.error("Failed to load tags:", e);
         }
@@ -1093,12 +1610,7 @@ function createAppStore() {
       loadSessionTags: async () => {
         try {
           const rows = await listAllSessionTags();
-          const map: Record<string, string[]> = {};
-          for (const row of rows) {
-            if (!map[row.session_id]) map[row.session_id] = [];
-            map[row.session_id].push(row.tag_id);
-          }
-          set({ sessionTagMap: map });
+          set({ sessionTagMap: groupBySession(rows, (r) => r.tag_id) });
         } catch (e) {
           console.error("Failed to load session tags:", e);
         }
@@ -1148,95 +1660,123 @@ function createAppStore() {
         set({ sessionTagMap: map });
       },
 
+      /**
+       * Starts a recording session. Never rejects: this is the single seam every
+       * entry point (sidebar button, global shortcut, tray menu) funnels through,
+       * and two of those three are fire-and-forget event handlers with nowhere to
+       * put a rejection — the shortcut path used to reject unhandled and show the
+       * user nothing at all. Failures are surfaced by `reportSessionStartFailure`.
+       */
       createAndStartSession: async (backfillSeconds?: number, trigger?: string) => {
-        const { settings, enginePhase, captureStatus } = get();
+        // Single-flight. The opening `dbCreateSession` can block for the whole
+        // write-lock retry budget while the sync drain catches up, so without this
+        // a second click (or the shortcut fired twice) would race a second row.
+        if (get().creatingSession) return;
+        set({ creatingSession: true });
 
-        if (enginePhase !== "ready") {
-          throw new Error("Engine is not ready");
-        }
-        if (captureStatus?.state !== "Capturing") {
-          throw new Error("Audio capture is not active");
-        }
-
-        const sessionId = crypto.randomUUID();
-
-        await dbCreateSession(sessionId, settings.captureSource);
-
-        const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
-        const vocabHints = buildVocabularyHints(freshFolders, freshTags);
-
-        const config: LiveTranscriptionConfig = {
-          silence_duration_ms: settings.silenceDurationMs,
-          max_chunk_seconds: settings.maxChunkSeconds,
-          backfill_seconds: backfillSeconds ?? 0,
-          source: settings.captureSource,
-          mix_config:
-            settings.captureSource === "Mixed" ? settings.mixConfig : null,
-          language: settings.language,
-          prompt_context_chars: settings.promptContextChars,
-          prompt_decay_silence_seconds:
-            settings.promptDecaySilenceSeconds > 0
-              ? settings.promptDecaySilenceSeconds
-              : null,
-          session_id: sessionId,
-          audio_save_location: settings.audioSaveLocation,
-          audio_export_format: settings.audioExportFormat,
-          mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-          diarization:
-            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
-          vocabulary_hints: vocabHints,
-          source_kind: "session",
-        };
-
-        // Pre-set `backfillActive` before the await so any `backfill-complete`
-        // event emitted by the spawned live task during the await transitions
-        // it cleanly to false. If we set it post-await instead, a fast or
-        // empty-branch backfill-complete could fire before our set, the
-        // listener would clear it to false, and our subsequent set would
-        // overwrite it back to true — leaving the UI affordance stuck on.
         const requestedBackfill = (backfillSeconds ?? 0) > 0;
-        if (requestedBackfill) {
-          set({ backfillActive: true });
-        }
+        try {
+          const { settings, enginePhase, captureStatus } = get();
 
-        const result = await commands.startLiveTranscription(config);
-        if (result.status === "error") {
-          // Clean up the DB row we just created
-          await dbDeleteSession(sessionId).catch(() => {});
+          if (enginePhase !== "ready") {
+            throw new Error("Engine is not ready");
+          }
+          if (captureStatus?.state !== "Capturing") {
+            throw new Error("Audio capture is not active");
+          }
+
+          const sessionId = crypto.randomUUID();
+
+          // Attribute the recording to THIS device (LIVE_SESSION_STATE D2); null when
+          // sync is not configured → single-device semantics unchanged.
+          await dbCreateSession(
+            sessionId,
+            settings.captureSource,
+            get().syncStatus?.deviceFingerprint ?? null,
+          );
+
+          const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
+          const vocabHints = buildVocabularyHints(freshFolders, freshTags);
+
+          const config: LiveTranscriptionConfig = {
+            silence_duration_ms: settings.silenceDurationMs,
+            max_chunk_seconds: settings.maxChunkSeconds,
+            backfill_seconds: backfillSeconds ?? 0,
+            source: settings.captureSource,
+            mix_config:
+              settings.captureSource === "Mixed" ? settings.mixConfig : null,
+            language: settings.language,
+            prompt_context_chars: settings.promptContextChars,
+            prompt_decay_silence_seconds:
+              settings.promptDecaySilenceSeconds > 0
+                ? settings.promptDecaySilenceSeconds
+                : null,
+            session_id: sessionId,
+            audio_save_location: settings.audioSaveLocation,
+            audio_export_format: settings.audioExportFormat,
+            mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
+            diarization:
+              settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+            vocabulary_hints: vocabHints,
+            source_kind: "session",
+          };
+
+          // Pre-set `backfillActive` before the await so any `backfill-complete`
+          // event emitted by the spawned live task during the await transitions
+          // it cleanly to false. If we set it post-await instead, a fast or
+          // empty-branch backfill-complete could fire before our set, the
+          // listener would clear it to false, and our subsequent set would
+          // overwrite it back to true — leaving the UI affordance stuck on.
+          if (requestedBackfill) {
+            set({ backfillActive: true });
+          }
+
+          const result = await commands.startLiveTranscription(config);
+          if (result.status === "error") {
+            // Clean up the DB row we just created
+            await dbDeleteSession(sessionId).catch(() => {});
+            throw new Error(commandErrorMessage(result.error));
+          }
+
+          trackSessionCreated({
+            source: settings.captureSource,
+            backfill_seconds: backfillSeconds ?? 0,
+            trigger: trigger ?? "unknown",
+          });
+
+          // Note: `backfillActive` deliberately omitted — the pre-await set
+          // above plus the `backfill-complete` listener are the source of
+          // truth. Re-asserting it here would re-introduce the race.
+          set({
+            activeSessionId: sessionId,
+            activeSessionSegments: [],
+            activeSessionParts: [],
+            activeSessionStartTime: result.data.effective_start_epoch_ms,
+            liveTranscriptionActive: true,
+            livePhase: "Running",
+            currentView: "note-detail",
+            selectedSessionId: sessionId,
+            // Initialize Current Insight from the persisted Default at session
+            // start. See `recoverActiveSession` for the same pattern.
+            currentInsightId: get().settings.insights.defaultInsightId,
+            // backfillActive intentionally omitted — pre-set before the await
+            // (and listener-driven thereafter) so a fast `backfill-complete`
+            // event arriving during the await isn't overwritten back to true.
+            backfillBoundarySeconds: null,
+          });
+
+          // Reload sidebar
+          const sessions = await listSessions();
+          set({ sessions });
+        } catch (e) {
+          // Covers the error-status branch above AND a throwing
+          // `startLiveTranscription`, so the "Processing prior audio" affordance
+          // can't stay stuck on after a failed start.
           if (requestedBackfill) set({ backfillActive: false });
-          throw new Error(commandErrorMessage(result.error));
+          reportSessionStartFailure(e);
+        } finally {
+          set({ creatingSession: false });
         }
-
-        trackSessionCreated({
-          source: settings.captureSource,
-          backfill_seconds: backfillSeconds ?? 0,
-          trigger: trigger ?? "unknown",
-        });
-
-        // Note: `backfillActive` deliberately omitted — the pre-await set
-        // above plus the `backfill-complete` listener are the source of
-        // truth. Re-asserting it here would re-introduce the race.
-        set({
-          activeSessionId: sessionId,
-          activeSessionSegments: [],
-          activeSessionParts: [],
-          activeSessionStartTime: result.data.effective_start_epoch_ms,
-          liveTranscriptionActive: true,
-          livePhase: "Running",
-          currentView: "note-detail",
-          selectedSessionId: sessionId,
-          // Initialize Current Insight from the persisted Default at session
-          // start. See `recoverActiveSession` for the same pattern.
-          currentInsightId: get().settings.insights.defaultInsightId,
-          // backfillActive intentionally omitted — pre-set before the await
-          // (and listener-driven thereafter) so a fast `backfill-complete`
-          // event arriving during the await isn't overwritten back to true.
-          backfillBoundarySeconds: null,
-        });
-
-        // Reload sidebar
-        const sessions = await listSessions();
-        set({ sessions });
       },
 
       resumeSession: async (sessionId: string) => {
@@ -1262,10 +1802,38 @@ function createAppStore() {
           return;
         }
 
-        const session = await getSession(sessionId).catch(() => null);
+        // A null here has two very different causes — no such row (legitimate)
+        // vs. the read itself failing. Log the failing case so the generic
+        // "Could not load session." below is diagnosable.
+        const session = await getSession(sessionId).catch((e) => {
+          logDbFailure("resumeSession/getSession", e);
+          return null;
+        });
         if (!session) {
           toast.error("Could not load session.");
           return;
+        }
+        // Defense-in-depth against the resume race (LIVE_SESSION_STATE resume-race
+        // transition). The `status !== 'completed'` refusal below is the operative
+        // guard and is strictly stronger — once a foreign device's `recording` write
+        // has synced, that check already refuses. This belt-and-suspenders adds
+        // nothing to the race window but yields a TRUTHFUL "live on <label>" message
+        // instead of the generic refusal when a fresh foreign owner holds the session.
+        const myFingerprint = get().syncStatus?.deviceFingerprint ?? null;
+        const owner = session.recording_device_id;
+        if (session.status === "recording" && owner && owner !== myFingerprint) {
+          const freshCheckSegments = await getSessionSegments(sessionId).catch(
+            () => [],
+          );
+          if (!isRecordingStale(session, freshCheckSegments)) {
+            const label =
+              get().syncStatus?.roster.find((r) => r.fingerprint === owner)
+                ?.label ?? "another device";
+            toast.error(`This session is live on ${label}.`);
+            return;
+          }
+          // A stale foreign owner falls through to the generic refusal below (v1 does
+          // not take over a session recorded elsewhere — see Non-goals).
         }
         if (session.status !== "completed") {
           toast.error("This session is not in a state that can be resumed.");
@@ -1332,9 +1900,12 @@ function createAppStore() {
 
         // Status flip happens *after* the backend has accepted the start, so a
         // rejected resume leaves the session as `completed`.
-        await dbMarkSessionRecording(sessionId).catch((e) =>
-          console.error("Failed to flip session to recording:", e),
-        );
+        // Re-attribute to THIS device — a resumed session re-owns to whoever resumed
+        // it (LIVE_SESSION_STATE D2). Null when sync is not configured.
+        await dbMarkSessionRecording(
+          sessionId,
+          get().syncStatus?.deviceFingerprint ?? null,
+        ).catch((e) => console.error("Failed to flip session to recording:", e));
 
         // Sidebar's `isRecording` keys off `activeSessionId`, so we don't
         // need to reload the sessions list — the badge updates from
@@ -1376,6 +1947,9 @@ function createAppStore() {
       },
 
       openSession: async (id: string) => {
+        // Stamp this open as the latest navigation (covers the active-session
+        // early return below too, so it supersedes any in-flight open).
+        const requestSeq = ++navRequestSeq;
         const { activeSessionId } = get();
 
         if (id === activeSessionId) {
@@ -1392,6 +1966,10 @@ function createAppStore() {
             getSessionSegments(id),
             listSessionAudioParts(id),
           ]);
+          // Post-await recheck (commit-after-navigation): a later navigation
+          // (open, navigateTo, or delete) has taken over — its selection wins,
+          // so drop these reads rather than clobbering the newer view.
+          if (navRequestSeq !== requestSeq) return;
           set({
             currentView: "note-detail",
             selectedSessionId: id,
@@ -1400,8 +1978,7 @@ function createAppStore() {
             viewSessionParts: parts,
           });
         } catch (e) {
-          console.error("Failed to open session:", e);
-          toast.error("Failed to open session");
+          reportDbFailure("openSession", "Failed to open session", e);
         }
       },
 
@@ -1410,6 +1987,10 @@ function createAppStore() {
 
         // Can't delete active recording session
         if (id === activeSessionId) return;
+
+        // A delete of the open session navigates to the list below; supersede any
+        // in-flight openSession so its late reads can't re-open a deleted row.
+        navRequestSeq++;
 
         try {
           // Read part paths *before* the cascade deletes them. Without this
@@ -1449,12 +2030,38 @@ function createAppStore() {
             set({ sessions, sessionFolderMap: restMap, sessionTagMap: restTagMap });
           }
         } catch (e) {
-          console.error("Failed to delete session:", e);
-          toast.error("Failed to delete session");
+          reportDbFailure("deleteSession", "Failed to delete session", e);
+        }
+      },
+
+      // Escape hatch (LIVE_SESSION_STATE.md Q1): finalize a foreign-and-stale
+      // 'recording' row the owner-only boot sweep will never touch (dead device or
+      // same-hardware re-pair orphan). The DB write is a plain LWW status flip
+      // (no destructive recompute — see db.markSessionCompleted). Reload the list +
+      // the open view row so the flip renders immediately.
+      markSessionCompleted: async (id: string) => {
+        try {
+          await dbMarkSessionCompleted(id);
+          const sessions = await listSessions();
+          set({ sessions });
+          if (get().selectedSessionId === id) {
+            const row = await getSession(id);
+            // Post-await recheck (commit-after-navigation): the user may have
+            // navigated to another session while getSession was in flight —
+            // don't overwrite the now-open view with this row.
+            if (row && get().selectedSessionId === id) set({ viewSession: row });
+          }
+        } catch (e) {
+          reportDbFailure(
+            "markSessionCompleted",
+            "Failed to mark session completed",
+            e,
+          );
         }
       },
 
       navigateTo: (view, sessionId) => {
+        navRequestSeq++; // supersede any in-flight openSession
         set({
           currentView: view,
           selectedSessionId: sessionId ?? null,
@@ -1464,6 +2071,129 @@ function createAppStore() {
       settingsRequest: null,
       setSettingsRequest: (request) => {
         set({ settingsRequest: request });
+      },
+
+      setSyncConfig: (partial) => {
+        set({ syncConfig: { ...get().syncConfig, ...partial } });
+      },
+      setSyncStatus: (status) => {
+        // Mirror the non-secret handles the UI persists. Never store tokens or
+        // the vault key here — those stay in the OS keychain (Rust side).
+        //
+        // Non-destructive mirror: a signed-out / disconnected status DTO returns
+        // serverUrl:"" and email:null (Rust `sync_status`). Blindly mirroring those into
+        // the PERSISTED syncConfig meant one signed-out poll wiped the relay URL the user
+        // configured (and their saved email) — so a later boot lost the relay entirely.
+        // Only mirror MEANINGFUL values: never clobber a non-empty saved serverUrl with an
+        // empty one, and never null a persisted email from a signed-out DTO. Sign-out
+        // clears the email deliberately through its OWN path (handleSignOut →
+        // setSyncConfig({ email: null })), not through a status poll.
+        const prev = get().syncConfig;
+        set({
+          syncStatus: status,
+          ...(status
+            ? {
+                syncConfig: {
+                  ...prev,
+                  serverUrl: status.serverUrl || prev.serverUrl,
+                  email: status.email ?? prev.email,
+                  syncEnabled: status.syncEnabled,
+                  deviceFingerprint: status.deviceFingerprint,
+                },
+              }
+            : {}),
+        });
+      },
+      refreshSyncStatus: async () => {
+        try {
+          const status = await syncCommands.status();
+          get().setSyncStatus(status);
+        } catch (e) {
+          // Surface the failure verbatim; do NOT auto-route or fall back. A
+          // broken connection is the user's to fix (feedback_surface_ai_errors).
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error("Failed to fetch sync status:", msg);
+          // R3: drain-level connectivity is now surfaced by the backend as a
+          // typed phase=="unreachable" on a successful status fetch (the drain
+          // classifies connect/timeout at the transport). This catch is only for
+          // a failed status COMMAND itself, so we still surface it verbatim as an
+          // error and never fabricate `relayConn = unreachable` by string-parsing.
+          //
+          // Carry the whole previous snapshot forward by construction: a status-fetch
+          // failure is a connection problem, not evidence the backlog changed (T024),
+          // and a field this path forgets to copy (cryptoQuarantined did) silently
+          // blanks a standing warning on one IPC blip. Only the four identity fields
+          // come from syncConfig, which is authoritative for them. NOT routed through
+          // `setSyncStatus` — an error snapshot must not run the syncConfig mirror.
+          const prev = get().syncStatus;
+          set({
+            syncStatus: {
+              ...(prev ?? EMPTY_SYNC_STATUS),
+              phase: "error",
+              lastError: msg,
+              serverUrl: get().syncConfig.serverUrl,
+              email: get().syncConfig.email,
+              deviceFingerprint: get().syncConfig.deviceFingerprint,
+              syncEnabled: get().syncConfig.syncEnabled,
+            },
+          });
+        }
+      },
+
+      probeRelay: async (url: string) => {
+        const token = ++relayProbeToken;
+        set({ relayConn: { kind: "testing" } });
+        try {
+          const ok = await syncCommands.probe(url);
+          // Single-flight: a newer probe (or a resetProbe) superseded us while
+          // the request was in flight — discard this now-stale result.
+          if (token !== relayProbeToken) return;
+          set({
+            relayConn: {
+              kind: "ok",
+              engineVersion: ok.engineVersion,
+              protocolVersion: ok.protocolVersion,
+              latencyMs: ok.latencyMs,
+              normalizedUrl: ok.normalizedUrl,
+              versionAdvisory: ok.versionAdvisory,
+            },
+          });
+          // Test-and-save (plan §0.1): persist the server's normalized URL on a
+          // successful probe — but ONLY when signed out. A signed-in device's
+          // URL is locked (changing it signs the device out; that's an explicit
+          // AlertDialog flow in T027), so never mutate it from an ambient probe.
+          const signedIn = get().syncConfig.email != null;
+          if (!signedIn) {
+            get().setSyncConfig({ serverUrl: ok.normalizedUrl });
+          }
+        } catch (e) {
+          if (token !== relayProbeToken) return;
+          // The T025 contract rejects with a tagged RelayProbeError; map it
+          // straight through (verbatim `raw` preserved). Any non-tagged throw
+          // (e.g. the sync feature not built) is treated as a connection-level
+          // failure with its message surfaced verbatim — never swallowed.
+          const err = e as Partial<RelayProbeError> | undefined;
+          if (
+            err &&
+            typeof err === "object" &&
+            (err.kind === "unreachable" ||
+              err.kind === "tls-error" ||
+              err.kind === "not-a-relay") &&
+            typeof err.raw === "string"
+          ) {
+            set({ relayConn: { kind: err.kind, raw: err.raw } });
+          } else {
+            const raw = e instanceof Error ? e.message : String(e);
+            set({ relayConn: { kind: "unreachable", raw } });
+          }
+        }
+      },
+
+      resetProbe: () => {
+        // Bump the token so any in-flight probe's response is discarded
+        // (cancel-on-edit), then return health to idle.
+        relayProbeToken++;
+        set({ relayConn: { kind: "idle" } });
       },
 
       setListFilter: (filter) => {
@@ -2051,6 +2781,14 @@ function createAppStore() {
           settings: { ...state.settings, ...partial },
         }));
 
+        // Apply the analytics gate BEFORE the tracked-key loop below: switching the
+        // toggle OFF must not itself emit a `setting_changed` event on its way out.
+        // (`analyticsEnabled` is deliberately absent from `trackedKeys` — YapStack
+        // sends no telemetry about the telemetry preference in either direction.)
+        if (partial.analyticsEnabled !== undefined) {
+          setAnalyticsEnabled(partial.analyticsEnabled);
+        }
+
         const trackedKeys = [
           "captureSource", "theme", "language", "silenceDurationMs",
           "maxChunkSeconds", "promptContextChars",
@@ -2141,8 +2879,7 @@ function createAppStore() {
             viewSessionSegments: [],
           });
         } catch (e) {
-          console.error("Failed to clear all sessions:", e);
-          toast.error("Failed to clear sessions");
+          reportDbFailure("clearAllSessions", "Failed to clear sessions", e);
         }
       },
 
@@ -2155,8 +2892,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to create folder:", e);
-          toast.error("Failed to create folder");
+          reportDbFailure("createFolder", "Failed to create folder", e);
         }
       },
 
@@ -2166,8 +2902,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to update folder:", e);
-          toast.error("Failed to update folder");
+          reportDbFailure("updateFolder", "Failed to update folder", e);
         }
       },
 
@@ -2183,8 +2918,7 @@ function createAppStore() {
           set({ folders, listFilter: newFilter, ...deriveFolderState(folders) });
           await get().loadSessionFolders();
         } catch (e) {
-          console.error("Failed to delete folder:", e);
-          toast.error("Failed to delete folder");
+          reportDbFailure("deleteFolder", "Failed to delete folder", e);
         }
       },
 
@@ -2194,8 +2928,7 @@ function createAppStore() {
           const folders = await listFolders();
           set({ folders, ...deriveFolderState(folders) });
         } catch (e) {
-          console.error("Failed to move folder:", e);
-          toast.error("Failed to move folder");
+          reportDbFailure("moveFolder", "Failed to move folder", e);
         }
       },
 
@@ -2225,8 +2958,7 @@ function createAppStore() {
           const freshFolders = await listFolders();
           set({ folders: freshFolders, ...deriveFolderState(freshFolders) });
         } catch (e) {
-          console.error("Failed to reorder folders:", e);
-          toast.error("Failed to reorder folders");
+          reportDbFailure("reorderFolders", "Failed to reorder folders", e);
         }
       },
 
@@ -2239,8 +2971,7 @@ function createAppStore() {
           const sessions = await listSessions();
           set({ sessions });
         } catch (e) {
-          console.error("Failed to toggle pin:", e);
-          toast.error("Failed to toggle pin");
+          reportDbFailure("togglePin", "Failed to toggle pin", e);
         }
       },
 
@@ -2260,8 +2991,7 @@ function createAppStore() {
           const name = get().folders.find(f => f.id === folderId)?.name ?? "folder";
           toast.success(isRemoving ? `Removed from ${name}` : `Added to ${name}`);
         } catch (e) {
-          console.error("Failed to toggle session folder:", e);
-          toast.error("Failed to update folder");
+          reportDbFailure("toggleSessionFolder", "Failed to update folder", e);
         }
       },
 
@@ -2275,8 +3005,7 @@ function createAppStore() {
           const name = get().folders.find(f => f.id === folderId)?.name ?? "folder";
           toast.success(`Added to ${name}`);
         } catch (e) {
-          console.error("Failed to add session to folder:", e);
-          toast.error("Failed to add to folder");
+          reportDbFailure("addSessionToFolder", "Failed to add to folder", e);
         }
       },
 
@@ -2287,19 +3016,30 @@ function createAppStore() {
           set({ sessionFolderMap: restMap });
           toast.success("Removed from all folders");
         } catch (e) {
-          console.error("Failed to remove from folders:", e);
-          toast.error("Failed to remove from folders");
+          reportDbFailure(
+            "removeSessionFromAllFolders",
+            "Failed to remove from folders",
+            e,
+          );
         }
       },
 
       // Segment editing
       editSegmentText: async (segmentId: string, newText: string) => {
+        // Mark the edit in progress so a concurrent D4 sync-applied refresh does not
+        // clobber this in-flight write (LIVE_SESSION_STATE.md D4 normative).
+        set({ editingSegmentId: segmentId });
         try {
           await dbUpdateSegmentText(segmentId, newText);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to edit segment:", e);
-          toast.error("Failed to edit segment");
+          reportDbFailure("editSegmentText", "Failed to edit segment", e);
+        } finally {
+          if (get().editingSegmentId === segmentId) {
+            // Through the setter, not a bare set(): closing the guard is what
+            // drains a refresh the guard skipped (B5).
+            get().setEditingSegmentId(null);
+          }
         }
       },
 
@@ -2308,8 +3048,7 @@ function createAppStore() {
           await dbSoftDeleteSegment(segmentId);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to delete segment:", e);
-          toast.error("Failed to delete segment");
+          reportDbFailure("deleteSegment", "Failed to delete segment", e);
         }
       },
 
@@ -2318,8 +3057,11 @@ function createAppStore() {
           await dbToggleSegmentHidden(segmentId);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to toggle segment visibility:", e);
-          toast.error("Failed to toggle segment visibility");
+          reportDbFailure(
+            "toggleSegmentHidden",
+            "Failed to toggle segment visibility",
+            e,
+          );
         }
       },
 
@@ -2404,8 +3146,7 @@ function createAppStore() {
           });
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to delete segments:", e);
-          toast.error("Failed to delete segments");
+          reportDbFailure("deleteSegments", "Failed to delete segments", e);
         }
       },
 
@@ -2415,8 +3156,11 @@ function createAppStore() {
           await dbSetSegmentsHidden(ids, hidden);
           await get().refreshViewSessionSegments();
         } catch (e) {
-          console.error("Failed to update segment visibility:", e);
-          toast.error("Failed to update segment visibility");
+          reportDbFailure(
+            "setSegmentsHidden",
+            "Failed to update segment visibility",
+            e,
+          );
         }
       },
 
@@ -2425,26 +3169,184 @@ function createAppStore() {
       },
 
       refreshViewSessionSegments: async () => {
-        const { selectedSessionId, activeSessionId } = get();
+        const { selectedSessionId } = get();
         if (!selectedSessionId) return;
         try {
           const segments = await getSessionSegments(selectedSessionId);
+          // Re-read after the await: openSession may have switched the view to a
+          // different session while this read was in flight. Mirror
+          // refreshOpenViewSession's post-await recheck — committing A's segments
+          // onto a view that is now B pairs a B header with an A transcript.
+          const now = get();
+          if (now.selectedSessionId !== selectedSessionId) return;
+          // Edit-in-progress guard — mirror refreshOpenViewSession's
+          // editingSegmentId skip. A concurrent transcript refresh (e.g. the
+          // replace_in_transcript AI tool's post-run reload) must not replace
+          // the segment array while the user has a segment open in the
+          // contentEditable: the swap remounts the bubble and drops the
+          // in-progress edit. Defer via pendingViewRefresh and let the drain
+          // re-run this reload when the guard clears (B5). editSegmentText
+          // holds editingSegmentId across its OWN reload too, so that reload
+          // also defers here and is likewise recovered by the drain.
+          if (now.editingSegmentId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
           // When the selected session is the live one, NoteDetailView reads
           // from activeSessionSegments — refresh that array so context-menu
           // edits/deletes/hides take effect immediately during recording.
-          if (selectedSessionId === activeSessionId) {
+          if (selectedSessionId === now.activeSessionId) {
             set({ activeSessionSegments: segments });
           } else {
             set({ viewSessionSegments: segments });
           }
         } catch (e) {
-          console.error("Failed to refresh segments:", e);
+          // Log-only by design: this runs after a successful write, so the row
+          // IS updated and a second toast would be misleading. It still must
+          // reach the file log — a silent failure here looks exactly like "the
+          // edit did nothing" to the user.
+          logDbFailure("refreshViewSessionSegments", e);
         }
       },
 
-      // Note refresh
-      incrementNoteRefresh: () =>
-        set((state) => ({ noteRefreshCounter: state.noteRefreshCounter + 1 })),
+      // D4 live refresh (LIVE_SESSION_STATE.md Gap 2). Reload the OPEN session's row +
+      // segments + audio parts when it is not the local active one, so a remote-live
+      // follow-along fills as rows merge. Normative constraints:
+      //   - Skip while a segment edit is in progress (editingSegmentId) so the reload
+      //     cannot clobber an open/in-flight edit or drop an editSegmentText write.
+      //     A skip is REMEMBERED (pendingViewRefresh) and drained when the guard
+      //     clears — otherwise the batch is silently lost (B5).
+      //   - Never bump noteRefreshCounter (that would re-run NoteEditor's content-reload
+      //     effect and could discard an open note edit). Note content instead travels
+      //     through `remoteNoteUpdate`, published only when the note-editing window is
+      //     closed (A1c).
+      //   - A vanished row means the session was deleted on another device: clear the
+      //     open view exactly like the local delete path does, rather than leaving an
+      //     editable ghost whose writes resurrect nothing (A2).
+      refreshOpenViewSession: async () => {
+        const {
+          selectedSessionId,
+          activeSessionId,
+          editingSegmentId,
+          noteEditingSessionId,
+        } = get();
+        if (!selectedSessionId || selectedSessionId === activeSessionId) return;
+        if (editingSegmentId) {
+          set({ pendingViewRefresh: true });
+          return;
+        }
+        const noteWindowOpen = noteEditingSessionId === selectedSessionId;
+        try {
+          const [row, segs, parts, note] = await Promise.all([
+            getSession(selectedSessionId),
+            getSessionSegments(selectedSessionId),
+            // B3: parts drive the player's timeline. Without this reload an
+            // appended remote part never surfaces until the view is reopened.
+            listSessionAudioParts(selectedSessionId),
+            noteWindowOpen ? Promise.resolve(null) : getNote(selectedSessionId),
+          ]);
+          // Re-check nothing changed during the await (session switched, or an edit
+          // opened) before committing the reload.
+          const now = get();
+          if (
+            now.selectedSessionId !== selectedSessionId ||
+            now.selectedSessionId === now.activeSessionId
+          ) {
+            return;
+          }
+          if (now.editingSegmentId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
+          if (!row) {
+            // A2: mirror the local-delete clear (see deleteSession) — an open
+            // note-detail view for a row that no longer exists still renders an
+            // editable title/notes surface whose writes go nowhere.
+            set({
+              currentView: "note-list",
+              selectedSessionId: null,
+              viewSession: null,
+              viewSessionSegments: [],
+              viewSessionParts: [],
+              remoteNoteUpdate: null,
+              pendingViewRefresh: false,
+            });
+            toast.info("Session was deleted on another device");
+            return;
+          }
+          set({
+            // Identity-stable (C3): an unchanged row must not re-render the whole
+            // note-detail surface on every batch.
+            viewSession:
+              now.viewSession && shallowEqualRow(now.viewSession, row)
+                ? now.viewSession
+                : row,
+            viewSessionSegments: mergeRowsById(now.viewSessionSegments, segs),
+            viewSessionParts: mergeRowsById(now.viewSessionParts, parts),
+            pendingViewRefresh: false,
+          });
+          // A1c: publish the note row only when no local edit is in flight. The
+          // window can have opened during the awaits above — re-check.
+          if (noteWindowOpen || get().noteEditingSessionId === selectedSessionId) {
+            set({ pendingViewRefresh: true });
+            return;
+          }
+          const content = note?.content ?? "";
+          const prev = get().remoteNoteUpdate;
+          if (
+            !prev ||
+            prev.sessionId !== selectedSessionId ||
+            prev.content !== content
+          ) {
+            set({
+              remoteNoteUpdate: {
+                sessionId: selectedSessionId,
+                content,
+                seq: (prev?.seq ?? 0) + 1,
+              },
+            });
+          }
+        } catch (e) {
+          console.error("Failed to live-refresh open session:", e);
+        }
+      },
+
+      // B5 catch-up. Called whenever an edit guard closes; no-op unless a refresh
+      // was actually skipped and every guard is now clear.
+      drainPendingViewRefresh: () => {
+        const { pendingViewRefresh, editingSegmentId, noteEditingSessionId } =
+          get();
+        if (!pendingViewRefresh) return;
+        if (editingSegmentId || noteEditingSessionId) return;
+        set({ pendingViewRefresh: false });
+        // Segment-only reloads (a transcript edit refresh) defer through the
+        // same flag, so the drain must re-run BOTH. refreshOpenViewSession
+        // early-returns for the active session and cannot restore its
+        // segments — only refreshViewSessionSegments writes activeSessionSegments
+        // — so run it too. For a non-active view both re-read the same rows and
+        // converge; the extra read is the price of one flag covering both paths.
+        void get().refreshViewSessionSegments();
+        void get().refreshOpenViewSession();
+      },
+
+      // Note refresh. Records the session so a note write on a DIFFERENT session
+      // can't make an unrelated open editor yield (session-scoping). The sync
+      // path must NEVER call this (D4): sync note content travels via
+      // `remoteNoteUpdate`, not this counter.
+      incrementNoteRefresh: (sessionId: string) =>
+        set((state) => ({
+          noteRefreshCounter: state.noteRefreshCounter + 1,
+          noteRefreshSessionId: sessionId,
+        })),
+      // Local session-meta write (e.g. AI `update_title`) signal. The sync path
+      // must NEVER call this — it distinguishes a same-machine rename from a peer
+      // edit in SessionHeader's title save (mirror the noteRefreshCounter/D4
+      // discipline).
+      incrementSessionMetaRefresh: (sessionId: string) =>
+        set((state) => ({
+          sessionMetaRefreshCounter: state.sessionMetaRefreshCounter + 1,
+          sessionMetaRefreshSessionId: sessionId,
+        })),
 
       // Audio playback
       setPlaybackTime: (time: number) => {
@@ -2493,8 +3395,11 @@ function createAppStore() {
           await dbDeleteDictationHistoryEntry(id);
           set({ dictationHistory: get().dictationHistory.filter((h) => h.id !== id) });
         } catch (e) {
-          console.error("Failed to delete dictation history entry:", e);
-          toast.error("Failed to delete entry");
+          reportDbFailure(
+            "deleteDictationHistoryEntry",
+            "Failed to delete entry",
+            e,
+          );
         }
       },
 
@@ -2521,8 +3426,7 @@ function createAppStore() {
           await dbClearDictationHistory();
           set({ dictationHistory: [] });
         } catch (e) {
-          console.error("Failed to clear dictation history:", e);
-          toast.error("Failed to clear history");
+          reportDbFailure("clearDictationHistory", "Failed to clear history", e);
         }
       },
 
@@ -2566,12 +3470,22 @@ function createAppStore() {
       },
 
       createManualNote: async (title?: string) => {
+        // Snapshot the selection at entry. Creating a manual note SHOULD jump to
+        // it — but only if the user hasn't navigated elsewhere while the create +
+        // reads were in flight; otherwise we'd yank them off the row they chose.
+        const selectedAtStart = get().selectedSessionId;
         try {
           const sessionId = crypto.randomUUID();
           await dbCreateManualSession(sessionId, title || "Untitled Note");
           trackManualNoteCreated();
           const sessions = await listSessions();
           const session = await getSession(sessionId);
+          // The refreshed list is always safe to commit; the navigation is gated
+          // on the selection being unchanged since entry (commit-after-nav).
+          if (get().selectedSessionId !== selectedAtStart) {
+            set({ sessions });
+            return;
+          }
           set({
             sessions,
             currentView: "note-detail",
@@ -2580,8 +3494,7 @@ function createAppStore() {
             viewSessionSegments: [],
           });
         } catch (e) {
-          console.error("Failed to create manual note:", e);
-          toast.error("Failed to create note");
+          reportDbFailure("createManualNote", "Failed to create note", e);
         }
       },
     }),
@@ -2590,6 +3503,9 @@ function createAppStore() {
       version: 31,
       partialize: (state) => ({
         settings: state.settings,
+        // Non-secret sync handles only (server URL, enabled flag, cursor,
+        // device fingerprint). Tokens + vault key never persist here.
+        syncConfig: state.syncConfig,
       }),
       // Custom merge does two non-obvious things:
       // 1. Deep-merges `settings` so new fields in DEFAULT_SETTINGS backfill
@@ -2598,7 +3514,11 @@ function createAppStore() {
       // 2. Hosts legacy field renames so they run unconditionally on every
       //    rehydrate, robust to any prior persist-version arithmetic skew.
       merge: (persisted, current) => {
-        const p = (persisted as { settings?: Record<string, unknown> }) ?? {};
+        const p =
+          (persisted as {
+            settings?: Record<string, unknown>;
+            syncConfig?: Partial<SyncConfig>;
+          }) ?? {};
         const persistedSettings = { ...(p.settings ?? {}) };
 
         // dictationDuckTarget (reduce-TO) → dictationDuckAmount (reduce-BY).
@@ -2619,7 +3539,21 @@ function createAppStore() {
             ...current.settings,
             ...(persistedSettings as Partial<Settings>),
           },
+          // Backfill new SyncConfig fields for pre-sync persisted state.
+          syncConfig: {
+            ...current.syncConfig,
+            ...(p.syncConfig ?? {}),
+          },
         };
+      },
+      // Push the persisted analytics choice into the emit gate the moment settings
+      // are back. Storage is the default (synchronous) localStorage, so this runs
+      // during store creation at import time — long before `useAutoSetup` can fire
+      // `app_launched`, which is the earliest event in the app. No `analyticsEnabled`
+      // key in persisted state (upgrade from before the toggle) deep-merges to the
+      // default `true`, i.e. behavior is unchanged for existing users.
+      onRehydrateStorage: () => (state) => {
+        setAnalyticsEnabled(state?.settings.analyticsEnabled ?? true);
       },
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as { settings?: Record<string, unknown> };
@@ -2967,3 +3901,12 @@ function getOrCreateAppStore(): HmrStore {
 }
 
 export const useAppStore = getOrCreateAppStore();
+
+// Auto-subscribe to backend `sync://applied` events at module load so pulled peer changes
+// refresh the UI without an app restart (R6 item 2). Guarded to a real Tauri window so unit
+// tests (jsdom, no `__TAURI_INTERNALS__`) don't register a live listener; those exercise
+// `startSyncAppliedRefresh` directly with a mocked event API. Best-effort: a failure here
+// must never break app boot.
+if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+  void useAppStore.getState().startSyncAppliedRefresh();
+}

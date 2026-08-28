@@ -26,9 +26,16 @@ tests/fixtures/*.wav
 models/
 *.bin
 
-# Databases
+# Databases — never commit personal/local DBs or their sidecars/backups
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.backup
+spike.db*
 
 # Environment
 .env
@@ -56,6 +63,7 @@ apps/desktop/src-tauri/gen/
 # Local Claude Code / agent scratch state
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+.claude/worktrees/
 
 # GoalBuddy board scaffolding — process state (local board URL, receipts), not
 # stable docs. User-facing docs live under docs/ and are routed via INDEX.md.
@@ -68,3 +76,10 @@ docs/goals/
 
 # GoalBuddy goal boards are local agent working state, not repo docs
 docs/goals/
+
+# Local business-strategy docs + spike harness — keep out of the public remote
+# (specific paths only; legitimate plan docs under docs/plans/ stay committed)
+docs/plans/ENTITLEMENTS_SEAM.md
+docs/plans/research/
+scripts/spike-crsqlite/
+scripts/spike-dbswap/

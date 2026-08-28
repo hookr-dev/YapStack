@@ -89,8 +89,9 @@ for target in "${TARGETS[@]}"; do
         # load-time webgpu_dawn.dll import (ort-sys links Dawn dynamically);
         # the DLL-staging block below MUST ship every dist DLL next to the
         # sidecar .exe or it fails before main(). Whisper stays CPU.
-        # Runtime default is still CPU: WebGPU is opt-in via
-        # YAPSTACK_PARAKEET_ACCEL=webgpu until Gate C validates it.
+        # Gate C passed (2026-07-05): `Auto` attempts WebGPU here, with an
+        # explicit CPU fallback on EP-init failure. YAPSTACK_PARAKEET_ACCEL=cpu
+        # is the escape hatch.
         FEATURES="whisper,parakeet,webgpu"
     fi
 
