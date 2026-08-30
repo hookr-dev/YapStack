@@ -18,7 +18,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 futures-util = { workspace = true }
-whisper-rs = { version = "0.15", optional = true }
+whisper-rs = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
