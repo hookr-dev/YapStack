@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 hound = "3.5"
 tempfile = "3"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["stream"] }
 sha2 = "0.10"
 futures-util = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
