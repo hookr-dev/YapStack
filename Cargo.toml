@@ -31,5 +31,5 @@ reqwest = { version = "0.12", features = ["stream"] }
 sha2 = "0.10"
 futures-util = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rubato = "0.16"
+rubato = "2.0"
 mp3lame-encoder = "0.2"
