@@ -48,6 +48,59 @@ function derive(partial: Partial<SyncDisplayInput>): ReturnType<typeof deriveSyn
   });
 }
 
+describe("deriveSyncDisplay — device approval ceremony (§7.5)", () => {
+  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null };
+  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop" };
+
+  it("a device awaiting approval reads 'Waiting for approval' even though sync is off", () => {
+    const d = derive({
+      syncEnabled: false,
+      status: status({ syncEnabled: false, roster: [{ ...self, pending: true }] }),
+    });
+    expect(d.state).toBe("waiting-approval");
+    expect(d.label).toBe("Waiting for approval");
+    expect(d.tone).toBe("amber");
+    expect(d.icon).toBe("device-alert");
+    expect(d.motion).toBe(false);
+  });
+
+  it("a peer requesting access outranks every sync state — including a live push", () => {
+    const d = derive({
+      status: status({ phase: "syncing", pendingEntries: 50, roster: [self, peer] }),
+    });
+    expect(d.state).toBe("approval-needed");
+    expect(d.label).toBe("Approve new device");
+    expect(d.tooltip).toBe("A new device is requesting access");
+  });
+
+  it("pluralizes several requests", () => {
+    const d = derive({
+      status: status({
+        roster: [self, peer, { ...peer, fingerprint: "PEER2", label: null }],
+      }),
+    });
+    expect(d.label).toBe("Approve 2 new devices");
+  });
+
+  it("an approving device that never turned sync on still sees the request", () => {
+    const d = derive({
+      syncEnabled: false,
+      status: status({ syncEnabled: false, roster: [self, peer] }),
+    });
+    expect(d.state).toBe("approval-needed");
+  });
+
+  it("signed out still wins — a stale roster cannot resurrect a badge", () => {
+    const d = derive({ signedIn: false, status: status({ roster: [self, peer] }) });
+    expect(d.state).toBe("off");
+  });
+
+  it("an approved roster with no requests falls through to the normal chain", () => {
+    const d = derive({ status: status({ roster: [self, { ...peer, pending: false }] }) });
+    expect(d.state).toBe("caught-up");
+  });
+});
+
 describe("deriveSyncDisplay — off", () => {
   it("is off when signed out (even with everything else 'live')", () => {
     const d = derive({

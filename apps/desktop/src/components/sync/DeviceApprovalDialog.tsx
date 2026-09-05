@@ -26,8 +26,14 @@ import { syncCommands, formatFingerprint, type DeviceRosterEntry } from "@/lib/s
  */
 export function DeviceApprovalDialog({
   device,
+  rosterFingerprint,
+  vaultKeyEpoch,
 }: {
   device: DeviceRosterEntry;
+  /** Current signed-roster fingerprint + epoch (§7.5.4): the new device shows what IT
+   *  received, and the human compares both codes before approving. */
+  rosterFingerprint: string | null;
+  vaultKeyEpoch: number | null;
 }) {
   const setSyncStatus = useAppStore((s) => s.setSyncStatus);
   const [open, setOpen] = useState(false);
@@ -62,8 +68,8 @@ export function DeviceApprovalDialog({
       }}
     >
       <DialogTrigger asChild>
-        <Button size="sm" variant="outline" className="justify-start font-mono">
-          {formatFingerprint(device.fingerprint)}
+        <Button size="sm" variant="outline">
+          Review
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-md">
@@ -80,19 +86,29 @@ export function DeviceApprovalDialog({
         <div className="space-y-3 py-1">
           <div className="rounded-lg border bg-muted/50 p-3 text-center">
             <p className="text-[11px] text-muted-foreground mb-1">
-              New device fingerprint
+              {device.label ?? "New device"}
             </p>
             <p className="font-mono text-base tracking-wide">
               {formatFingerprint(device.fingerprint)}
             </p>
+            {rosterFingerprint && (
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Roster code{" "}
+                <span className="font-mono text-foreground">
+                  {formatFingerprint(rosterFingerprint)}
+                </span>
+                {vaultKeyEpoch != null && ` · epoch ${vaultKeyEpoch}`}
+              </p>
+            )}
           </div>
           <Alert>
             <ShieldAlert className="h-4 w-4" />
-            <AlertTitle>Verify out-of-band</AlertTitle>
+            <AlertTitle>Check both codes on the new device</AlertTitle>
             <AlertDescription>
-              Compare this fingerprint to the one shown on the new device. If
-              they differ, do not approve — the relay may be serving a stale or
-              hostile roster.
+              Its Sync page shows its own fingerprint and the roster code it
+              received. Both must match what you see here. If either differs,
+              do not approve — the relay may be serving a stale or hostile
+              roster.
             </AlertDescription>
           </Alert>
           <label className="flex items-start gap-2 text-xs">
@@ -103,7 +119,8 @@ export function DeviceApprovalDialog({
               className="mt-0.5"
             />
             <span>
-              I compared the fingerprint on both devices and they match.
+              I compared the fingerprint and roster code on both devices and
+              they match.
             </span>
           </label>
           {error && (

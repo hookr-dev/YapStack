@@ -16,8 +16,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-/** Hosted relay default. Users may paste a self-host URL instead. */
-export const DEFAULT_SYNC_SERVER_URL = "https://sync.yapstack.app";
+/**
+ * Default relay URL for a fresh install: none. Sync is self-hosted today (README), and the
+ * Sync page gates account actions until a relay URL is entered, so a first-run user is
+ * walked to the server step instead of failing against a host that does not exist. Set
+ * this to the hosted relay's origin when one launches.
+ */
+export const DEFAULT_SYNC_SERVER_URL = "";
 
 // ----- Wire types (contract with the Rust `sync` command surface) -----
 
@@ -98,6 +103,18 @@ export interface DeviceRosterEntry {
   /** Pending devices are awaiting approval by an existing device. */
   pending: boolean;
   label: string | null;
+}
+
+/** Devices other than this one that are awaiting approval (§7.5) — the approving side's
+ *  to-do list. Empty before the first status fetch. */
+export function pendingPeerDevices(status: SyncStatus | null): DeviceRosterEntry[] {
+  return (status?.roster ?? []).filter((d) => d.pending && !d.isSelf);
+}
+
+/** True while THIS device is enrolled but not yet approved by an existing device — it
+ *  must wait (and cannot turn on sync) until then. */
+export function isSelfPending(status: SyncStatus | null): boolean {
+  return (status?.roster ?? []).some((d) => d.isSelf && d.pending);
 }
 
 export interface SyncStatus {

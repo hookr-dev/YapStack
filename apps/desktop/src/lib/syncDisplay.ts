@@ -11,6 +11,8 @@ import {
   formatCatchingUp,
   formatLastSynced,
   formatSyncProgress,
+  isSelfPending,
+  pendingPeerDevices,
   type RelayConnState,
   type SyncStatus,
 } from "./sync";
@@ -31,6 +33,8 @@ export const SYNC_MOTION_MS = 2000;
  *  `quarantined` added for the §11.3 crypto-quarantine honesty fix). */
 export type SyncDisplayState =
   | "off"
+  | "waiting-approval"
+  | "approval-needed"
   | "caught-up"
   | "quarantined"
   | "syncing"
@@ -50,7 +54,8 @@ export type SyncDisplayIcon =
   | "refresh"
   | "cloud-alert"
   | "cloud-off"
-  | "cloud-dot";
+  | "cloud-dot"
+  | "device-alert";
 
 export interface SyncDisplay {
   state: SyncDisplayState;
@@ -89,7 +94,8 @@ function hostOf(url: string): string {
 
 /**
  * Derive the one display object every sync surface renders. Precedence (binding,
- * plan §1b + R12 + §11.3 crypto-quarantine): off → unreachable → auth-expired → error →
+ * plan §1b + R12 + §11.3 crypto-quarantine): off → waiting-approval → approval-needed →
+ * unreachable → auth-expired → error →
  * syncing (push) → catching-up (pull behind) → pending → { caught-up | quarantined }.
  * Connection failure short-circuits BEFORE any sync phase, "catching up" outranks "up to
  * date" so a pull backlog can never masquerade as green, and — at the caught-up slot only —
@@ -105,17 +111,53 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   const { conn, status, signedIn, syncEnabled, syncingSince } = input;
   const now = input.now ?? new Date();
 
-  // 1. Signed-out or sync disabled — nothing to say.
-  if (!signedIn || !syncEnabled) {
+  const off: SyncDisplay = {
+    state: "off",
+    label: "Sync is off",
+    tone: "muted",
+    icon: "cloud",
+    motion: false,
+    tooltip: "Sync is off",
+  };
+
+  // 1. Signed out — nothing to say.
+  if (!signedIn) return off;
+
+  // 1b. The device-approval ceremony (§7.5) outranks every sync state, including "off":
+  //     it is the one moment a person is standing at another machine waiting on this one.
+  //     Both sides read from the relay's device index, which is empty whenever that fetch
+  //     failed — so these never mask an unreachable/expired/error state.
+  if (isSelfPending(status)) {
     return {
-      state: "off",
-      label: "Sync is off",
-      tone: "muted",
-      icon: "cloud",
+      state: "waiting-approval",
+      label: "Waiting for approval",
+      tone: "amber",
+      icon: "device-alert",
       motion: false,
-      tooltip: "Sync is off",
+      tooltip: "Waiting for approval from one of your other devices",
     };
   }
+  const pendingPeers = pendingPeerDevices(status).length;
+  if (pendingPeers > 0) {
+    const label =
+      pendingPeers === 1
+        ? "Approve new device"
+        : `Approve ${pendingPeers} new devices`;
+    return {
+      state: "approval-needed",
+      label,
+      tone: "amber",
+      icon: "device-alert",
+      motion: false,
+      tooltip:
+        pendingPeers === 1
+          ? "A new device is requesting access"
+          : `${pendingPeers} new devices are requesting access`,
+    };
+  }
+
+  // 1c. Signed in but sync not turned on — nothing to report.
+  if (!syncEnabled) return off;
 
   const serverUrl = status?.serverUrl ?? "";
   const phase = status?.phase ?? null;

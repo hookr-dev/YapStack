@@ -129,7 +129,9 @@ export function RelayCard({
           Relay server
         </CardTitle>
         <CardDescription className="text-xs">
-          Point YapStack at a blind relay. The server never sees your plaintext.
+          {signedIn
+            ? "Where your encrypted data is stored. The relay only ever sees ciphertext."
+            : "The address of the relay you host. It stores your encrypted data and only ever sees ciphertext."}
         </CardDescription>
         <CardAction>
           <ConnectionBadge conn={relayConn} />
@@ -184,7 +186,7 @@ export function RelayCard({
                   onPaste={() => {
                     pendingPasteProbe.current = true;
                   }}
-                  placeholder="https://sync.yapstack.app"
+                  placeholder="https://relay.example.com"
                   className="pl-7 text-xs"
                 />
               </div>

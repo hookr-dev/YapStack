@@ -37,12 +37,17 @@ import {
   AlertTriangle,
   ChevronDown,
   RefreshCw,
+  Hourglass,
+  Check,
 } from "lucide-react";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   syncCommands,
   isCommandNotFound,
+  isSelfPending,
+  isValidServerUrl,
+  pendingPeerDevices,
   shouldShowUpgrade,
   formatFingerprint,
   formatBytes,
@@ -65,11 +70,15 @@ const IDLE_POLL_MS = 5000;
 const FETCHED_AUDIO_POLL_MS = IDLE_POLL_MS;
 
 /**
- * Settings → Sync. A single adaptive page composed as four stacked cards (plan
- * §2): Relay server, Account, Devices (signed-in), Enable sync (first-run). The
- * connection health axis (probe → `relayConn`) is separate from the sync phase;
- * one `deriveSyncDisplay` derivation feeds the header badge + steady-state line
- * so surfaces can never disagree. Connection/auth errors surface verbatim, never
+ * Settings → Sync. One adaptive page. While a device is being set up it reads as a
+ * guided flow: a setup rail under the header names the steps (Server → Sign in →
+ * [Approval] → Turn on) and the card for the CURRENT step floats to the top, with the
+ * Relay/Account identity cards beneath it as completed context. Once sync is on, the
+ * page settles into the steady-state stack (status line, audio lanes, warnings).
+ *
+ * The connection health axis (probe → `relayConn`) is separate from the sync phase;
+ * one `deriveSyncDisplay` derivation feeds the header badge + steady-state line so
+ * surfaces can never disagree. Connection/auth errors surface verbatim, never
  * auto-routed (feedback_surface_ai_errors).
  */
 export function SyncTab() {
@@ -98,10 +107,14 @@ export function SyncTab() {
   const signedIn = !!syncStatus?.email;
   const syncEnabled = !!syncStatus?.syncEnabled;
   const phase = syncStatus?.phase ?? "disconnected";
+  const selfPending = isSelfPending(syncStatus);
+  const pendingDevices = pendingPeerDevices(syncStatus);
+  const relayReady = isValidServerUrl(syncConfig.serverUrl);
 
   // Poll while the panel is open so progress feels live. Faster during an active
-  // push; a gentle idle cadence keeps the "synced Nm ago" line fresh and catches
-  // the transition INTO syncing (T024). Only runs while this tab is mounted.
+  // push; a gentle idle cadence keeps the "synced Nm ago" line fresh, catches the
+  // transition INTO syncing (T024), and — for a device waiting on approval — is how
+  // the page notices the approval landed. Only runs while this tab is mounted.
   useEffect(() => {
     if (!signedIn) return;
     const active = phase === "syncing" || phase === "catching_up";
@@ -131,11 +144,11 @@ export function SyncTab() {
     try {
       const status = await syncCommands.enable();
       setSyncStatus(status);
-      toast.success("Sync enabled.");
+      toast.success("Sync is on.");
     } catch (e) {
       // Surface verbatim — do not fall back.
       const msg = e instanceof Error ? e.message : String(e);
-      toast.error(`Could not enable sync: ${msg}`);
+      toast.error(`Could not turn on sync: ${msg}`);
     } finally {
       setEnabling(false);
     }
@@ -152,10 +165,6 @@ export function SyncTab() {
       toast.error(e instanceof Error ? e.message : String(e));
     }
   };
-
-  const pendingDevices = (syncStatus?.roster ?? []).filter(
-    (d) => d.pending && !d.isSelf,
-  );
 
   // The single named self-host gate (ENTITLEMENTS_SEAM) — decided once here so the
   // upgrade card and its click handler share one decision instead of re-guarding.
@@ -206,26 +215,34 @@ export function SyncTab() {
     );
   }
 
+  const settingUp = !signedIn || !syncEnabled;
+
   return (
     <div className="space-y-4">
       {/* Header + single-source-of-truth status badge. */}
-      <div className="flex items-start justify-between gap-3">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2">
-            {signedIn ? (
-              <Cloud className="h-4 w-4 text-primary" />
-            ) : (
-              <CloudOff className="h-4 w-4 text-muted-foreground" />
-            )}
-            <h3 className="text-sm font-semibold">YapStack Sync</h3>
-            <StatusBadge display={display} />
-          </div>
-          <p className="text-xs text-muted-foreground max-w-md">
-            End-to-end encrypted sync across your devices. Your notes and audio
-            are encrypted on this device before they ever reach the relay — the
-            server never sees plaintext.
-          </p>
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          {signedIn ? (
+            <Cloud className="h-4 w-4 text-primary" />
+          ) : (
+            <CloudOff className="h-4 w-4 text-muted-foreground" />
+          )}
+          <h3 className="text-sm font-semibold">YapStack Sync</h3>
+          <StatusBadge display={display} />
         </div>
+        <p className="text-xs text-muted-foreground max-w-md">
+          End-to-end encrypted sync across your devices. Your notes and audio
+          are encrypted on this device before they ever reach the relay — the
+          server never sees plaintext.
+        </p>
+        {settingUp && (
+          <SetupRail
+            relayReady={relayReady}
+            signedIn={signedIn}
+            selfPending={selfPending}
+            syncEnabled={syncEnabled}
+          />
+        )}
       </div>
 
       {/* Pinned verbatim connection error (never auto-routed, must-preserve). */}
@@ -237,7 +254,17 @@ export function SyncTab() {
         </Alert>
       )}
 
-      {/* Card 1 — Relay server (always shown). */}
+      {/* Current step while setting up, floated above the identity cards: either
+          this device is waiting on an approval, or it is approved and ready to turn on. */}
+      {signedIn && syncStatus && !syncEnabled && (
+        selfPending ? (
+          <WaitingApprovalCard status={syncStatus} />
+        ) : (
+          <TurnOnCard status={syncStatus} enabling={enabling} onEnable={handleEnable} />
+        )
+      )}
+
+      {/* Relay server (always shown). */}
       <RelayCard
         serverUrl={serverUrl}
         setServerUrl={setServerUrl}
@@ -250,7 +277,7 @@ export function SyncTab() {
         onChangeServer={handleSignOut}
       />
 
-      {/* Card 2 — Account (always shown). */}
+      {/* Account (always shown). */}
       <AccountCard
         status={syncStatus}
         signedIn={signedIn}
@@ -258,37 +285,12 @@ export function SyncTab() {
         savedServerUrl={syncConfig.serverUrl}
       />
 
-      {/* Card 3 — Devices (signed-in only). */}
+      {/* Devices (signed-in only). */}
       {signedIn && syncStatus && (
         <DevicesCard status={syncStatus} pendingDevices={pendingDevices} />
       )}
 
-      {/* Card 4 — Enable sync (signed-in && !enabled, first-run only). */}
-      {signedIn && syncStatus && !syncEnabled && (
-        <Card className={CARD}>
-          <CardHeader className={HEAD}>
-            <CardTitle className="text-sm">Enable sync</CardTitle>
-            <CardDescription className="text-xs">
-              Upgrades this library in place for encrypted sync and keeps a full
-              backup alongside it (yapstack.db.pre-sync-backup) as a safety net.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className={BODY}>
-            <Button size="sm" onClick={handleEnable} disabled={enabling}>
-              {enabling ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Upgrading your library for sync…
-                </>
-              ) : (
-                "Enable sync on this device"
-              )}
-            </Button>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Steady-state status line (replaces the Enable card once enabled). */}
+      {/* Steady-state status line once sync is on. */}
       {signedIn && syncEnabled && syncStatus && (
         <SyncStatusLine status={syncStatus} display={display} />
       )}
@@ -377,10 +379,179 @@ export function SyncTab() {
   );
 }
 
+type StepState = "done" | "current" | "todo";
+
 /**
- * Account card: signed-out offers create/sign-in (dialogs unchanged); signed-in
- * shows the account email + this-device fingerprint. An expired session gets a
- * warm amber "sign in again" CTA — never destructive, never conflated with a
+ * The setup rail: a compact "you are here" for the device-setup journey, shown only
+ * until sync is on. Server → Sign in → [Approval, only for a device that joined an
+ * existing account and is waiting] → Turn on. Done steps carry a check, the current
+ * step is emphasized, the rest are muted — the page's cards do the explaining.
+ */
+function SetupRail({
+  relayReady,
+  signedIn,
+  selfPending,
+  syncEnabled,
+}: {
+  relayReady: boolean;
+  signedIn: boolean;
+  selfPending: boolean;
+  syncEnabled: boolean;
+}) {
+  const steps: { label: string; state: StepState }[] = [
+    { label: "Server", state: relayReady ? "done" : "current" },
+    {
+      label: "Sign in",
+      state: signedIn ? "done" : relayReady ? "current" : "todo",
+    },
+  ];
+  if (selfPending) steps.push({ label: "Approval", state: "current" });
+  steps.push({
+    label: "Turn on",
+    state: syncEnabled
+      ? "done"
+      : signedIn && !selfPending
+        ? "current"
+        : "todo",
+  });
+
+  return (
+    <ol aria-label="Sync setup steps" className="flex items-center gap-1.5 pt-1">
+      {steps.map((step, i) => (
+        <li key={step.label} className="flex items-center gap-1.5">
+          {i > 0 && <span aria-hidden className="h-px w-4 bg-border" />}
+          <span
+            aria-current={step.state === "current" ? "step" : undefined}
+            className={`flex items-center gap-1.5 text-[11px] ${
+              step.state === "current"
+                ? "font-medium text-foreground"
+                : "text-muted-foreground"
+            }`}
+          >
+            <span
+              aria-hidden
+              className={`flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-semibold tabular-nums ${
+                step.state === "done"
+                  ? "bg-primary/10 text-primary"
+                  : step.state === "current"
+                    ? "bg-foreground text-background"
+                    : "border border-border text-muted-foreground"
+              }`}
+            >
+              {step.state === "done" ? <Check className="h-2.5 w-2.5" /> : i + 1}
+            </span>
+            {step.label}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * The joining device's side of the approval ceremony (§7.5). It cannot turn on sync
+ * until an existing device approves it, so this card IS the page for now: what to do
+ * on the other device, this device's fingerprint large enough to read across a desk,
+ * and the roster code the approver's dialog shows for the out-of-band check (§7.5.4).
+ * The panel's status poll picks the approval up by itself.
+ */
+function WaitingApprovalCard({ status }: { status: SyncStatus }) {
+  const approvers = status.roster.filter((d) => !d.isSelf && !d.pending);
+  const named = approvers.map((d) => d.label).filter((l): l is string => !!l);
+
+  return (
+    <Card className={`${CARD} border-amber-500/30 view-enter`}>
+      <CardHeader className={HEAD}>
+        <CardTitle className="flex items-center gap-1.5 text-sm">
+          <Hourglass className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+          Waiting for approval
+        </CardTitle>
+        <CardDescription className="text-xs">
+          {approvers.length === 0
+            ? "No other approved device is on this account yet, so nothing can approve this one. Open YapStack on a device you have used with this account before."
+            : `Sync starts once one of your other devices approves this one. On ${
+                named.length > 0 ? named.join(" or ") : "a device that is already signed in"
+              }, open Settings → Sync → Devices and review the request.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className={`${BODY} space-y-3`}>
+        <div className="rounded-lg border bg-muted/50 p-3 text-center">
+          <p className="mb-1 text-[11px] text-muted-foreground">This device</p>
+          <p className="font-mono text-base tracking-wide">
+            {status.deviceFingerprint
+              ? formatFingerprint(status.deviceFingerprint)
+              : "—"}
+          </p>
+          {status.rosterFingerprint && (
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              Roster code{" "}
+              <span className="font-mono text-foreground">
+                {formatFingerprint(status.rosterFingerprint)}
+              </span>
+              {status.vaultKeyEpoch != null && ` · epoch ${status.vaultKeyEpoch}`}
+            </p>
+          )}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          The approving device shows the same fingerprint and roster code. If either
+          differs, don’t approve.
+        </p>
+        <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          Checking for approval — this page updates by itself.
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Turn on sync (signed-in, approved, not yet enabled). The copy says what will
+ * actually happen to THIS library: a first device uploads it; a device joining an
+ * account that already has approved peers downloads theirs and merges. Both keep a
+ * full pre-sync backup first.
+ */
+function TurnOnCard({
+  status,
+  enabling,
+  onEnable,
+}: {
+  status: SyncStatus;
+  enabling: boolean;
+  onEnable: () => void;
+}) {
+  const hasPeers = status.roster.some((d) => !d.isSelf && !d.pending);
+  return (
+    <Card className={`${CARD} view-enter`}>
+      <CardHeader className={HEAD}>
+        <CardTitle className="text-sm">Turn on sync</CardTitle>
+        <CardDescription className="text-xs">
+          {hasPeers
+            ? "Notes and recordings from your other devices download here, and anything already on this device is merged in. A full backup of this library is kept first."
+            : "This library is prepared for sync and uploaded to your relay, encrypted on this device. A full backup copy is kept first."}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className={BODY}>
+        <Button size="sm" onClick={onEnable} disabled={enabling}>
+          {enabling ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Preparing your library…
+            </>
+          ) : (
+            "Turn on sync"
+          )}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Account card: signed-out offers create/sign-in, gated on a usable relay URL (an
+ * account lives on a relay, so there is nothing to sign in to before one is set);
+ * signed-in shows the account email + this-device fingerprint. An expired session
+ * gets a warm amber "sign in again" CTA — never destructive, never conflated with a
  * wrong server (plan §2).
  */
 function AccountCard({
@@ -398,6 +569,7 @@ function AccountCard({
   // Signed-out dialogs authenticate against the URL the user is about to save;
   // signed-in re-login uses the locked, persisted server.
   const dialogUrl = signedIn ? savedServerUrl : serverUrl.trim() || savedServerUrl;
+  const relayReady = isValidServerUrl(dialogUrl);
 
   return (
     <Card className={CARD}>
@@ -406,15 +578,22 @@ function AccountCard({
         <CardDescription className="text-xs">
           {signedIn
             ? "Your YapStack Sync account on this device."
-            : "Sign in on this device, or create an account to start syncing."}
+            : "Sign in to your account, or create one on this relay."}
         </CardDescription>
       </CardHeader>
       <CardContent className={`${BODY} space-y-2`}>
         {!signedIn ? (
-          <div className="flex items-center gap-2">
-            <SignupDialog serverUrl={dialogUrl} />
-            <LoginDialog serverUrl={dialogUrl} />
-          </div>
+          relayReady ? (
+            <div className="flex items-center gap-2">
+              <SignupDialog serverUrl={dialogUrl} />
+              <LoginDialog serverUrl={dialogUrl} />
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Enter your relay server above first — your account lives on the
+              relay you choose.
+            </p>
+          )
         ) : (
           <>
             <div className="space-y-0.5">
@@ -445,8 +624,10 @@ function AccountCard({
 }
 
 /**
- * Devices card (signed-in): the pending-approval gate (ceremony copy UNCHANGED)
- * plus the roster rows — mono fingerprints with this-device / pending badges.
+ * Devices card (signed-in): the pending-approval gate — each requesting device as a
+ * named row with a Review button that opens the ceremony dialog — plus the roster of
+ * approved devices (name first, fingerprint second). Pending peers appear only in the
+ * request list, never twice.
  */
 function DevicesCard({
   status,
@@ -455,19 +636,20 @@ function DevicesCard({
   status: SyncStatus;
   pendingDevices: SyncStatus["roster"];
 }) {
+  const roster = status.roster.filter((d) => !(d.pending && !d.isSelf));
   return (
     <Card className={CARD}>
       <CardHeader className={HEAD}>
         <CardTitle className="text-sm">Devices</CardTitle>
         <CardDescription className="text-xs">
-          Approve each new device before it can sync.
+          Every device signed in to this account. A new device syncs only after
+          one you already trust approves it.
         </CardDescription>
       </CardHeader>
       <CardContent className={`${BODY} space-y-3`}>
-        {/* Pending device approvals — the roster gate (§7.5, copy unchanged). */}
         {pendingDevices.length > 0 && (
-          <Alert>
-            <AlertTriangle className="h-4 w-4" />
+          <Alert className="border-amber-500/30 bg-amber-500/5">
+            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
             <AlertTitle>
               {pendingDevices.length === 1
                 ? "A new device is requesting access"
@@ -475,58 +657,67 @@ function DevicesCard({
             </AlertTitle>
             <AlertDescription className="space-y-2">
               <span>
-                Approve it only if you started signing in on that device. Check
-                the fingerprint matches out-of-band.
+                Approve only if you just signed in on that device yourself, and
+                its fingerprint matches what that device shows.
               </span>
               <div className="flex flex-col gap-1.5 pt-1">
                 {pendingDevices.map((d) => (
-                  <DeviceApprovalDialog key={d.fingerprint} device={d} />
+                  <div
+                    key={d.fingerprint}
+                    className="flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-medium text-foreground">
+                        {d.label ?? "New device"}
+                      </p>
+                      <p className="font-mono text-[11px] text-muted-foreground">
+                        {formatFingerprint(d.fingerprint)}
+                      </p>
+                    </div>
+                    <DeviceApprovalDialog
+                      device={d}
+                      rosterFingerprint={status.rosterFingerprint}
+                      vaultKeyEpoch={status.vaultKeyEpoch}
+                    />
+                  </div>
                 ))}
               </div>
             </AlertDescription>
           </Alert>
         )}
 
-        {status.roster.length > 0 && (
-          <div className="space-y-1.5">
-            {status.rosterFingerprint && (
-              <div className="flex items-center justify-end">
-                <span className="text-[11px] text-muted-foreground font-mono">
-                  roster {formatFingerprint(status.rosterFingerprint)}
-                  {status.vaultKeyEpoch != null &&
-                    ` · epoch ${status.vaultKeyEpoch}`}
-                </span>
-              </div>
-            )}
-            <div className="rounded-lg border divide-y">
-              {status.roster.map((d) => (
-                <div
-                  key={d.fingerprint}
-                  className="flex items-center justify-between px-3 py-2"
-                >
-                  <span className="text-xs font-mono">
+        {roster.length > 0 && (
+          <div className="rounded-lg border divide-y">
+            {roster.map((d) => (
+              <div
+                key={d.fingerprint}
+                className="flex items-center justify-between gap-3 px-3 py-2"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium">
+                    {d.label ?? "Unnamed device"}
+                  </p>
+                  <p className="font-mono text-[11px] text-muted-foreground">
                     {formatFingerprint(d.fingerprint)}
-                  </span>
-                  <div className="flex items-center gap-1.5">
-                    {d.label && (
-                      <span className="text-[11px] text-muted-foreground">
-                        {d.label}
-                      </span>
-                    )}
-                    {d.isSelf && (
-                      <Badge variant="secondary" className="text-[10px]">
-                        this device
-                      </Badge>
-                    )}
-                    {d.pending && (
-                      <Badge variant="outline" className="text-[10px]">
-                        pending
-                      </Badge>
-                    )}
-                  </div>
+                  </p>
                 </div>
-              ))}
-            </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {d.isSelf && (
+                    <Badge variant="secondary" className="text-[10px]">
+                      this device
+                    </Badge>
+                  )}
+                  {d.pending && (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400 text-[10px]"
+                    >
+                      awaiting approval
+                    </Badge>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </CardContent>

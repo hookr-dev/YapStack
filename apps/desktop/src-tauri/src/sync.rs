@@ -4484,10 +4484,16 @@ fn roster_fingerprint_from_canonical(canonical: &[u8]) -> String {
 }
 
 /// A friendly device label (best-effort; not security-relevant).
+/// The roster label for this device: the computer name the user knows it by ("Clayton's
+/// MacBook Pro", "DESKTOP-4F2K"), falling back to the hostname. `HOSTNAME` is a shell
+/// variable that GUI launches rarely export, which left every device labelled
+/// "macos device" and the roster rows indistinguishable.
 fn device_label() -> String {
-    std::env::var("HOSTNAME")
+    let nonblank = |s: String| (!s.trim().is_empty()).then_some(s);
+    whoami::fallible::devicename()
         .ok()
-        .filter(|h| !h.is_empty())
+        .and_then(nonblank)
+        .or_else(|| whoami::fallible::hostname().ok().and_then(nonblank))
         .unwrap_or_else(|| format!("{} device", std::env::consts::OS))
 }
 
@@ -5208,6 +5214,24 @@ pub async fn sync_enable(
     runtime: State<'_, SyncRuntimeState>,
 ) -> Result<SyncStatusDto, String> {
     let mut session = load_session()?.ok_or_else(|| "Sign in before enabling sync.".to_string())?;
+
+    // A device still PENDING approval (§7.5) does not turn on sync: the drain would push
+    // as an unapproved member, which is exactly what the ceremony exists to prevent. The
+    // Sync page reads the same device index and shows the waiting state instead of the
+    // control; this is the decision at the command boundary.
+    if !session.sync_enabled {
+        let devices = http_get_devices(&session).await?;
+        let self_pending = devices
+            .devices
+            .iter()
+            .any(|d| d.client_id == session.client_id && d.status == "pending");
+        if self_pending {
+            return Err(
+                "This device is still waiting for approval from one of your other devices."
+                    .to_string(),
+            );
+        }
+    }
 
     let db_path = live_db_path(&app)?;
     let db_service = app

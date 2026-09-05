@@ -34,7 +34,6 @@ type Step = "credentials" | "recovery" | "confirm";
  * once a code exists.
  */
 export function SignupDialog({ serverUrl }: { serverUrl: string }) {
-  const setSyncStatus = useAppStore((s) => s.setSyncStatus);
   const refreshSyncStatus = useAppStore((s) => s.refreshSyncStatus);
 
   const [open, setOpen] = useState(false);
@@ -74,10 +73,13 @@ export function SignupDialog({ serverUrl }: { serverUrl: string }) {
     if (!next) reset();
   };
 
-  const credentialsValid =
-    /.+@.+\..+/.test(email) && password.length >= 8 && password === confirmPw;
+  const emailValid = /.+@.+\..+/.test(email);
+  const passwordLongEnough = password.length >= 8;
+  const passwordsMatch = password === confirmPw;
+  const credentialsValid = emailValid && passwordLongEnough && passwordsMatch;
 
   const handleCreate = async () => {
+    if (!credentialsValid || busy) return;
     setBusy(true);
     setError(null);
     try {
@@ -109,7 +111,6 @@ export function SignupDialog({ serverUrl }: { serverUrl: string }) {
   const handleFinish = async () => {
     // Adopt the freshly-created session, then close.
     await refreshSyncStatus();
-    setSyncStatus(useAppStore.getState().syncStatus);
     toast.success("Account created. You're signed in.");
     setOpen(false);
     reset();
@@ -155,6 +156,16 @@ export function SignupDialog({ serverUrl }: { serverUrl: string }) {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                 />
+                <p
+                  className={`text-[11px] ${
+                    password && !passwordLongEnough
+                      ? "text-destructive"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  At least 8 characters. It also protects your encryption key,
+                  so it can’t be reset — only recovered with your recovery code.
+                </p>
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="signup-pw2" className="text-xs">
@@ -166,7 +177,13 @@ export function SignupDialog({ serverUrl }: { serverUrl: string }) {
                   autoComplete="new-password"
                   value={confirmPw}
                   onChange={(e) => setConfirmPw(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleCreate()}
                 />
+                {confirmPw && !passwordsMatch && (
+                  <p className="text-[11px] text-destructive">
+                    Passwords don’t match.
+                  </p>
+                )}
               </div>
               {error && (
                 <Alert variant="destructive">
@@ -259,6 +276,9 @@ export function SignupDialog({ serverUrl }: { serverUrl: string }) {
                 placeholder="AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"
                 value={confirmEntry}
                 onChange={(e) => setConfirmEntry(e.target.value)}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && confirmMatches && handleFinish()
+                }
                 className="font-mono text-sm"
               />
               {confirmEntry && !confirmMatches && (

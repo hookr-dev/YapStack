@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
-import { Cloud, CloudCheck, CloudAlert, CloudOff, RefreshCw } from "lucide-react";
+import {
+  Cloud,
+  CloudCheck,
+  CloudAlert,
+  CloudOff,
+  MonitorSmartphone,
+  RefreshCw,
+} from "lucide-react";
+import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
-import { isCommandNotFound } from "@/lib/sync";
+import { isCommandNotFound, pendingPeerDevices } from "@/lib/sync";
 import {
   deriveSyncDisplay,
   type SyncDisplayIcon,
@@ -41,6 +49,30 @@ export function SyncStatusGlyph() {
 
   const available = useAmbientSyncPoll(engaged);
 
+  const openSyncSettings = () => {
+    setSettingsRequest("sync");
+    navigateTo("settings");
+  };
+
+  // A device requesting access is time-sensitive — someone is sitting at it, waiting —
+  // and the request otherwise only shows inside Settings → Sync. Raise it wherever the
+  // user is, once per count increase, with a jump straight to the approval.
+  const pendingPeers = pendingPeerDevices(syncStatus).length;
+  useEffect(() => {
+    if (!engaged || pendingPeers === 0) return;
+    toast("A new device is requesting access", {
+      id: "sync-device-approval",
+      description: "Approve it only if you just signed in there yourself.",
+      duration: Infinity,
+      action: { label: "Review", onClick: openSyncSettings },
+    });
+    return () => {
+      toast.dismiss("sync-device-approval");
+    };
+    // Re-fire only when the COUNT changes (a second request while one is showing).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engaged, pendingPeers]);
+
   if (!engaged || !available) return null;
 
   const display = deriveSyncDisplay({
@@ -53,11 +85,6 @@ export function SyncStatusGlyph() {
   // "off" means signed-out / disabled — never engaged from the glyph's view, so
   // show nothing (belt-and-suspenders with the `engaged` gate above).
   if (display.state === "off") return null;
-
-  const openSyncSettings = () => {
-    setSettingsRequest("sync");
-    navigateTo("settings");
-  };
 
   return (
     <Tooltip>
@@ -116,6 +143,8 @@ function SyncGlyphIcon({
       return <CloudAlert className={cn(size, toneClass)} aria-hidden />;
     case "cloud-off":
       return <CloudOff className={cn(size, toneClass)} aria-hidden />;
+    case "device-alert":
+      return <MonitorSmartphone className={cn(size, toneClass)} aria-hidden />;
     case "refresh":
       // Slow spin (~3s) so drain-cycle bursts don't strobe the sidebar. Motion
       // is gated upstream by deriveSyncDisplay — we only honor its decision and

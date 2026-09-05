@@ -23,6 +23,11 @@ vi.mock("@tauri-apps/api/dpi", () => tauriDpiMock());
 vi.mock("@tauri-apps/api/webviewWindow", () => tauriWebviewWindowMock());
 vi.mock("@/lib/db-backend", () => tauriSqlMock());
 vi.mock("@/lib/tauri", () => tauriCommandsMock());
+vi.mock("sonner", () => {
+  const toast = Object.assign(vi.fn(), { dismiss: vi.fn() });
+  return { toast };
+});
+import { toast } from "sonner";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -203,6 +208,50 @@ describe("SyncStatusGlyph — icon + tone per state", () => {
     expect(icon).toBeTruthy();
     expect(icon).toHaveClass("text-destructive");
     expect(icon).not.toHaveClass("animate-spin");
+  });
+});
+
+describe("SyncStatusGlyph — device approval ceremony", () => {
+  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null };
+  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop" };
+
+  it("a peer requesting access → MonitorSmartphone, amber, plus a persistent toast with a Review action", async () => {
+    const setSettingsRequest = vi.fn();
+    const navigateTo = vi.fn();
+    seed({ status: baseStatus({ roster: [self, peer] }) });
+    useAppStore.setState({ setSettingsRequest, navigateTo });
+    const { container } = await renderSettled();
+    const icon = container.querySelector(".lucide-monitor-smartphone");
+    expect(icon).toBeTruthy();
+    expect(icon).toHaveClass("text-amber-600");
+
+    expect(toast).toHaveBeenCalledWith(
+      "A new device is requesting access",
+      expect.objectContaining({ id: "sync-device-approval", duration: Infinity }),
+    );
+    const opts = vi.mocked(toast).mock.calls[0]![1] as unknown as {
+      action: { onClick: () => void };
+    };
+    opts.action.onClick();
+    expect(setSettingsRequest).toHaveBeenCalledWith("sync");
+    expect(navigateTo).toHaveBeenCalledWith("settings");
+  });
+
+  it("this device awaiting approval → same glyph, shown even though sync is off", async () => {
+    seed({
+      status: baseStatus({ syncEnabled: false, roster: [{ ...self, pending: true }] }),
+      syncEnabled: false,
+    });
+    const { container } = await renderSettled();
+    expect(container.querySelector(".lucide-monitor-smartphone")).toBeTruthy();
+    // Waiting is this device's own state — nothing for the user to approve here.
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it("no requests → no toast", async () => {
+    seed({ status: baseStatus({ roster: [self] }) });
+    await renderSettled();
+    expect(toast).not.toHaveBeenCalled();
   });
 });
 

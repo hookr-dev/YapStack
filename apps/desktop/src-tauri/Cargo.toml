@@ -82,6 +82,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = { workspace = true, optional = true }
 data-encoding = { version = "2", optional = true }
 ed25519-dalek = { version = "2", optional = true }
+# The user-facing computer name for the device roster label (§7.5): the name a person
+# knows their machine by, so roster rows can be told apart. Already in the lockfile.
+whoami = { version = "1", optional = true }
 
 [features]
 # Off by default. See the sync deps block above and src/sync.rs for why.
@@ -96,6 +99,7 @@ sync = [
     "dep:sha2",
     "dep:data-encoding",
     "dep:ed25519-dalek",
+    "dep:whoami",
     # Windows-only credential shim (R5); a no-op reference on non-Windows targets, where the
     # optional dep is not present.
     "dep:windows-sys",

@@ -88,7 +88,7 @@ export function LoginDialog({ serverUrl }: { serverUrl: string }) {
     try {
       const status = await syncCommands.recover(serverUrl, email, recoveryCode);
       setSyncStatus(status);
-      toast.success("Recovered. Set a new password in settings.");
+      toast.success("Recovered — you're signed in on this device.");
       setOpen(false);
       reset();
     } catch (e) {
@@ -223,6 +223,8 @@ export function LoginDialog({ serverUrl }: { serverUrl: string }) {
               </DialogTitle>
               <DialogDescription>
                 Enter the recovery code you saved when you created your account.
+                Your password stays the same afterwards — this only signs this
+                device in.
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-3 py-1">
@@ -231,6 +233,12 @@ export function LoginDialog({ serverUrl }: { serverUrl: string }) {
                 placeholder="AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"
                 value={recoveryCode}
                 onChange={(e) => setRecoveryCode(e.target.value)}
+                onKeyDown={(e) =>
+                  e.key === "Enter" &&
+                  isValidRecoveryCode(recoveryCode) &&
+                  !busy &&
+                  handleRecover()
+                }
                 className="font-mono text-sm"
               />
               {error && (
