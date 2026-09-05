@@ -657,6 +657,20 @@ export function formatFingerprint(base32: string): string {
 }
 
 /**
+ * The §7.5.4 roster check in plain words: "Security code XXXX-XXXX-XXXX-XXXX · key v3".
+ * Shown on BOTH sides of the approval ceremony (the waiting device and the approver's
+ * dialog) for the human to compare. Null when no roster has been received yet.
+ */
+export function formatSecurityCode(
+  rosterFingerprint: string | null,
+  vaultKeyEpoch: number | null,
+): string | null {
+  if (!rosterFingerprint) return null;
+  const code = `Security code ${formatFingerprint(rosterFingerprint)}`;
+  return vaultKeyEpoch != null ? `${code} · key v${vaultKeyEpoch}` : code;
+}
+
+/**
  * Validate that a normalized recovery-code entry is a plausible 32-char base32
  * string (RFC 4648 uppercase alphabet). Used by the recovery-confirm step to
  * gate the "I saved it" flow before we let the user proceed.

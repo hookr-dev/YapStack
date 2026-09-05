@@ -13,7 +13,12 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Loader2, ShieldCheck, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
-import { syncCommands, formatFingerprint, type DeviceRosterEntry } from "@/lib/sync";
+import {
+  syncCommands,
+  formatFingerprint,
+  formatSecurityCode,
+  type DeviceRosterEntry,
+} from "@/lib/sync";
 
 /**
  * Device-authorization ceremony (CRYPTO_SPEC §7.5). An existing (already
@@ -80,7 +85,7 @@ export function DeviceApprovalDialog({
           </DialogTitle>
           <DialogDescription>
             Only approve if you are signing in on a new device right now. The
-            fingerprint below must exactly match the one shown on that device.
+            codes below must match exactly what that device shows.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 py-1">
@@ -92,23 +97,18 @@ export function DeviceApprovalDialog({
               {formatFingerprint(device.fingerprint)}
             </p>
             {rosterFingerprint && (
-              <p className="mt-2 text-[11px] text-muted-foreground">
-                Roster code{" "}
-                <span className="font-mono text-foreground">
-                  {formatFingerprint(rosterFingerprint)}
-                </span>
-                {vaultKeyEpoch != null && ` · epoch ${vaultKeyEpoch}`}
+              <p className="mt-1.5 text-[10px] text-muted-foreground">
+                {formatSecurityCode(rosterFingerprint, vaultKeyEpoch)}
               </p>
             )}
           </div>
           <Alert>
             <ShieldAlert className="h-4 w-4" />
-            <AlertTitle>Check both codes on the new device</AlertTitle>
+            <AlertTitle>Check the codes on the new device</AlertTitle>
             <AlertDescription>
-              Its Sync page shows its own fingerprint and the roster code it
-              received. Both must match what you see here. If either differs,
-              do not approve — the relay may be serving a stale or hostile
-              roster.
+              Its Sync page shows the same two codes. If either differs, don't
+              approve — the server may be showing that device an out-of-date or
+              tampered device list.
             </AlertDescription>
           </Alert>
           <label className="flex items-start gap-2 text-xs">
@@ -119,8 +119,7 @@ export function DeviceApprovalDialog({
               className="mt-0.5"
             />
             <span>
-              I compared the fingerprint and roster code on both devices and
-              they match.
+              I compared the codes on both devices and they match.
             </span>
           </label>
           {error && (

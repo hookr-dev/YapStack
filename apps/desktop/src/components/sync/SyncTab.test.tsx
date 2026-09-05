@@ -112,11 +112,11 @@ describe("SyncTab — build without the sync feature", () => {
   it("renders the not-in-this-build placeholder instead of the dead controls", () => {
     setup({ status: missing() });
     render(<SyncTab />);
-    expect(screen.getByText("Sync isn’t included in this build")).toBeInTheDocument();
+    expect(screen.getByText("Not in this build")).toBeInTheDocument();
     expect(screen.getByText("docs/self-hosting.md")).toBeInTheDocument();
     expect(screen.getByText("--features sync")).toBeInTheDocument();
     // None of the sync controls (all of which would fail) are rendered.
-    expect(screen.queryByText("Relay server")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Sync server URL")).not.toBeInTheDocument();
     expect(screen.queryByText("Account")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Test connection" }),
@@ -136,10 +136,8 @@ describe("SyncTab — build without the sync feature", () => {
       }),
     });
     render(<SyncTab />);
-    expect(
-      screen.queryByText("Sync isn’t included in this build"),
-    ).not.toBeInTheDocument();
-    expect(screen.getByText("Relay server")).toBeInTheDocument();
+    expect(screen.queryByText("Not in this build")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Sync server URL")).toBeInTheDocument();
     expect(screen.getByText("Connection problem")).toBeInTheDocument();
     expect(
       screen.getByText("relay unreachable: connection refused"),
@@ -148,10 +146,10 @@ describe("SyncTab — build without the sync feature", () => {
 });
 
 describe("SyncTab", () => {
-  it("signed-out shows only the Relay + Account cards", () => {
+  it("signed-out shows only the Server + Account sections", () => {
     setup();
     render(<SyncTab />);
-    expect(screen.getByText("Relay server")).toBeInTheDocument();
+    expect(screen.getByLabelText("Sync server URL")).toBeInTheDocument();
     expect(screen.getByText("Account")).toBeInTheDocument();
     expect(screen.queryByText("Devices")).not.toBeInTheDocument();
     expect(screen.queryByText("Turn on sync")).not.toBeInTheDocument();
@@ -169,7 +167,7 @@ describe("SyncTab", () => {
   it("auto-probes once on blur when the URL is dirty + valid", async () => {
     setup();
     render(<SyncTab />);
-    const input = screen.getByLabelText("Relay server URL");
+    const input = screen.getByLabelText("Sync server URL");
     await userEvent.clear(input);
     await userEvent.type(input, "https://relay.example.com");
     fireEvent.blur(input);
@@ -192,10 +190,10 @@ describe("SyncTab", () => {
       },
     });
     render(<SyncTab />);
-    expect(
-      screen.getByText("engine v0.16.3", { exact: false }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("42 ms", { exact: false })).toBeInTheDocument();
+    const line = screen.getByText("42 ms", { exact: false });
+    expect(line).toBeInTheDocument();
+    // Engine/protocol versions ride in the tooltip, out of the copy.
+    expect(line).toHaveAttribute("title", "Engine v0.16.3 · protocol v1");
   });
 
   it("shows an explicit 'saved' cue once the probed URL is persisted", () => {
@@ -260,7 +258,7 @@ describe("SyncTab", () => {
     });
     render(<SyncTab />);
     expect(screen.getByText("relay.example.com")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Relay server URL")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Sync server URL")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /Change server/ }),
     ).toBeInTheDocument();
@@ -313,7 +311,7 @@ describe("SyncTab — device setup flow", () => {
     render(<SyncTab />);
     expect(screen.queryByRole("button", { name: "Create account" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
-    expect(screen.getByText(/Enter your relay server above first/)).toBeInTheDocument();
+    expect(screen.getByText(/Enter your server above first/)).toBeInTheDocument();
     // The rail points at the server step.
     const rail = screen.getByRole("list", { name: "Sync setup steps" });
     expect(within(rail).getByText("Server").closest("[aria-current]")).toHaveAttribute(
@@ -349,11 +347,11 @@ describe("SyncTab — device setup flow", () => {
       }),
     });
     render(<SyncTab />);
-    expect(screen.getByText("Waiting for approval", { selector: "div" })).toBeInTheDocument();
+    expect(screen.getByText("Waiting for approval", { selector: "p" })).toBeInTheDocument();
     expect(screen.getByText(/On Work Laptop, open Settings/)).toBeInTheDocument();
     // Fingerprint large in the waiting card (and again in the roster row below).
     expect(screen.getAllByText("AAAA-BBBB-CCCC-DDDD").length).toBeGreaterThan(0);
-    expect(screen.getByText("EEEE-FFFF-GGGG-HHHH")).toBeInTheDocument();
+    expect(screen.getByText(/Security code EEEE-FFFF-GGGG-HHHH · key v3/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Turn on sync" })).not.toBeInTheDocument();
     // Header badge agrees with the card.
     expect(screen.getAllByText("Waiting for approval").length).toBeGreaterThan(1);
@@ -393,7 +391,7 @@ describe("SyncTab — device setup flow", () => {
       status: makeStatus({ syncEnabled: false, roster: [self] }),
     });
     render(<SyncTab />);
-    expect(screen.getByText(/uploaded to your relay, encrypted on this device/)).toBeInTheDocument();
+    expect(screen.getByText(/uploaded to your server, encrypted on this device/)).toBeInTheDocument();
   });
 
   it("a pending peer is a named row with a Review button that opens the ceremony with the roster code", async () => {
@@ -413,8 +411,7 @@ describe("SyncTab — device setup flow", () => {
     await userEvent.click(screen.getByRole("button", { name: "Review" }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("PPPP-QQQQ-RRRR-SSSS")).toBeInTheDocument();
-    expect(within(dialog).getByText("EEEE-FFFF-GGGG-HHHH")).toBeInTheDocument();
-    expect(within(dialog).getByText(/epoch 2/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Security code EEEE-FFFF-GGGG-HHHH · key v2/)).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Approve device" })).toBeDisabled();
   });
 
@@ -425,7 +422,7 @@ describe("SyncTab — device setup flow", () => {
   });
 });
 
-describe("SyncTab — audio backup card (S2)", () => {
+describe("SyncTab — audio backup row (S2)", () => {
   it("is hidden when there is no audio activity", () => {
     setup({ status: makeStatus() });
     render(<SyncTab />);
@@ -514,8 +511,8 @@ describe("SyncTab — audio backup card (S2)", () => {
   it("animates in rather than popping into the stack", () => {
     setup({ status: makeStatus({ audioUploadOutstanding: 1 }) });
     const { container } = render(<SyncTab />);
-    const card = screen.getByText("Audio backup").closest("[data-slot='card']");
-    expect(card?.className).toContain("view-enter");
+    const row = screen.getByText("Audio backup").closest(".view-enter");
+    expect(row).toBeTruthy();
     expect(container).toBeTruthy();
   });
 });
@@ -531,11 +528,11 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     return vi.mocked(invoke);
   }
 
-  it("shows 'Fetched audio: N MB' once the cache holds fetched audio", async () => {
+  it("shows the downloaded-audio row once the cache holds fetched audio", async () => {
     await mockCache(5 * 1024 * 1024, 3);
     setup({ email: "user@example.com", status: makeStatus() });
     render(<SyncTab />);
-    expect(await screen.findByText("Fetched audio: 5.0 MB")).toBeInTheDocument();
+    expect(await screen.findByText(/5\.0 MB from your other devices/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
   });
 
@@ -546,7 +543,7 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("audio_cache_stats"),
     );
-    expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Downloaded audio")).not.toBeInTheDocument();
   });
 
   it("clears only through the confirm dialog, then hides the emptied row", async () => {
@@ -558,7 +555,7 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     expect(invoke).not.toHaveBeenCalledWith("audio_cache_clear");
     const dialog = screen.getByRole("alertdialog");
     expect(
-      within(dialog).getByText("Clear fetched audio?"),
+      within(dialog).getByText("Clear downloaded audio?"),
     ).toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole("button", { name: "Clear" }));
     await waitFor(() =>
@@ -566,7 +563,7 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     );
     // The refreshed (now empty) footprint hides the row.
     await waitFor(() =>
-      expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument(),
+      expect(screen.queryByText("Downloaded audio")).not.toBeInTheDocument(),
     );
   });
 
@@ -585,12 +582,12 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
       render(<SyncTab />);
       await vi.advanceTimersByTimeAsync(0);
       expect(invoke).toHaveBeenCalledWith("audio_cache_stats");
-      expect(screen.queryByText(/Fetched audio:/)).not.toBeInTheDocument();
+      expect(screen.queryByText("Downloaded audio")).not.toBeInTheDocument();
 
       // A background fetch lands while the panel sits open.
       bytes = 2 * 1024 * 1024;
       await vi.advanceTimersByTimeAsync(5000);
-      expect(screen.getByText("Fetched audio: 2.0 MB")).toBeInTheDocument();
+      expect(screen.getByText(/2\.0 MB from your other devices/)).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -600,9 +597,7 @@ describe("SyncTab — fetched-audio cache row (S3.5)", () => {
     await mockCache(5 * 1024 * 1024, 3);
     setup({ email: "user@example.com", status: makeStatus() });
     render(<SyncTab />);
-    const card = (await screen.findByText("Fetched audio: 5.0 MB")).closest(
-      "[data-slot='card']",
-    );
-    expect(card?.className).toContain("view-enter");
+    const row = (await screen.findByText("Downloaded audio")).closest(".view-enter");
+    expect(row).toBeTruthy();
   });
 });
