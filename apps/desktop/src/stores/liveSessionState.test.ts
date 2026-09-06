@@ -454,7 +454,7 @@ describe("resume guard (resume-race defense-in-depth)", () => {
     useAppStore.setState({
       syncStatus: syncStatus({
         roster: [
-          { fingerprint: "PEER", isSelf: false, pending: false, label: "Windows" },
+          { fingerprint: "PEER", isSelf: false, pending: false, label: "Windows", platform: null },
         ],
       }),
     });

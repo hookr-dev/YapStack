@@ -212,8 +212,8 @@ describe("SyncStatusGlyph — icon + tone per state", () => {
 });
 
 describe("SyncStatusGlyph — device approval ceremony", () => {
-  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null };
-  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop" };
+  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null, platform: null };
+  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop", platform: null };
 
   it("a peer requesting access → MonitorSmartphone, amber, plus a persistent toast with a Review action", async () => {
     const setSettingsRequest = vi.fn();

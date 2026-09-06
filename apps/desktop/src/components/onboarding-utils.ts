@@ -10,7 +10,7 @@ export interface OnboardingFlow {
 export const ONBOARDING_FLOWS: OnboardingFlow[] = [
   {
     id: "initial",
-    steps: ["welcome", "audio", "ai", "ready"],
+    steps: ["welcome", "audio", "ai", "sync", "ready"],
     blocking: true,
     shouldShow: (s) => !s.completedFlows["initial"],
   },

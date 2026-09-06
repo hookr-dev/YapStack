@@ -95,7 +95,7 @@ function syncStatus(over: Partial<SyncStatus> = {}): SyncStatus {
     serverUrl: "https://relay.example",
     email: "o@e.com",
     deviceFingerprint: "ME",
-    roster: [{ fingerprint: "PEER", isSelf: false, pending: false, label: "Windows" }],
+    roster: [{ fingerprint: "PEER", isSelf: false, pending: false, label: "Windows", platform: null }],
     vaultKeyEpoch: null,
     rosterFingerprint: null,
     syncEnabled: true,

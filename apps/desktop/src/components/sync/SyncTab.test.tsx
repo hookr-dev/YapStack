@@ -5,7 +5,6 @@ import {
   cleanup,
   waitFor,
   within,
-  fireEvent,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -20,7 +19,7 @@ import {
   tauriOpenerMock,
 } from "@/test/tauri-mocks";
 import { useAppStore } from "@/stores/appStore";
-import type { SyncStatus, RelayConnState } from "@/lib/sync";
+import type { SyncStatus, RelayConnState, DeviceRosterEntry } from "@/lib/sync";
 import { SyncTab } from "./SyncTab";
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
@@ -39,7 +38,7 @@ function makeStatus(overrides: Partial<SyncStatus> = {}): SyncStatus {
     email: "user@example.com",
     deviceFingerprint: "AAAABBBBCCCCDDDD",
     roster: [
-      { fingerprint: "AAAABBBBCCCCDDDD", isSelf: true, pending: false, label: null },
+      { fingerprint: "AAAABBBBCCCCDDDD", isSelf: true, pending: false, label: null, platform: null },
     ],
     vaultKeyEpoch: 0,
     rosterFingerprint: "EEEEFFFFGGGGHHHH",
@@ -86,6 +85,7 @@ function setup({
     },
     syncStatus: status,
     relayConn,
+    settingsRequest: null,
     refreshSyncStatus: vi.fn().mockResolvedValue(undefined),
     probeRelay: vi.fn().mockResolvedValue(undefined),
     resetProbe: vi.fn(),
@@ -96,6 +96,22 @@ function setup({
 
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
+
+
+const SELF: DeviceRosterEntry = {
+  fingerprint: "AAAABBBBCCCCDDDD",
+  isSelf: true,
+  pending: false,
+  label: "Mac Studio",
+  platform: "macos",
+};
+const PEER: DeviceRosterEntry = {
+  fingerprint: "PPPPQQQQRRRRSSSS",
+  isSelf: false,
+  pending: false,
+  label: "Work Laptop",
+  platform: "windows",
+};
 
 describe("SyncTab — build without the sync feature", () => {
   /** What `refreshSyncStatus` parks in the store when `sync_status` is not a
@@ -109,23 +125,17 @@ describe("SyncTab — build without the sync feature", () => {
       lastError: "Command sync_status not found",
     });
 
-  it("renders the not-in-this-build placeholder instead of the dead controls", () => {
+  it("renders the not-in-this-build placeholder instead of the setup hero", () => {
     setup({ status: missing() });
     render(<SyncTab />);
     expect(screen.getByText("Not in this build")).toBeInTheDocument();
     expect(screen.getByText("docs/self-hosting.md")).toBeInTheDocument();
-    expect(screen.getByText("--features sync")).toBeInTheDocument();
-    // None of the sync controls (all of which would fail) are rendered.
-    expect(screen.queryByLabelText("Sync server URL")).not.toBeInTheDocument();
-    expect(screen.queryByText("Account")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Test connection" }),
-    ).not.toBeInTheDocument();
-    // Not surfaced as a "Connection problem" — the relay is not the issue.
+    expect(screen.queryByRole("button", { name: "Set up sync" })).not.toBeInTheDocument();
+    // Not surfaced as a "Connection problem" — the server is not the issue.
     expect(screen.queryByText("Connection problem")).not.toBeInTheDocument();
   });
 
-  it("keeps the real UI (and the verbatim error) for an actual status failure", () => {
+  it("keeps the real UI for an actual status failure", () => {
     setup({
       status: makeStatus({
         phase: "error",
@@ -137,276 +147,96 @@ describe("SyncTab — build without the sync feature", () => {
     });
     render(<SyncTab />);
     expect(screen.queryByText("Not in this build")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Sync server URL")).toBeInTheDocument();
-    expect(screen.getByText("Connection problem")).toBeInTheDocument();
-    expect(
-      screen.getByText("relay unreachable: connection refused"),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Set up sync" })).toBeInTheDocument();
   });
 });
 
-describe("SyncTab", () => {
-  it("signed-out shows only the Server + Account sections", () => {
+describe("SyncTab — not set up", () => {
+  it("signed out: the hero and nothing to configure", () => {
     setup();
     render(<SyncTab />);
-    expect(screen.getByLabelText("Sync server URL")).toBeInTheDocument();
-    expect(screen.getByText("Account")).toBeInTheDocument();
+    expect(screen.getByText("Your notes on every device")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Set up sync" })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/server/i)).not.toBeInTheDocument();
     expect(screen.queryByText("Devices")).not.toBeInTheDocument();
-    expect(screen.queryByText("Turn on sync")).not.toBeInTheDocument();
   });
 
-  it("clicking Test connection probes the entered URL", async () => {
-    setup();
-    render(<SyncTab />);
-    await userEvent.click(screen.getByRole("button", { name: "Test connection" }));
-    expect(useAppStore.getState().probeRelay).toHaveBeenCalledWith(
-      "https://sync.yapstack.app",
-    );
-  });
-
-  it("auto-probes once on blur when the URL is dirty + valid", async () => {
-    setup();
-    render(<SyncTab />);
-    const input = screen.getByLabelText("Sync server URL");
-    await userEvent.clear(input);
-    await userEvent.type(input, "https://relay.example.com");
-    fireEvent.blur(input);
-    await waitFor(() =>
-      expect(useAppStore.getState().probeRelay).toHaveBeenCalledWith(
-        "https://relay.example.com",
-      ),
-    );
-  });
-
-  it("renders the collapsed connected line on probe success", () => {
-    setup({
-      relayConn: {
-        kind: "ok",
-        engineVersion: "0.16.3",
-        protocolVersion: 1,
-        latencyMs: 42,
-        normalizedUrl: "https://relay.example.com",
-        versionAdvisory: null,
-      },
-    });
-    render(<SyncTab />);
-    const line = screen.getByText("42 ms", { exact: false });
-    expect(line).toBeInTheDocument();
-    // Engine/protocol versions ride in the tooltip, out of the copy.
-    expect(line).toHaveAttribute("title", "Engine v0.16.3 · protocol v1");
-  });
-
-  it("shows an explicit 'saved' cue once the probed URL is persisted", () => {
-    // A signed-out successful probe auto-persists the normalized URL into syncConfig, so
-    // savedUrl === normalizedUrl → the muted line must read "· saved" (owner asked for an
-    // explicit save cue for the relay connection).
-    setup({
-      serverUrl: "https://relay.example.com",
-      relayConn: {
-        kind: "ok",
-        engineVersion: "0.16.3",
-        protocolVersion: 1,
-        latencyMs: 7,
-        normalizedUrl: "https://relay.example.com",
-        versionAdvisory: null,
-      },
-    });
-    render(<SyncTab />);
-    expect(screen.getByText("saved", { exact: false })).toBeInTheDocument();
-  });
-
-  it("omits the 'saved' cue when the probed URL was not persisted", () => {
-    // normalizedUrl differs from the persisted serverUrl (e.g. a probe of a different URL
-    // that has not been saved) → no "saved" suffix.
-    setup({
-      serverUrl: "https://sync.yapstack.app",
-      relayConn: {
-        kind: "ok",
-        engineVersion: "0.16.3",
-        protocolVersion: 1,
-        latencyMs: 7,
-        normalizedUrl: "https://relay.example.com",
-        versionAdvisory: null,
-      },
-    });
-    render(<SyncTab />);
-    expect(screen.queryByText("saved", { exact: false })).not.toBeInTheDocument();
-  });
-
-  it("renders the verbatim raw error + Save anyway on probe failure", () => {
-    setup({
-      relayConn: {
-        kind: "unreachable",
-        raw: "error trying to connect: tcp connect error: Connection refused (os error 61)",
-      },
-    });
-    render(<SyncTab />);
-    expect(screen.getByText("Can't reach server")).toBeInTheDocument();
-    expect(screen.getByRole("alert").textContent).toBe(
-      "error trying to connect: tcp connect error: Connection refused (os error 61)",
-    );
-    expect(
-      screen.getByRole("button", { name: "Save anyway" }),
-    ).toBeInTheDocument();
-  });
-
-  it("locks the URL as a host identity line when signed in", () => {
-    setup({
-      email: "user@example.com",
-      status: makeStatus(),
-      serverUrl: "https://relay.example.com",
-    });
-    render(<SyncTab />);
-    expect(screen.getByText("relay.example.com")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Sync server URL")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /Change server/ }),
-    ).toBeInTheDocument();
-  });
-
-  it("shows a warm re-login CTA when the session is expired", () => {
-    setup({
-      email: "user@example.com",
-      status: makeStatus({ phase: "auth_expired" }),
-    });
-    render(<SyncTab />);
-    expect(
-      screen.getByText(/sign in again to resume syncing/i),
-    ).toBeInTheDocument();
-  });
-
-  it("routes sign-out through the Advanced AlertDialog confirmation", async () => {
-    setup({
-      email: "user@example.com",
-      status: makeStatus(),
-    });
-    render(<SyncTab />);
-    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    await userEvent.click(
-      screen.getByRole("button", { name: "Sign out" }),
-    );
-    const dialog = screen.getByRole("alertdialog");
-    expect(
-      within(dialog).getByText("Sign out of sync on this device?"),
-    ).toBeInTheDocument();
-    // Confirm → handleSignOut awaits sync_sign_out then clears status.
-    await userEvent.click(within(dialog).getByRole("button", { name: "Sign out" }));
-    await waitFor(() =>
-      expect(useAppStore.getState().setSyncStatus).toHaveBeenCalledWith(null),
-    );
-  });
-});
-
-describe("SyncTab — device setup flow", () => {
-  const self = { fingerprint: "AAAABBBBCCCCDDDD", isSelf: true, pending: false, label: "Mac Studio" };
-  const peerPending = {
-    fingerprint: "PPPPQQQQRRRRSSSS",
-    isSelf: false,
-    pending: true,
-    label: "Work Laptop",
-  };
-
-  it("signed out with no relay URL: account actions wait for the server step", () => {
+  it("Set up sync opens the wizard on its intro", async () => {
     setup({ serverUrl: "" });
     render(<SyncTab />);
-    expect(screen.queryByRole("button", { name: "Create account" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
-    expect(screen.getByText(/Enter your server above first/)).toBeInTheDocument();
-    // The rail points at the server step.
-    const rail = screen.getByRole("list", { name: "Sync setup steps" });
-    expect(within(rail).getByText("Server").closest("[aria-current]")).toHaveAttribute(
-      "aria-current",
-      "step",
-    );
+    await userEvent.click(screen.getByRole("button", { name: "Set up sync" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("button", { name: /Get started/ })).toBeInTheDocument();
   });
 
-  it("signed out with a relay URL: account actions are live and Sign in is the current step", () => {
-    setup({ serverUrl: "https://relay.example.com" });
-    render(<SyncTab />);
-    expect(screen.getByRole("button", { name: "Create account" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
-    const rail = screen.getByRole("list", { name: "Sync setup steps" });
-    expect(within(rail).getByText("Sign in").closest("[aria-current]")).toHaveAttribute(
-      "aria-current",
-      "step",
-    );
-  });
-
-  it("a device awaiting approval sees the waiting card, its fingerprint, and NO turn-on control", () => {
+  it("a signed-in device that never turned sync on is offered 'Continue setup'", async () => {
     setup({
       email: "user@example.com",
-      serverUrl: "https://relay.example.com",
+      status: makeStatus({ syncEnabled: false, roster: [SELF] }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText(/Signed in as user@example.com/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
+    // Resumes at the turn-on step, not the intro.
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("button", { name: "Turn on sync" })).toBeInTheDocument();
+  });
+
+  it("a device waiting for approval says so and resumes at the approval step", async () => {
+    setup({
+      email: "user@example.com",
       status: makeStatus({
         syncEnabled: false,
         rosterFingerprint: "EEEEFFFFGGGGHHHH",
         vaultKeyEpoch: 3,
-        roster: [
-          { ...self, pending: true },
-          { fingerprint: "PPPPQQQQRRRRSSSS", isSelf: false, pending: false, label: "Work Laptop" },
-        ],
+        roster: [{ ...SELF, pending: true }, PEER],
       }),
     });
     render(<SyncTab />);
-    expect(screen.getByText("Waiting for approval", { selector: "p" })).toBeInTheDocument();
-    expect(screen.getByText(/On Work Laptop, open Settings/)).toBeInTheDocument();
-    // Fingerprint large in the waiting card (and again in the roster row below).
-    expect(screen.getAllByText("AAAA-BBBB-CCCC-DDDD").length).toBeGreaterThan(0);
-    expect(screen.getByText(/Security code EEEE-FFFF-GGGG-HHHH · key v3/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Turn on sync" })).not.toBeInTheDocument();
-    // Header badge agrees with the card.
-    expect(screen.getAllByText("Waiting for approval").length).toBeGreaterThan(1);
+    expect(screen.getByText(/waiting for one of your other devices/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Approve this device")).toBeInTheDocument();
+    expect(within(dialog).getByText("AAAA-BBBB-CCCC-DDDD")).toBeInTheDocument();
+    expect(within(dialog).getByText(/Security code EEEE-FFFF-GGGG-HHHH · key v3/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/On Work Laptop, open Settings/)).toBeInTheDocument();
   });
 
-  it("a waiting device with no approved peer is told plainly there is nothing to approve it", () => {
-    setup({
-      email: "user@example.com",
-      serverUrl: "https://relay.example.com",
-      status: makeStatus({ syncEnabled: false, roster: [{ ...self, pending: true }] }),
-    });
+  it("a 'sync-setup' deep link opens the wizard on mount and clears itself", async () => {
+    setup();
+    const setSettingsRequest = vi.fn();
+    useAppStore.setState({ settingsRequest: "sync-setup", setSettingsRequest });
     render(<SyncTab />);
-    expect(screen.getByText(/No other approved device is on this account yet/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(setSettingsRequest).toHaveBeenCalledWith(null);
   });
+});
 
-  it("an approved device that has not turned sync on gets the turn-on card, worded for a join", async () => {
-    setup({
-      email: "user@example.com",
-      serverUrl: "https://relay.example.com",
-      status: makeStatus({
-        syncEnabled: false,
-        roster: [self, { ...peerPending, pending: false }],
-      }),
-    });
+describe("SyncTab — on", () => {
+  it("shows devices as named tiles with this-device marked, plus Add a device", () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [SELF, PEER] }) });
     render(<SyncTab />);
-    expect(screen.getByText(/download here, and anything already on this device is merged/)).toBeInTheDocument();
-    expect(screen.queryByText("Waiting for approval")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Turn on sync" }));
-    const { invoke } = await import("@tauri-apps/api/core");
-    await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("sync_enable"));
+    expect(screen.getByText("Mac Studio")).toBeInTheDocument();
+    expect(screen.getByText("This device")).toBeInTheDocument();
+    expect(screen.getByText("Work Laptop")).toBeInTheDocument();
+    expect(screen.getByText("Windows")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Add a device/ })).toBeInTheDocument();
+    // No hero, no setup.
+    expect(screen.queryByRole("button", { name: "Set up sync" })).not.toBeInTheDocument();
   });
 
-  it("a first device is told its library uploads, not that peers download", () => {
+  it("a requesting device is an amber tile whose Review opens the ceremony with both codes", async () => {
     setup({
       email: "user@example.com",
-      serverUrl: "https://relay.example.com",
-      status: makeStatus({ syncEnabled: false, roster: [self] }),
-    });
-    render(<SyncTab />);
-    expect(screen.getByText(/uploaded to your server, encrypted on this device/)).toBeInTheDocument();
-  });
-
-  it("a pending peer is a named row with a Review button that opens the ceremony with the roster code", async () => {
-    setup({
-      email: "user@example.com",
-      serverUrl: "https://relay.example.com",
       status: makeStatus({
         rosterFingerprint: "EEEEFFFFGGGGHHHH",
         vaultKeyEpoch: 2,
-        roster: [self, peerPending],
+        roster: [SELF, { ...PEER, pending: true }],
       }),
     });
     render(<SyncTab />);
-    expect(screen.getByText("A new device is requesting access")).toBeInTheDocument();
-    // Named once in the request list — not duplicated into the approved roster below.
+    expect(screen.getByText("Wants to join")).toBeInTheDocument();
+    // Named once — the request tile, not also an approved tile.
     expect(screen.getAllByText("Work Laptop")).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "Review" }));
     const dialog = screen.getByRole("dialog");
@@ -415,10 +245,63 @@ describe("SyncTab — device setup flow", () => {
     expect(within(dialog).getByRole("button", { name: "Approve device" })).toBeDisabled();
   });
 
-  it("the setup rail is gone once sync is on", () => {
-    setup({ email: "user@example.com", status: makeStatus() });
+  it("Add a device opens the guide with this account's server and email", async () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ roster: [SELF], serverUrl: "https://relay.example.com" }),
+    });
     render(<SyncTab />);
-    expect(screen.queryByRole("list", { name: "Sync setup steps" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Add a device/ }));
+    const sheet = screen.getByRole("dialog");
+    expect(within(sheet).getByText("https://relay.example.com")).toBeInTheDocument();
+    expect(within(sheet).getByText("user@example.com")).toBeInTheDocument();
+    expect(within(sheet).getByText(/Approve it from here/)).toBeInTheDocument();
+  });
+
+  it("shows the server host and account as quiet rows", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ roster: [SELF], serverUrl: "https://relay.example.com" }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("relay.example.com")).toBeInTheDocument();
+    expect(screen.getByText("user@example.com")).toBeInTheDocument();
+  });
+
+  it("an expired sign-in offers Sign in, which opens the wizard with the email locked", async () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ phase: "auth_expired", roster: [SELF] }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText(/Your sign-in expired/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Sign in again")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Email")).toHaveValue("user@example.com");
+    expect(within(dialog).getByLabelText("Email")).toBeDisabled();
+  });
+
+  it("routes sign-out through a confirmation", async () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [SELF] }) });
+    render(<SyncTab />);
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText("Sign out of sync on this device?")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Sign out" }));
+    await waitFor(() =>
+      expect(useAppStore.getState().setSyncStatus).toHaveBeenCalledWith(null),
+    );
+  });
+
+  it("surfaces a verbatim connection error under the heading", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ roster: [SELF], lastError: "relay unreachable: connection refused" }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Connection problem")).toBeInTheDocument();
+    expect(screen.getByText("relay unreachable: connection refused")).toBeInTheDocument();
   });
 });
 
@@ -505,7 +388,7 @@ describe("SyncTab — audio backup row (S2)", () => {
     rerender(<SyncTab />);
 
     expect(screen.queryByText("Backing up 2 recordings")).not.toBeInTheDocument();
-    expect(screen.getByText("Audio backup — nothing waiting")).toBeInTheDocument();
+    expect(screen.getByText("Nothing waiting")).toBeInTheDocument();
   });
 
   it("animates in rather than popping into the stack", () => {
@@ -517,7 +400,7 @@ describe("SyncTab — audio backup row (S2)", () => {
   });
 });
 
-describe("SyncTab — fetched-audio cache row (S3.5)", () => {
+describe("SyncTab — downloaded-audio row (S3.5)", () => {
   async function mockCache(bytes: number, files: number) {
     const { invoke } = await import("@tauri-apps/api/core");
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {

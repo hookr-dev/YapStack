@@ -61,6 +61,10 @@ pub struct RosterEnvelope {
     pub ed25519_pub: String, // base64
     #[serde(default)]
     pub label: String,
+    /// Operating system of the enrolling device (`std::env::consts::OS`: "macos",
+    /// "windows", "linux"); advisory index metadata for the devices UI, like `label`.
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Access+refresh token pair returned by signup / refresh. `tenant_id` is bound into
@@ -108,6 +112,9 @@ pub struct LoginFinishRequest {
     pub ed25519_pub: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Operating system of the enrolling device (see `RosterEnvelope::platform`).
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 /// Round-2 success response: the token pair plus the bootstrap material — `salt_enc`,
@@ -176,6 +183,10 @@ pub struct DeviceInfo {
     /// base64 of the device's 32-byte Ed25519 public key.
     pub ed25519_pub: String,
     pub label: String,
+    /// Operating system the device reported at enrollment ("macos" | "windows" |
+    /// "linux" | ""), for the devices UI. Advisory, like `label`.
+    #[serde(default)]
+    pub platform: String,
     /// `"pending"` (enrolled, awaiting approval) or `"active"` (in an accepted roster).
     pub status: String,
     pub added_at: String,

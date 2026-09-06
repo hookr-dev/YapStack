@@ -898,7 +898,12 @@ export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcr
  * implicit rowid no caller can use.)
  */
 export type DbExecuteResult = { rowsAffected: number }
-export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null }
+export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pending: boolean; label: string | null;
+/**
+ * "macos" | "windows" | "linux" as the device reported at enrollment; None when
+ * unknown (a device enrolled before platforms were recorded).
+ */
+platform: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**
  * Engine capabilities + supported languages for the cascading UI in Settings.

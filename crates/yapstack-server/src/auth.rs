@@ -166,14 +166,15 @@ pub async fn signup(
     .await?;
 
     sqlx::query(
-        "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, platform) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(req.device_list.client_id)
     .bind(workspace_id)
     .bind(user_id)
     .bind(&ed_pub)
     .bind(&req.device_list.label)
+    .bind(&req.device_list.platform)
     .execute(&mut *tx)
     .await?;
 
@@ -306,8 +307,8 @@ pub async fn login_finish(
             ));
         }
         sqlx::query(
-            "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, status) \
-             VALUES ($1, $2, $3, $4, $5, 'pending') \
+            "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, platform, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending') \
              ON CONFLICT (client_id) DO NOTHING",
         )
         .bind(cid)
@@ -315,6 +316,7 @@ pub async fn login_finish(
         .bind(row.id)
         .bind(&ed_pub)
         .bind(req.label.clone().unwrap_or_default())
+        .bind(req.platform.clone().unwrap_or_default())
         .execute(&mut *tx)
         .await?;
     }

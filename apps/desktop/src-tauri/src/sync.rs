@@ -1587,6 +1587,9 @@ pub struct DeviceRosterEntryDto {
     is_self: bool,
     pending: bool,
     label: Option<String>,
+    /// "macos" | "windows" | "linux" as the device reported at enrollment; None when
+    /// unknown (a device enrolled before platforms were recorded).
+    platform: Option<String>,
 }
 
 /// Args for `sync_signup` (mirrors `SignupRequest` in `lib/sync.ts`).
@@ -4853,6 +4856,11 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
                     } else {
                         Some(d.label)
                     },
+                    platform: if d.platform.is_empty() {
+                        None
+                    } else {
+                        Some(d.platform)
+                    },
                 });
             }
         }
@@ -5960,6 +5968,7 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
             client_id,
             ed25519_pub: dev_pub_b64,
             label,
+            platform: std::env::consts::OS.to_string(),
         },
     };
 
@@ -6090,6 +6099,7 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
             client_id: Some(client_id),
             ed25519_pub: Some(B64.encode(dev_pub)),
             label: Some(device_label()),
+            platform: Some(std::env::consts::OS.to_string()),
         }))
         .await?;
 
@@ -6619,6 +6629,7 @@ mod tests {
             client_id: target_id,
             ed25519_pub: target_pub.clone(),
             label: "target".into(),
+            platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
         };
@@ -6639,6 +6650,7 @@ mod tests {
                 client_id: self_id,
                 ed25519_pub: self_pub.clone(),
                 label: "self".into(),
+                platform: String::new(),
                 status: "active".into(),
                 added_at: "2026-01-01T00:00:00Z".into(),
             },
@@ -6682,6 +6694,7 @@ mod tests {
             client_id: target_id,
             ed25519_pub: B64.encode([0x22u8; 32]),
             label: "target".into(),
+            platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
         };
@@ -6690,6 +6703,7 @@ mod tests {
             client_id: self_id,
             ed25519_pub: B64.encode([0xEEu8; 32]),
             label: "self".into(),
+            platform: String::new(),
             status: "active".into(),
             added_at: "2026-01-01T00:00:00Z".into(),
         }];

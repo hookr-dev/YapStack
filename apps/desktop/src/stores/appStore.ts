@@ -296,6 +296,13 @@ export const DEFAULT_DICTATION_SETTINGS: DictationSettings = {
   slots: DEFAULT_DICTATION_SLOTS,
 };
 
+/**
+ * One-shot deep links into Settings. `"sync"` lands on the Sync tab; `"sync-setup"`
+ * lands there AND opens the setup wizard (from first-run onboarding or the not-set-up
+ * hero); `"ai-add-connection"` opens the AI connection editor.
+ */
+export type SettingsRequest = "ai-add-connection" | "sync" | "sync-setup" | null;
+
 export interface OnboardingState {
   completedFlows: Record<string, string>; // flowId → ISO timestamp
 }
@@ -647,8 +654,8 @@ interface AppState {
    * Sync tab and is cleared by SettingsPanel itself. Single-value rather than a
    * queue — only the most recent intent matters. Cleared after consumption.
    */
-  settingsRequest: "ai-add-connection" | "sync" | null;
-  setSettingsRequest: (request: "ai-add-connection" | "sync" | null) => void;
+  settingsRequest: SettingsRequest;
+  setSettingsRequest: (request: SettingsRequest) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
   /**

@@ -49,8 +49,8 @@ function derive(partial: Partial<SyncDisplayInput>): ReturnType<typeof deriveSyn
 }
 
 describe("deriveSyncDisplay — device approval ceremony (§7.5)", () => {
-  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null };
-  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop" };
+  const self = { fingerprint: "SELF", isSelf: true, pending: false, label: null, platform: null };
+  const peer = { fingerprint: "PEER", isSelf: false, pending: true, label: "Laptop", platform: null };
 
   it("a device awaiting approval reads 'Waiting for approval' even though sync is off", () => {
     const d = derive({
@@ -76,7 +76,7 @@ describe("deriveSyncDisplay — device approval ceremony (§7.5)", () => {
   it("pluralizes several requests", () => {
     const d = derive({
       status: status({
-        roster: [self, peer, { ...peer, fingerprint: "PEER2", label: null }],
+        roster: [self, peer, { ...peer, fingerprint: "PEER2", label: null, platform: null }],
       }),
     });
     expect(d.label).toBe("Approve 2 new devices");

@@ -103,6 +103,8 @@ export interface DeviceRosterEntry {
   /** Pending devices are awaiting approval by an existing device. */
   pending: boolean;
   label: string | null;
+  /** "macos" | "windows" | "linux" as reported at enrollment; null when unknown. */
+  platform: string | null;
 }
 
 /** Devices other than this one that are awaiting approval (§7.5) — the approving side's

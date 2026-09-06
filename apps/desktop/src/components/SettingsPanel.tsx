@@ -22,17 +22,18 @@ export function SettingsPanel() {
   const initialTab =
     settingsRequest === "ai-add-connection"
       ? "ai"
-      : settingsRequest === "sync"
+      : settingsRequest === "sync" || settingsRequest === "sync-setup"
         ? "sync"
         : "general";
   const [tab, setTab] = useState(initialTab);
 
-  // Handle a "sync" request that arrives while the panel is already open: switch
-  // to the Sync tab and clear the one-shot so it doesn't re-fire on remount.
+  // Handle a sync request that arrives while the panel is already open: switch to
+  // the Sync tab. `"sync"` is consumed here; `"sync-setup"` is left for SyncTab,
+  // which needs to be mounted to open the wizard from it.
   useEffect(() => {
-    if (settingsRequest === "sync") {
+    if (settingsRequest === "sync" || settingsRequest === "sync-setup") {
       setTab("sync");
-      setSettingsRequest(null);
+      if (settingsRequest === "sync") setSettingsRequest(null);
     }
   }, [settingsRequest, setSettingsRequest]);
 

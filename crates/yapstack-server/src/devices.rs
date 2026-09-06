@@ -44,6 +44,7 @@ struct DeviceRow {
     client_id: Uuid,
     ed25519_pub: Vec<u8>,
     label: String,
+    platform: String,
     status: String,
     added_at: chrono::DateTime<chrono::Utc>,
 }
@@ -57,7 +58,7 @@ pub async fn list(
 ) -> Result<Json<DevicesResponse>, AppError> {
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
     let rows: Vec<DeviceRow> = sqlx::query_as(
-        "SELECT client_id, ed25519_pub, label, status, added_at \
+        "SELECT client_id, ed25519_pub, label, platform, status, added_at \
          FROM devices WHERE workspace_id = $1 ORDER BY added_at",
     )
     .bind(auth.tenant_id)
@@ -71,6 +72,7 @@ pub async fn list(
             client_id: r.client_id,
             ed25519_pub: B64.encode(&r.ed25519_pub),
             label: r.label,
+            platform: r.platform,
             status: r.status,
             added_at: r.added_at.to_rfc3339(),
         })
