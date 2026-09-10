@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
-  shouldShowUpgrade,
   normalizeCode,
   groupBase32,
   formatRecoveryCode,
@@ -29,16 +28,6 @@ import {
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-
-describe("shouldShowUpgrade", () => {
-  it("shows upgrade only when a billing_url is advertised", () => {
-    expect(shouldShowUpgrade({ billingUrl: "https://pay.example" })).toBe(true);
-  });
-  it("hides upgrade for self-host (no billing_url)", () => {
-    expect(shouldShowUpgrade({ billingUrl: null })).toBe(false);
-    expect(shouldShowUpgrade({ billingUrl: "" })).toBe(false);
-  });
-});
 
 describe("normalizeCode", () => {
   it("strips hyphens/whitespace and uppercases", () => {

@@ -93,14 +93,18 @@ pub async fn presign(
     auth: AuthTenant,
     Query(q): Query<PresignQuery>,
 ) -> Result<Json<PresignResponse>, AppError> {
+    let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+    // Write gate (§7.5, SYNC_SPEC §15.B): only an ACTIVE device may reserve upload bytes.
+    // Checked before storage/limits so an unapproved device is refused for that reason,
+    // not for a deployment's missing object store. `GET /audio/part/{id}` stays open.
+    crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
+
     let cfg = storage_cfg(&st)?;
     let (hash, hash_hex) = storage::parse_sha256(&q.sha256)?;
     let key = storage::object_key(auth.tenant_id, &hash_hex);
 
     let limits = st.limits.limits(auth.tenant_id).await;
     let help_url = st.config.help_url();
-
-    let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
 
     let blob: Option<(i64,)> = sqlx::query_as(
         "SELECT size_bytes FROM audio_blobs WHERE workspace_id = $1 AND ciphertext_sha256 = $2",

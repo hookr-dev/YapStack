@@ -88,7 +88,6 @@ export type SyncPhase =
   | "disconnected"
   | "connecting"
   | "connected"
-  | "preparing" // crr_migrate running: "preparing your library for sync"
   | "syncing" // a push is in flight — unacked entries remain in the outbox (T024)
   | "catching_up" // outbox drained, but the PULL is still behind the relay tip (R12)
   | "auth_expired" // session expired; the drain stopped and needs a fresh sign-in (T023)
@@ -136,9 +135,6 @@ export interface SyncStatus {
   syncEnabled: boolean;
   /** Last connection / auth error surfaced verbatim (never auto-routed). */
   lastError: string | null;
-  /** Present ONLY when the deployment advertises a control plane (hosted); self-host
-   *  omits it. Originally a `GET /sync/info` echo — it now rides on `sync_status`. */
-  billingUrl: string | null;
   /** Unacked outbox entries still to push (0 == up to date). Drives the
    *  "Syncing — N remaining" indicator (T024). */
   pendingEntries: number;
@@ -225,7 +221,7 @@ export const syncCommands = {
    *  and applies the 2xx-sentinel check (protocol_version + engine_version) so a bare proxy
    *  200 never reads as connected. Resolves with `RelayProbeOk`; REJECTS with a
    *  `RelayProbeError` the caller discriminates on `kind`. This is the only relay-metadata
-   *  call; `billingUrl` rides on `sync_status`. */
+   *  call. */
   probe: (serverUrl: string): Promise<RelayProbeOk> =>
     invoke("sync_probe", { serverUrl }),
 
@@ -612,15 +608,6 @@ export function enqueueAudioForSession(sessionId: string): void {
 }
 
 // ----- Pure display / parsing helpers (unit-tested, no Tauri) -----
-
-/**
- * True only when the deployment advertised a billing control plane. The upgrade
- * UI is gated on this so self-host builds never show a "buy" affordance
- * (ENTITLEMENTS_SEAM: OSS/self-host advertises no billing_url).
- */
-export function shouldShowUpgrade(info: { billingUrl: string | null }): boolean {
-  return typeof info.billingUrl === "string" && info.billingUrl.length > 0;
-}
 
 /**
  * Normalize user-entered recovery-code / fingerprint input: strip hyphens and

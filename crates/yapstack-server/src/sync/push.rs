@@ -79,6 +79,11 @@ pub async fn push(
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
 
+    // Write gate (§7.5, SYNC_SPEC §15.B): only an ACTIVE device may push. A pending
+    // (unapproved) device's token — or a token with no device identity — is refused, so a
+    // password alone can no longer write ciphertext into the tenant's stream.
+    crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
+
     // (1) Bootstrap + (2) acquire the per-tenant push lock (held until commit).
     sqlx::query("INSERT INTO tenant_seq (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(auth.tenant_id)

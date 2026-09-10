@@ -1148,7 +1148,7 @@ export type SignupArgs = { serverUrl: string; email: string; password: string }
 export type SignupResultDto = { recoveryCode: string; deviceFingerprint: string }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
-export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null; billingUrl: string | null;
+export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null;
 /**
  * T024 push progress. Unacked outbox entries still to push (0 == up to date).
  */

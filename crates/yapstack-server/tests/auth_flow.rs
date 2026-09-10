@@ -659,6 +659,98 @@ async fn pending_caller_put_roster_forbidden_active_accepted() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// SYNC_SPEC §15.B: the write gate covers every device-authored write, not only the
+/// roster. A PENDING device's token is refused on `POST /sync/push` and
+/// `POST /audio/presign` (403), while the ACTIVE signup device pushes normally. Reads are
+/// not gated (a pending device may still pull). The presign check runs BEFORE the
+/// object-store lookup, so this holds on a relay with no storage configured (as here).
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn pending_caller_cannot_push_or_presign_active_can() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x24u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (pending_client, pending_access) = enroll_pending(&app, &email, &auth_key).await;
+
+    let push_body = |client: uuid::Uuid| {
+        json!({ "changes": [{
+            "client_id": client,
+            "client_seq": 1,
+            "ciphertext": B64.encode(b"opaque"),
+            "schema_version": 1,
+            "engine_version": 16003
+        }]})
+    };
+
+    // PENDING: push refused, presign refused (before any storage lookup).
+    let resp = post_auth(
+        &app,
+        "/sync/push",
+        &pending_access,
+        push_body(pending_client),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "pending device must not push"
+    );
+    let presign_path = format!(
+        "/audio/presign?sha256={}&size=10&part_id={}&session_id={}",
+        "00".repeat(32),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4()
+    );
+    let resp = post_auth(&app, &presign_path, &pending_access, json!({})).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "pending device must not presign"
+    );
+
+    // PENDING may still READ.
+    let resp = get_auth(&app, "/sync/pull?since=0", &pending_access).await;
+    assert_eq!(resp.status(), StatusCode::OK, "pending device may pull");
+
+    // ACTIVE: push accepted.
+    let resp = post_auth(&app, "/sync/push", &active_access, push_body(first_client)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "active device pushes");
+}
+
+/// Bearer POST helper for the write-gate test.
+async fn post_auth(
+    app: &axum::Router,
+    path: &str,
+    access: &str,
+    body: Value,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
 // =====================================================================================
 // PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
 //   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"

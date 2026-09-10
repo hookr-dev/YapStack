@@ -49,7 +49,7 @@
 | Point the app at a self-hosted relay (typed probe, advisory version gap, "use anyway") | Shipped | Wizard server step, `sync_probe` |
 | Sign a second device in; it waits as **pending** until an existing device approves it | Shipped | Wizard account + approval steps, `sync_login_*` |
 | Approve a device by comparing the device fingerprint and the roster **security code** on both screens | Shipped | `DeviceApprovalDialog`, `sync_approve_device` |
-| Sign in with the recovery code when the password is lost | Shipped; lost-only-device dead end ratified for fix (§15.A) | `sync_recover` |
+| Sign in with the recovery code when the password is lost | Shipped; a recovery-signed-in device cannot turn sync on until it is enrolled (§15.A, next slice) | `sync_recover` |
 | Turn sync on: the live database becomes CRDT-tracked, history is captured, the drain starts | Shipped | Wizard turn-on step, `sync_enable` |
 | Steady-state sync of sessions, transcripts, notes, folders, tags, chat, dictation, audio-part rows | Shipped | Drain, §6 |
 | Follow a session that is **recording on another device** live (read-only) | Shipped | `NoteDetailView` remote-live branch, §8 |
@@ -270,7 +270,9 @@ relay enrolled an unknown device as `pending`; a known device is untouched.
 `sync_recover(server_url, email, code)` authenticates with `recovery_auth_key`,
 receives the recovery wrap, unwraps the vault key, verifies the roster, stores the
 session. The recovery token carries **no `client_id`**, the device is **not enrolled**,
-and the forgotten password stays in force. See §15.A and §15.C.
+and the forgotten password stays in force. Because the relay now refuses writes from an
+unenrolled device, `sync_enable` refuses such a session with an explicit message rather
+than starting a drain that would fail forever. See §15.A and §15.C.
 
 ### 5.6 Tokens
 
@@ -465,8 +467,9 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /snapshot/presign`, `GET /snapshot` | access JWT | snapshot bootstrap seam (no client caller) |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
-Push, audio presign and `PUT /devices/roster` are the only writes; **none of push, pull
-or audio checks the caller's device `status`** (§15.B).
+Push, audio presign and `PUT /devices/roster` are the only device-authored writes, and
+all three require the caller's device row to be `active` (`devices::require_active_caller`).
+Pull, audio GET and the roster GET are never gated.
 
 ### 9.2 Schema (migrations 0001–0009)
 
@@ -626,11 +629,11 @@ reference; "Decision" points to §15.
 | D4 | Decision report §9: `Content-MD5`, multipart > 100 MB, lazy re-hash, `GET /audio/{session_id}` | STREAM envelope, part-id addressing, pinned-length presigned PUT, AEAD tags as verification, no multipart | CRYPTO_SPEC §1.5 + this §7 are authoritative |
 | D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns; no floor | Not implemented. Keep additive-only as the safety lever; **Decision §15.I** on whether to drop the columns |
 | D6 | Decision report §8, CRYPTO_SPEC §8–§9: private-link shares and a JS share-viewer | `shares` table on both sides only; no routes, no UI, no JS stack | Not built; deferred. CRYPTO_SPEC §8/§9/§13.6 stay as the future contract |
-| D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` exist with no caller | **Ratified 2026-09-10: delete `sync-policy.ts`, its test, and the AI-wrap helpers in the simplification pass**; the classification lives in §4.5 |
+| D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` exist with no caller | **Done (pass):** `sync-policy.ts`, its test and the AI-wrap helpers deleted; the classification lives in §4.5 |
 | D8 | Decision report Phase 3: default server URL is the hosted relay | `DEFAULT_SYNC_SERVER_URL = ""`; the hosted hostname does not resolve | Self-host only until a hosted relay exists (**§15.G**) |
 | D9 | Decision report §6.1: a v2 device's unknown column is applied-known / quarantined-rest by v1 | Both true, but because the changeset AAD binds the **sender's** schema/engine version, any bump of `SYNC_SCHEMA_VERSION` quarantines every changeset from the newer device wholesale until the older updates and retries | Documented v1 posture; a version bump is a coordinated update. **§15.J** |
-| D10 | `self-hosting.md`, SYNC_REMEDIATION §6b: snapshot seed/join "designed and partially built, not available" | Server `POST /snapshot/presign` + `GET /snapshot`, engine `snapshot.rs`/`reconcile.rs`, transport methods; no Tauri command | **Ratified: delete `reconcile.rs` + its tests in the pass; keep `snapshot.rs`, the transport snapshot methods and the server routes** for compaction (§15.F) |
-| D11 | CRYPTO_SPEC §7.5 step 3: a pending device "may pull/read" | The client refuses `sync_enable` while pending; the relay gates only `PUT /devices/roster` — push, pull and audio are open to a pending token | **Ratified: relay rejects `POST /sync/push` and `POST /audio/presign` from a pending `client_id`** (pull and audio GET stay open). Pass scope |
+| D10 | `self-hosting.md`, SYNC_REMEDIATION §6b: snapshot seed/join "designed and partially built, not available" | Server `POST /snapshot/presign` + `GET /snapshot`, engine `snapshot.rs`/`reconcile.rs`, transport methods; no Tauri command | **Done (pass):** `reconcile.rs` and its tests deleted; `resite_as_fresh_peer` moved to `snapshot.rs` (the shared-ancestry test needs it); snapshot seam kept for compaction (§15.F) |
+| D11 | CRYPTO_SPEC §7.5 step 3: a pending device "may pull/read" | The client refuses `sync_enable` while pending; the relay gates only `PUT /devices/roster` — push, pull and audio are open to a pending token | **Done (pass):** `devices::require_active_caller` gates roster PUT, push and audio presign; pull and audio GET stay open. Client `sync_enable` also refuses an unenrolled (recovery-signed-in) device with an honest message until A7 lands |
 | D12 | CRYPTO_SPEC §4.3 password change (LOCKED flow) | No endpoint, no command, no UI | **Ratified: build after the pass** (§17 sequence) |
 | D13 | CRYPTO_SPEC §4.4 vault-key rotation, §6.3 recovery-code revocation | Epoch is always 0; nothing rotates or re-wraps | Not built; the anti-rollback plumbing (epoch in AADs, roster, session store) is in place |
 | D14 | CRYPTO_SPEC §7.5: recovery re-establishes the device | `sync_recover` sends no device identity; the token has no `client_id`; the device is neither enrolled nor able to write the roster | **Ratified: recovery enrols the device and may re-bootstrap the roster** (CRYPTO_SPEC §7.5 amendment A7, first slice after the pass) |
@@ -638,12 +641,12 @@ reference; "Decision" points to §15.
 | D16 | CRYPTO_SPEC §7.3 roster entries: `client_id, ed25519_pub, label, added_at` | Same; `platform` is device-index metadata, **not** in the signed roster | Accurate; `platform` is advisory like `label` |
 | D17 | `self-hosting.md`: "choose self-host, paste your relay URL"; "Settings → Sync → enable" on each device | The wizard has one server-address step (no hosted/self-host choice) and the second device must be approved before it can enable | Doc updated with this commit |
 | D18 | `CHANGELOG.md` Unreleased: sync "not yet included in official release builds" vs README "official releases include sync going forward" and `release.yml -f sync` | The release workflow on this branch builds with sync; no tag has shipped it yet | CHANGELOG wording updated with this commit |
-| D19 | SYNC_REMEDIATION §3 tree-shake list; SYNC_REVIEW_FINDINGS 21 findings | All listed removals landed (`sync_info` → `sync_probe`, seed/join unregistered, device_list/wrap_secret/repair_oversized/legacy migration gone); all 21 findings have fix commits between `15ed390` and `517c699`; the audio lane's uninterruptible idle sleep remains a deferred nit | Plans marked historical; **the idle-sleep nit is pass scope** (interruptible slices) |
+| D19 | SYNC_REMEDIATION §3 tree-shake list; SYNC_REVIEW_FINDINGS 21 findings | All listed removals landed (`sync_info` → `sync_probe`, seed/join unregistered, device_list/wrap_secret/repair_oversized/legacy migration gone); all 21 findings have fix commits between `15ed390` and `517c699`; the audio lane's uninterruptible idle sleep remains a deferred nit | Plans marked historical; **done (pass):** the audio lane's idle wait is now 250 ms slices that re-check stop |
 | D20 | SYNC_PAGE_REDESIGN §0.6: "single adaptive page, not a wizard" | Wizard from Settings, ratified 2026-09-06 | Plan marked superseded |
-| D21 | AUDIO_ROUND_TRIP D10: blob GC deferred; S4 custom `audio_save_location` feeds the fetch cache | GC implemented (migration 0006, `gc.rs`); the fetch cache lives beside the database regardless of `audio_save_location`; `tenant_usage` never decremented | GC done; S4 not built; **usage decrement is pass scope** (one statement in the row-delete tx) |
+| D21 | AUDIO_ROUND_TRIP D10: blob GC deferred; S4 custom `audio_save_location` feeds the fetch cache | GC implemented (migration 0006, `gc.rs`); the fetch cache lives beside the database regardless of `audio_save_location`; `tenant_usage` never decremented | GC done; S4 not built; **done (pass):** the GC row-delete transaction decrements `tenant_usage.storage_bytes` (floored at 0) |
 | D22 | Decision report §10: audit log of RLS denials; §15: nightly completeness check | Neither exists; completeness is read at drain spawn and its tips fold in per cycle; the dense cursor makes client-side gaps impossible | Not built; not needed for correctness. Drop from the contract |
-| D23 | `lib/sync.ts` `SyncPhase` includes `preparing`; `syncConfig.lastChangesetSeq` is persisted; `billingUrl` is a status field | Rust never emits `preparing`; `lastChangesetSeq` has no writer; `build_status_dto` always sets `billing_url: None` and the probe does not read it | **Ratified: trim in the pass** |
-| D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Ratified: drop the variant in the pass** |
+| D23 | `lib/sync.ts` `SyncPhase` includes `preparing`; `syncConfig.lastChangesetSeq` is persisted; `billingUrl` is a status field | Rust never emits `preparing`; `lastChangesetSeq` has no writer; `build_status_dto` always sets `billing_url: None` and the probe does not read it | **Done (pass):** removed |
+| D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (pass):** removed |
 | D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | **Ratified: after the feature slices** (§17) |
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | Updated with this commit |
 
@@ -734,8 +737,9 @@ bump. The AAD binding is not relaxed.
 
 ## 17. Ratified plan (2026-09-10)
 
-**Simplification pass (client + relay), fixed scope.** Cut against §12 so no
-load-bearing test disappears; anything else found on the way is reported, not done.
+**Simplification pass (client + relay), fixed scope — executed 2026-09-10.** Cut
+against §12 so no load-bearing test disappeared; the general sweep's findings that were
+out of scope are listed in the pass commit message.
 
 | Item | Change |
 |---|---|

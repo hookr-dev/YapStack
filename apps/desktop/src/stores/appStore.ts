@@ -322,8 +322,6 @@ export interface SyncConfig {
   syncEnabled: boolean;
   /** Signed-in account email (non-secret), null when signed out. */
   email: string | null;
-  /** Last-seen server changeset_seq watermark (dense cursor, arch §7). */
-  lastChangesetSeq: number;
   /** This device's public fingerprint (base32 4×4), null before enrollment. */
   deviceFingerprint: string | null;
 }
@@ -361,7 +359,7 @@ export interface Settings {
   showRecordingIndicator: boolean;
   /// Opt out of anonymous usage analytics. Default true (ON), matching the
   /// behavior before the toggle existed. Device-local by design: consent is
-  /// per-machine and must never travel over sync (sync-policy.ts).
+  /// per-machine and must never travel over sync (SYNC_SPEC §4.5).
   analyticsEnabled: boolean;
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
@@ -946,7 +944,6 @@ const defaultSyncConfig: SyncConfig = {
   serverUrl: DEFAULT_SYNC_SERVER_URL,
   syncEnabled: false,
   email: null,
-  lastChangesetSeq: 0,
   deviceFingerprint: null,
 };
 
@@ -963,7 +960,6 @@ const EMPTY_SYNC_STATUS: SyncStatus = {
   rosterFingerprint: null,
   syncEnabled: false,
   lastError: null,
-  billingUrl: null,
   pendingEntries: 0,
   pendingBytes: 0,
   ackedThisSession: 0,

@@ -20,7 +20,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import {
   AlertTriangle,
-  ExternalLink,
   Laptop,
   Loader2,
   Lock,
@@ -32,13 +31,11 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   syncCommands,
   isCommandNotFound,
   isSelfPending,
   pendingPeerDevices,
-  shouldShowUpgrade,
   formatBytes,
   deriveAudioBackup,
 } from "@/lib/sync";
@@ -130,10 +127,6 @@ export function SyncTab() {
       toast.error(e instanceof Error ? e.message : String(e));
     }
   };
-
-  // The single named self-host gate (ENTITLEMENTS_SEAM).
-  const billingUrl =
-    syncStatus && shouldShowUpgrade(syncStatus) ? syncStatus.billingUrl : null;
 
   // A build compiled WITHOUT the `sync` cargo feature registers none of the `sync_*`
   // commands, so the mount status call rejects with Tauri's exact "Command sync_status
@@ -335,26 +328,6 @@ export function SyncTab() {
           </AlertDialogContent>
         </AlertDialog>
       </div>
-
-      {billingUrl && (
-        <div className="flex items-center justify-between gap-3">
-          <div className="space-y-0.5">
-            <Label className="text-xs">Plan</Label>
-            <p className="text-[10px] text-muted-foreground">
-              View usage and upgrade for more storage.
-            </p>
-          </div>
-          <Button
-            size="sm"
-            variant="outline"
-            className="text-xs"
-            onClick={() => openUrl(billingUrl).catch(() => {})}
-          >
-            Upgrade
-            <ExternalLink className="h-3 w-3" />
-          </Button>
-        </div>
-      )}
 
       {wizardEl}
     </>

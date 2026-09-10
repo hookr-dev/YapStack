@@ -36,7 +36,6 @@ function disconnectedStatus(): SyncStatus {
     rosterFingerprint: null,
     syncEnabled: false,
     lastError: null,
-    billingUrl: null,
     pendingEntries: 0,
     pendingBytes: 0,
     ackedThisSession: 0,

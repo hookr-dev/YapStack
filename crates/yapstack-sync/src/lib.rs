@@ -13,8 +13,8 @@
 //!
 //! ## Scope
 //! This crate is the runtime only. Desktop wiring (key-management UI, device
-//! ceremony, starting the drain task) is T010b; two-populated-device bootstrap
-//! reconciliation is T011.
+//! ceremony, starting the drain lanes) lives in `apps/desktop/src-tauri/src/sync.rs`;
+//! the system as built is specified in `docs/SYNC_SPEC.md`.
 
 pub mod audio;
 pub mod cascade;
@@ -23,7 +23,6 @@ pub mod crsqlite;
 pub mod crypto;
 pub mod outbox;
 pub mod quarantine;
-pub mod reconcile;
 pub mod schema;
 pub mod snapshot;
 pub mod state;
@@ -71,19 +70,6 @@ pub enum SyncError {
     /// `size` is the base64 wire size (what the relay body limit measures).
     #[error("outbox entry client_seq={client_seq} is {size} base64 bytes on the wire, exceeding the per-request push budget")]
     Oversized { client_seq: i64, size: usize },
-    /// A pulled changeset could not be decrypted or decoded (§11.3 crypto-quarantine). The
-    /// drain STOPS the pull at this changeset rather than skipping-and-forgetting it: silently
-    /// dropping a peer's write while advancing the watermark is the "up to date" lie. The pull
-    /// watermark is left at the last fully-merged seq so the NEXT cycle retries from here, and
-    /// no later changeset is merged out of commit order. Carries ONLY the commit `seq`, the
-    /// authoring `client_id`, and a short non-sensitive `detail` naming the failed stage —
-    /// never any ciphertext, plaintext, or key material.
-    #[error("pulled changeset seq={seq} from client {author_client_id} could not be decrypted/decoded ({detail})")]
-    CryptoSkip {
-        seq: i64,
-        author_client_id: uuid::Uuid,
-        detail: String,
-    },
     /// The relay could not be reached at the transport layer — a connection failure or a
     /// timeout (reqwest `is_connect()` / `is_timeout()`), NOT an HTTP-status error. Kept
     /// distinct from [`SyncError::Http`] so the drain surfaces the amber "can't reach relay"

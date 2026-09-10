@@ -1628,7 +1628,6 @@ pub struct SyncStatusDto {
     roster_fingerprint: Option<String>,
     sync_enabled: bool,
     last_error: Option<String>,
-    billing_url: Option<String>,
     /// T024 push progress. Unacked outbox entries still to push (0 == up to date).
     pending_entries: u64,
     /// Total ciphertext bytes of those unacked entries (base64 upload is ~4/3 of this).
@@ -1667,8 +1666,7 @@ pub struct SyncStatusDto {
 //
 // `sync_probe` returns a TYPED result the redesigned Sync page branches on: reachability /
 // TLS / not-a-relay are distinct error classes, and a version gap is advisory metadata on
-// SUCCESS (never a failure). It is the ONLY relay-metadata call on the client — `billing_url`
-// (self-host vs hosted upgrade affordance) rides on `sync_status` (`SyncStatusDto.billing_url`).
+// SUCCESS (never a failure). It is the ONLY relay-metadata call on the client.
 
 /// Sentinel body for the probe. A 2xx counts as a YapStack relay ONLY if the body
 /// deserializes here with BOTH `protocol_version` and `engine_version` present
@@ -4412,14 +4410,15 @@ fn spawn_audio_uploader(
                     }
                 }
                 publish_audio_lane(conn);
-                // Item 3 (DEFERRED quality follow-up): this outer-loop tail is a bare,
-                // uninterruptible sleep that does not re-check `stop`, so an idle sign-out's
-                // `DrainHandle::stop()` join can wait up to a full AUDIO_DRAIN_INTERVAL for this
-                // lane. That join no longer blocks the UI (sign-out is async + off-task, item 3),
-                // so this is a latency-quality nit, not a freeze. The green fix is the SSE lane's
-                // interruptible slice loop (sleep in <=250 ms slices, re-checking `stop`); left
-                // as a follow-up per the ratified spec to keep this change tightly scoped.
-                std::thread::sleep(AUDIO_DRAIN_INTERVAL);
+                // Idle wait in <=250 ms slices, re-checking `stop`, so a sign-out's
+                // `DrainHandle::stop()` join never waits out a full interval on this lane
+                // (same discipline as the SSE lane's reconnect backoff).
+                let mut waited = Duration::ZERO;
+                while waited < AUDIO_DRAIN_INTERVAL && !stop.load(Ordering::SeqCst) {
+                    let slice = (AUDIO_DRAIN_INTERVAL - waited).min(Duration::from_millis(250));
+                    std::thread::sleep(slice);
+                    waited += slice;
+                }
             }
             tracing::info!("audio uploader stopped");
         })
@@ -4919,7 +4918,6 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         roster_fingerprint: session.roster_fingerprint.clone(),
         sync_enabled: session.sync_enabled,
         last_error,
-        billing_url: None,
         pending_entries: progress.pending_entries,
         pending_bytes: progress.pending_bytes,
         acked_this_session: progress.acked_this_session,
@@ -5197,7 +5195,6 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             roster_fingerprint: None,
             sync_enabled: false,
             last_error: None,
-            billing_url: None,
             pending_entries: 0,
             pending_bytes: 0,
             acked_this_session: 0,
@@ -5229,15 +5226,31 @@ pub async fn sync_enable(
     // control; this is the decision at the command boundary.
     if !session.sync_enabled {
         let devices = http_get_devices(&session).await?;
-        let self_pending = devices
+        let me = devices
             .devices
             .iter()
-            .any(|d| d.client_id == session.client_id && d.status == "pending");
-        if self_pending {
-            return Err(
-                "This device is still waiting for approval from one of your other devices."
-                    .to_string(),
-            );
+            .find(|d| d.client_id == session.client_id);
+        match me {
+            Some(d) if d.status == "pending" => {
+                return Err(
+                    "This device is still waiting for approval from one of your other devices."
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
+            // Not in the device index at all: a recovery-code sign-in (the recovery token
+            // carries no device identity and enrols nothing). The relay refuses pushes and
+            // audio uploads from an unenrolled device, so turning sync on would only surface
+            // a permanent error; say so instead. Recovery re-bootstrap (SYNC_SPEC §15.A,
+            // CRYPTO_SPEC A7) is the slice that closes this.
+            None => {
+                return Err(
+                    "This device signed in with a recovery code and isn't enrolled yet, so it \
+                     can't sync. Sign in with your password on this device once another \
+                     device can approve it."
+                        .to_string(),
+                );
+            }
         }
     }
 

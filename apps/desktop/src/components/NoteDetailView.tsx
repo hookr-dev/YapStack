@@ -634,7 +634,7 @@ export function NoteDetailView() {
   // array of the SAME paths several times a minute. Keying the probe on array identity
   // restarted it (and everything downstream of it) each time; keying on the paths
   // themselves means only a genuinely different track restarts anything.
-  const partsKey = partPaths.join(" ");
+  const partsKey = partPaths.join("\0");
   const partPathsRef = useRef(partPaths);
   partPathsRef.current = partPaths;
   const [probe, setProbe] = useState<PresenceProbe>({ status: "probing" });

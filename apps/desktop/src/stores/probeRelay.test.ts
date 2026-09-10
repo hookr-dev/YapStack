@@ -54,7 +54,6 @@ beforeEach(() => {
       serverUrl: DEFAULT_SYNC_SERVER_URL,
       syncEnabled: false,
       email: null,
-      lastChangesetSeq: 0,
       deviceFingerprint: null,
     },
   });

@@ -37,7 +37,6 @@ function connectedStatus(over: Partial<SyncStatus> = {}): SyncStatus {
     rosterFingerprint: "EEEE-FFFF-GGGG-HHHH",
     syncEnabled: true,
     lastError: null,
-    billingUrl: "https://pay.example",
     pendingEntries: 4,
     pendingBytes: 512,
     ackedThisSession: 9,
@@ -89,7 +88,6 @@ describe("refreshSyncStatus — failed fetch preserves the last-known snapshot",
     expect(syncStatus?.pendingEntries).toBe(4);
     expect(syncStatus?.pullBehind).toBe(2);
     expect(syncStatus?.audioUploadFailed).toBe(1);
-    expect(syncStatus?.billingUrl).toBe("https://pay.example");
   });
 
   it("falls back to zero values on a first-ever failure with no previous status", async () => {

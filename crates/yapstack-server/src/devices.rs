@@ -115,6 +115,36 @@ pub async fn get_roster(
     }))
 }
 
+/// The relay's write-authorization gate (§7.5 defense-in-depth): the caller — identified
+/// ONLY by the `client_id` bound into its access token — must have an `active` row in the
+/// tenant's device index. A PENDING (awaiting approval) device, an unknown device, or a
+/// token without a device identity (the recovery path) is refused. Applied to every route
+/// that writes on behalf of a device: `PUT /devices/roster`, `POST /sync/push`, and
+/// `POST /audio/presign` (SYNC_SPEC §15.B). Reads (`pull`, audio `GET`, the roster `GET`)
+/// are deliberately NOT gated — a pending device may still read (§7.5 step 3). The lookup
+/// runs inside the caller's tenant transaction so it is RLS-scoped.
+///
+/// # Errors
+/// [`AppError::Forbidden`] when the caller is not an active device; a DB error otherwise.
+pub async fn require_active_caller(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    client_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    let caller = client_id.ok_or(AppError::Forbidden)?;
+    let status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM devices WHERE workspace_id = $1 AND client_id = $2")
+            .bind(tenant_id)
+            .bind(caller)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if matches!(status.as_ref(), Some((s,)) if s == "active") {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
 /// `PUT /devices/roster` — upload a re-signed roster with §7.4 anti-rollback.
 ///
 /// The counter monotonicity is a compare-and-set on the PLAINTEXT integer `counter`
@@ -149,20 +179,8 @@ pub async fn put_roster(
     // writes the FIRST active roster directly (no active device exists yet at signup, so
     // that path never reaches this gate). A caller whose token carries no `client_id`
     // (e.g. the recovery login) also cannot mutate the roster here.
-    let caller = auth.client_id.ok_or(AppError::Forbidden)?;
-
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
-
-    // The caller-device lookup is RLS-scoped to the tenant (the tx set `app.tenant_id`).
-    let caller_status: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM devices WHERE workspace_id = $1 AND client_id = $2")
-            .bind(auth.tenant_id)
-            .bind(caller)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if !matches!(caller_status.as_ref(), Some((s,)) if s == "active") {
-        return Err(AppError::Forbidden);
-    }
+    require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
 
     // Lock the roster row for this tenant, then compare-and-set (§7.4). The lock is held
     // to commit, so concurrent uploads are serialized and the check is race-free.

@@ -60,7 +60,6 @@ function makeStatus(overrides: Partial<SyncStatus> = {}): SyncStatus {
     rosterFingerprint: "EEEEFFFFGGGGHHHH",
     syncEnabled: false,
     lastError: null,
-    billingUrl: null,
     pendingEntries: 0,
     pendingBytes: 0,
     ackedThisSession: 0,
@@ -94,7 +93,7 @@ function setup({
   relayConn = { kind: "idle" } as RelayConnState,
 } = {}) {
   useAppStore.setState({
-    syncConfig: { serverUrl, syncEnabled: false, email, lastChangesetSeq: 0, deviceFingerprint: null },
+    syncConfig: { serverUrl, syncEnabled: false, email, deviceFingerprint: null },
     syncStatus: status,
     relayConn,
     refreshSyncStatus: vi.fn().mockResolvedValue(undefined),

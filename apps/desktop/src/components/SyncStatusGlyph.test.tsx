@@ -42,7 +42,6 @@ function baseStatus(over: Partial<SyncStatus> = {}): SyncStatus {
     rosterFingerprint: null,
     syncEnabled: true,
     lastError: null,
-    billingUrl: null,
     pendingEntries: 0,
     pendingBytes: 0,
     ackedThisSession: 0,

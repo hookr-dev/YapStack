@@ -13,12 +13,13 @@
 //! CRR base. The seed encrypts it ([`crate::crypto::SnapshotCipher`]) and uploads it as
 //! an opaque blob; the relay stores bytes it cannot read (§9-style blob store).
 //!
-//! ## What the join does with it
-//! The join writes the decrypted bytes to a fresh file, opens it, then **re-sites** it
-//! (see [`crate::reconcile::resite_as_fresh_peer`]) so the snapshot's rows become a
-//! peer's history and the join gets its own fresh `site_id` — WITHOUT re-pushing the
-//! seed's rows. It then pulls only the incremental changesets committed *after* the
-//! snapshot baseline and reconciles its own local-only rows.
+//! ## Status
+//! No desktop command produces or consumes a snapshot today: every device joins by
+//! replaying the relay's changeset history (`docs/SYNC_SPEC.md` §6). The producer, the
+//! cipher, the transport methods and [`resite_as_fresh_peer`] are kept as the seam for
+//! relay history compaction (SYNC_SPEC §15.F); the former two-populated-library
+//! reconciliation module was removed in the simplification pass and is recoverable from
+//! git history if that feature returns.
 //!
 //! The artifact is byte-for-byte a SQLite file, so it is content-addressable by its
 //! ciphertext SHA-256 exactly like an audio blob — the relay presigns it to object
@@ -27,6 +28,7 @@
 use std::path::Path;
 
 use rusqlite::Connection;
+use uuid::Uuid;
 
 use crate::SyncError;
 
@@ -92,4 +94,63 @@ pub fn write_snapshot_file(dest_path: &Path, bytes: &[u8]) -> Result<(), SyncErr
 pub fn ciphertext_sha256_hex(ciphertext: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(ciphertext))
+}
+
+/// List this database's cr-sqlite per-table clock tables (`*__crsql_clock`).
+fn clock_tables(conn: &Connection) -> Result<Vec<String>, SyncError> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master \
+         WHERE type='table' AND name LIKE '%\\_\\_crsql\\_clock' ESCAPE '\\'",
+    )?;
+    let v = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
+/// Re-site a database freshly opened from a SEED snapshot so the join device becomes an
+/// independent peer (see module docs). Demotes the snapshot's local rows (ordinal 0) to
+/// a new peer ordinal and mints a fresh random 16-byte `site_id` at ordinal 0.
+///
+/// MUST be called immediately after opening the snapshot copy and BEFORE any local
+/// write; the [`crate::CrsqlDb`] MUST then be reopened so cr-sqlite re-reads the fresh
+/// ordinal-0 site id (it caches the site id per connection on first use). Idempotent
+/// guard: if ordinal 0 already holds a site id with no rows attributed to a demoted
+/// peer, re-running would mint another fresh id — callers gate this behind a one-shot
+/// bootstrap flag.
+pub fn resite_as_fresh_peer(conn: &Connection) -> Result<(), SyncError> {
+    let seed_sid: Vec<u8> = conn.query_row(
+        "SELECT site_id FROM crsql_site_id WHERE ordinal = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let next_ord: i64 = conn.query_row(
+        "SELECT coalesce(max(ordinal), 0) + 1 FROM crsql_site_id",
+        [],
+        |r| r.get(0),
+    )?;
+    let fresh = *Uuid::new_v4().as_bytes();
+    let clocks = clock_tables(conn)?;
+
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    // Mint the join's fresh local identity at ordinal 0 (frees the seed's blob).
+    tx.execute(
+        "UPDATE crsql_site_id SET site_id = ?1 WHERE ordinal = 0",
+        rusqlite::params![fresh.to_vec()],
+    )?;
+    // Register the seed as a peer at a new ordinal.
+    tx.execute(
+        "INSERT INTO crsql_site_id (site_id, ordinal) VALUES (?1, ?2)",
+        rusqlite::params![seed_sid, next_ord],
+    )?;
+    // Re-attribute the snapshot's local rows (ordinal 0) to the seed's peer ordinal.
+    for clock in &clocks {
+        tx.execute(
+            &format!("UPDATE \"{clock}\" SET site_id = ?1 WHERE site_id = 0"),
+            rusqlite::params![next_ord],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }

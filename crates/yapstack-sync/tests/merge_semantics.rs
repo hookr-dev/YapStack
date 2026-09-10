@@ -20,8 +20,7 @@ mod support;
 
 use rusqlite::Connection;
 
-use yapstack_sync::reconcile::resite_as_fresh_peer;
-use yapstack_sync::snapshot::{produce_snapshot_bytes, write_snapshot_file};
+use yapstack_sync::snapshot::{produce_snapshot_bytes, resite_as_fresh_peer, write_snapshot_file};
 use yapstack_sync::CrsqlDb;
 
 fn count(conn: &Connection, sql: &str) -> i64 {

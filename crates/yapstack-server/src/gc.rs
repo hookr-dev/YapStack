@@ -121,9 +121,10 @@ pub async fn run_sweep(
 
             // PHASE 2: delete the row — re-asserting eligibility so a blob that was referenced
             // again (refcount back up / released_at cleared) after the scan is NOT removed.
-            // TODO(AUDIO_ROUND_TRIP D10): `tenant_usage.storage_bytes` is never decremented —
-            // it is monotonic, so GC'd bytes are never reclaimed. The decrement belongs in this
-            // tx (it holds the tenant guard and `blob.size`); doing it is a behavior change.
+            // In the SAME transaction, give the reclaimed bytes back to the tenant's metered
+            // usage (`tenant_usage.storage_bytes` was charged once at first presign; without
+            // this it would only ever grow). Floored at zero: a pre-metering row, or a usage
+            // row reset by the control plane, must never drive the counter negative.
             let mut tx = db::begin_tenant_tx(pool, workspace_id).await?;
             let res = sqlx::query(
                 "DELETE FROM audio_blobs \
@@ -135,6 +136,17 @@ pub async fn run_sweep(
             .bind(cutoff)
             .execute(&mut *tx)
             .await?;
+            if res.rows_affected() > 0 {
+                sqlx::query(
+                    "UPDATE tenant_usage \
+                     SET storage_bytes = GREATEST(0, storage_bytes - $2) \
+                     WHERE tenant_id = $1",
+                )
+                .bind(workspace_id)
+                .bind(blob.size.max(0))
+                .execute(&mut *tx)
+                .await?;
+            }
             tx.commit().await?;
 
             if res.rows_affected() > 0 {
