@@ -751,6 +751,309 @@ async fn post_auth(
     app.clone().oneshot(req).await.unwrap()
 }
 
+/// CRYPTO_SPEC §7.5 amendment A7 (SYNC_SPEC §15.A): a device that authenticates with the
+/// recovery code and presents its identity is enrolled PENDING with a one-shot recovery
+/// grant, its tokens carry its client_id, and it may upload the next roster ITSELF — the
+/// lost-only-device path. The grant is strict (exactly counter+1, same epoch, names itself
+/// active) and single-use; a plain pending device (password login) still cannot.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn recovery_enrols_device_and_lets_it_rebootstrap_roster_once() {
+    let st = setup().await;
+    let pool = st.pool.clone();
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x25u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let lost_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, lost_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The only device is lost. A NEW device recovers with the code and its identity.
+    let new_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": email,
+            "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": new_client,
+            "ed25519_pub": B64.encode([0x09u8; 32]),
+            "label": "replacement",
+            "platform": "macos"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Enrolled pending: visible in the index, not yet a writer (push refused).
+    let resp = get_auth(&app, "/devices", &access).await;
+    let devices = body_json(resp).await;
+    let me = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(new_client))
+        .expect("recovering device enrolled");
+    assert_eq!(me["status"], "pending");
+    let vault_key = [0x33u8; 32];
+
+    // Wrong shape for a grant: skipping ahead (counter 2 when stored is 0) → 409; a roster
+    // that does not name the caller active → 403; a changed epoch → 403; promoting a
+    // THIRD pending device alongside itself → 403. None consumes the grant.
+    let (third, _third_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, 1, 1);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 1,
+            "active_devices": [lost_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "recovery cannot change the epoch"
+    );
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client, third]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "recovery cannot promote a third party"
+    );
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [lost_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The re-bootstrap itself: exactly counter+1, same epoch, names itself → accepted.
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "recovery re-bootstrap accepted"
+    );
+    // One-shot, proven at the column: the grant is consumed and the row is active. The
+    // third party was NOT promoted.
+    let (ws,): (uuid::Uuid,) = sqlx::query_as("SELECT workspace_id FROM yapstack_lookup_login($1)")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut tx = yapstack_server::db::begin_tenant_tx(&pool, ws)
+        .await
+        .unwrap();
+    let rows: Vec<(uuid::Uuid, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT client_id, status, recovery_grant_at FROM devices WHERE workspace_id = $1",
+    )
+    .bind(ws)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let row = |id: uuid::Uuid| rows.iter().find(|r| r.0 == id).unwrap();
+    assert_eq!(row(new_client).1, "active");
+    assert!(row(new_client).2.is_none(), "grant consumed");
+    assert_eq!(row(third).1, "pending", "third party untouched");
+
+    // Now ACTIVE: pushes are accepted and the ordinary write path applies (counter 2 ok).
+    let resp = post_auth(
+        &app,
+        "/sync/push",
+        &access,
+        json!({ "changes": [{
+        "client_id": new_client, "client_seq": 1, "ciphertext": B64.encode(b"x"),
+        "schema_version": 1, "engine_version": 16003 }]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "recovered device is a writer"
+    );
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A PASSWORD login of yet another new device gets no grant: still forbidden.
+    let (_other, other_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, 3, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &other_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 3, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client, _other]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "no grant without the recovery code"
+    );
+
+    // An OLDER client recovering without an identity: tokens carry no device, nothing is
+    // enrolled, and a roster write is refused (unchanged behaviour).
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({ "email": email, "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES) }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bare_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (roster, sig) = signed_roster(&vault_key, 3, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &bare_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 3, "vault_key_epoch": 0,
+            "active_devices": [lost_client, new_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// A7 cross-account hardening: `client_id` is a GLOBAL primary key, so a recovery for
+/// account T that presents a `client_id` already enrolled under account V must NOT arm a
+/// grant on V's row (a stolen pending token for V plus a throwaway account T would
+/// otherwise promote itself into V). The relay refuses and V's row is untouched — by the
+/// tenant-scoped conflict arm itself, independent of RLS (an RLS violation also counts).
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn recovery_cannot_arm_a_grant_on_another_accounts_device() {
+    let st = setup().await;
+    let pool = st.pool.clone();
+    let app = build_router(st);
+    let salt_enc = [0x26u8; 16];
+    // Victim V with a pending device.
+    let v_email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let v_auth = client_auth_key("victim horse battery staple", &salt_enc);
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&v_email, &salt_enc, &v_auth, uuid::Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (victim_pending, _) = enroll_pending(&app, &v_email, &v_auth).await;
+    // Attacker T recovers its OWN account presenting V's pending client_id.
+    let t_email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let t_auth = client_auth_key("attacker horse battery staple", &salt_enc);
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&t_email, &salt_enc, &t_auth, uuid::Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": t_email,
+            "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": victim_pending,
+            "ed25519_pub": B64.encode([0x0Au8; 32]),
+            "label": "collide"
+        }),
+    )
+    .await;
+    assert!(
+        resp.status() == StatusCode::CONFLICT || resp.status().is_server_error(),
+        "colliding client_id must not be armed (got {})",
+        resp.status()
+    );
+    // V's row: still pending, no grant.
+    let (ws,): (uuid::Uuid,) = sqlx::query_as("SELECT workspace_id FROM yapstack_lookup_login($1)")
+        .bind(&v_email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut tx = yapstack_server::db::begin_tenant_tx(&pool, ws)
+        .await
+        .unwrap();
+    let (status, grant): (String, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT status, recovery_grant_at FROM devices WHERE workspace_id = $1 AND client_id = $2",
+    )
+    .bind(ws)
+    .bind(victim_pending)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(status, "pending");
+    assert!(grant.is_none(), "victim row must not be armed");
+}
+
 // =====================================================================================
 // PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
 //   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"

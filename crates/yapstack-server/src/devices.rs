@@ -118,7 +118,7 @@ pub async fn get_roster(
 /// The relay's write-authorization gate (§7.5 defense-in-depth): the caller — identified
 /// ONLY by the `client_id` bound into its access token — must have an `active` row in the
 /// tenant's device index. A PENDING (awaiting approval) device, an unknown device, or a
-/// token without a device identity (the recovery path) is refused. Applied to every route
+/// token without a device identity (an older client recovering without one) is refused. Applied to every route
 /// that writes on behalf of a device: `PUT /devices/roster`, `POST /sync/push`, and
 /// `POST /audio/presign` (SYNC_SPEC §15.B). Reads (`pull`, audio `GET`, the roster `GET`)
 /// are deliberately NOT gated — a pending device may still read (§7.5 step 3). The lookup
@@ -180,10 +180,12 @@ pub async fn put_roster(
     // that path never reaches this gate). A caller whose token carries no `client_id`
     // (e.g. the recovery login) also cannot mutate the roster here.
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
-    require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
 
-    // Lock the roster row for this tenant, then compare-and-set (§7.4). The lock is held
-    // to commit, so concurrent uploads are serialized and the check is race-free.
+    let caller = auth.client_id.ok_or(AppError::Forbidden)?;
+
+    // Lock the roster row for this tenant FIRST, then compare-and-set (§7.4). The lock is
+    // held to commit, so concurrent uploads are serialized and every check below —
+    // including the caller's status read — sees a consistent state.
     let current: Option<(i64, i64)> = sqlx::query_as(
         "SELECT counter, vault_key_epoch FROM device_roster \
          WHERE workspace_id = $1 FOR UPDATE",
@@ -191,6 +193,29 @@ pub async fn put_roster(
     .bind(auth.tenant_id)
     .fetch_optional(&mut *tx)
     .await?;
+
+    // AUTHZ: an ACTIVE caller writes freely (subject to anti-rollback below). A caller that
+    // is not active is admitted ONLY through the A7 recovery re-bootstrap path: its row
+    // carries a FRESH `recovery_grant_at` (stamped solely by a successful recovery-code
+    // login carrying its identity, within the last 15 minutes), and its upload must be
+    // exactly the next counter at the unchanged epoch, must name itself active, and may
+    // not promote anyone else. Anyone else (pending without a grant, an expired grant,
+    // unknown, or a token with no device) is refused.
+    let caller_row: Option<(String, bool)> = sqlx::query_as(
+        "SELECT status, \
+                (recovery_grant_at IS NOT NULL \
+                 AND recovery_grant_at > now() - interval '15 minutes') AS grant_fresh \
+         FROM devices WHERE workspace_id = $1 AND client_id = $2",
+    )
+    .bind(auth.tenant_id)
+    .bind(caller)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let recovery_bootstrap = match caller_row {
+        Some((ref s, _)) if s == "active" => false,
+        Some((_, true)) => true,
+        _ => return Err(AppError::Forbidden),
+    };
 
     // A roster row always exists for an authenticated tenant (created at signup). Its
     // absence would be a corrupt account, not a client-supplied condition.
@@ -213,6 +238,45 @@ pub async fn put_roster(
             "vault_key_epoch is older than the stored roster".into(),
         ));
     }
+    // A7 strictness for the recovery path: exactly the next counter (no skipping ahead
+    // past a concurrent approval — the client re-fetches and retries on 409), the SAME
+    // epoch (a recovering device cannot rotate), and the caller must list itself active
+    // (the grant exists only so the device can admit ITSELF).
+    if recovery_bootstrap {
+        if req.counter != stored_counter + 1 {
+            return Err(AppError::Conflict(
+                "recovery re-bootstrap must advance the roster counter by exactly one".into(),
+            ));
+        }
+        if req.vault_key_epoch != stored_epoch {
+            return Err(AppError::Forbidden);
+        }
+        if !req.active_devices.contains(&caller) {
+            return Err(AppError::Forbidden);
+        }
+        // Every OTHER id named active must already be active in the index: the grant
+        // never promotes a third party. The honest client names the signed roster's
+        // members plus itself, all already active, so this is never a false negative.
+        let others: Vec<Uuid> = req
+            .active_devices
+            .iter()
+            .copied()
+            .filter(|id| *id != caller)
+            .collect();
+        if !others.is_empty() {
+            let (already_active,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM devices \
+                 WHERE workspace_id = $1 AND client_id = ANY($2) AND status = 'active'",
+            )
+            .bind(auth.tenant_id)
+            .bind(&others)
+            .fetch_one(&mut *tx)
+            .await?;
+            if already_active != others.len() as i64 {
+                return Err(AppError::Forbidden);
+            }
+        }
+    }
 
     // Store the opaque roster + signature + the advanced watermarks verbatim.
     sqlx::query(
@@ -232,9 +296,11 @@ pub async fn put_roster(
     // Advance the ADVISORY device index from the client-supplied active-device metadata
     // (NOT read from the opaque roster). Devices the new roster names as active are
     // promoted pending→active; this is how a pending device becomes a sync peer (§7.5).
+    // Promotion also CLEARS any recovery grant on the promoted rows: the grant is
+    // one-shot, and an approved device has no further use for it.
     if !req.active_devices.is_empty() {
         sqlx::query(
-            "UPDATE devices SET status = 'active' \
+            "UPDATE devices SET status = 'active', recovery_grant_at = NULL \
              WHERE workspace_id = $1 AND client_id = ANY($2)",
         )
         .bind(auth.tenant_id)
@@ -242,6 +308,16 @@ pub async fn put_roster(
         .execute(&mut *tx)
         .await?;
     }
+    // And the caller's own grant is consumed by ANY roster write it makes, so a stale
+    // stamp never outlives a normal approval.
+    sqlx::query(
+        "UPDATE devices SET recovery_grant_at = NULL \
+         WHERE workspace_id = $1 AND client_id = $2 AND recovery_grant_at IS NOT NULL",
+    )
+    .bind(auth.tenant_id)
+    .bind(caller)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(Json(RosterUploadResponse {

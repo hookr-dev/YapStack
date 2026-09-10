@@ -5245,9 +5245,9 @@ pub async fn sync_enable(
             // CRYPTO_SPEC A7) is the slice that closes this.
             None => {
                 return Err(
-                    "This device signed in with a recovery code and isn't enrolled yet, so it \
-                     can't sync. Sign in with your password on this device once another \
-                     device can approve it."
+                    "This device signed in with a recovery code but the relay didn't enrol it \
+                     (the relay may need updating), so it can't sync yet. Sign in with your \
+                     password on this device so another device can approve it."
                         .to_string(),
                 );
             }
@@ -6185,11 +6185,21 @@ pub async fn sync_recover(
         .map_err(|_| "recovery code: expected 160 bits".to_string())?;
     let (recovery_key, recovery_auth_key) = recovery_key_and_auth(&recovery_bytes);
 
+    // A7: present this device's identity so the relay enrols it (pending + a one-shot
+    // recovery grant) and binds `client_id` into the tokens — the recovery code proves we
+    // hold the vault key, so this device may admit itself to the roster below.
+    let (dev_seed, client_id) = load_or_create_device_identity()?;
+    let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
+
     let url = format!("{server_url}/auth/recover");
     let resp: RecoverResponse =
         send_json(reqwest::Client::new().post(&url).json(&RecoverRequest {
             email: email.clone(),
             recovery_auth_key: B64.encode(recovery_auth_key),
+            client_id: Some(client_id),
+            ed25519_pub: Some(B64.encode(dev_pub)),
+            label: Some(device_label()),
+            platform: Some(std::env::consts::OS.to_string()),
         }))
         .await?;
 
@@ -6197,9 +6207,6 @@ pub async fn sync_recover(
         .decode(resp.wrapped_vault_key_recovery.as_bytes())
         .map_err(|_| "wrapped_vault_key_recovery: invalid base64".to_string())?;
     let vault_key = unwrap_vault_key(&recovery_key, &wrapped_rec, WRAP_VAULT_REC_DOMAIN)?;
-
-    let (dev_seed, client_id) = load_or_create_device_identity()?;
-    let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
     // Item 1: §7.4 anti-rollback floor from the per-account anchor (survives sign-out) first,
     // falling back to the live session.
     let cached_counter = load_account_anchor(&server_url, &email)?
@@ -6212,18 +6219,35 @@ pub async fn sync_recover(
         })
         .unwrap_or(-1);
 
-    let (epoch, counter, _active, roster_fp) = verify_and_inspect_roster(
+    let (prev_roster, prev_fp) = verify_roster_signed(
         resp.device_list.as_ref(),
         resp.signature.as_deref(),
         &vault_key,
-        client_id,
         cached_counter,
     )?;
+    // A7 honesty: a recovering device that has never seen this account is TOFU-grade —
+    // it cannot tell a stale-but-validly-signed roster from the live one (§7.4 C2). When
+    // this install DOES hold an anchor for the account, a served roster at the SAME counter
+    // with a DIFFERENT fingerprint is a substitution, not a refresh: refuse to sign on it.
+    if let Some(anchor) = load_account_anchor(&server_url, &email)? {
+        if anchor.roster_counter == prev_roster.counter as i64 {
+            if let Some(known_fp) = anchor.roster_fingerprint.as_deref() {
+                if known_fp != prev_fp {
+                    return Err(
+                        "The device list the relay served does not match the one this                          device last verified at the same version — refusing to continue                          (possible tamper)."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let epoch = prev_roster.vault_key_epoch;
+    let already_member = prev_roster.devices.iter().any(|d| d.client_id == client_id);
 
     let served_salt = B64
         .decode(resp.salt_enc.as_bytes())
         .map_err(|_| "relay salt_enc: invalid base64".to_string())?;
-    let session = Session {
+    let mut session = Session {
         server_url,
         email,
         vault_key_b64: B64.encode(vault_key),
@@ -6236,12 +6260,91 @@ pub async fn sync_recover(
         client_id,
         device_sk_b64: B64.encode(dev_seed),
         salt_enc_b64: Some(B64.encode(served_salt)),
-        roster_counter: counter as i64,
-        roster_fingerprint: Some(roster_fp),
+        roster_counter: prev_roster.counter as i64,
+        roster_fingerprint: Some(prev_fp),
     };
+
+    // The session is stored FIRST: the recovery sign-in itself succeeded, so even if the
+    // self-admission below cannot complete (an older relay that enrols nothing, a
+    // concurrent approval) the user is signed in and the honest state shows — pending
+    // (wizard approval step) or "not enrolled" (`sync_enable`).
     store_session(&session)?;
-    // Item 1: anchor this account so its baselines survive a subsequent sign-out.
     persist_account_anchor(&session)?;
+
+    // A7 recovery re-bootstrap: if this device is not a roster member, admit it ourselves.
+    // The verified membership is carried forward verbatim (no eviction), this device is
+    // appended, the counter advances by exactly one at the SAME epoch, and the roster is
+    // signed with the vault-derived key we just unwrapped. The relay accepts this single
+    // upload from a still-pending caller only because the recovery login set its one-shot
+    // grant; the security code changes, and any surviving device sees an ordinary
+    // counter advance. A 409 means a concurrent approval moved the counter: surface it
+    // (the user can simply sign in again with the code) rather than skipping ahead.
+    // An older relay ignores the identity fields and enrols nothing; `GET /devices` then
+    // lacks this device, and we skip the upload it would refuse.
+    let enrolled_here = http_get_devices(&session)
+        .await?
+        .devices
+        .iter()
+        .any(|d| d.client_id == client_id);
+    if !already_member && !enrolled_here {
+        tracing::warn!(
+            "sync recover: relay did not enrol this device (older relay?) — signed in,              cannot self-admit; another device must approve it"
+        );
+    }
+    if !already_member && enrolled_here {
+        let mut entries = prev_roster.devices.clone();
+        entries.push(RosterDeviceEntry {
+            client_id,
+            ed25519_pub: B64.encode(dev_pub),
+            label: device_label(),
+            added_at: chrono::Utc::now().to_rfc3339(),
+        });
+        let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
+        let new_counter = prev_roster.counter as i64 + 1;
+        let roster = SignedRoster {
+            version: 1,
+            tenant_id: resp.tenant_id,
+            vault_key_epoch: epoch,
+            counter: new_counter as u64,
+            devices: entries,
+        };
+        let canonical = roster_canonical_bytes(&roster)?;
+        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
+        let roster_fp = roster_fingerprint_from_canonical(&canonical);
+        let device_list_value =
+            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        match http_put_roster(
+            &session,
+            &RosterUploadRequest {
+                device_list: device_list_value,
+                signature: B64.encode(signature),
+                counter: new_counter,
+                vault_key_epoch: epoch as i64,
+                active_devices: active_ids,
+            },
+        )
+        .await?
+        {
+            RosterPutOutcome::Ok(_) => {
+                // Field-merge under the store lock (the drain may already be rotating
+                // tokens), then refresh the anchor so the ratcheted floor survives sign-out.
+                let (c, fp) = (new_counter, roster_fp.clone());
+                session = update_session(move |s| {
+                    s.roster_counter = c;
+                    s.roster_fingerprint = Some(fp);
+                })?;
+                persist_account_anchor(&session)?;
+            }
+            RosterPutOutcome::Conflict => {
+                return Err(
+                    "Another device changed the device list while this one was recovering. \
+                     Enter the recovery code again to retry."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     Ok(build_status_dto(&session).await)
 }
 

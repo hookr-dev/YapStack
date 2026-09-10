@@ -1,0 +1,15 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Recovery re-bootstrap (CRYPTO_SPEC §7.5 amendment A7, SYNC_SPEC §15.A).
+--
+-- A device that authenticates with the RECOVERY CODE proves it holds the vault key — the
+-- very authority that authors rosters — yet, when it is not already active, the roster
+-- write gate refused it and nobody active may remain to approve it (the lost-only-device
+-- dead end). `recovery_grant_at` is a one-shot, time-boxed server-side allowance stamped
+-- ONLY by a successful `POST /auth/recover` that carried the device's identity, and only
+-- onto a row of the SAME account. While fresh (15 min), `PUT /devices/roster` accepts ONE
+-- upload from that (still pending) device under strict conditions — the roster counter
+-- must be exactly stored+1, the epoch unchanged, the caller must name itself active, and
+-- it may not promote any other pending device — after which the caller is promoted and
+-- the stamp cleared. Additive; every existing row reads NULL (no grant). The relay still
+-- never reads the opaque roster.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS recovery_grant_at timestamptz;

@@ -49,7 +49,7 @@
 | Point the app at a self-hosted relay (typed probe, advisory version gap, "use anyway") | Shipped | Wizard server step, `sync_probe` |
 | Sign a second device in; it waits as **pending** until an existing device approves it | Shipped | Wizard account + approval steps, `sync_login_*` |
 | Approve a device by comparing the device fingerprint and the roster **security code** on both screens | Shipped | `DeviceApprovalDialog`, `sync_approve_device` |
-| Sign in with the recovery code when the password is lost | Shipped; a recovery-signed-in device cannot turn sync on until it is enrolled (§15.A, next slice) | `sync_recover` |
+| Sign in with the recovery code when the password is lost; a new device admits itself to the roster (no approver needed) | Shipped | `sync_recover`, CRYPTO_SPEC A7 |
 | Turn sync on: the live database becomes CRDT-tracked, history is captured, the drain starts | Shipped | Wizard turn-on step, `sync_enable` |
 | Steady-state sync of sessions, transcripts, notes, folders, tags, chat, dictation, audio-part rows | Shipped | Drain, §6 |
 | Follow a session that is **recording on another device** live (read-only) | Shipped | `NoteDetailView` remote-live branch, §8 |
@@ -267,12 +267,22 @@ relay enrolled an unknown device as `pending`; a known device is untouched.
 
 ### 5.5 Recovery
 
-`sync_recover(server_url, email, code)` authenticates with `recovery_auth_key`,
-receives the recovery wrap, unwraps the vault key, verifies the roster, stores the
-session. The recovery token carries **no `client_id`**, the device is **not enrolled**,
-and the forgotten password stays in force. Because the relay now refuses writes from an
-unenrolled device, `sync_enable` refuses such a session with an explicit message rather
-than starting a drain that would fail forever. See §15.A and §15.C.
+`sync_recover(server_url, email, code)` sends this device's identity with the
+recovery auth key, receives the recovery wrap, unwraps the vault key and verifies the
+served roster. If this device is **not a roster member** it admits itself (CRYPTO_SPEC
+A7): the verified membership is carried forward, this device is appended, the counter
+advances by exactly one at the same epoch, the roster is re-signed and uploaded. The
+relay accepts that single upload from a still-pending caller because the recovery login
+stamped a one-shot, 15-minute `recovery_grant_at` on its device row (only on a row of
+the same account; it cannot promote a third party); the device is then active, the
+security code changes, and any surviving device sees an ordinary counter advance. The
+session is stored before the upload, so a 409 (a concurrent approval moved the counter)
+leaves the user signed in and pending with an explicit message. A recovering device
+that holds an anchor for the account refuses a served roster whose fingerprint differs
+from the anchored one at the same counter; a brand-new install is TOFU-grade here
+(CRYPTO_SPEC A7 step 3). The forgotten password stays in force until password change
+ships (§15.C). Against an older relay that does not enrol on recovery, the client skips
+the upload and `sync_enable` refuses the unenrolled session with an explicit message.
 
 ### 5.6 Tokens
 
@@ -454,10 +464,10 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /auth/login/begin` | none | `salt_enc` or a peppered decoy |
 | `POST /auth/login/finish` | none; per-IP 10/min | verifier check; enrol unknown device pending; tokens + wraps + roster |
 | `POST /auth/refresh` | refresh JWT | rotation + reuse detection |
-| `POST /auth/recover` | none; per-IP | recovery verifier check; recovery wrap + roster; tokens without `client_id` |
+| `POST /auth/recover` | none; per-IP | recovery verifier check; enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409); recovery wrap + roster; tokens bound to the device |
 | `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
-| `PUT /devices/roster` | access JWT with `client_id` whose row is **active** | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices` |
+| `PUT /devices/roster` | access JWT with `client_id` whose row is **active**, or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; consumes the grant |
 | `POST /sync/push` | access JWT; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
 | `GET /sync/pull?since&limit` | access JWT | dense pages, never gated |
 | `GET /sync/completeness` | access JWT | `max`, `count`, `contiguous`, per-client tails |
@@ -474,7 +484,7 @@ Pull, audio GET and the roster GET are never gated.
 ### 9.2 Schema (migrations 0001–0009)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
-`devices` (pubkey, label, platform, `status` pending|active, unused `state`
+`devices` (pubkey, label, platform, `status` pending|active, one-shot `recovery_grant_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `audio_blobs` (+ `released_at`),
@@ -657,18 +667,12 @@ reference; "Decision" points to §15.
 Every item below was walked through with the owner on 2026-09-10. The chosen option is
 recorded; the rationale from the review is kept so the reasoning survives.
 
-**A. Lost-only-device recovery — DECIDED: recovery enrols the device and may
-re-bootstrap the roster.** Today a user with one device who loses it and signs in on a
-new one with the recovery code gets a session but is never enrolled and can never be
-approved (nobody active exists; the recovery token cannot write the roster). Chosen:
-`RecoverRequest` carries the device identity (`client_id`, `ed25519_pub`, label,
-platform); the relay enrols it and issues tokens carrying a `recovery` claim; a single
-`PUT /devices/roster` from a recovery-authenticated caller is accepted even though the
-caller is not active, and must present a roster at the stored `counter + 1` and the
-stored epoch that lists the recovering device as active. Human-visible consequence: the
-security code changes, and every other device (if any survive) sees the new roster as a
-normal counter advance. Vault-key rotation on recovery is deferred with §4.4.
-Normative text: CRYPTO_SPEC §7.5 amendment A7. First slice after the pass.
+**A. Lost-only-device recovery — DONE (slice 1, CRYPTO_SPEC A7).** A recovery-code
+sign-in now enrols the device and lets it admit itself to the roster once, under strict
+conditions, via a server-side one-shot `recovery_grant_at`. Independently reviewed
+before landing (findings folded in: tenant-scoped grant, 15-min TTL, no third-party
+promotion, old-relay handling, anchor fingerprint check). Vault-key rotation on
+recovery stays deferred with §4.4. See §5.5 and §9.1.
 
 **B. Server-side gating of pending devices — DECIDED: gate push and audio presign.**
 The relay rejects `POST /sync/push` and `POST /audio/presign` when the token's
@@ -754,7 +758,7 @@ out of scope are listed in the pass commit message.
 
 **Feature slices after the pass, in order, each its own spec amendment + commit:**
 
-1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7).
+1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10.
 2. Password change (§15.C, CRYPTO_SPEC §4.3).
 3. Turn off sync (§15.E).
 4. Remove a device (§15.D).

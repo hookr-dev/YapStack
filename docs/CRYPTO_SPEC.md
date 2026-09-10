@@ -770,8 +770,8 @@ subsequent device joins via the ceremony below.
    (for the epoch check) is `SHA-256(canonical_bytes(device_list))` → first 10 bytes →
    same base32 4×4 grouping, displayed next to the `vault_key_epoch`.
 
-> **A7 — recovery re-bootstrap (amendment, owner-ratified 2026-09-10; adversarial
-> review required before the implementation lands).** As implemented, a recovery-code
+> **A7 — recovery re-bootstrap (amendment, owner-ratified 2026-09-10; implemented the
+> same day, independent review recorded in the implementing commit).** As implemented, a recovery-code
 > sign-in (§6.2) on a device that is not already in the roster **enrols nothing**: the
 > recovery token carries no `client_id`, the device is never listed, and the
 > server-side write gate above (active callers only) refuses it a roster upload. A user
@@ -780,17 +780,30 @@ subsequent device joins via the ceremony below.
 >
 > 1. `POST /auth/recover` **also** carries the recovering device's `client_id`,
 >    `ed25519_pub`, label and platform (exactly the `login/finish` enrolment fields). The
->    relay enrols an unknown device as `pending` and binds `client_id` into the issued
->    tokens, plus a `recovery: true` claim on the access token.
-> 2. A `PUT /devices/roster` whose access token carries `recovery: true` is accepted
->    **once** even though the caller is pending, subject to every existing check: the
->    counter MUST equal the stored `counter + 1`, the epoch MUST equal the stored epoch,
->    the signature MUST be present, and the uploaded `active_devices` MUST include the
->    caller. On acceptance the relay promotes the caller to `active` and clears the
->    recovery allowance for that token family.
+>    relay enrols an unknown device as `pending` (never demoting an existing row), binds
+>    `client_id` into the issued tokens, and sets a one-shot server-side
+>    **`devices.recovery_grant`** on that row. The grant lives in the device index rather
+>    than in a token claim so it survives token refresh and cannot be minted by anything
+>    but a successful recovery-code verification.
+> 2. A `PUT /devices/roster` from a caller whose row carries `recovery_grant` is accepted
+>    **once** even though the caller is pending, subject to every existing check plus
+>    three strict ones: the counter MUST equal the stored `counter + 1` (409 otherwise),
+>    the epoch MUST equal the stored epoch, the uploaded `active_devices` MUST include
+>    the caller and MUST NOT name any device that is not already active in the index
+>    (403 otherwise — the grant admits the caller, never a third party). The grant is
+>    time-boxed (15 min) and scoped: `/auth/recover` stamps it only on a row of the SAME
+>    account (a `client_id` enrolled elsewhere is refused with 409). On acceptance the
+>    relay promotes the caller to `active` and clears the grant; promotion clears it on
+>    every promoted row, and any later roster write by the caller clears its own.
 > 3. The client signs that roster with the vault-derived key it just unwrapped (§7.2),
 >    carrying forward the verified membership of the served roster and adding itself.
->    It ratchets its anti-rollback floor exactly as approval does.
+>    **Honest limit:** a recovering device that has never seen the account holds no
+>    anchor, so this is a TOFU-grade signing (§7.4 C2) — a relay with DB write could
+>    serve it a stale-but-valid roster and have it re-sign that membership at
+>    `counter + 1`. A device that DOES hold an anchor for the account refuses a served
+>    roster whose fingerprint differs from the anchored one at the same counter. The real
+>    closer is vault-key rotation on recovery (§4.4), deferred; until then the security
+>    code shown after recovery is the human check, exactly as at approval.
 > 4. Human-visible: the roster fingerprint (security code) changes; any surviving
 >    device observes a normal counter advance on its next status poll. Rotating the
 >    vault key on recovery (so a lost device's key is retired) is deferred with §4.4.

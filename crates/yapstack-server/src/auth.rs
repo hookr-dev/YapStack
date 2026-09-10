@@ -421,7 +421,46 @@ pub async fn recover(
     // unwrap locally and re-establish. The relay never unwraps it (no vault key).
     let roster: Option<(Value, Vec<u8>)> = fetch_roster(&mut tx, row.workspace_id).await?;
 
-    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, None).await?;
+    // A7 recovery re-bootstrap: a recovering device that presents its identity is enrolled
+    // like a password login (PENDING, never demoting an existing row) AND receives a
+    // one-shot, time-boxed `recovery_grant_at` — the recovery code proved it holds the
+    // vault key, so it may author the next roster itself even when no active device is
+    // left to approve it (`devices::put_roster`). An already-active device keeps its
+    // status; a device that was pending (password login, never approved) gains the grant
+    // and can self-approve. `client_id` is a GLOBAL primary key, so the conflict arm is
+    // scoped to this account (RLS is the second line, not the only one): a `client_id`
+    // enrolled under another account is refused rather than armed.
+    if let (Some(cid), Some(pub_b64)) = (req.client_id, req.ed25519_pub.as_deref()) {
+        let ed_pub = b64_decode("ed25519_pub", pub_b64)?;
+        if ed_pub.len() != 32 {
+            return Err(AppError::BadRequest(
+                "ed25519_pub: expected 32 bytes".into(),
+            ));
+        }
+        let armed = sqlx::query(
+            "INSERT INTO devices \
+             (client_id, workspace_id, user_id, ed25519_pub, label, platform, status, recovery_grant_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', now()) \
+             ON CONFLICT (client_id) DO UPDATE SET recovery_grant_at = now() \
+             WHERE devices.workspace_id = EXCLUDED.workspace_id \
+               AND devices.user_id = EXCLUDED.user_id",
+        )
+        .bind(cid)
+        .bind(row.workspace_id)
+        .bind(row.id)
+        .bind(&ed_pub)
+        .bind(req.label.clone().unwrap_or_default())
+        .bind(req.platform.clone().unwrap_or_default())
+        .execute(&mut *tx)
+        .await?;
+        if armed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "client_id is already enrolled under a different account".into(),
+            ));
+        }
+    }
+
+    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, req.client_id).await?;
     tx.commit().await?;
 
     let (device_list, signature) = match roster {

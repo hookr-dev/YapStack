@@ -70,7 +70,7 @@ deliberately **no `[limits]` section and no admin key**.
 | `MINIO_PUBLIC_ENDPOINT` | `http://localhost:9000` | Public URL baked into presigned audio/snapshot URLs — set to your TLS storage hostname behind a proxy. |
 | `MINIO_ENDPOINT` | `http://minio:9000` | In-network endpoint the server signs against. |
 | `MINIO_BUCKET` | `yapstack` | Bucket holding encrypted audio + bootstrap snapshots. |
-| `DATABASE_URL` | owner DSN | Postgres connection. Unset = the owner DSN compose builds from `POSTGRES_*`; set it in `.env` to serve as the non-owner `yapstack_app` role (see self-hosting doc). |
+| `DATABASE_URL` | `yapstack_app` DSN | Serving connection. Unset = compose serves as the non-owner `yapstack_app` role (migrations run as the owner in the one-shot `migrate` service); override only if you know why (see self-hosting doc). |
 | `YAPSTACK_GC_ENABLED` | `true` | Audio-blob GC master switch (`1`/`true`/`on` vs `0`/`false`/`off`). |
 | `YAPSTACK_GC_INTERVAL_SECS` | `86400` | Seconds between GC sweeps (one also runs shortly after boot). |
 | `YAPSTACK_GC_GRACE_SECS` | `604800` | How long a blob must be unreferenced before GC may delete it. |

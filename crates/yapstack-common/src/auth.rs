@@ -153,6 +153,20 @@ pub struct RefreshRequest {
 pub struct RecoverRequest {
     pub email: String,
     pub recovery_auth_key: String,
+    /// The recovering device's identity (CRYPTO_SPEC §7.5 amendment A7), the same
+    /// enrolment fields `login/finish` carries. When present the relay enrols an unknown
+    /// device as `pending` with a one-shot **recovery grant** that lets it upload the next
+    /// roster itself (a user whose only device is lost has nobody left to approve it), and
+    /// binds `client_id` into the issued tokens. Absent (older clients): tokens carry no
+    /// device and nothing is enrolled.
+    #[serde(default)]
+    pub client_id: Option<Uuid>,
+    #[serde(default)]
+    pub ed25519_pub: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 /// `POST /auth/recover` success (§6.2). Carries the RECOVERY-wrapped vault key — the

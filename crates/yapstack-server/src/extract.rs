@@ -22,7 +22,7 @@ pub struct AuthTenant {
     pub user_id: Uuid,
     pub tenant_id: Uuid,
     /// The calling DEVICE bound into the access token at login (never request-supplied).
-    /// `None` on the recovery path (no specific enrolled device). Handlers that must
+    /// `None` only for an older client that recovered without a device identity. Handlers that must
     /// know which device is calling (e.g. `PUT /devices/roster`, §7.5) read this.
     pub client_id: Option<Uuid>,
 }
