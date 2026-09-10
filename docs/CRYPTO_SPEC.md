@@ -770,6 +770,35 @@ subsequent device joins via the ceremony below.
    (for the epoch check) is `SHA-256(canonical_bytes(device_list))` → first 10 bytes →
    same base32 4×4 grouping, displayed next to the `vault_key_epoch`.
 
+> **A7 — recovery re-bootstrap (amendment, owner-ratified 2026-09-10; adversarial
+> review required before the implementation lands).** As implemented, a recovery-code
+> sign-in (§6.2) on a device that is not already in the roster **enrols nothing**: the
+> recovery token carries no `client_id`, the device is never listed, and the
+> server-side write gate above (active callers only) refuses it a roster upload. A user
+> whose only device is lost therefore has no path back into their own account. The
+> amendment:
+>
+> 1. `POST /auth/recover` **also** carries the recovering device's `client_id`,
+>    `ed25519_pub`, label and platform (exactly the `login/finish` enrolment fields). The
+>    relay enrols an unknown device as `pending` and binds `client_id` into the issued
+>    tokens, plus a `recovery: true` claim on the access token.
+> 2. A `PUT /devices/roster` whose access token carries `recovery: true` is accepted
+>    **once** even though the caller is pending, subject to every existing check: the
+>    counter MUST equal the stored `counter + 1`, the epoch MUST equal the stored epoch,
+>    the signature MUST be present, and the uploaded `active_devices` MUST include the
+>    caller. On acceptance the relay promotes the caller to `active` and clears the
+>    recovery allowance for that token family.
+> 3. The client signs that roster with the vault-derived key it just unwrapped (§7.2),
+>    carrying forward the verified membership of the served roster and adding itself.
+>    It ratchets its anti-rollback floor exactly as approval does.
+> 4. Human-visible: the roster fingerprint (security code) changes; any surviving
+>    device observes a normal counter advance on its next status poll. Rotating the
+>    vault key on recovery (so a lost device's key is retired) is deferred with §4.4.
+>
+> Threat note: a recovery code already yields the vault key, i.e. the authority to author
+> rosters; this amendment removes a server-side refusal that protected nothing the code
+> holder did not already have, and adds no new capability to a password-only attacker.
+
 ---
 
 ## 8. Share keys
@@ -857,6 +886,27 @@ mandatory KAT vectors in §13**, which both stacks' CI **MUST** pass (architectu
   scrub the bytes). We do not claim cryptographic erasure on the JS/WASM stack; the
   mitigation there is minimizing lifetime and never persisting the key (§8), not
   zeroization.
+
+> **A8 — desktop session store as built (amendment, documents shipped behaviour,
+> owner-ratified 2026-09-10).** Windows Credential Manager cannot hold the session blob
+> (vault key + tokens + roster metadata), so the desktop client does **not** keep the
+> unwrapped vault key as a keychain item directly:
+>
+> - **Release builds:** the keychain holds (a) `identity-v1` — `client_id` + the Ed25519
+>   seed — and (b) `session-key-v1` — a random 32-byte XChaCha20-Poly1305 wrapping key.
+>   The session JSON (containing the vault key and tokens) is sealed under that wrapping
+>   key with the standard envelope, AAD `LP(version, "yapstack.session.store.v2",
+>   epoch_u32)`, and written to `sync-session.enc` in the app config directory (owner-only
+>   file mode on unix, atomic temp-file replace). Per-account anchors
+>   (`account-anchor-v1:<sha256(server_url, email)>`) are keychain items holding only
+>   public baselines (tenant id, epoch, `salt_enc`, roster counter and fingerprint).
+> - **Debug builds:** a plaintext JSON dev file replaces every keychain call, because a
+>   rebuilt unsigned binary makes macOS re-prompt on each read. The release path is the
+>   only at-rest store that satisfies this section and MUST be exercised before shipping.
+>
+> Security posture is unchanged: the vault key is never in the webview, localStorage, or
+> the plaintext SQLite file; the wrapping key never leaves the OS secret store; the
+> epoch in the AAD gives the sealed file the §7.4 anti-rollback property.
 
 ---
 
