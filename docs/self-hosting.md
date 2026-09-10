@@ -37,8 +37,9 @@ curl -s http://localhost:8080/health      # {"status":"ok"}
 curl -s http://localhost:8080/sync/info   # protocol/min-client/engine versions; NO billing_url
 ```
 
-In the desktop app, open **Settings → Sync**, choose *self-host*, and paste your relay
-URL (behind TLS in production, see below).
+In the desktop app, open **Settings → Sync → Set up sync** and enter your relay's
+address on the server step (behind TLS in production, see below). The app probes it and
+tells you if it is unreachable, not a YapStack relay, or newer than this app.
 
 ## What the relay never sees
 
@@ -151,10 +152,15 @@ securely: they contain the wrapped vault keys and auth verifiers.
 
 ## Two-device onboarding
 
-Enabling sync on each device is the same single flow: **Settings → Sync → enable**.
-Every device captures its local library and merges what the relay holds. Because all
-synced records use random unique IDs, two **independently-grown** libraries merge as a
-lossless union — nothing is overwritten.
+The first device creates the account (**Settings → Sync → Set up sync → Create
+account**) and must record the recovery code it is shown once. Every later device signs
+in with the same email and password, then **waits for approval**: one of your existing
+devices shows "Approve new device"; compare the device fingerprint and the security code
+on both screens, then approve. Only then can the new device turn sync on. Every device
+captures its local library and merges what the relay holds. Because all synced records
+use random unique IDs, two **independently-grown** libraries merge as a lossless union —
+nothing is overwritten. The full flow and its edge cases are specified in
+[`SYNC_SPEC.md`](SYNC_SPEC.md) §5–§6.
 
 **One rule: never copy a YapStack library between machines by hand** (e.g. copying the
 database file to a second computer) and then sync both. Two copies of the *same*

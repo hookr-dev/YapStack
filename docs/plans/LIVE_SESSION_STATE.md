@@ -1,5 +1,7 @@
 # Live Session State — remote-recording lifecycle across synced devices
 
+> **Status (2026-09-10): executed — historical.** As-built description: [`../SYNC_SPEC.md`](../SYNC_SPEC.md) §8.
+
 Grounded in a scout audit of the working tree (branch `feat/sync-relay-skeleton`) and a
 live two-device UAT (2026-07-11). Every file:line below was re-checked against the tree.
 Principle (from SYNC_REMEDIATION): build for the production user, model the states sync

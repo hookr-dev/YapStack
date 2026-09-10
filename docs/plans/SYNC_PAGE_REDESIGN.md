@@ -1,5 +1,7 @@
 # Sync Page Redesign — Plan v1
 
+> **Status (2026-09-10): executed, then superseded.** The single-adaptive-page decision (§0.6) was replaced by the owner-ratified setup wizard on 2026-09-06; `deriveSyncDisplay`, the ambient glyph and the typed probe survive as specified. Current surface: [`../SYNC_SPEC.md`](../SYNC_SPEC.md) §10.
+
 Grounded in a 10-target OSINT pass (Obsidian LiveSync, Joplin, Bitwarden, Standard
 Notes, Syncthing, Nextcloud desktop, Immich, shadcn/ui forms + settings corpus, and
 ambient-indicator conventions across Dropbox/OneDrive/iCloud/Notion/Linear/Figma),

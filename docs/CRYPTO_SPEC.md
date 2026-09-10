@@ -18,6 +18,13 @@
 > review) before any change.
 >
 > **Keywords** MUST / MUST NOT / SHOULD / MAY are RFC 2119.
+>
+> **References to `architecture §N`** (here and in code comments) point at the original
+> sync architecture decision report, which is not in this repository. The system as
+> built, and a table mapping those section numbers, is [`SYNC_SPEC.md`](SYNC_SPEC.md)
+> (§13); its §14 lists every place the implementation departs from this spec (e.g. the
+> §10 session store on Windows, the unimplemented §4.3/§4.4 flows, the §7.5 recovery
+> gap). This spec stays normative for every construction it defines.
 
 ---
 

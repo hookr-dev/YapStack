@@ -1,5 +1,7 @@
 # Sync Remediation Plan — one path, tree-shaken
 
+> **Status (2026-09-10): executed — historical.** Every item landed; the system as built and the remaining owner decisions are in [`../SYNC_SPEC.md`](../SYNC_SPEC.md) (§13–§15).
+
 Grounded in a three-scout audit of HEAD 90a1401 (surface inventory / engine + vendored
 cr-sqlite source analysis / dev-vs-prod classification of the T019–T030 chain).
 Principle: build for the typical production user; stop carrying this dev environment's

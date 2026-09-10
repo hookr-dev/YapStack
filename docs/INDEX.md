@@ -19,6 +19,7 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — data flow between crates, ring buffer, sidecar IPC, live transcription pipeline, AI chat tool calling, frontend component tree, analytics.
 - [`API_REFERENCE.md`](API_REFERENCE.md) — exact function signatures, struct fields, error variants, Tauri command shapes. Read before adding or modifying public APIs.
 - [`GLOSSARY.md`](GLOSSARY.md) — domain terms (session, segment, part, dictation, diarization, etc.).
+- [`SYNC_SPEC.md`](SYNC_SPEC.md) — the sync system as built: user contract, device lifecycle, drain, audio lane, relay endpoints, invariants→tests, the divergence register (docs vs code), and the open owner decisions. Start here for any sync work.
 - [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md) — normative cryptographic design for E2E sync: envelopes, AAD discipline, key hierarchy, device roster, KAT vectors. Read before any sync/crypto work.
 - [`self-hosting.md`](self-hosting.md) — run the sync relay yourself: install, hardening, TLS, backups.
 - [`../deploy/README.md`](../deploy/README.md) — relay day-two operations quick reference (start/stop, env knobs, keep-host-awake, backup).
@@ -51,3 +52,4 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 ## Plans (transient)
 
 - [`plans/`](plans/) — historical implementation plans, mostly archived. Browse only when researching prior approaches.
+- Sync plans — all executed and folded into [`SYNC_SPEC.md`](SYNC_SPEC.md) §13: [`plans/SYNC_REMEDIATION.md`](plans/SYNC_REMEDIATION.md), [`plans/SYNC_PAGE_REDESIGN.md`](plans/SYNC_PAGE_REDESIGN.md) (superseded by the setup wizard), [`plans/AUDIO_ROUND_TRIP.md`](plans/AUDIO_ROUND_TRIP.md), [`plans/LIVE_SESSION_STATE.md`](plans/LIVE_SESSION_STATE.md).

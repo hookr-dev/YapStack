@@ -1,5 +1,7 @@
 # Audio Round-Trip — E2E blob sync for recordings & dictation
 
+> **Status (2026-09-10): S1–S3 executed; S4 (custom save location for the fetch cache, opt-in mirror) not built; server GC (D10 follow-on) implemented.** As-built description: [`../SYNC_SPEC.md`](../SYNC_SPEC.md) §7.
+
 Grounded in a scout audit of the working tree (branch `feat/sync-relay-skeleton`) and the
 owner's live library; revised after an adversarial Judge review (fail list applied in
 full). Every file:line below was re-checked against the tree. Principle (from

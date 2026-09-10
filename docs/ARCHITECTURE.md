@@ -995,6 +995,17 @@ The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Parti
 ### Playback sync
 `AudioPlayer` provides time updates via `requestAnimationFrame`. `ChatView` highlights the active segment by matching `currentPlaybackTime` against `audio_offset_seconds`. Clicking a segment timestamp seeks the audio via the parts-aware `handleSeek`.
 
+## Sync (optional feature)
+
+Behind the off-by-default `sync` cargo feature the live SQLite database is converted to
+cr-sqlite CRRs and synchronized end-to-end encrypted through a self-hosted blind relay.
+The full system specification — user contract, device lifecycle, drain and audio lanes,
+relay endpoints, invariants and their tests, and the register of where the design
+documents and the implementation differ — is [`SYNC_SPEC.md`](SYNC_SPEC.md). The
+cryptography is normative in [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md); running the relay is
+[`self-hosting.md`](self-hosting.md). Code comments that cite `architecture §N` refer
+to the original decision report; `SYNC_SPEC.md` §13 maps those section numbers.
+
 ## Key Design Decisions
 
 1. **Sidecar process for Whisper** — Isolates heavy native dependency (whisper.cpp/cmake) from the main app binary. Crash isolation. Can be updated independently.
