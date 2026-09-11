@@ -666,6 +666,24 @@ async syncDisable() : Promise<Result<SyncStatusDto, string>> {
 }
 },
 /**
+ * Remove another device from the account (SYNC_SPEC §15.D). The human chose the device by
+ * its tile; this ACTIVE device re-anchors on the authoritative signed roster, drops the
+ * target from the VERIFIED membership (never from the relay's index), signs `counter + 1`
+ * at the current epoch, and uploads with `revoked_devices = [target]`. The relay marks the
+ * row revoked and kills its refresh families; its writes are refused at once and its reads
+ * stop when its access token expires. Relay-side eviction only: the removed device keeps
+ * what it already synced (retiring its key is vault-key rotation, deferred). Refuses to
+ * remove this device itself.
+ */
+async syncRemoveDevice(fingerprint: string, password: string) : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_remove_device", { fingerprint, password }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Explicitly forget an account (item 1): clears its per-account anchor — the tenant binding
  * and §3.2-C3 / §7.4 anti-substitution baselines that routine sign-out preserves. After this,
  * the next sign-in for this account is treated as a first-time (TOFU) device. Distinct from
@@ -1234,7 +1252,13 @@ audioUploadedTotal: number;
 /**
  * Whether the one-time idempotent backfill walk has completed on this device (D9).
  */
-audioBackfillComplete: boolean }
+audioBackfillComplete: boolean;
+/**
+ * SYNC_SPEC §15.D: this device was REMOVED from the account by another device. Its
+ * tokens are dying (refresh family revoked, writes refused); the page tells the user
+ * to sign out and, if they want it back, sign in again to be re-approved.
+ */
+removed: boolean }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

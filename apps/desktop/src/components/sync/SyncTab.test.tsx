@@ -298,6 +298,58 @@ describe("SyncTab — on", () => {
     expect(useAppStore.getState().syncConfig.email).toBe("user@example.com");
   });
 
+  it("Remove on another device's tile confirms, then calls the command with its fingerprint", async () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [SELF, PEER] }) });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "sync_remove_device" ? makeStatus({ roster: [SELF] }) : makeStatus({ roster: [SELF, PEER] }),
+    );
+    render(<SyncTab />);
+    // This device has no Remove affordance.
+    expect(screen.queryByRole("button", { name: /Remove This/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: `Remove ${PEER.label}` }));
+    const dialog = screen.getByRole("alertdialog");
+    const confirm = within(dialog).getByRole("button", { name: "Remove device" });
+    expect(confirm).toBeDisabled();
+    await userEvent.type(within(dialog).getByLabelText("Your password"), "hunter22");
+    await userEvent.click(confirm);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("sync_remove_device", {
+        fingerprint: PEER.fingerprint,
+        password: "hunter22",
+      }),
+    );
+    // The page now reflects the shrunken roster.
+    await waitFor(() =>
+      expect(useAppStore.getState().setSyncStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ roster: [SELF] }),
+      ),
+    );
+  });
+
+  it("a removed device is told so, offered Sign out, and cannot remove others", async () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [PEER], removed: true }) });
+    render(<SyncTab />);
+    expect(screen.getByText("This device was removed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: `Remove ${PEER.label}` })).not.toBeInTheDocument();
+    // The banner's own Sign out (first in DOM order; the Account row keeps its confirmed one).
+    const [bannerSignOut] = screen.getAllByRole("button", { name: "Sign out" });
+    await userEvent.click(bannerSignOut);
+    await waitFor(() =>
+      expect(useAppStore.getState().setSyncStatus).toHaveBeenCalledWith(null),
+    );
+  });
+
+  it("a removed device with sync off sees the removed hero instead of Turn on sync", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ syncEnabled: false, roster: [PEER], removed: true }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("This device was removed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Turn on sync" })).not.toBeInTheDocument();
+  });
+
   it("routes sign-out through a confirmation", async () => {
     setup({ email: "user@example.com", status: makeStatus({ roster: [SELF] }) });
     render(<SyncTab />);

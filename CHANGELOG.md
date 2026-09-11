@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ## [Unreleased]
 
 ### Added
+- **Remove a device.** Each other device's tile on Settings → Sync gains *Remove* (asks for your password): the device's sign-in is cancelled, it can no longer send changes, and it must be approved again to rejoin. It keeps what it already had, and if whoever has it knows your password you should change it too. (Relay migration 0012.)
 - **Turn sync off without signing out.** Settings → Sync gains a *Turn off* control; the device stops syncing and stays signed in, and turning sync back on resumes where it left off.
 - **Change your sync password.** Settings → Sync → Account gains *Change password* (asks for the current one), and the setup wizard offers a new password right after a recovery-code sign-in so a forgotten password stops working. Your other devices are signed out and ask for the new password; your encryption key and local notes are untouched. (Relay migration 0011.)
 - **Recovery on a new device works even when every other device is gone.** Signing in with the recovery code now enrols the device and lets it add itself to the account's device list once, so a user who lost their only device is no longer stuck waiting for an approval nobody can give. The security code changes when this happens; other devices see it as a normal update. (Relay migration 0010.)

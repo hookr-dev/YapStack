@@ -216,6 +216,48 @@ pub async fn put_roster(
         Some((_, true)) => true,
         _ => return Err(AppError::Forbidden),
     };
+    // Device removal (§15.D) is an ACTIVE caller's action only, never self-directed, a
+    // removed id cannot simultaneously be named active, and it requires RE-AUTHENTICATION
+    // with the caller's current `auth_key` (constant-time against the stored verifier),
+    // so a stolen 15-minute access token alone cannot evict every other device.
+    if !req.revoked_devices.is_empty() {
+        if recovery_bootstrap || req.revoked_devices.contains(&caller) {
+            return Err(AppError::Forbidden);
+        }
+        if req.revoked_devices.len() > 32 {
+            return Err(AppError::BadRequest(
+                "too many devices in one removal".into(),
+            ));
+        }
+        if req
+            .revoked_devices
+            .iter()
+            .any(|id| req.active_devices.contains(id))
+        {
+            return Err(AppError::BadRequest(
+                "a device cannot be both revoked and active".into(),
+            ));
+        }
+        let Some(cur_b64) = req.current_auth_key.as_deref() else {
+            return Err(AppError::Unauthorized);
+        };
+        let cur = zeroize::Zeroizing::new(
+            B64.decode(cur_b64)
+                .map_err(|_| AppError::BadRequest("current_auth_key: invalid base64".into()))?,
+        );
+        let row: Option<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("SELECT verifier, server_salt FROM users WHERE id = $1")
+                .bind(auth.user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((verifier, server_salt)) = row else {
+            return Err(AppError::Unauthorized);
+        };
+        let computed = st.server_verifier(cur, server_salt).await?;
+        if !crate::auth::ct_eq(&computed, &verifier) {
+            return Err(AppError::Unauthorized);
+        }
+    }
 
     // A roster row always exists for an authenticated tenant (created at signup). Its
     // absence would be a corrupt account, not a client-supplied condition.
@@ -305,6 +347,27 @@ pub async fn put_roster(
         )
         .bind(auth.tenant_id)
         .bind(&req.active_devices)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // Device removal (§15.D): mark the dropped members revoked (clearing any grants) and
+    // kill their refresh families. Their access tokens die at expiry; the write gate
+    // refuses them immediately.
+    if !req.revoked_devices.is_empty() {
+        sqlx::query(
+            "UPDATE devices SET status = 'revoked', recovery_grant_at = NULL, recovered_at = NULL \
+             WHERE workspace_id = $1 AND client_id = ANY($2)",
+        )
+        .bind(auth.tenant_id)
+        .bind(&req.revoked_devices)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked = true \
+             WHERE workspace_id = $1 AND client_id = ANY($2) AND NOT revoked",
+        )
+        .bind(auth.tenant_id)
+        .bind(&req.revoked_devices)
         .execute(&mut *tx)
         .await?;
     }

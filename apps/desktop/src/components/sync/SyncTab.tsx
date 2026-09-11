@@ -126,6 +126,16 @@ export function SyncTab() {
     syncEnabled,
   });
 
+  const handleRemoveDevice = async (device: DeviceRosterEntry, password: string) => {
+    try {
+      const status = await syncCommands.removeDevice(device.fingerprint, password);
+      setSyncStatus(status);
+      toast.success(`${device.label ?? "Device"} removed.`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const handleDisable = async () => {
     try {
       const status = await syncCommands.disable();
@@ -189,6 +199,24 @@ export function SyncTab() {
   if (!syncEnabled) {
     const midway = signedIn;
     const waiting = midway && isSelfPending(syncStatus);
+    if (midway && syncStatus?.removed) {
+      return (
+        <>
+          <div className="flex flex-col items-center rounded-xl border bg-gradient-to-b from-amber-500/[0.08] to-transparent px-6 py-8 text-center">
+            <DevicesIllustration className="mb-5" />
+            <h3 className="mb-1 text-base font-semibold">This device was removed</h3>
+            <p className="mb-5 max-w-sm text-xs text-muted-foreground">
+              Another device removed this one from {syncStatus.email}. Sign out; to
+              rejoin, sign in again and approve it from another device.
+            </p>
+            <Button className="w-48" variant="outline" onClick={() => void handleSignOut()}>
+              Sign out
+            </Button>
+          </div>
+          {wizardEl}
+        </>
+      );
+    }
     return (
       <>
         <div className="flex flex-col items-center rounded-xl border bg-gradient-to-b from-primary/[0.06] to-transparent px-6 py-8 text-center">
@@ -265,6 +293,21 @@ export function SyncTab() {
         </div>
       )}
 
+      {status.removed && (
+        <Alert className="border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-400">
+          <ShieldAlert className="h-4 w-4" />
+          <AlertTitle>This device was removed</AlertTitle>
+          <AlertDescription className="flex items-center justify-between gap-3 text-xs">
+            <span>
+              Another device removed this one from the account. Sign out; to rejoin, sign
+              in again and approve it from another device.
+            </span>
+            <Button size="sm" variant="outline" className="text-xs" onClick={() => void handleSignOut()}>
+              Sign out
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
       <UnreadableChangesWarning status={status} onRetried={() => void refreshSyncStatus()} />
 
       {/* Devices */}
@@ -275,7 +318,11 @@ export function SyncTab() {
             <PendingDeviceTile key={d.fingerprint} device={d} status={status} />
           ))}
           {roster.map((d) => (
-            <DeviceTile key={d.fingerprint} device={d} />
+            <DeviceTile
+              key={d.fingerprint}
+              device={d}
+              onRemove={status.removed ? undefined : handleRemoveDevice}
+            />
           ))}
           <AddDeviceTile email={status.email ?? ""} serverUrl={status.serverUrl} />
         </div>
@@ -429,19 +476,76 @@ function TileShell({
   );
 }
 
-function DeviceTile({ device }: { device: DeviceRosterEntry }) {
+function DeviceTile({
+  device,
+  onRemove,
+}: {
+  device: DeviceRosterEntry;
+  onRemove?: (device: DeviceRosterEntry, password: string) => void;
+}) {
   const { Icon, name } = platformLook(device.platform);
+  const label = device.label ?? "Unnamed device";
+  const [password, setPassword] = useState("");
   return (
     <TileShell className={device.isSelf ? "border-primary/40" : ""}>
       <span className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-primary">
         <Icon className="h-4 w-4" />
       </span>
       <div className="min-w-0 space-y-0.5">
-        <p className="truncate text-xs font-medium">{device.label ?? "Unnamed device"}</p>
+        <p className="truncate text-xs font-medium">{label}</p>
         <p className="text-[10px] text-muted-foreground">
           {device.isSelf ? "This device" : (name ?? "Approved")}
         </p>
       </div>
+      {!device.isSelf && onRemove && (
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <button
+              type="button"
+              className="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+              aria-label={`Remove ${label}`}
+            >
+              Remove
+            </button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Remove {label}?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Its sign-in is cancelled and it can no longer send changes. It keeps
+                what it already has. To bring it back, sign in on it and approve it
+                again. If whoever has it knows your password, also change your
+                password from the Account row.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <div className="space-y-1.5">
+              <Label htmlFor={`remove-pw-${device.fingerprint}`} className="text-xs text-muted-foreground">
+                Your password
+              </Label>
+              <Input
+                id={`remove-pw-${device.fingerprint}`}
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="h-9"
+              />
+            </div>
+            <AlertDialogFooter>
+              <AlertDialogCancel onClick={() => setPassword("")}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={password.length === 0}
+                onClick={() => {
+                  onRemove(device, password);
+                  setPassword("");
+                }}
+              >
+                Remove device
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </TileShell>
   );
 }

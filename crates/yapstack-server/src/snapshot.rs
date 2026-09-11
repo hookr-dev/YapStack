@@ -49,6 +49,12 @@ pub async fn presign(
     auth: AuthTenant,
     Json(req): Json<SnapshotPresignRequest>,
 ) -> Result<Json<SnapshotPresignResponse>, AppError> {
+    // Write gate (§7.5, SYNC_SPEC §15.B): only an ACTIVE device may reserve snapshot bytes.
+    {
+        let mut gate = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+        crate::devices::require_active_caller(&mut gate, auth.tenant_id, auth.client_id).await?;
+        gate.commit().await?;
+    }
     let cfg = storage_cfg(&st)?;
     let (hash, hash_hex) = storage::parse_sha256(&req.sha256)?;
     let key = storage::snapshot_object_key(auth.tenant_id, &hash_hex);

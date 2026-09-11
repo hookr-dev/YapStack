@@ -1303,6 +1303,352 @@ async fn change_password_requires_reauth_or_fresh_recovery_and_keeps_salt() {
     );
 }
 
+/// SYNC_SPEC §15.D device removal: an ACTIVE caller re-signs the roster without a member and
+/// names it in `revoked_devices`. The relay marks it revoked, revokes its refresh family,
+/// refuses its writes, and re-enrols it PENDING if it signs in again. A caller cannot
+/// remove itself, a recovery-bootstrap caller cannot remove anyone, and an id cannot be
+/// both revoked and active.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn device_removal_revokes_access_and_requires_reapproval() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x28u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let vault_key = [0x33u8; 32];
+
+    // Approve a second device the normal way.
+    let (second, second_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [first_client, second]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Its refresh family (from a fresh login as that device).
+    let (second_login_access, _) = login_finish_as(&app, &email, &auth_key, second).await;
+    let _ = second_login_access;
+
+    // Invalid removals: self → 403; revoked-and-active → 400.
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [second], "revoked_devices": [first_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "cannot remove self");
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client, second], "revoked_devices": [second]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "revoked and active at once"
+    );
+
+    // The removal (re-authenticated with the current auth key).
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client], "revoked_devices": [second],
+            "current_auth_key": auth_key
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Index shows it revoked; its writes are refused; reads still work on the live token.
+    let resp = get_auth(&app, "/devices", &active_access).await;
+    let devices = body_json(resp).await;
+    let row = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(second))
+        .unwrap();
+    assert_eq!(row["status"], "revoked");
+    let resp = post_auth(
+        &app,
+        "/sync/push",
+        &second_access,
+        json!({ "changes": [{
+        "client_id": second, "client_seq": 1, "ciphertext": B64.encode(b"x"),
+        "schema_version": 1, "engine_version": 16003 }]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "removed device cannot write"
+    );
+    let resp = get_auth(&app, "/sync/pull?since=0", &second_access).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "reads run out with the access token"
+    );
+    // Its refresh family is dead: a fresh login as that device re-enrols it PENDING.
+    let (_, _) = login_finish_as(&app, &email, &auth_key, second).await;
+    let resp = get_auth(&app, "/devices", &active_access).await;
+    let devices = body_json(resp).await;
+    let row = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(second))
+        .unwrap();
+    assert_eq!(
+        row["status"], "pending",
+        "re-login re-enrols a removed device as pending"
+    );
+
+    // A recovery-bootstrap caller may not remove anyone.
+    let rec_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": email, "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": rec_client, "ed25519_pub": B64.encode([0x0Cu8; 32]), "label": "rec"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rec_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (roster, sig) = signed_roster(&vault_key, 3, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &rec_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 3, "vault_key_epoch": 0,
+            "active_devices": [rec_client], "revoked_devices": [first_client]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "recovery bootstrap cannot remove"
+    );
+}
+
+/// Device-removal edges the review asked for: a removed device's refresh family really
+/// is dead; removal needs the caller's current auth key (401 without / wrong); a removed
+/// device that recovers with the code is re-enrolled pending WITHOUT a grant (its
+/// self-admit is refused); a pending caller naming `revoked_devices` is refused; and the
+/// snapshot write route is gated like every other device-authored write.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn device_removal_reauth_and_revoked_row_edges() {
+    let st = setup().await;
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x29u8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let vault_key = [0x33u8; 32];
+
+    // Approve a second device and capture ITS refresh token.
+    let (second, _) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [first_client, second]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": second,
+            "ed25519_pub": B64.encode([0x07u8; 32]), "label": "device"
+        }),
+    )
+    .await;
+    let second_tokens = body_json(resp).await;
+    let second_refresh = second_tokens["refresh_token"].as_str().unwrap().to_string();
+    let second_access = second_tokens["access_token"].as_str().unwrap().to_string();
+
+    // A pending caller naming revoked_devices → 403 (before any re-auth question).
+    let (_third, third_access) = enroll_pending(&app, &email, &auth_key).await;
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &third_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client], "revoked_devices": [second],
+            "current_auth_key": auth_key
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Removal without the current key → 401; with a wrong key → 401; with it → OK.
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client], "revoked_devices": [second]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "removal needs re-auth"
+    );
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client], "revoked_devices": [second],
+            "current_auth_key": client_auth_key("wrong", &salt_enc)
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong key");
+    let (roster, sig) = signed_roster(&vault_key, 2, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &active_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 2, "vault_key_epoch": 0,
+            "active_devices": [first_client], "revoked_devices": [second],
+            "current_auth_key": auth_key
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The removed device's refresh family is dead, and its snapshot write is refused.
+    let resp = post(
+        &app,
+        "/auth/refresh",
+        json!({ "refresh_token": second_refresh }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "family revoked");
+    let resp = post_auth(
+        &app,
+        "/snapshot/presign",
+        &second_access,
+        json!({ "sha256": "00".repeat(32), "size": 10, "generation": 1, "baseline_seq": 0 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "snapshot write gated");
+
+    // The removed device recovers with the code: re-enrolled PENDING, but NO grant — its
+    // self-admission is refused; it needs approval like any new device.
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": email,
+            "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": second,
+            "ed25519_pub": B64.encode([0x07u8; 32]),
+            "label": "device"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rec_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = get_auth(&app, "/devices", &active_access).await;
+    let devices = body_json(resp).await;
+    let row = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["client_id"] == json!(second))
+        .unwrap();
+    assert_eq!(row["status"], "pending", "re-enrolled pending");
+    let (roster, sig) = signed_roster(&vault_key, 3, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &rec_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 3, "vault_key_epoch": 0,
+            "active_devices": [first_client, second]
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a removed device gets no recovery grant"
+    );
+}
+
 // =====================================================================================
 // PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
 //   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"

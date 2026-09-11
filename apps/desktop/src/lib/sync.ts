@@ -168,6 +168,9 @@ export interface SyncStatus {
   audioUploadedTotal: number;
   /** Whether the one-time idempotent backfill walk has completed on this device. */
   audioBackfillComplete: boolean;
+  /** This device was removed from the account by another device (§15.D): its sign-in is
+   *  dying and writes are refused. Optional so older status snapshots read as false. */
+  removed?: boolean;
 }
 
 export interface SignupRequest {
@@ -268,6 +271,11 @@ export const syncCommands = {
     invoke("sync_approve_device", { fingerprint }),
 
   signOut: (): Promise<void> => invoke("sync_sign_out"),
+
+  /** Remove another device from the account by fingerprint (§15.D): re-signs the roster
+   *  without it and revokes its relay access. Never this device. */
+  removeDevice: (fingerprint: string, password: string): Promise<SyncStatus> =>
+    invoke("sync_remove_device", { fingerprint, password }),
 
   /** Turn sync off on this device while staying signed in: stops the lanes and persists
    *  the choice. The database stays prepared, so turning it back on resumes in place. */

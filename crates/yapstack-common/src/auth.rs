@@ -224,7 +224,8 @@ pub struct DeviceInfo {
     /// "linux" | ""), for the devices UI. Advisory, like `label`.
     #[serde(default)]
     pub platform: String,
-    /// `"pending"` (enrolled, awaiting approval) or `"active"` (in an accepted roster).
+    /// `"pending"` (enrolled, awaiting approval), `"active"` (in an accepted roster), or
+    /// `"revoked"` (removed from the roster by another device; must re-enrol via login).
     pub status: String,
     pub added_at: String,
 }
@@ -252,6 +253,18 @@ pub struct RosterUploadRequest {
     pub vault_key_epoch: i64,
     #[serde(default)]
     pub active_devices: Vec<Uuid>,
+    /// Device removal (SYNC_SPEC §15.D): client_ids the re-signed roster DROPPED. The
+    /// relay marks them `revoked`, revokes their refresh families, and its write gate
+    /// refuses their remaining access tokens. Plaintext metadata like `active_devices`,
+    /// never derived from the opaque roster. Refused on the recovery re-bootstrap path
+    /// and must never include the caller.
+    #[serde(default)]
+    pub revoked_devices: Vec<Uuid>,
+    /// Re-authentication for removal: base64 of the caller's CURRENT `auth_key`,
+    /// REQUIRED whenever `revoked_devices` is non-empty (a stolen 15-minute access token
+    /// alone must not be able to evict every other device). Ignored otherwise.
+    #[serde(default)]
+    pub current_auth_key: Option<String>,
 }
 
 /// `PUT /devices/roster` success: the accepted anti-rollback watermarks, echoed back so

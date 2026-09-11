@@ -1661,6 +1661,10 @@ pub struct SyncStatusDto {
     audio_uploaded_total: u64,
     /// Whether the one-time idempotent backfill walk has completed on this device (D9).
     audio_backfill_complete: bool,
+    /// SYNC_SPEC §15.D: this device was REMOVED from the account by another device. Its
+    /// tokens are dying (refresh family revoked, writes refused); the page tells the user
+    /// to sign out and, if they want it back, sign in again to be re-approved.
+    removed: bool,
 }
 
 // ----- Typed relay connection probe (T025) -----
@@ -4843,9 +4847,18 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
     let audio = AUDIO_LANE.get();
     let mut roster = Vec::new();
     let mut last_error = None;
+    let mut removed = false;
     match http_get_devices(session).await {
         Ok(devs) => {
             for d in devs.devices {
+                // A REVOKED row (§15.D) is not a device tile: removed peers vanish from
+                // the list; a removed SELF is surfaced as a distinct flag instead.
+                if d.status == "revoked" {
+                    if d.client_id == session.client_id {
+                        removed = true;
+                    }
+                    continue;
+                }
                 let pk = B64.decode(d.ed25519_pub.as_bytes()).unwrap_or_default();
                 roster.push(DeviceRosterEntryDto {
                     fingerprint: device_fingerprint(&pk),
@@ -4930,6 +4943,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         audio_upload_failed: audio.failed,
         audio_uploaded_total: audio.uploaded_total,
         audio_backfill_complete: audio.backfill_complete,
+        removed,
     }
 }
 
@@ -5207,6 +5221,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             audio_upload_failed: 0,
             audio_uploaded_total: 0,
             audio_backfill_complete: false,
+            removed: false,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -5235,6 +5250,13 @@ pub async fn sync_enable(
             Some(d) if d.status == "pending" => {
                 return Err(
                     "This device is still waiting for approval from one of your other devices."
+                        .to_string(),
+                );
+            }
+            Some(d) if d.status == "revoked" => {
+                return Err(
+                    "This device was removed from the account on another device. Sign out, \
+                     then sign in again to request approval."
                         .to_string(),
                 );
             }
@@ -5331,6 +5353,139 @@ pub async fn sync_sign_out(runtime: State<'_, SyncRuntimeState>) -> Result<(), S
             .map_err(|e| e.to_string())?;
     }
     clear_session()
+}
+
+/// Remove another device from the account (SYNC_SPEC §15.D). The human chose the device by
+/// its tile; this ACTIVE device re-anchors on the authoritative signed roster, drops the
+/// target from the VERIFIED membership (never from the relay's index), signs `counter + 1`
+/// at the current epoch, and uploads with `revoked_devices = [target]`. The relay marks the
+/// row revoked and kills its refresh families; its writes are refused at once and its reads
+/// stop when its access token expires. Relay-side eviction only: the removed device keeps
+/// what it already synced (retiring its key is vault-key rotation, deferred). Refuses to
+/// remove this device itself.
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_remove_device(
+    fingerprint: String,
+    password: String,
+) -> Result<SyncStatusDto, String> {
+    let mut session = load_session()?.ok_or_else(|| "Sign in first.".to_string())?;
+    let vault_key = session.vault_key()?;
+    // Re-authentication (the relay requires the current auth key for any removal).
+    let salt_b64 = session
+        .salt_enc_b64
+        .clone()
+        .ok_or_else(|| "This session has no cached salt — sign in again first.".to_string())?;
+    let salt_enc = B64
+        .decode(salt_b64.as_bytes())
+        .map_err(|_| "corrupt cached salt".to_string())?;
+    let stretch = yapstack_crypto::kdf::client_stretch(password.as_bytes(), &salt_enc)
+        .map_err(|e| e.to_string())?;
+    let (current_auth_key, _) = yapstack_crypto::kdf::split_keys(&stretch);
+    let current_auth_key_b64 = B64.encode(current_auth_key);
+    if session.device_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return Err("You can't remove the device you're using. Sign out instead.".to_string());
+    }
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let fetched = http_get_roster(&session).await?;
+        let (prev_roster, prev_fp) = verify_roster_signed(
+            Some(&fetched.device_list),
+            Some(&fetched.signature),
+            &vault_key,
+            session.roster_counter,
+        )?;
+        let verified_counter = prev_roster.counter;
+        if fetched.counter as u64 != verified_counter {
+            return Err(
+                "relay's plaintext roster counter disagrees with the signed \
+                 roster — refusing to sign (possible tamper)"
+                    .to_string(),
+            );
+        }
+        session.roster_counter = verified_counter as i64;
+        session.roster_fingerprint = Some(prev_fp);
+        let (rc, rf) = (session.roster_counter, session.roster_fingerprint.clone());
+        session = update_session(move |s| {
+            s.roster_counter = rc;
+            s.roster_fingerprint = rf;
+        })?;
+        persist_account_anchor(&session)?;
+
+        // The target is located in the VERIFIED roster by fingerprint — never in the
+        // relay's advisory index.
+        let target = prev_roster
+            .devices
+            .iter()
+            .find(|d| {
+                B64.decode(d.ed25519_pub.as_bytes())
+                    .map(|pk| device_fingerprint(&pk) == fingerprint)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .ok_or_else(|| "No device with that fingerprint is in the roster.".to_string())?;
+        if target.client_id == session.client_id {
+            return Err("You can't remove the device you're using. Sign out instead.".to_string());
+        }
+        let entries: Vec<RosterDeviceEntry> = prev_roster
+            .devices
+            .iter()
+            .filter(|d| d.client_id != target.client_id)
+            .cloned()
+            .collect();
+        let active_ids: Vec<Uuid> = entries.iter().map(|e| e.client_id).collect();
+        let new_counter = verified_counter as i64 + 1;
+        let roster = SignedRoster {
+            version: 1,
+            tenant_id: session.tenant_id,
+            vault_key_epoch: session.epoch,
+            counter: new_counter as u64,
+            devices: entries,
+        };
+        let canonical = roster_canonical_bytes(&roster)?;
+        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
+        let roster_fp = roster_fingerprint_from_canonical(&canonical);
+        let device_list_value =
+            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        match http_put_roster(
+            &session,
+            &RosterUploadRequest {
+                device_list: device_list_value,
+                signature: B64.encode(signature),
+                counter: new_counter,
+                vault_key_epoch: session.epoch as i64,
+                active_devices: active_ids,
+                revoked_devices: vec![target.client_id],
+                current_auth_key: Some(current_auth_key_b64.clone()),
+            },
+        )
+        .await
+        .map_err(|e| {
+            if e.starts_with("relay error 401") {
+                "The password is incorrect.".to_string()
+            } else {
+                e
+            }
+        })? {
+            RosterPutOutcome::Ok(_) => {
+                let (c, fp) = (new_counter, roster_fp);
+                session = update_session(move |s| {
+                    s.roster_counter = c;
+                    s.roster_fingerprint = Some(fp);
+                })?;
+                persist_account_anchor(&session)?;
+                break;
+            }
+            RosterPutOutcome::Conflict if attempts < 2 => continue,
+            RosterPutOutcome::Conflict => {
+                return Err(
+                    "roster upload kept losing to a concurrent change — please try again".into(),
+                )
+            }
+        }
+    }
+    Ok(build_status_dto(&session).await)
 }
 
 /// Turn sync OFF on this device while staying signed in (SYNC_SPEC §15.E): stop every lane
@@ -6337,7 +6492,7 @@ pub async fn sync_recover(
         let roster_fp = roster_fingerprint_from_canonical(&canonical);
         let device_list_value =
             serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
-        match http_put_roster(
+        let put = http_put_roster(
             &session,
             &RosterUploadRequest {
                 device_list: device_list_value,
@@ -6345,13 +6500,13 @@ pub async fn sync_recover(
                 counter: new_counter,
                 vault_key_epoch: epoch as i64,
                 active_devices: active_ids,
+                revoked_devices: Vec::new(),
+                current_auth_key: None,
             },
         )
-        .await?
-        {
-            RosterPutOutcome::Ok(_) => {
-                // Field-merge under the store lock (the drain may already be rotating
-                // tokens), then refresh the anchor so the ratcheted floor survives sign-out.
+        .await;
+        match put {
+            Ok(RosterPutOutcome::Ok(_)) => {
                 let (c, fp) = (new_counter, roster_fp.clone());
                 session = update_session(move |s| {
                     s.roster_counter = c;
@@ -6359,13 +6514,22 @@ pub async fn sync_recover(
                 })?;
                 persist_account_anchor(&session)?;
             }
-            RosterPutOutcome::Conflict => {
+            Ok(RosterPutOutcome::Conflict) => {
                 return Err(
                     "Another device changed the device list while this one was recovering. \
                      Enter the recovery code again to retry."
                         .to_string(),
                 );
             }
+            // No grant for this device: it was REMOVED from the account (re-enrolled pending,
+            // must be approved again) or the relay is older. Signed in, not self-admitted —
+            // the status shows pending and the wizard's approval step takes over.
+            Err(e) if e.starts_with("relay error 403") => {
+                tracing::warn!(
+                    "sync recover: relay refused self-admission ({e}); waiting for approval"
+                );
+            }
+            Err(e) => return Err(e),
         }
     }
 
@@ -6565,6 +6729,8 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
                 counter: new_counter,
                 vault_key_epoch: session.epoch as i64,
                 active_devices: active_ids,
+                revoked_devices: Vec::new(),
+                current_auth_key: None,
             },
         )
         .await?;

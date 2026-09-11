@@ -62,7 +62,7 @@
 | Forget an account on this device (clears the anchor) | Command only, no UI | `sync_forget_account` |
 | Turn sync **off** while staying signed in (and back on, resuming in place) | Shipped | `sync_disable`, Sync page "Turn off" |
 | Change password (from Account, or offered right after a recovery sign-in) | Shipped | `sync_change_password`, CRYPTO_SPEC §4.3 + A9 |
-| Remove or revoke a device | **Not built**; ratified to build (§15.D) | — |
+| Remove another device from the account (it loses relay access; rejoining needs approval) | Shipped | `sync_remove_device`, tile "Remove" |
 | Regenerate the recovery code; rotate the vault key | **Not built** | — |
 | Sync settings or AI connection keys across devices | **Not built**; not planned (§4.5, §15.H) | — |
 | Share a note by private link | **Not built**; tables only | — |
@@ -301,7 +301,34 @@ credential, and maps 403 to "approve this device first". Offered in the wizard
 immediately after a recovery sign-in ("Set a new password", skippable) and from the
 Account row ("Change password", asks for the current password).
 
-### 5.7 Tokens
+### 5.7 Device removal
+
+`sync_remove_device(fingerprint, password)` (never this device): re-anchor on the
+authoritative signed roster, drop the target from the **verified** membership, sign
+`counter + 1` at the current epoch, and `PUT /devices/roster` with `active_devices` =
+the remaining members, `revoked_devices = [target]`, and the caller's current
+`auth_key` (re-authentication — a stolen access token alone cannot evict devices). The
+relay marks the row `revoked`, clears any grants on it, and revokes its refresh
+families; `require_active_caller` refuses its writes immediately (push, audio presign,
+snapshot presign, roster) and its reads end with its access token (≤ 15 min). Only an
+active caller may revoke (never on the recovery re-bootstrap path, never itself, at most
+32 per upload, and an id cannot be both revoked and active). A revoked device that signs
+in again with the password, or recovers with the code, is re-enrolled **pending with no
+recovery grant** and must be approved anew. Removed peers disappear from the device
+tiles; a removed device sees "This device was removed" with Sign out (hero when sync is
+off, banner when on) and `sync_enable` refuses it.
+
+**What removal guarantees, honestly.** It is relay-side eviction of that device's
+*tokens*. The removed device keeps what it already synced (retiring its key is vault-key
+rotation, CRYPTO_SPEC §4.4, deferred). If whoever holds it knows the **password**, they
+can sign in again and — because pending devices may pull — keep *reading* new changes
+until the password is changed (§5.6), which the Remove dialog says. A **compromised
+relay** can undo removal by flipping the row back (peers do not filter pulled changes by
+roster membership). And until login carries proof of possession (§15.K), a password
+holder can even mint a token for another device's `client_id`; removal does not help
+against that attacker.
+
+### 5.8 Tokens
 
 Access JWT 15 min, refresh JWT 30 days, per-device families with rotation and reuse
 detection (a spent token presented again revokes the family, serialised with `FOR
@@ -310,7 +337,7 @@ persisting the rotated pair **before** using it. A rejected refresh strips the
 credentials but keeps the session record, so the UI lands on "Sign in again" rather
 than "off". The audio lane never refreshes; it reloads the persisted bearer.
 
-### 5.8 Sign-out, change server, forget
+### 5.9 Sign-out, change server, forget
 
 - **Turn off sync** (`sync_disable`): stops all lanes off the event loop, clears their
   published state, persists `sync_enabled = false`; the session, tokens, vault key and
@@ -492,14 +519,14 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /auth/recover` | none; per-IP | recovery verifier check; enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409); recovery wrap + roster; tokens bound to the device |
 | `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
-| `PUT /devices/roster` | access JWT with `client_id` whose row is **active**, or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; consumes the grant |
+| `PUT /devices/roster` | access JWT with `client_id` whose row is **active** (plus the current `auth_key` when `revoked_devices` is non-empty), or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; revokes `revoked_devices` (active callers only, never self); consumes the grant |
 | `POST /sync/push` | access JWT; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
 | `GET /sync/pull?since&limit` | access JWT | dense pages, never gated |
 | `GET /sync/completeness` | access JWT | `max`, `count`, `contiguous`, per-client tails |
 | `GET /sync/stream` | access JWT | SSE `wakeup` events carrying only the seq |
 | `POST /audio/presign?sha256&size&part_id&session_id` | access JWT | dedup + refcount + existence-checked presigned PUT |
 | `GET /audio/part/{part_id}` | access JWT | 302 to a presigned GET, never gated |
-| `POST /snapshot/presign`, `GET /snapshot` | access JWT | snapshot bootstrap seam (no client caller) |
+| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller) |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
 Push, audio presign and `PUT /devices/roster` are the only device-authored writes, and
@@ -509,7 +536,7 @@ Pull, audio GET and the roster GET are never gated.
 ### 9.2 Schema (migrations 0001–0009)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
-`devices` (pubkey, label, platform, `status` pending|active, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
+`devices` (pubkey, label, platform, `status` pending|active|revoked, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `audio_blobs` (+ `released_at`),
@@ -709,10 +736,12 @@ with the new `auth_key` and password wrap; `salt_enc` retained (A9) so every dev
 baseline survives; re-authentication with the current key, waived once within 15 minutes
 of a recovery sign-in. Offered after recovery and from the Account row.
 
-**D. Device removal — DECIDED: build, fourth slice.** The approver re-signs the roster
-without the device; the relay marks the row `revoked`, revokes its refresh families and
-rejects its access tokens on the write routes. Copy states plainly that a removed device
-keeps what it already synced; cryptographic eviction needs rotation (§4.4, deferred).
+**D. Device removal — DONE (slice 4).** Approver re-authenticates and re-signs the
+roster without the device; the relay marks it revoked, kills its refresh families and
+refuses its writes; re-login or recovery re-enrols it pending with no grant. Independent
+review folded in: re-auth, no grant for revoked rows, revoked self refused at enable,
+snapshot write gated, honest copy about password holders and compromised relays. The
+review also surfaced §15.K. See §5.7.
 
 **E. Turning sync off — DONE (slice 3).** `sync_disable` stops the lanes and persists
 `sync_enabled = false` while keeping the session; surfaced as "Turn off" on the Sync
@@ -735,6 +764,20 @@ from that list.
 **I. Dead relay columns — DECIDED: leave them.** `devices.state`, `devices.last_seen`,
 `shares`, `snapshots` stay; additive columns are harmless and a v1 relay with real data
 does not earn a destructive migration.
+
+**K. Proof of possession at login — OPEN (surfaced by the removal review, 2026-09-10).**
+`login/finish` and `recover` take `client_id` and `ed25519_pub` from the request and
+never prove the caller holds the matching private key: an existing row's identity is
+simply reused. Anyone with the **password** can therefore obtain a token bound to any
+device's `client_id` (the ids are visible via `GET /devices` and the signed roster) and
+pass the active-device write gate, including to remove the real owner's device. This is
+pre-existing and orthogonal to removal, but removal's promise is weakest against exactly
+this attacker. Recommended fix (a CRYPTO_SPEC §3.2 amendment, LOCKED, review-gated):
+`login/begin` returns a server nonce; `login/finish` and `recover` carry
+`Ed25519.sign(device_sk, nonce ‖ client_id ‖ ed25519_pub ‖ email)`; the relay verifies
+against the **stored** public key when the row exists (409 on mismatch) and against the
+presented key when new; older clients that send no proof get a token with no
+`client_id` (read-only). Owner decision needed before it is built.
 
 **J. Schema-version bumps — DECIDED: documented posture, auto-retry built when the
 first bump is scheduled.** A `SYNC_SCHEMA_VERSION` bump quarantines updated devices'
@@ -786,9 +829,13 @@ out of scope are listed in the pass commit message.
 1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10.
 2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10.
 3. Turn off sync (§15.E) — done 2026-09-10.
-4. Remove a device (§15.D).
+4. Remove a device (§15.D) — done 2026-09-10.
 5. Relay compaction (§15.F).
 
 **Deferred, documented only:** D5 version floor and device staleness, D9 auto-retry
 until the first schema bump, D13 rotation and recovery-code revocation, D6 shares, D8
 hosted default.
+
+**Newly open (needs owner decision):** §15.K proof of possession at login — a LOCKED
+§3.2 amendment; recommended before rollout, since it closes the password-only
+impersonation of any device identity.

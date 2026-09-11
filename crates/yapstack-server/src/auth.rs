@@ -43,7 +43,7 @@ fn b64_decode(field: &str, s: &str) -> Result<Vec<u8>, AppError> {
 
 /// Constant-time byte comparison for the verifier check (no early-exit timing
 /// oracle). Length mismatch returns false without leaking where.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -307,10 +307,16 @@ pub async fn login_finish(
                 "ed25519_pub: expected 32 bytes".into(),
             ));
         }
+        // A REVOKED device (removed by another device, §15.D) that signs in again with the
+        // password re-enrols PENDING under the same identity and must be approved anew;
+        // every other existing row (pending/active) is left exactly as it is.
         sqlx::query(
             "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, platform, status) \
              VALUES ($1, $2, $3, $4, $5, $6, 'pending') \
-             ON CONFLICT (client_id) DO NOTHING",
+             ON CONFLICT (client_id) DO UPDATE SET status = 'pending' \
+             WHERE devices.status = 'revoked' \
+               AND devices.workspace_id = EXCLUDED.workspace_id \
+               AND devices.user_id = EXCLUDED.user_id",
         )
         .bind(cid)
         .bind(row.workspace_id)
@@ -428,9 +434,12 @@ pub async fn recover(
     // vault key, so it may author the next roster itself even when no active device is
     // left to approve it (`devices::put_roster`). An already-active device keeps its
     // status; a device that was pending (password login, never approved) gains the grant
-    // and can self-approve. `client_id` is a GLOBAL primary key, so the conflict arm is
-    // scoped to this account (RLS is the second line, not the only one): a `client_id`
-    // enrolled under another account is refused rather than armed.
+    // and can self-approve. A REVOKED device (removed by another device, §15.D) is
+    // re-enrolled PENDING but gets NO grant: the account demonstrably has an approver,
+    // so the lost-only-device rationale does not apply and re-admission goes through
+    // approval. `client_id` is a GLOBAL primary key, so the conflict arm is scoped to
+    // this account (RLS is the second line, not the only one): a `client_id` enrolled
+    // under another account is refused rather than armed.
     if let (Some(cid), Some(pub_b64)) = (req.client_id, req.ed25519_pub.as_deref()) {
         let ed_pub = b64_decode("ed25519_pub", pub_b64)?;
         if ed_pub.len() != 32 {
@@ -444,7 +453,11 @@ pub async fn recover(
               recovery_grant_at, recovered_at) \
              VALUES ($1, $2, $3, $4, $5, $6, 'pending', now(), now()) \
              ON CONFLICT (client_id) DO UPDATE \
-             SET recovery_grant_at = now(), recovered_at = now() \
+             SET status = CASE WHEN devices.status = 'revoked' THEN 'pending' \
+                               ELSE devices.status END, \
+                 recovery_grant_at = CASE WHEN devices.status = 'revoked' THEN NULL \
+                                          ELSE now() END, \
+                 recovered_at = now() \
              WHERE devices.workspace_id = EXCLUDED.workspace_id \
                AND devices.user_id = EXCLUDED.user_id",
         )
