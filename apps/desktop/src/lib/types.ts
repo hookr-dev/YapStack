@@ -595,6 +595,23 @@ async syncRecover(serverUrl: string, email: string, recoveryCode: string) : Prom
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Change the account password (CRYPTO_SPEC §4.3 as amended by A9). Re-derives the
+ * auth/master split from the NEW password under the account's EXISTING `salt_enc` (so
+ * every known device's C3 salt baseline stays valid), re-wraps the vault key under the
+ * new master key, and uploads the new second-hash input + wrap. `current_password` is
+ * required for re-authentication except within 15 minutes of a recovery-code sign-in
+ * (the forgotten-password case). Nothing changes locally: the salt, vault key and
+ * tokens are all unchanged. NEVER sends the password / master_key / vault_key.
+ */
+async syncChangePassword(currentPassword: string | null, newPassword: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_change_password", { currentPassword, newPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async syncEnable() : Promise<Result<SyncStatusDto, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_enable") };
@@ -628,6 +645,21 @@ async syncApproveDevice(fingerprint: string) : Promise<Result<SyncStatusDto, str
 async syncSignOut() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_sign_out") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Turn sync OFF on this device while staying signed in (SYNC_SPEC §15.E): stop every lane
+ * (off the event loop, like sign-out) and persist `sync_enabled = false` so neither this
+ * session nor the next boot starts a drain. The database stays CRR-prepared and keeps its
+ * watermarks and account binding, so turning sync back on (`sync_enable`) resumes where it
+ * left off instead of re-syncing history. Tokens, the vault key and the roster are untouched.
+ */
+async syncDisable() : Promise<Result<SyncStatusDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_disable") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

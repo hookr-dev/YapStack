@@ -167,14 +167,14 @@ describe("SyncTab — not set up", () => {
     expect(within(dialog).getByRole("button", { name: /Get started/ })).toBeInTheDocument();
   });
 
-  it("a signed-in device that never turned sync on is offered 'Continue setup'", async () => {
+  it("a signed-in device with sync off is offered 'Turn on sync'", async () => {
     setup({
       email: "user@example.com",
       status: makeStatus({ syncEnabled: false, roster: [SELF] }),
     });
     render(<SyncTab />);
     expect(screen.getByText(/Signed in as user@example.com/)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
+    await userEvent.click(screen.getByRole("button", { name: "Turn on sync" }));
     // Resumes at the turn-on step, not the intro.
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByRole("button", { name: "Turn on sync" })).toBeInTheDocument();
@@ -278,6 +278,24 @@ describe("SyncTab — on", () => {
     expect(within(dialog).getByText("Sign in again")).toBeInTheDocument();
     expect(within(dialog).getByLabelText("Email")).toHaveValue("user@example.com");
     expect(within(dialog).getByLabelText("Email")).toBeDisabled();
+  });
+
+  it("Turn off sync routes through a confirmation and keeps the user signed in", async () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [SELF] }) });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "sync_disable"
+        ? makeStatus({ syncEnabled: false, roster: [SELF] })
+        : makeStatus({ roster: [SELF] }),
+    );
+    render(<SyncTab />);
+    await userEvent.click(screen.getByRole("button", { name: "Turn off" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText("Turn off sync on this device?")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Turn off sync" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("sync_disable"));
+    expect(useAppStore.getState().syncConfig.syncEnabled).toBe(false);
+    expect(useAppStore.getState().syncConfig.email).toBe("user@example.com");
   });
 
   it("routes sign-out through a confirmation", async () => {

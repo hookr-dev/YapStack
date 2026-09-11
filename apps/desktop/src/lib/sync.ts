@@ -269,6 +269,10 @@ export const syncCommands = {
 
   signOut: (): Promise<void> => invoke("sync_sign_out"),
 
+  /** Turn sync off on this device while staying signed in: stops the lanes and persists
+   *  the choice. The database stays prepared, so turning it back on resumes in place. */
+  disable: (): Promise<SyncStatus> => invoke("sync_disable"),
+
   /** S2 manual-retry for the audio-upload lane: re-arm every `failed` blob so the
    *  uploader retries it next cycle. Resolves with the count re-armed. */
   retryFailedAudioUploads: (): Promise<number> =>

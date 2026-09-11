@@ -126,6 +126,17 @@ export function SyncTab() {
     syncEnabled,
   });
 
+  const handleDisable = async () => {
+    try {
+      const status = await syncCommands.disable();
+      setSyncStatus(status);
+      setSyncConfig({ syncEnabled: false });
+      toast.success("Sync is off on this device.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const handleSignOut = async () => {
     try {
       await syncCommands.signOut();
@@ -187,11 +198,11 @@ export function SyncTab() {
             {waiting
               ? "This device is signed in and waiting for one of your other devices to approve it."
               : midway
-                ? `Signed in as ${syncStatus?.email}. One more step and this device starts syncing.`
+                ? `Signed in as ${syncStatus?.email}. Sync is off on this device.`
                 : "Record on one device, read and edit on another. Everything is encrypted before it leaves this device — the server you run only ever holds scrambled data."}
           </p>
           <Button className="w-48" onClick={() => openWizard("auto")}>
-            {midway ? "Continue setup" : "Set up sync"}
+            {waiting ? "Continue setup" : midway ? "Turn on sync" : "Set up sync"}
           </Button>
           <p className="mt-4 flex items-center gap-2 text-[11px] text-muted-foreground">
             <ShieldCheck className="h-3 w-3 text-primary" />
@@ -303,6 +314,37 @@ export function SyncTab() {
               <AlertDialogCancel>Cancel</AlertDialogCancel>
               <AlertDialogAction onClick={() => void handleSignOut()}>
                 Sign out & change
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+
+      <div className="flex items-center justify-between gap-3">
+        <div className="space-y-0.5">
+          <Label className="text-xs">Sync on this device</Label>
+          <p className="text-[10px] text-muted-foreground">
+            Stop syncing here without signing out. Turn it back on any time.
+          </p>
+        </div>
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button size="sm" variant="ghost" className="text-xs">
+              Turn off
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Turn off sync on this device?</AlertDialogTitle>
+              <AlertDialogDescription>
+                New changes here stay on this device until you turn sync back on;
+                nothing is deleted anywhere. You stay signed in.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={() => void handleDisable()}>
+                Turn off sync
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

@@ -60,7 +60,7 @@
 | Clear downloaded (fetched) audio | Shipped | `audio_cache_clear` |
 | Sign out (keeps the account anchor so re-sign-in is not TOFU); change server (= sign out) | Shipped | `sync_sign_out` |
 | Forget an account on this device (clears the anchor) | Command only, no UI | `sync_forget_account` |
-| Turn sync **off** while staying signed in | **Not available**; ratified to build (§15.E) | — |
+| Turn sync **off** while staying signed in (and back on, resuming in place) | Shipped | `sync_disable`, Sync page "Turn off" |
 | Change password (from Account, or offered right after a recovery sign-in) | Shipped | `sync_change_password`, CRYPTO_SPEC §4.3 + A9 |
 | Remove or revoke a device | **Not built**; ratified to build (§15.D) | — |
 | Regenerate the recovery code; rotate the vault key | **Not built** | — |
@@ -312,6 +312,11 @@ than "off". The audio lane never refreshes; it reloads the persisted bearer.
 
 ### 5.8 Sign-out, change server, forget
 
+- **Turn off sync** (`sync_disable`): stops all lanes off the event loop, clears their
+  published state, persists `sync_enabled = false`; the session, tokens, vault key and
+  roster are untouched and the database stays CRR-prepared with its watermarks and
+  account binding, so turning sync back on resumes in place. The Sync page then shows
+  the hero with "Turn on sync".
 - **Sign out**: stops all lanes off the event loop, deletes the session entry, keeps
   the identity and the account anchor, leaves the database CRR-prepared and its
   watermarks in place (bound to the tenant).
@@ -337,7 +342,9 @@ than "off". The audio lane never refreshes; it reloads the persisted bearer.
 4. Spawn the drain, then stop any previous drain on a blocking task.
 5. Persist `sync_enabled = true` and refresh the anchor.
 
-There is no reverse path: once prepared, a database stays CRR-prepared.
+There is no reverse path: once prepared, a database stays CRR-prepared. Turning sync
+off (`sync_disable`) stops the lanes and clears `sync_enabled`; it does not touch the
+database.
 
 ### 6.2 Lanes
 
@@ -707,9 +714,10 @@ without the device; the relay marks the row `revoked`, revokes its refresh famil
 rejects its access tokens on the write routes. Copy states plainly that a removed device
 keeps what it already synced; cryptographic eviction needs rotation (§4.4, deferred).
 
-**E. Turning sync off — DECIDED: build, third slice.** `sync_disable`: stop the lanes,
-`sync_enabled = false`, keep the session and the database CRR-prepared. Surfaced as
-"Turn off sync" on the Sync page. "Return to a plain database" stays deferred.
+**E. Turning sync off — DONE (slice 3).** `sync_disable` stops the lanes and persists
+`sync_enabled = false` while keeping the session; surfaced as "Turn off" on the Sync
+page with a confirmation, and the hero offers "Turn on sync" afterwards. "Return to a
+plain database" stays deferred.
 
 **F. Relay history compaction — DECIDED: after the four feature slices.** The snapshot
 seam (server routes, `snapshot.rs`, transport methods) is kept for it. Open questions
@@ -777,7 +785,7 @@ out of scope are listed in the pass commit message.
 
 1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10.
 2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10.
-3. Turn off sync (§15.E).
+3. Turn off sync (§15.E) — done 2026-09-10.
 4. Remove a device (§15.D).
 5. Relay compaction (§15.F).
 
