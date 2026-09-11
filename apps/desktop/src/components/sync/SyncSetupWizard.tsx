@@ -458,7 +458,7 @@ function ServerStep({ onBack, onNext }: { onBack: () => void; onNext: () => void
 // --- Account -----------------------------------------------------------------------
 
 type AccountMode = "sign-in" | "create";
-type SignInPhase = "email" | "password" | "recovery" | "salt-mismatch";
+type SignInPhase = "email" | "password" | "recovery" | "salt-mismatch" | "set-password";
 type CreatePhase = "credentials" | "recovery" | "confirm";
 
 /**
@@ -488,6 +488,11 @@ function AccountStep({
   const [password, setPassword] = useState("");
   const [confirmPw, setConfirmPw] = useState("");
   const [recoveryCode, setRecoveryCode] = useState("");
+  // After a recovery-code sign-in: the status to hand on once the user has (or has
+  // declined) setting a new password, and the new-password fields.
+  const [recoveredStatus, setRecoveredStatus] = useState<SyncStatus | null>(null);
+  const [newPw, setNewPw] = useState("");
+  const [newPw2, setNewPw2] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -544,8 +549,21 @@ function AccountStep({
       const status = await syncCommands.recover(serverUrl, email, recoveryCode);
       setSyncStatus(status);
       toast.success("Recovered — you're signed in on this device.");
-      onSignedIn(status);
+      // The forgotten password still works until it is changed; offer that now, while
+      // the relay's 15-minute recovery window waives the current-password check.
+      setRecoveredStatus(status);
+      setSignInPhase("set-password");
     });
+  const newPwValid = newPw.length >= 8 && newPw === newPw2;
+  const setNewPassword = () =>
+    run(async () => {
+      await syncCommands.changePassword(null, newPw);
+      toast.success("Password changed.");
+      if (recoveredStatus) onSignedIn(recoveredStatus);
+    });
+  const keepOldPassword = () => {
+    if (recoveredStatus) onSignedIn(recoveredStatus);
+  };
 
   // --- create ---
   const passwordLongEnough = password.length >= 8;
@@ -579,6 +597,66 @@ function AccountStep({
     });
 
   // --- render ---
+  if (mode === "sign-in" && signInPhase === "set-password") {
+    return (
+      <div className="flex flex-col">
+        <StepIcon>
+          <KeyRound />
+        </StepIcon>
+        <StepHeading title="Set a new password">
+          You're back in. The old password still works until you change it, so
+          choose a new one now — or keep it if you remember it.
+        </StepHeading>
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <Label htmlFor="wizard-set-password" className="text-xs text-muted-foreground">
+              New password
+            </Label>
+            <Input
+              id="wizard-set-password"
+              autoFocus
+              type="password"
+              autoComplete="new-password"
+              value={newPw}
+              onChange={(e) => setNewPw(e.target.value)}
+              className="h-9"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="wizard-set-password-2" className="text-xs text-muted-foreground">
+              Confirm new password
+            </Label>
+            <Input
+              id="wizard-set-password-2"
+              type="password"
+              autoComplete="new-password"
+              value={newPw2}
+              onChange={(e) => setNewPw2(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && newPwValid && setNewPassword()}
+              className="h-9"
+            />
+            {newPw && newPw.length < 8 && (
+              <p className="text-[11px] text-muted-foreground">At least 8 characters.</p>
+            )}
+            {newPw2 && newPw !== newPw2 && (
+              <p className="text-[11px] text-destructive">Passwords don't match.</p>
+            )}
+          </div>
+          <ErrorLine error={error} />
+        </div>
+        <div className="mt-auto space-y-2 pt-4">
+          <Button className="w-full" disabled={!newPwValid || busy} onClick={setNewPassword}>
+            {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+            Change password
+          </Button>
+          <Button variant="ghost" className="w-full" disabled={busy} onClick={keepOldPassword}>
+            Keep my current password
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   if (mode === "sign-in" && signInPhase === "salt-mismatch") {
     return (
       <div className="flex flex-col">

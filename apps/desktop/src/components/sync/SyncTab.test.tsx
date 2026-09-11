@@ -292,6 +292,33 @@ describe("SyncTab — on", () => {
     );
   });
 
+  it("Change password asks for the current password and calls the command", async () => {
+    setup({ email: "user@example.com", status: makeStatus({ roster: [SELF] }) });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "sync_change_password" ? undefined : makeStatus({ roster: [SELF] }),
+    );
+    render(<SyncTab />);
+    await userEvent.click(screen.getByRole("button", { name: "Change password" }));
+    const dialog = screen.getByRole("dialog");
+    const submit = within(dialog).getByRole("button", { name: "Change password" });
+    expect(submit).toBeDisabled();
+    await userEvent.type(within(dialog).getByLabelText("Current password"), "old-secret");
+    await userEvent.type(within(dialog).getByLabelText("New password"), "new-secret-1");
+    await userEvent.type(within(dialog).getByLabelText("Confirm new password"), "new-secret-2");
+    expect(within(dialog).getByText("Passwords don't match.")).toBeInTheDocument();
+    expect(submit).toBeDisabled();
+    await userEvent.clear(within(dialog).getByLabelText("Confirm new password"));
+    await userEvent.type(within(dialog).getByLabelText("Confirm new password"), "new-secret-1");
+    await userEvent.click(submit);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("sync_change_password", {
+        currentPassword: "old-secret",
+        newPassword: "new-secret-1",
+      }),
+    );
+  });
+
   it("surfaces a verbatim connection error under the heading", () => {
     setup({
       email: "user@example.com",

@@ -251,6 +251,12 @@ export const syncCommands = {
   ): Promise<SyncStatus> =>
     invoke("sync_recover", { serverUrl, email, recoveryCode }),
 
+  /** Change the account password (CRYPTO_SPEC §4.3 / A9). `currentPassword` is required
+   *  unless this device signed in with the recovery code in the last 15 minutes. The salt,
+   *  vault key and tokens are unchanged; other devices are unaffected. */
+  changePassword: (currentPassword: string | null, newPassword: string): Promise<void> =>
+    invoke("sync_change_password", { currentPassword, newPassword }),
+
   /** Enable sync: run crr_migrate ONCE against a `.backup` COPY of the live DB,
    *  gated on SYNC_SCHEMA_VERSION, then start the drain. Long-running;
    *  drives the "preparing your library for sync" state. */

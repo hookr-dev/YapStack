@@ -59,9 +59,10 @@ use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
 use yapstack_common::auth::{
-    DeviceInfo, DevicesResponse, LoginBeginRequest, LoginBeginResponse, LoginFinishRequest,
-    LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest, RosterEnvelope,
-    RosterFetchResponse, RosterUploadRequest, RosterUploadResponse, SignupRequest, TokenResponse,
+    ChangePasswordRequest, DeviceInfo, DevicesResponse, LoginBeginRequest, LoginBeginResponse,
+    LoginFinishRequest, LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest,
+    RosterEnvelope, RosterFetchResponse, RosterUploadRequest, RosterUploadResponse, SignupRequest,
+    TokenResponse,
 };
 use yapstack_sync::crypto::ChangesetCipher;
 use yapstack_sync::transport::SyncTransport;
@@ -6346,6 +6347,99 @@ pub async fn sync_recover(
     }
 
     Ok(build_status_dto(&session).await)
+}
+
+/// Change the account password (CRYPTO_SPEC §4.3 as amended by A9). Re-derives the
+/// auth/master split from the NEW password under the account's EXISTING `salt_enc` (so
+/// every known device's C3 salt baseline stays valid), re-wraps the vault key under the
+/// new master key, and uploads the new second-hash input + wrap. `current_password` is
+/// required for re-authentication except within 15 minutes of a recovery-code sign-in
+/// (the forgotten-password case). Nothing changes locally: the salt, vault key and
+/// tokens are all unchanged. NEVER sends the password / master_key / vault_key.
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_change_password(
+    current_password: Option<String>,
+    new_password: String,
+) -> Result<(), String> {
+    let session = load_session()?.ok_or_else(|| "Sign in first.".to_string())?;
+    let salt_b64 = session
+        .salt_enc_b64
+        .clone()
+        .ok_or_else(|| "This session has no cached salt — sign in again first.".to_string())?;
+    let salt_enc = B64
+        .decode(salt_b64.as_bytes())
+        .map_err(|_| "corrupt cached salt".to_string())?;
+    let vault_key = session.vault_key()?;
+
+    let stretch = yapstack_crypto::kdf::client_stretch(new_password.as_bytes(), &salt_enc)
+        .map_err(|e| e.to_string())?;
+    let (auth_key, master_key_v) = yapstack_crypto::kdf::split_keys(&stretch);
+    let master_key: [u8; 32] = master_key_v
+        .as_slice()
+        .try_into()
+        .map_err(|_| "master_key length".to_string())?;
+    let wrapped_pw = wrap_vault_key(&master_key, &vault_key, WRAP_VAULT_PW_DOMAIN)?;
+
+    let current_auth_key = match current_password {
+        Some(cur) => {
+            let s = yapstack_crypto::kdf::client_stretch(cur.as_bytes(), &salt_enc)
+                .map_err(|e| e.to_string())?;
+            let (cur_auth, _) = yapstack_crypto::kdf::split_keys(&s);
+            Some(B64.encode(cur_auth))
+        }
+        None => None,
+    };
+
+    let url = format!("{}/auth/password", base_url(&session.server_url));
+    let body = ChangePasswordRequest {
+        current_auth_key: current_auth_key.clone(),
+        auth_key: B64.encode(auth_key),
+        wrapped_vault_key_password: B64.encode(&wrapped_pw),
+    };
+    let send = |bearer: String| {
+        let url = url.clone();
+        let body = body.clone();
+        async move {
+            reqwest::Client::new()
+                .put(&url)
+                .bearer_auth(bearer)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let mut resp = send(session.bearer.clone()).await?;
+    // A 401 may be a STALE BEARER (the wizard runs before any drain exists to rotate it;
+    // the Account row may sit idle past the access TTL): refresh once and retry, so the
+    // residual 401 below can honestly be attributed to the credential, not the token.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if let Ok(fresh) = refresh_access_token().await {
+            resp = send(fresh).await?;
+        }
+    }
+    let status = resp.status();
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED if current_auth_key.is_some() => {
+            Err("The current password is incorrect.".to_string())
+        }
+        reqwest::StatusCode::UNAUTHORIZED => Err(
+            "The 15-minute window after a recovery sign-in has passed. Sign in with your \
+             recovery code again to set a new password, or enter your current password."
+                .to_string(),
+        ),
+        reqwest::StatusCode::FORBIDDEN => Err(
+            "This device isn't approved yet. Approve it from another device, then change \
+             the password from Settings → Sync."
+                .to_string(),
+        ),
+        s if !s.is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!("relay error {}: {}", s.as_u16(), body.trim()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Approve a pending device (§7.5 step 3/4). The human has already compared the

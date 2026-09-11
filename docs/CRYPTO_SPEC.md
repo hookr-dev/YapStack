@@ -438,13 +438,45 @@ under vault-key generation N cannot be silently reinterpreted under generation N
 > before any segment is decrypted**. As with every wrapped key, `version` is the first AAD
 > field (C1).
 
-### 4.3 Password change (LOCKED)
+### 4.3 Password change (LOCKED, amended by A9)
 
-Re-derive `master_key'` from the new password + a **fresh `salt_enc'`**, re-wrap
-**only** `vault_key` under `master_key'`, upload `{new auth_key, salt_enc',
-wrapped_vault_key_password'}`. **No content is re-encrypted.** The recovery wrap is
-untouched. Server updates `verifier`, `server_salt`, `salt_enc`, and the password
-wrap atomically.
+Re-derive `master_key'` from the new password, re-wrap **only** `vault_key` under
+`master_key'`, upload `{new auth_key, wrapped_vault_key_password'}`. **No content is
+re-encrypted.** The recovery wrap is untouched. Server updates `verifier`, a fresh
+`server_salt`, and the password wrap atomically.
+
+> **A9 — `salt_enc` is RETAINED across a password change (amendment, owner-ratified
+> 2026-09-10; implemented the same day).** The original text called for a fresh
+> `salt_enc'`. That collides with C3 (§2.1/§3.2): every known device caches the
+> account's `salt_enc` as its anti-substitution baseline and MUST hard-stop when the
+> served salt differs, so a fresh salt would turn the next sign-in on every other device
+> into a false "hostile relay" alarm, and there is no relay-independent channel to
+> distribute a new salt. The salt's purpose is cross-user precomputation resistance, not
+> separation between two passwords of one account; reusing it across a password change
+> costs nothing (Argon2id over a different password under the same salt is an
+> independent stretch). Therefore: the client stretches the NEW password under the
+> EXISTING `salt_enc`, the server keeps `salt_enc` and replaces only `verifier` (fresh
+> `server_salt`) and the password wrap, and every device's C3 baseline stays valid.
+>
+> **Authorization (`PUT /auth/password`).** The caller must be an ACTIVE device (§7.5
+> write gate) and must EITHER re-authenticate by presenting the current `auth_key`
+> (constant-time verified against the stored verifier — a stolen 15-minute access token
+> alone cannot change the password) OR have authenticated with the recovery code on that
+> device within the last 15 minutes (`devices.recovered_at`, stamped by `/auth/recover`,
+> consumed atomically by the change — the forgotten-password case, where no current key
+> exists). The endpoint is throttled on the authenticated per-(tenant, IP) bucket because it
+> runs the server Argon2id.
+>
+> **What a password change does and does not do.** It stops future logins with the old
+> password and makes the old password wrap useless in any future DB dump. It also revokes
+> every OTHER device's refresh-token families, so a device enrolled with the leaked
+> password loses relay access at that moment and every legitimate device is asked to sign
+> in again with the new password. It is **not** cryptographic eviction: a device that
+> already unwrapped `vault_key` keeps what it holds (E2E cannot take that back) and keeps
+> its local data; removing its roster membership is §7.5's device-removal flow and
+> retiring its key is §4.4 rotation. Residual: the 15-minute recovery waiver stays armed
+> on the recovering device if the user declines to set a password; only a token stolen
+> from that very device (which already holds the vault key) could use it.
 
 ### 4.4 Vault-key rotation (LOCKED — flow specified even though the UI ships later)
 

@@ -1054,6 +1054,255 @@ async fn recovery_cannot_arm_a_grant_on_another_accounts_device() {
     assert!(grant.is_none(), "victim row must not be armed");
 }
 
+/// CRYPTO_SPEC §4.3 / A9: `PUT /auth/password` replaces the verifier (fresh server salt)
+/// and the password wrap while RETAINING `salt_enc`; it requires the current auth key
+/// unless the caller recovered with the code in the last 15 minutes; a pending device
+/// is refused.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn change_password_requires_reauth_or_fresh_recovery_and_keeps_salt() {
+    let st = setup().await;
+    let pool = st.pool.clone();
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x27u8; 16];
+    let old_auth = client_auth_key("old horse battery staple", &salt_enc);
+    let new_auth = client_auth_key("new horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &old_auth, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let signup = body_json(resp).await;
+    let active_access = signup["access_token"].as_str().unwrap().to_string();
+    let first_refresh = signup["refresh_token"].as_str().unwrap().to_string();
+    let new_wrap = B64.encode([0x02u8; 105]);
+    let body = |current: Option<&str>| {
+        json!({
+            "current_auth_key": current,
+            "auth_key": new_auth,
+            "wrapped_vault_key_password": new_wrap
+        })
+    };
+
+    // No current key, no recent recovery → 401. Wrong current key → 401.
+    let resp = put_auth(&app, "/auth/password", &active_access, body(None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let wrong = client_auth_key("wrong", &salt_enc);
+    let resp = put_auth(&app, "/auth/password", &active_access, body(Some(&wrong))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Malformed material → 400 (never brick password login with a truncated wrap).
+    let resp = put_auth(
+        &app,
+        "/auth/password",
+        &active_access,
+        json!({
+            "current_auth_key": old_auth,
+            "auth_key": new_auth,
+            "wrapped_vault_key_password": B64.encode([0u8; 20])
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A PENDING device (password login, unapproved) → 403 even with the right key.
+    let (_p, pending_access) = enroll_pending(&app, &email, &old_auth).await;
+    let resp = put_auth(
+        &app,
+        "/auth/password",
+        &pending_access,
+        body(Some(&old_auth)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // A second ACTIVE session holds a refresh family that the change will revoke.
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({ "email": email, "auth_key": old_auth }),
+    )
+    .await;
+    let other_refresh = body_json(resp).await["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (old_server_salt,): (Vec<u8>,) = sqlx::query_as(
+        "SELECT u.server_salt FROM yapstack_lookup_login($1) l JOIN users u ON u.id = l.user_id",
+    )
+    .bind(&email)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Correct current key → OK. Old login fails, new login works and serves the NEW wrap
+    // under the SAME salt_enc.
+    let resp = put_auth(
+        &app,
+        "/auth/password",
+        &active_access,
+        body(Some(&old_auth)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({ "email": email, "auth_key": old_auth }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "old password dead");
+    let resp = post(&app, "/auth/login/begin", json!({ "email": email })).await;
+    assert_eq!(
+        body_json(resp).await["salt_enc"],
+        json!(B64.encode(salt_enc)),
+        "salt_enc retained (A9)"
+    );
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({ "email": email, "auth_key": new_auth }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "new password works");
+    assert_eq!(
+        body_json(resp).await["wrapped_vault_key_password"],
+        json!(new_wrap)
+    );
+    // server_salt rotated; the OTHER session's refresh family is revoked; the caller's
+    // own family survives.
+    let (new_server_salt,): (Vec<u8>,) = sqlx::query_as(
+        "SELECT u.server_salt FROM yapstack_lookup_login($1) l JOIN users u ON u.id = l.user_id",
+    )
+    .bind(&email)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(old_server_salt, new_server_salt, "server_salt rotated");
+    let resp = post(
+        &app,
+        "/auth/refresh",
+        json!({ "refresh_token": other_refresh }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "other device's family revoked"
+    );
+    let resp = post(
+        &app,
+        "/auth/refresh",
+        json!({ "refresh_token": first_refresh }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "caller's own family kept");
+
+    // Recovery on a fresh device, then a change WITHOUT the current key.
+    let rec_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": email,
+            "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": rec_client,
+            "ed25519_pub": B64.encode([0x0Bu8; 32]),
+            "label": "replacement"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rec_access = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let newer_auth = client_auth_key("newer horse battery staple", &salt_enc);
+    let body2 = json!({ "auth_key": newer_auth, "wrapped_vault_key_password": new_wrap });
+    // Still PENDING (before the A7 roster re-bootstrap) → 403 even with the fresh waiver.
+    let resp = put_auth(&app, "/auth/password", &rec_access, body2.clone()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "pending recovering device"
+    );
+    // The recovering device re-bootstraps the roster (A7) and becomes active.
+    let (roster, sig) = signed_roster(&[0x33u8; 32], 1, 0);
+    let resp = put_auth(
+        &app,
+        "/devices/roster",
+        &rec_access,
+        json!({
+            "device_list": roster, "signature": sig, "counter": 1, "vault_key_epoch": 0,
+            "active_devices": [first_client, rec_client]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Fresh waiver + a WRONG current key → 401 (a presented key is always checked).
+    let resp = put_auth(
+        &app,
+        "/auth/password",
+        &rec_access,
+        json!({
+            "current_auth_key": wrong,
+            "auth_key": newer_auth,
+            "wrapped_vault_key_password": new_wrap
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The waiver is PER DEVICE: the first device's active token cannot use it. (Its
+    // access token is still valid — only refresh families were revoked.)
+    let resp = put_auth(&app, "/auth/password", &active_access, body2.clone()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "waiver is per device"
+    );
+    // An EXPIRED waiver (backdated) → 401; a fresh one → OK once; then single-use → 401.
+    let (ws,): (uuid::Uuid,) = sqlx::query_as("SELECT workspace_id FROM yapstack_lookup_login($1)")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    async fn backdate(pool: &sqlx::PgPool, ws: uuid::Uuid, client: uuid::Uuid, when: &str) {
+        let mut tx = yapstack_server::db::begin_tenant_tx(pool, ws)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE devices SET recovered_at = now() - interval '{when}' \
+             WHERE workspace_id = $1 AND client_id = $2"
+        ))
+        .bind(ws)
+        .bind(client)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    backdate(&pool, ws, rec_client, "16 minutes").await;
+    let resp = put_auth(&app, "/auth/password", &rec_access, body2.clone()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "expired waiver");
+    backdate(&pool, ws, rec_client, "1 minute").await;
+    let resp = put_auth(&app, "/auth/password", &rec_access, body2.clone()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "recent recovery waives the current key"
+    );
+    let resp = put_auth(&app, "/auth/password", &rec_access, body2).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "waiver is single-use"
+    );
+}
+
 // =====================================================================================
 // PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
 //   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"

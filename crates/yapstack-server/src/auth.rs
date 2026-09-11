@@ -23,13 +23,14 @@ use zeroize::Zeroizing;
 // second-hash verifier, decoy salt, two-round login, JWT rotation/reuse — is
 // unchanged; only the DTO's home moved.
 use yapstack_common::auth::{
-    LoginBeginRequest, LoginBeginResponse, LoginFinishRequest, LoginFinishResponse, RecoverRequest,
-    RecoverResponse, RefreshRequest, SignupRequest, TokenResponse,
+    ChangePasswordRequest, LoginBeginRequest, LoginBeginResponse, LoginFinishRequest,
+    LoginFinishResponse, RecoverRequest, RecoverResponse, RefreshRequest, SignupRequest,
+    TokenResponse,
 };
 
 use crate::db;
 use crate::error::AppError;
-use crate::extract::ClientIp;
+use crate::extract::{AuthTenant, ClientIp};
 use crate::jwt::REFRESH_TTL_SECS;
 use crate::state::AppState;
 
@@ -439,9 +440,11 @@ pub async fn recover(
         }
         let armed = sqlx::query(
             "INSERT INTO devices \
-             (client_id, workspace_id, user_id, ed25519_pub, label, platform, status, recovery_grant_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', now()) \
-             ON CONFLICT (client_id) DO UPDATE SET recovery_grant_at = now() \
+             (client_id, workspace_id, user_id, ed25519_pub, label, platform, status, \
+              recovery_grant_at, recovered_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', now(), now()) \
+             ON CONFLICT (client_id) DO UPDATE \
+             SET recovery_grant_at = now(), recovered_at = now() \
              WHERE devices.workspace_id = EXCLUDED.workspace_id \
                AND devices.user_id = EXCLUDED.user_id",
         )
@@ -476,6 +479,132 @@ pub async fn recover(
         device_list,
         signature,
     }))
+}
+
+// ------------------------------------------------------------- change password
+
+/// `PUT /auth/password` — CRYPTO_SPEC §4.3 as amended by A9: the account's `salt_enc` is
+/// RETAINED; the relay atomically replaces the password verifier (fresh `server_salt`) and
+/// the password wrap of the vault key. Nothing else changes: the recovery wrap, the
+/// roster, other devices' sessions. Authorization: an ACTIVE caller device that either
+/// re-authenticates with its current `auth_key` or recovered with the recovery code in the
+/// last 15 minutes (`devices.recovered_at`). Throttled per (tenant, IP) on the
+/// authenticated bucket (it runs Argon2, but the caller already holds a valid token, so
+/// the unauthenticated login bucket's tighter budget would only punish legitimate use).
+pub async fn change_password(
+    State(st): State<AppState>,
+    auth: AuthTenant,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !st.ratelimit.check(auth.tenant_id, &ip) {
+        return Err(AppError::RateLimited);
+    }
+    let new_auth_key = Zeroizing::new(b64_decode("auth_key", &req.auth_key)?);
+    let new_wrap = b64_decode(
+        "wrapped_vault_key_password",
+        &req.wrapped_vault_key_password,
+    )?;
+    // Shape checks so a buggy client cannot brick password login with truncated material:
+    // `auth_key` is a 32-byte HKDF output (§2.3); the wrap is a committing envelope of a
+    // 32-byte key = 1 + 32 + 24 + 32 + 16 bytes (§1.3/§4.2).
+    if new_auth_key.len() != 32 {
+        return Err(AppError::BadRequest("auth_key: expected 32 bytes".into()));
+    }
+    if new_wrap.len() != 105 {
+        return Err(AppError::BadRequest(
+            "wrapped_vault_key_password: expected a 105-byte committing envelope".into(),
+        ));
+    }
+    let current = req
+        .current_auth_key
+        .as_deref()
+        .map(|s| b64_decode("current_auth_key", s).map(Zeroizing::new))
+        .transpose()?;
+
+    let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+    crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
+
+    // The user row is looked up by the token's `sub` (server-validated), never by email,
+    // and LOCKED so two concurrent changes serialise on the verifier they check against.
+    let row: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT verifier, server_salt FROM users WHERE id = $1 FOR UPDATE")
+            .bind(auth.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((verifier, server_salt)) = row else {
+        return Err(AppError::Unauthorized);
+    };
+
+    match current {
+        // Re-authentication: the presented current key must verify (constant time).
+        Some(cur) => {
+            let computed = st.server_verifier(cur, server_salt).await?;
+            if !ct_eq(&computed, &verifier) {
+                return Err(AppError::Unauthorized);
+            }
+        }
+        // Forgotten password: only a device that recovered with the code just now may
+        // skip re-authentication. The consume IS the check — one UPDATE that clears the
+        // stamp only while it is fresh — so the waiver is single-use even under two
+        // concurrent keyless calls (the second finds it already cleared).
+        None => {
+            let consumed = sqlx::query(
+                "UPDATE devices SET recovered_at = NULL \
+                 WHERE workspace_id = $1 AND client_id = $2 \
+                   AND recovered_at IS NOT NULL \
+                   AND recovered_at > now() - interval '15 minutes'",
+            )
+            .bind(auth.tenant_id)
+            .bind(auth.client_id)
+            .execute(&mut *tx)
+            .await?;
+            if consumed.rows_affected() != 1 {
+                return Err(AppError::Unauthorized);
+            }
+        }
+    }
+
+    // New second hash under a FRESH server salt; the new auth key is discarded after.
+    let new_server_salt = gen_salt();
+    let new_verifier = st
+        .server_verifier(new_auth_key, new_server_salt.to_vec())
+        .await?;
+    sqlx::query(
+        "UPDATE users SET verifier = $2, server_salt = $3, wrapped_vault_key_password = $4 \
+         WHERE id = $1",
+    )
+    .bind(auth.user_id)
+    .bind(new_verifier.as_slice())
+    .bind(new_server_salt.as_slice())
+    .bind(&new_wrap)
+    .execute(&mut *tx)
+    .await?;
+    // A password change is the one lever the owner has against a device enrolled with
+    // the OLD password (device removal and vault-key rotation are later slices): revoke
+    // every OTHER device's refresh families so they must sign in again — with the new
+    // password. Devices that already unwrapped the vault key keep what they hold (E2E
+    // cannot take that back); what they lose is continued relay access. The caller's own
+    // family is kept so the change does not sign this device out. A re-authenticated
+    // caller's own waiver is also cleared (a stale stamp never outlives a change).
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked = true \
+         WHERE workspace_id = $1 AND client_id IS DISTINCT FROM $2 AND NOT revoked",
+    )
+    .bind(auth.tenant_id)
+    .bind(auth.client_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE devices SET recovered_at = NULL \
+         WHERE workspace_id = $1 AND client_id = $2 AND recovered_at IS NOT NULL",
+    )
+    .bind(auth.tenant_id)
+    .bind(auth.client_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 // --------------------------------------------------------------------- refresh

@@ -224,6 +224,44 @@ describe("SyncSetupWizard — sign in", () => {
     expect(within(dialog()).getByText(/On Work Laptop, open Settings/)).toBeInTheDocument();
   });
 
+  it("after a recovery sign-in, offers a new password before moving on", async () => {
+    const { dialog } = atAccount();
+    await userEvent.click(within(dialog()).getByRole("button", { name: /Continue/ }));
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "sync_login_begin") return { saltMismatch: false };
+      if (cmd === "sync_recover") return makeStatus({ roster: [SELF, PEER] });
+      if (cmd === "sync_change_password") return undefined;
+      return null;
+    });
+    await userEvent.type(within(dialog()).getByLabelText("Email"), "user@example.com");
+    await userEvent.click(within(dialog()).getByRole("button", { name: /Continue/ }));
+    await userEvent.click(
+      await within(dialog()).findByRole("button", { name: /Forgot your password/ }),
+    );
+    await userEvent.type(
+      within(dialog()).getByLabelText("Recovery code"),
+      "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ23-4567",
+    );
+    await userEvent.click(within(dialog()).getByRole("button", { name: /Recover/ }));
+    expect(await within(dialog()).findByText("Set a new password")).toBeInTheDocument();
+    await userEvent.type(within(dialog()).getByLabelText("New password"), "fresh-secret-1");
+    await userEvent.type(
+      within(dialog()).getByLabelText("Confirm new password"),
+      "fresh-secret-1",
+    );
+    await userEvent.click(within(dialog()).getByRole("button", { name: "Change password" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("sync_change_password", {
+        currentPassword: null,
+        newPassword: "fresh-secret-1",
+      }),
+    );
+    // Recovered as an approved member → lands on turn-on.
+    expect(
+      await within(dialog()).findByRole("heading", { name: "Turn on sync" }),
+    ).toBeInTheDocument();
+  });
+
   it("hard-stops on a salt mismatch and never shows the password field", async () => {
     const { dialog } = atAccount();
     await userEvent.click(within(dialog()).getByRole("button", { name: /Continue/ }));

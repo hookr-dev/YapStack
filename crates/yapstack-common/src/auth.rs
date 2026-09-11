@@ -185,6 +185,29 @@ pub struct RecoverResponse {
     pub signature: Option<String>,
 }
 
+// ------------------------------------------------------------- change password
+
+/// `PUT /auth/password` (CRYPTO_SPEC §4.3 as amended by A9). The client re-derives
+/// `auth_key'`/`master_key'` from the NEW password under the account's EXISTING
+/// `salt_enc` (A9: the salt is retained so every known device's C3 baseline stays valid),
+/// re-wraps the vault key under `master_key'`, and uploads the new second-hash input plus
+/// the new wrap. No content is re-encrypted; other devices are unaffected.
+///
+/// Authorization: the caller must be an ACTIVE device, and must EITHER present the
+/// `current_auth_key` (re-authentication — a stolen 15-minute access token alone cannot
+/// change the password) OR have signed in with the recovery code within the last 15
+/// minutes (the forgotten-password case, where no current key exists to present).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    /// base64 of the CURRENT `auth_key`; required unless the caller recovered recently.
+    #[serde(default)]
+    pub current_auth_key: Option<String>,
+    /// base64 of the NEW `auth_key` (§2.3). Second-hashed and discarded like at signup.
+    pub auth_key: String,
+    /// The vault key re-wrapped under the NEW `master_key` (committing envelope, §4.2).
+    pub wrapped_vault_key_password: String,
+}
+
 // --------------------------------------------------------------------- devices
 
 /// One device as seen by the relay's advisory device index (§7.5). `status` is a UI

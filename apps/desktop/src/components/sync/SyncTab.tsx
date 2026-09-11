@@ -3,10 +3,20 @@ import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -304,6 +314,8 @@ export function SyncTab() {
           <Label className="text-xs">Account</Label>
           <p className="text-[10px] text-muted-foreground">{status.email}</p>
         </div>
+        <div className="flex items-center gap-1">
+        <ChangePasswordDialog />
         <AlertDialog>
           <AlertDialogTrigger asChild>
             <Button size="sm" variant="ghost" className="text-xs">
@@ -327,6 +339,7 @@ export function SyncTab() {
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+        </div>
       </div>
 
       {wizardEl}
@@ -724,5 +737,126 @@ function DownloadedAudioRow() {
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+}
+
+/**
+ * Change the account password from the Account row (CRYPTO_SPEC §4.3 / A9). Asks for
+ * the current password (re-authentication) and the new one twice. Nothing else changes:
+ * the encryption key, this device's sign-in, and other devices are unaffected.
+ */
+function ChangePasswordDialog() {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [next2, setNext2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const valid = current.length > 0 && next.length >= 8 && next === next2;
+  const reset = () => {
+    setCurrent("");
+    setNext("");
+    setNext2("");
+    setError(null);
+  };
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await syncCommands.changePassword(current, next);
+      toast.success("Password changed.");
+      setOpen(false);
+      reset();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (busy) return;
+        setOpen(o);
+        if (!o) reset();
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button size="sm" variant="ghost" className="text-xs">
+          Change password
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Change password</DialogTitle>
+          <DialogDescription>
+            Your other devices will ask you to sign in again with the new password.
+            Your encryption key and your notes are untouched. If you've forgotten the
+            current password, sign out and use your recovery code.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <Label htmlFor="pw-current" className="text-xs text-muted-foreground">
+              Current password
+            </Label>
+            <Input
+              id="pw-current"
+              autoFocus
+              type="password"
+              autoComplete="current-password"
+              value={current}
+              onChange={(e) => setCurrent(e.target.value)}
+              className="h-9"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="pw-next" className="text-xs text-muted-foreground">
+              New password
+            </Label>
+            <Input
+              id="pw-next"
+              type="password"
+              autoComplete="new-password"
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              className="h-9"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="pw-next-2" className="text-xs text-muted-foreground">
+              Confirm new password
+            </Label>
+            <Input
+              id="pw-next-2"
+              type="password"
+              autoComplete="new-password"
+              value={next2}
+              onChange={(e) => setNext2(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && valid && void submit()}
+              className="h-9"
+            />
+            {next2 && next !== next2 && (
+              <p className="text-[11px] text-destructive">Passwords don't match.</p>
+            )}
+          </div>
+          {error && (
+            <p role="alert" className="text-[11px] text-destructive">
+              {error}
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => setOpen(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={!valid || busy} onClick={() => void submit()}>
+            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Change password
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

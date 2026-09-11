@@ -61,7 +61,7 @@
 | Sign out (keeps the account anchor so re-sign-in is not TOFU); change server (= sign out) | Shipped | `sync_sign_out` |
 | Forget an account on this device (clears the anchor) | Command only, no UI | `sync_forget_account` |
 | Turn sync **off** while staying signed in | **Not available**; ratified to build (§15.E) | — |
-| Change password | **Not built**; ratified to build (§15.C) | — |
+| Change password (from Account, or offered right after a recovery sign-in) | Shipped | `sync_change_password`, CRYPTO_SPEC §4.3 + A9 |
 | Remove or revoke a device | **Not built**; ratified to build (§15.D) | — |
 | Regenerate the recovery code; rotate the vault key | **Not built** | — |
 | Sync settings or AI connection keys across devices | **Not built**; not planned (§4.5, §15.H) | — |
@@ -284,7 +284,24 @@ from the anchored one at the same counter; a brand-new install is TOFU-grade her
 ships (§15.C). Against an older relay that does not enrol on recovery, the client skips
 the upload and `sync_enable` refuses the unenrolled session with an explicit message.
 
-### 5.6 Tokens
+### 5.6 Password change
+
+`sync_change_password(current_password?, new_password)` stretches the new password
+under the account's **existing** `salt_enc` (CRYPTO_SPEC A9, so every known device's
+salt baseline stays valid), re-wraps the vault key under the new master key, and calls
+`PUT /auth/password`. The relay requires an active device and either the current
+`auth_key` or a recovery-code sign-in on that device within the last 15 minutes (a
+single-use waiver, consumed atomically), then atomically replaces the verifier (fresh
+server salt) and the password wrap **and revokes every other device's refresh
+families** — a device enrolled with the leaked password loses relay access, and every
+legitimate device shows "Sign in again" and re-authenticates with the new password (its
+vault key and local data are untouched). Nothing changes on the calling device. The
+client refreshes its token once on a 401 before attributing the failure to the
+credential, and maps 403 to "approve this device first". Offered in the wizard
+immediately after a recovery sign-in ("Set a new password", skippable) and from the
+Account row ("Change password", asks for the current password).
+
+### 5.7 Tokens
 
 Access JWT 15 min, refresh JWT 30 days, per-device families with rotation and reuse
 detection (a spent token presented again revokes the family, serialised with `FOR
@@ -293,7 +310,7 @@ persisting the rotated pair **before** using it. A rejected refresh strips the
 credentials but keeps the session record, so the UI lands on "Sign in again" rather
 than "off". The audio lane never refreshes; it reloads the persisted bearer.
 
-### 5.7 Sign-out, change server, forget
+### 5.8 Sign-out, change server, forget
 
 - **Sign out**: stops all lanes off the event loop, deletes the session entry, keeps
   the identity and the account anchor, leaves the database CRR-prepared and its
@@ -464,6 +481,7 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /auth/login/begin` | none | `salt_enc` or a peppered decoy |
 | `POST /auth/login/finish` | none; per-IP 10/min | verifier check; enrol unknown device pending; tokens + wraps + roster |
 | `POST /auth/refresh` | refresh JWT | rotation + reuse detection |
+| `PUT /auth/password` | access JWT of an **active** device; per-(tenant, IP) 120/min; current `auth_key` or a recovery sign-in within 15 min | replaces verifier + password wrap, keeps `salt_enc` (A9) |
 | `POST /auth/recover` | none; per-IP | recovery verifier check; enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409); recovery wrap + roster; tokens bound to the device |
 | `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
@@ -484,7 +502,7 @@ Pull, audio GET and the roster GET are never gated.
 ### 9.2 Schema (migrations 0001–0009)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
-`devices` (pubkey, label, platform, `status` pending|active, one-shot `recovery_grant_at`, unused `state`
+`devices` (pubkey, label, platform, `status` pending|active, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `audio_blobs` (+ `released_at`),
@@ -679,11 +697,10 @@ The relay rejects `POST /sync/push` and `POST /audio/presign` when the token's
 `client_id` row is `pending`; `GET /sync/pull` and `GET /audio/part/{id}` stay open per
 §7.5 step 3. A stolen password alone can then no longer write to the relay. Pass scope.
 
-**C. Password change — DECIDED: build, second slice after the pass.** `PUT
-/auth/password` with the new `auth_key`, `salt_enc'` and `wrapped_vault_key_password'`,
-applied atomically with a fresh `server_salt` (CRYPTO_SPEC §4.3). The client
-re-derives, updates its anchor salt; other devices are unaffected (vault key
-unchanged). Offered after a recovery sign-in and from the Account row.
+**C. Password change — DONE (slice 2, CRYPTO_SPEC §4.3 + A9).** `PUT /auth/password`
+with the new `auth_key` and password wrap; `salt_enc` retained (A9) so every device's C3
+baseline survives; re-authentication with the current key, waived once within 15 minutes
+of a recovery sign-in. Offered after recovery and from the Account row.
 
 **D. Device removal — DECIDED: build, fourth slice.** The approver re-signs the roster
 without the device; the relay marks the row `revoked`, revokes its refresh families and
@@ -759,7 +776,7 @@ out of scope are listed in the pass commit message.
 **Feature slices after the pass, in order, each its own spec amendment + commit:**
 
 1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10.
-2. Password change (§15.C, CRYPTO_SPEC §4.3).
+2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10.
 3. Turn off sync (§15.E).
 4. Remove a device (§15.D).
 5. Relay compaction (§15.F).
