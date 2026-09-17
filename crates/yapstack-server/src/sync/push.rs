@@ -83,6 +83,8 @@ pub async fn push(
     // (unapproved) device's token — or a token with no device identity — is refused, so a
     // password alone can no longer write ciphertext into the tenant's stream.
     crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
+    // NOTE (SYNC_SPEC §15.L, follow-on): per-change `client_id` is NOT yet bound to the
+    // caller — an active device can push changes attributed to another in-tenant device.
 
     // (1) Bootstrap + (2) acquire the per-tenant push lock (held until commit).
     sqlx::query("INSERT INTO tenant_seq (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")

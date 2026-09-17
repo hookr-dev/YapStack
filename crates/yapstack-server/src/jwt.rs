@@ -22,7 +22,7 @@ pub struct AccessClaims {
     /// login/finish + refresh from server-validated state (the device authenticating
     /// IS the client), NEVER request-supplied — it lets a handler tell WHICH device is
     /// calling (e.g. gate `PUT /devices/roster` to an ACTIVE caller, §7.5). `Option`
-    /// because an older client may recover without presenting a device identity.
+    /// because a login/recover without a valid proof of possession (A10) binds no device.
     #[serde(default)]
     pub client_id: Option<Uuid>,
     pub typ: String, // "access"

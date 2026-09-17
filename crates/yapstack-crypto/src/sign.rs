@@ -36,6 +36,51 @@ pub fn verify_roster(
         .map_err(|_| CryptoError::Signature)
 }
 
+/// AAD-style domain for the login proof of possession (CRYPTO_SPEC §3.2 amendment A10).
+pub const LOGIN_POP_DOMAIN: &[u8] = b"yapstack.login.pop.v1";
+
+/// The canonical message a device signs to prove it holds its Ed25519 private key at
+/// login / recovery (A10): `LP(domain, nonce, client_id(16), ed25519_pub(32), email_lower)`.
+/// Binding the nonce defeats replay, the `client_id` + public key defeat identity
+/// substitution, and the lower-cased email pins the account the nonce was issued for.
+#[must_use]
+pub fn login_pop_message(
+    nonce: &[u8],
+    client_id: &[u8; 16],
+    ed25519_pub: &[u8; 32],
+    email_lower: &str,
+) -> Vec<u8> {
+    crate::aead::lp(&[
+        LOGIN_POP_DOMAIN,
+        nonce,
+        client_id,
+        ed25519_pub,
+        email_lower.as_bytes(),
+    ])
+}
+
+/// Sign the login proof with the device's 32-byte Ed25519 seed (§7.1).
+#[must_use]
+pub fn sign_login_pop(device_seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
+    SigningKey::from_bytes(device_seed).sign(message).to_bytes()
+}
+
+/// Verify a login proof against a 32-byte public key using strict verification (rejects
+/// non-canonical / small-order points, so a captured proof cannot be malleated).
+///
+/// # Errors
+/// [`CryptoError::Signature`] on an invalid public key or a bad signature.
+pub fn verify_login_pop(
+    public_key: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), CryptoError> {
+    let vk = VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::Signature)?;
+    let sig = Signature::from_bytes(signature);
+    vk.verify_strict(message, &sig)
+        .map_err(|_| CryptoError::Signature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +114,32 @@ mod tests {
             .verifying_key()
             .to_bytes();
         assert!(verify_roster(&other, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn login_pop_message_field_order_and_domain() {
+        // LP(domain, nonce, client_id, pub, email_lower) — a change in order or domain
+        // would silently break every client/relay pair, so pin the exact bytes.
+        let nonce = [0xAAu8; 4];
+        let cid = [0x11u8; 16];
+        let pk = [0x22u8; 32];
+        let m = login_pop_message(&nonce, &cid, &pk, "a@b.c");
+        let mut want = Vec::new();
+        for f in [LOGIN_POP_DOMAIN, &nonce[..], &cid[..], &pk[..], b"a@b.c"] {
+            want.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            want.extend_from_slice(f);
+        }
+        assert_eq!(m, want);
+        assert_eq!(
+            hex::encode(LOGIN_POP_DOMAIN),
+            "796170737461636b2e6c6f67696e2e706f702e7631"
+        );
+        let seed = [7u8; 32];
+        let sig = sign_login_pop(&seed, &m);
+        let pk_real = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert!(verify_login_pop(&pk_real, &m, &sig).is_ok());
+        let mut tampered = m.clone();
+        tampered[5] ^= 1;
+        assert!(verify_login_pop(&pk_real, &tampered, &sig).is_err());
     }
 }

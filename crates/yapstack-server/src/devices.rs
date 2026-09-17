@@ -118,7 +118,7 @@ pub async fn get_roster(
 /// The relay's write-authorization gate (§7.5 defense-in-depth): the caller — identified
 /// ONLY by the `client_id` bound into its access token — must have an `active` row in the
 /// tenant's device index. A PENDING (awaiting approval) device, an unknown device, or a
-/// token without a device identity (an older client recovering without one) is refused. Applied to every route
+/// token without a device identity (a login that carried no valid proof, A10) is refused. Applied to every route
 /// that writes on behalf of a device: `PUT /devices/roster`, `POST /sync/push`, and
 /// `POST /audio/presign` (SYNC_SPEC §15.B). Reads (`pull`, audio `GET`, the roster `GET`)
 /// are deliberately NOT gated — a pending device may still read (§7.5 step 3). The lookup

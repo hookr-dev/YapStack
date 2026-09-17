@@ -199,7 +199,7 @@ pub struct SyncInfoConfig {
 impl Default for SyncInfoConfig {
     fn default() -> Self {
         Self {
-            protocol_version: 1,
+            protocol_version: 2,
             min_client_version: "1.0.0".to_string(),
             engine_version: "0.16.3".to_string(),
             billing_url: None,
@@ -332,7 +332,7 @@ mod tests {
         "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         assert!(!cfg.limits_enabled());
-        assert_eq!(cfg.sync.protocol_version, 1);
+        assert_eq!(cfg.sync.protocol_version, 2);
         assert!(cfg.sync.billing_url.is_none());
         // GC section absent ⇒ defaults: on, 24h interval, 7d grace.
         assert!(cfg.gc.enabled);

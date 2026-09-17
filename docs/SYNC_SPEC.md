@@ -244,10 +244,16 @@ the wizard **stops** ("Stopped for your safety") and never collects the password
 first-time device accepts the served salt (TOFU, residual §3.3).
 
 `sync_login_finish(password)` derives `auth_key`, sends this device's `client_id`,
-Ed25519 public key, label and platform, receives tokens + the password wrap + the
-signed roster, unwraps the vault key, **verifies the roster signature and the counter
-against the cached floor**, and stores the session with `sync_enabled = false`. The
-relay enrolled an unknown device as `pending`; a known device is untouched.
+Ed25519 public key, label and platform **plus a proof of possession** — the
+`login/begin` nonce signed with the device key (CRYPTO_SPEC A10) — receives tokens +
+the password wrap + the signed roster, unwraps the vault key, **verifies the roster
+signature and the counter against the cached floor**, and stores the session with
+`sync_enabled = false`. The relay verifies the proof against the stored key for a known
+`client_id`, enrols an unknown device as `pending`, and leaves a known device untouched;
+without a valid proof the token binds no device and every write is refused. The client
+fails closed if the relay issues no nonce, refreshes a nonce older than 4 minutes
+transparently (re-checking the salt), and retries a 401 once before reporting
+"Incorrect password".
 
 ### 5.4 Approval ceremony
 
@@ -267,8 +273,8 @@ relay enrolled an unknown device as `pending`; a known device is untouched.
 
 ### 5.5 Recovery
 
-`sync_recover(server_url, email, code)` sends this device's identity with the
-recovery auth key, receives the recovery wrap, unwraps the vault key and verifies the
+`sync_recover(server_url, email, code)` fetches a nonce from `login/begin`, sends this
+device's identity and proof of possession (A10) with the recovery auth key, receives the recovery wrap, unwraps the vault key and verifies the
 served roster. If this device is **not a roster member** it admits itself (CRYPTO_SPEC
 A7): the verified membership is carried forward, this device is appended, the counter
 advances by exactly one at the same epoch, the roster is re-signed and uploaded. The
@@ -324,9 +330,8 @@ rotation, CRYPTO_SPEC §4.4, deferred). If whoever holds it knows the **password
 can sign in again and — because pending devices may pull — keep *reading* new changes
 until the password is changed (§5.6), which the Remove dialog says. A **compromised
 relay** can undo removal by flipping the row back (peers do not filter pulled changes by
-roster membership). And until login carries proof of possession (§15.K), a password
-holder can even mint a token for another device's `client_id`; removal does not help
-against that attacker.
+roster membership). Since A10, a password holder can no longer mint a token for another device's
+`client_id` (§15.K).
 
 ### 5.8 Tokens
 
@@ -512,15 +517,15 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `GET /health`, `GET /version` | none | liveness, build digest |
 | `GET /sync/info` | none | `protocol_version`, `min_client_version`, `engine_version`, optional `billing_url` — the probe sentinel |
 | `POST /auth/signup` | none; per-IP 5/min; optional `X-YapStack-Invite` | create user + workspace + first device + roster |
-| `POST /auth/login/begin` | none | `salt_enc` or a peppered decoy |
-| `POST /auth/login/finish` | none; per-IP 10/min | verifier check; enrol unknown device pending; tokens + wraps + roster |
+| `POST /auth/login/begin` | none; per-IP 120/min | `salt_enc` or a peppered decoy, plus a single-use 5-minute proof-of-possession nonce (A10) |
+| `POST /auth/login/finish` | none; per-IP 10/min | verifier check; device identity honoured only with a valid nonce + device-key proof verified against the stored key (A10); enrol unknown device pending; tokens + wraps + roster |
 | `POST /auth/refresh` | refresh JWT | rotation + reuse detection |
 | `PUT /auth/password` | access JWT of an **active** device; per-(tenant, IP) 120/min; current `auth_key` or a recovery sign-in within 15 min | replaces verifier + password wrap, keeps `salt_enc` (A9) |
-| `POST /auth/recover` | none; per-IP | recovery verifier check; enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409); recovery wrap + roster; tokens bound to the device |
+| `POST /auth/recover` | none; per-IP | recovery verifier check; device identity honoured only with a valid proof (A10); enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409; none for a revoked row); recovery wrap + roster; tokens bound to the device |
 | `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
 | `PUT /devices/roster` | access JWT with `client_id` whose row is **active** (plus the current `auth_key` when `revoked_devices` is non-empty), or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; revokes `revoked_devices` (active callers only, never self); consumes the grant |
-| `POST /sync/push` | access JWT; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
+| `POST /sync/push` | access JWT of an active device; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
 | `GET /sync/pull?since&limit` | access JWT | dense pages, never gated |
 | `GET /sync/completeness` | access JWT | `max`, `count`, `contiguous`, per-client tails |
 | `GET /sync/stream` | access JWT | SSE `wakeup` events carrying only the seq |
@@ -539,7 +544,7 @@ Pull, audio GET and the roster GET are never gated.
 `devices` (pubkey, label, platform, `status` pending|active|revoked, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
-`tenant_seq`, `changesets`, `shares` (unused), `audio_blobs` (+ `released_at`),
+`tenant_seq`, `changesets`, `shares` (unused), `login_nonces` (A10, non-RLS), `audio_blobs` (+ `released_at`),
 `audio_objects` keyed by part, `snapshots`, `admin_nonces`.
 
 ### 9.3 Isolation
@@ -748,10 +753,12 @@ review also surfaced §15.K. See §5.7.
 page with a confirmation, and the hero offers "Turn on sync" afterwards. "Return to a
 plain database" stays deferred.
 
-**F. Relay history compaction — DECIDED: after the four feature slices.** The snapshot
-seam (server routes, `snapshot.rs`, transport methods) is kept for it. Open questions
-from the compaction design (one-time re-seed vs sweep-first, cadence, quota
-monotonicity, truncation recovery) are settled when that slice is planned.
+**F. Relay history compaction — PROPOSED, awaiting ratification.** The design with a
+recommendation per open question (sweep-first pruning below every active device's
+acknowledged pull position, any caught-up device publishes size-triggered snapshots,
+journaled bootstrap install that carries local-only tables) is
+[`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md). It is held for the owner's
+go because the bootstrap replaces a device's live database file.
 
 **G. Hosted relay default — DECIDED: unchanged.** Flip `DEFAULT_SYNC_SERVER_URL` and
 the wizard copy when a hosted relay launches.
@@ -765,19 +772,21 @@ from that list.
 `shares`, `snapshots` stay; additive columns are harmless and a v1 relay with real data
 does not earn a destructive migration.
 
-**K. Proof of possession at login — OPEN (surfaced by the removal review, 2026-09-10).**
-`login/finish` and `recover` take `client_id` and `ed25519_pub` from the request and
-never prove the caller holds the matching private key: an existing row's identity is
-simply reused. Anyone with the **password** can therefore obtain a token bound to any
-device's `client_id` (the ids are visible via `GET /devices` and the signed roster) and
-pass the active-device write gate, including to remove the real owner's device. This is
-pre-existing and orthogonal to removal, but removal's promise is weakest against exactly
-this attacker. Recommended fix (a CRYPTO_SPEC §3.2 amendment, LOCKED, review-gated):
-`login/begin` returns a server nonce; `login/finish` and `recover` carry
-`Ed25519.sign(device_sk, nonce ‖ client_id ‖ ed25519_pub ‖ email)`; the relay verifies
-against the **stored** public key when the row exists (409 on mismatch) and against the
-presented key when new; older clients that send no proof get a token with no
-`client_id` (read-only). Owner decision needed before it is built.
+**K. Proof of possession at login — DONE (slice 5, CRYPTO_SPEC A10).** `login/begin`
+issues a single-use nonce; `login/finish` and `recover` carry a device-key signature over
+it that the relay verifies against the stored key for a known `client_id`. A password
+holder can no longer mint a token for another device's identity. Requests without a
+valid proof bind no device and cannot write.
+
+**L. Per-change `client_id` binding on push — OPEN (surfaced by the A10 review).** The
+write gate keys on the token's `client_id`, but each change in a push batch carries its
+own `client_id`, which is the idempotency key and the stored author. An active device can
+therefore push changes attributed to another in-tenant device and pre-occupy its
+`(client_id, client_seq)` pairs (a spurious "counter regression" 409 on that device's
+real pushes). Cross-tenant is impossible (RLS). Fix: reject any change whose `client_id`
+differs from the caller's. Held for a follow-on because the relay's multi-device push
+fixtures (`sync_flow.rs`) push several device streams through one token and need
+re-authoring with per-device tokens first.
 
 **J. Schema-version bumps — DECIDED: documented posture, auto-retry built when the
 first bump is scheduled.** A `SYNC_SCHEMA_VERSION` bump quarantines updated devices'
@@ -830,12 +839,10 @@ out of scope are listed in the pass commit message.
 2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10.
 3. Turn off sync (§15.E) — done 2026-09-10.
 4. Remove a device (§15.D) — done 2026-09-10.
-5. Relay compaction (§15.F).
+5. Relay compaction (§15.F) — design proposed in `plans/RELAY_COMPACTION.md`; awaiting ratification.
 
 **Deferred, documented only:** D5 version floor and device staleness, D9 auto-retry
 until the first schema bump, D13 rotation and recovery-code revocation, D6 shares, D8
 hosted default.
 
-**Newly open (needs owner decision):** §15.K proof of possession at login — a LOCKED
-§3.2 amendment; recommended before rollout, since it closes the password-only
-impersonation of any device identity.
+5b. Proof of possession at login (§15.K, CRYPTO_SPEC A10) — done 2026-09-16.

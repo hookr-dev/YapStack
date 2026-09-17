@@ -209,8 +209,18 @@ pub async fn signup(
 /// `POST /auth/login/begin` — round 1 of §3.2.
 pub async fn login_begin(
     State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<LoginBeginRequest>,
 ) -> Result<Json<LoginBeginResponse>, AppError> {
+    // Bounded on the general per-IP bucket (it now writes a nonce row per call), and the
+    // stored email is length-capped (RFC 5321 maximum) so an unauthenticated caller cannot
+    // grow `login_nonces` with megabyte strings. Applied before any lookup — no oracle.
+    if !st.ratelimit.check(Uuid::nil(), &ip) {
+        return Err(AppError::RateLimited);
+    }
+    if req.email.len() > 254 {
+        return Err(AppError::BadRequest("email: too long".into()));
+    }
     let row: Option<(Vec<u8>,)> =
         sqlx::query_as("SELECT salt_enc FROM users WHERE lower(email) = lower($1)")
             .bind(&req.email)
@@ -229,9 +239,98 @@ pub async fn login_begin(
             )
         }
     };
+    // A10 proof-of-possession nonce: issued for known AND unknown emails alike (no
+    // oracle), single-use, 5-minute validity, pruned after 10.
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let _ = sqlx::query("DELETE FROM login_nonces WHERE issued_at < now() - interval '10 minutes'")
+        .execute(&st.pool)
+        .await;
+    sqlx::query("INSERT INTO login_nonces (nonce, email_lower) VALUES ($1, $2)")
+        .bind(nonce.as_slice())
+        .bind(req.email.to_lowercase())
+        .execute(&st.pool)
+        .await?;
     Ok(Json(LoginBeginResponse {
         salt_enc: B64.encode(salt),
+        nonce: Some(B64.encode(nonce)),
     }))
+}
+
+/// A10 proof of possession. Consumes the nonce (single-use, 5 min, bound to this email)
+/// and verifies the device's signature over `login_pop_message` against the STORED public
+/// key when a row for `client_id` exists in this tenant (identity substitution fails even
+/// if the request presents a different key) or the presented key when the device is new.
+/// Returns the decoded public key on success. Any failure is a uniform 401.
+/// The A10 proof-of-possession fields a login/recover request carries (all base64).
+struct LoginPop<'a> {
+    client_id: Uuid,
+    presented_pub_b64: &'a str,
+    nonce_b64: &'a str,
+    proof_b64: &'a str,
+}
+
+async fn verify_login_pop(
+    pool: &sqlx::PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+    email: &str,
+    pop: LoginPop<'_>,
+) -> Result<Vec<u8>, AppError> {
+    let LoginPop {
+        client_id,
+        presented_pub_b64,
+        nonce_b64,
+        proof_b64,
+    } = pop;
+    let presented = b64_decode("ed25519_pub", presented_pub_b64)?;
+    if presented.len() != 32 {
+        return Err(AppError::BadRequest(
+            "ed25519_pub: expected 32 bytes".into(),
+        ));
+    }
+    let nonce = B64.decode(nonce_b64).map_err(|_| AppError::Unauthorized)?;
+    let proof: [u8; 64] = B64
+        .decode(proof_b64)
+        .map_err(|_| AppError::Unauthorized)?
+        .try_into()
+        .map_err(|_| AppError::Unauthorized)?;
+    // Consume-as-check: exactly one fresh row for this nonce AND this email. Runs in its
+    // own autocommit statement on the pool — NOT inside the caller's transaction — so a
+    // proof that then fails still burns the nonce (single attempt, not single success).
+    let consumed = sqlx::query(
+        "DELETE FROM login_nonces WHERE nonce = $1 AND email_lower = $2 \
+           AND issued_at > now() - interval '5 minutes'",
+    )
+    .bind(&nonce)
+    .bind(email.to_lowercase())
+    .execute(pool)
+    .await?;
+    if consumed.rows_affected() != 1 {
+        return Err(AppError::Unauthorized);
+    }
+    let stored: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT ed25519_pub FROM devices WHERE workspace_id = $1 AND client_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(client_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let key_bytes = stored.map_or(presented.clone(), |(k,)| k);
+    let key: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::Unauthorized)?;
+    let presented_arr: [u8; 32] = presented.as_slice().try_into().unwrap_or([0u8; 32]);
+    let message = yapstack_crypto::sign::login_pop_message(
+        &nonce,
+        client_id.as_bytes(),
+        &presented_arr,
+        &email.to_lowercase(),
+    );
+    yapstack_crypto::sign::verify_login_pop(&key, &message, &proof)
+        .map_err(|_| AppError::Unauthorized)?;
+    Ok(key.to_vec())
 }
 
 // ---------------------------------------------------------------- login finish
@@ -300,22 +399,40 @@ pub async fn login_finish(
     // account but NOT yet a signed-roster sync peer. No auto-promotion; ON CONFLICT DO
     // NOTHING never demotes an already-active/pending device. The roster (the crypto
     // source of truth) is untouched here — promotion happens only via PUT /devices/roster.
-    if let (Some(cid), Some(pub_b64)) = (req.client_id, req.ed25519_pub.as_deref()) {
-        let ed_pub = b64_decode("ed25519_pub", pub_b64)?;
-        if ed_pub.len() != 32 {
-            return Err(AppError::BadRequest(
-                "ed25519_pub: expected 32 bytes".into(),
-            ));
-        }
+    // A10: a device identity is honoured ONLY with a valid proof of possession. A request
+    // that names a device without one (an older client) is treated as device-less: no
+    // enrolment, tokens without `client_id`, refused by every write gate.
+    let mut bound_client: Option<Uuid> = None;
+    if let (Some(cid), Some(pub_b64), Some(nonce), Some(proof)) = (
+        req.client_id,
+        req.ed25519_pub.as_deref(),
+        req.nonce.as_deref(),
+        req.proof.as_deref(),
+    ) {
+        let ed_pub = verify_login_pop(
+            &st.pool,
+            &mut tx,
+            row.workspace_id,
+            &req.email,
+            LoginPop {
+                client_id: cid,
+                presented_pub_b64: pub_b64,
+                nonce_b64: nonce,
+                proof_b64: proof,
+            },
+        )
+        .await?;
+        bound_client = Some(cid);
         // A REVOKED device (removed by another device, §15.D) that signs in again with the
         // password re-enrols PENDING under the same identity and must be approved anew;
         // every other existing row (pending/active) is left exactly as it is.
-        sqlx::query(
+        let touched = sqlx::query(
             "INSERT INTO devices (client_id, workspace_id, user_id, ed25519_pub, label, platform, status) \
              VALUES ($1, $2, $3, $4, $5, $6, 'pending') \
-             ON CONFLICT (client_id) DO UPDATE SET status = 'pending' \
-             WHERE devices.status = 'revoked' \
-               AND devices.workspace_id = EXCLUDED.workspace_id \
+             ON CONFLICT (client_id) DO UPDATE \
+             SET status = CASE WHEN devices.status = 'revoked' THEN 'pending' \
+                               ELSE devices.status END \
+             WHERE devices.workspace_id = EXCLUDED.workspace_id \
                AND devices.user_id = EXCLUDED.user_id",
         )
         .bind(cid)
@@ -326,9 +443,15 @@ pub async fn login_finish(
         .bind(req.platform.clone().unwrap_or_default())
         .execute(&mut *tx)
         .await?;
+        // `client_id` is a global PK: a row under ANOTHER account is refused, never bound.
+        if touched.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "client_id is already enrolled under a different account".into(),
+            ));
+        }
     }
 
-    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, req.client_id).await?;
+    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, bound_client).await?;
     tx.commit().await?;
 
     let (device_list, signature) = match roster {
@@ -440,13 +563,29 @@ pub async fn recover(
     // approval. `client_id` is a GLOBAL primary key, so the conflict arm is scoped to
     // this account (RLS is the second line, not the only one): a `client_id` enrolled
     // under another account is refused rather than armed.
-    if let (Some(cid), Some(pub_b64)) = (req.client_id, req.ed25519_pub.as_deref()) {
-        let ed_pub = b64_decode("ed25519_pub", pub_b64)?;
-        if ed_pub.len() != 32 {
-            return Err(AppError::BadRequest(
-                "ed25519_pub: expected 32 bytes".into(),
-            ));
-        }
+    let mut bound_client: Option<Uuid> = None;
+    if let (Some(cid), Some(pub_b64), Some(nonce), Some(proof)) = (
+        req.client_id,
+        req.ed25519_pub.as_deref(),
+        req.nonce.as_deref(),
+        req.proof.as_deref(),
+    ) {
+        // A10: the recovering device proves it holds its key (against the stored key if
+        // it is already enrolled), else it is treated as device-less like an old client.
+        let ed_pub = verify_login_pop(
+            &st.pool,
+            &mut tx,
+            row.workspace_id,
+            &req.email,
+            LoginPop {
+                client_id: cid,
+                presented_pub_b64: pub_b64,
+                nonce_b64: nonce,
+                proof_b64: proof,
+            },
+        )
+        .await?;
+        bound_client = Some(cid);
         let armed = sqlx::query(
             "INSERT INTO devices \
              (client_id, workspace_id, user_id, ed25519_pub, label, platform, status, \
@@ -476,7 +615,7 @@ pub async fn recover(
         }
     }
 
-    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, req.client_id).await?;
+    let tokens = issue_pair(&st, &mut tx, row.id, row.workspace_id, bound_client).await?;
     tx.commit().await?;
 
     let (device_list, signature) = match roster {

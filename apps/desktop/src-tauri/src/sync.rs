@@ -4684,6 +4684,72 @@ struct PendingLogin {
     server_url: String,
     email: String,
     salt_enc: Vec<u8>,
+    /// A10 proof-of-possession nonce from `login/begin` — 32 bytes, valid 5 minutes.
+    nonce: Vec<u8>,
+    /// When the nonce was issued (local clock), so a stale one is refreshed transparently.
+    issued_at: Instant,
+}
+
+/// Decode the relay's A10 login nonce, failing closed when it is absent or malformed.
+fn decode_login_nonce(nonce_b64: Option<&str>) -> Result<Vec<u8>, String> {
+    let Some(n) = nonce_b64 else {
+        return Err(
+            "This relay didn't issue a sign-in challenge. It is older than this app — \
+             update the relay (deploy/), then try again."
+                .to_string(),
+        );
+    };
+    let bytes = B64
+        .decode(n.as_bytes())
+        .map_err(|_| "relay nonce: invalid base64".to_string())?;
+    if bytes.len() != 32 {
+        return Err("relay nonce: expected 32 bytes".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Nonces are valid for 5 minutes relay-side; refresh ours before it gets close.
+const LOGIN_NONCE_MAX_AGE: Duration = Duration::from_secs(4 * 60);
+
+/// A10 proof of possession: `(nonce_b64, proof_b64)` for a login/recover request.
+fn login_pop(
+    nonce: &[u8],
+    dev_seed: &[u8; 32],
+    client_id: Uuid,
+    dev_pub: &[u8; 32],
+    email: &str,
+) -> (Option<String>, Option<String>) {
+    let msg = yapstack_crypto::sign::login_pop_message(
+        nonce,
+        client_id.as_bytes(),
+        dev_pub,
+        &email.to_lowercase(),
+    );
+    let sig = yapstack_crypto::sign::sign_login_pop(dev_seed, &msg);
+    (Some(B64.encode(nonce)), Some(B64.encode(sig)))
+}
+
+/// Re-run `login/begin` for a pending login to obtain a fresh nonce. The served salt MUST
+/// equal the one the pending login stretched under (C3 hard-stop otherwise — a changed salt
+/// mid-login is a substitution, not a refresh).
+async fn refresh_login_nonce(pending: &PendingLogin) -> Result<Vec<u8>, String> {
+    let url = format!("{}/auth/login/begin", pending.server_url);
+    let resp: LoginBeginResponse =
+        send_json(reqwest::Client::new().post(&url).json(&LoginBeginRequest {
+            email: pending.email.clone(),
+        }))
+        .await?;
+    let served_salt = B64
+        .decode(resp.salt_enc.as_bytes())
+        .map_err(|_| "relay salt_enc: invalid base64".to_string())?;
+    if served_salt != pending.salt_enc {
+        return Err(
+            "The server returned a different encryption salt mid sign-in — stopping for \
+             your safety."
+                .to_string(),
+        );
+    }
+    decode_login_nonce(resp.nonce.as_deref())
 }
 
 fn pending_login_cell() -> &'static Mutex<Option<PendingLogin>> {
@@ -5268,9 +5334,9 @@ pub async fn sync_enable(
             // CRYPTO_SPEC A7) is the slice that closes this.
             None => {
                 return Err(
-                    "This device signed in with a recovery code but the relay didn't enrol it \
-                     (the relay may need updating), so it can't sync yet. Sign in with your \
-                     password on this device so another device can approve it."
+                    "The relay doesn't list this device, so it can't sync yet. This usually \
+                     means the app or the relay needs updating; sign out and sign in again \
+                     once both are current."
                         .to_string(),
                 );
             }
@@ -6236,12 +6302,18 @@ pub async fn sync_login_begin(
         None => false, // first-time device: TOFU-accept the served salt (§3.2).
     };
 
+    // A10: the relay MUST issue a nonce. Fail closed — a relay (or a relay-in-the-middle)
+    // that omits it would otherwise silently downgrade this sign-in to a device-less token
+    // that can never sync. There are no pre-A10 relays to stay compatible with.
+    let nonce = decode_login_nonce(resp.nonce.as_deref())?;
     *pending_login_cell()
         .lock()
         .map_err(|_| "login state lock".to_string())? = Some(PendingLogin {
         server_url,
         email,
         salt_enc: served_salt,
+        nonce,
+        issued_at: Instant::now(),
     });
     Ok(LoginBeginResultDto { salt_mismatch })
 }
@@ -6283,17 +6355,51 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
         })
         .unwrap_or(-1);
 
+    // A10 proof of possession over the login/begin nonce (device key, never the vault key).
+    // A nonce older than ~4 min (the user paused on the password field) is refreshed
+    // transparently — re-running begin with the C3 salt check against the salt we already
+    // stretched under — and a 401 is retried once the same way before it is attributed to
+    // the password. A wrong password never consumes the nonce (verifier fails first).
     let url = format!("{}/auth/login/finish", pending.server_url);
-    let resp: LoginFinishResponse =
-        send_json(reqwest::Client::new().post(&url).json(&LoginFinishRequest {
-            email: pending.email.clone(),
-            auth_key: B64.encode(auth_key),
-            client_id: Some(client_id),
-            ed25519_pub: Some(B64.encode(dev_pub)),
-            label: Some(device_label()),
-            platform: Some(std::env::consts::OS.to_string()),
-        }))
-        .await?;
+    let auth_key_b64 = B64.encode(auth_key);
+    let mut nonce = pending.nonce.clone();
+    if pending.issued_at.elapsed() > LOGIN_NONCE_MAX_AGE {
+        nonce = refresh_login_nonce(&pending).await?;
+    }
+    let mut attempts = 0;
+    let resp: LoginFinishResponse = loop {
+        attempts += 1;
+        let (nonce_b64, proof_b64) =
+            login_pop(&nonce, &dev_seed, client_id, &dev_pub, &pending.email);
+        let sent = reqwest::Client::new()
+            .post(&url)
+            .json(&LoginFinishRequest {
+                email: pending.email.clone(),
+                auth_key: auth_key_b64.clone(),
+                client_id: Some(client_id),
+                ed25519_pub: Some(B64.encode(dev_pub)),
+                label: Some(device_label()),
+                platform: Some(std::env::consts::OS.to_string()),
+                nonce: nonce_b64,
+                proof: proof_b64,
+            })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = sent.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempts < 2 {
+            nonce = refresh_login_nonce(&pending).await?;
+            continue;
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Incorrect password.".to_string());
+        }
+        if !status.is_success() {
+            let body = sent.text().await.unwrap_or_default();
+            return Err(format!("relay error {}: {}", status.as_u16(), body.trim()));
+        }
+        break sent.json().await.map_err(|e| e.to_string())?;
+    };
 
     let wrapped_pw = B64
         .decode(resp.wrapped_vault_key_password.as_bytes())
@@ -6370,6 +6476,17 @@ pub async fn sync_recover(
     let (dev_seed, client_id) = load_or_create_device_identity()?;
     let dev_pub = SigningKey::from_bytes(&dev_seed).verifying_key().to_bytes();
 
+    // A10: fetch a fresh nonce (login/begin also serves the salt, unused here) and prove
+    // possession of this device's key; a relay that issues no nonce is refused (A10).
+    let begin_url = format!("{server_url}/auth/login/begin");
+    let begin: LoginBeginResponse = send_json(reqwest::Client::new().post(&begin_url).json(
+        &LoginBeginRequest {
+            email: email.clone(),
+        },
+    ))
+    .await?;
+    let nonce_bytes = decode_login_nonce(begin.nonce.as_deref())?;
+    let (nonce_b64, proof_b64) = login_pop(&nonce_bytes, &dev_seed, client_id, &dev_pub, &email);
     let url = format!("{server_url}/auth/recover");
     let resp: RecoverResponse =
         send_json(reqwest::Client::new().post(&url).json(&RecoverRequest {
@@ -6379,6 +6496,8 @@ pub async fn sync_recover(
             ed25519_pub: Some(B64.encode(dev_pub)),
             label: Some(device_label()),
             platform: Some(std::env::consts::OS.to_string()),
+            nonce: nonce_b64,
+            proof: proof_b64,
         }))
         .await?;
 

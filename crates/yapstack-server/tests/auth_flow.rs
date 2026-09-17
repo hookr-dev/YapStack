@@ -45,14 +45,73 @@ async fn setup() -> AppState {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for --ignored tests");
     let pool = yapstack_server::db::connect(&url).await.unwrap();
     yapstack_server::db::migrate(&pool).await.unwrap();
+    // The auth suites exercise many logins per account inside one minute; the per-IP
+    // login throttle is not what they test (client_ip_spoof.rs covers the limiter), so
+    // raise it here.
     let cfg = Config::from_toml_str(&format!(
-        "database_url = \"{url}\"\njwt_secret = \"test-secret\"\nserver_pepper = \"test-pepper\"\n"
+        "database_url = \"{url}\"\njwt_secret = \"test-secret\"\nserver_pepper = \"test-pepper\"\n\n[ratelimit]\nlogin_per_minute = 200\n"
     ))
     .unwrap();
     AppState::new(pool, cfg)
 }
 
 const RECOVERY_BYTES: [u8; 20] = [0x5au8; 20];
+
+/// Deterministic per-device Ed25519 seed for tests (derived from the client_id), so a
+/// test can present a device identity AND prove possession (A10) without carrying keys.
+fn dev_seed(client_id: uuid::Uuid) -> [u8; 32] {
+    yapstack_crypto::hkdf::expand(client_id.as_bytes(), b"test-device-seed", 32)
+        .try_into()
+        .unwrap()
+}
+
+fn dev_pub(client_id: uuid::Uuid) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&dev_seed(client_id))
+        .verifying_key()
+        .to_bytes()
+}
+
+fn dev_pub_b64(client_id: uuid::Uuid) -> String {
+    B64.encode(dev_pub(client_id))
+}
+
+/// Fetch a login nonce and sign the A10 proof with `seed` for (`client_id`, its
+/// PRESENTED public key `pub_bytes`). Returns `(nonce_b64, proof_b64)`.
+async fn pop_with(
+    app: &axum::Router,
+    email: &str,
+    client_id: uuid::Uuid,
+    pub_bytes: &[u8; 32],
+    seed: &[u8; 32],
+) -> (String, String) {
+    let resp = post(app, "/auth/login/begin", json!({ "email": email })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let nonce_b64 = body_json(resp).await["nonce"]
+        .as_str()
+        .expect("A10 relay issues a nonce")
+        .to_string();
+    let nonce = B64.decode(&nonce_b64).unwrap();
+    let msg = yapstack_crypto::sign::login_pop_message(
+        &nonce,
+        client_id.as_bytes(),
+        pub_bytes,
+        &email.to_lowercase(),
+    );
+    let sig = yapstack_crypto::sign::sign_login_pop(seed, &msg);
+    (nonce_b64, B64.encode(sig))
+}
+
+/// The honest device's proof: its own deterministic key.
+async fn pop(app: &axum::Router, email: &str, client_id: uuid::Uuid) -> (String, String) {
+    pop_with(
+        app,
+        email,
+        client_id,
+        &dev_pub(client_id),
+        &dev_seed(client_id),
+    )
+    .await
+}
 
 fn signup_body(email: &str, salt_enc: &[u8], auth_key_b64: &str) -> Value {
     signup_body_with_client(email, salt_enc, auth_key_b64, uuid::Uuid::new_v4())
@@ -67,7 +126,6 @@ fn signup_body_with_client(
     // Placeholder committing-envelope blobs (the server stores them opaquely).
     let wrapped = B64.encode([0x01u8; 73]);
     let vault_key = [0x33u8; 32];
-    let sk = yapstack_crypto::sign::roster_signing_key(&vault_key);
     let roster = json!({ "version": 1, "counter": 0, "vault_key_epoch": 0 });
     let sig = yapstack_crypto::sign::sign_roster(&vault_key, roster.to_string().as_bytes());
     json!({
@@ -83,7 +141,7 @@ fn signup_body_with_client(
             "counter": 0,
             "vault_key_epoch": 0,
             "client_id": client_id,
-            "ed25519_pub": B64.encode(sk.verifying_key().to_bytes()),
+            "ed25519_pub": dev_pub_b64(client_id),
             "label": "test-device"
         }
     })
@@ -372,7 +430,8 @@ async fn unknown_device_enrolls_pending_then_roster_promotes() {
     // A NEW device logs in presenting its own client_id + Ed25519 pubkey -> enrolled
     // PENDING (not auto-promoted). It also receives the roster signature (§7.5 step 2).
     let new_client = uuid::Uuid::new_v4();
-    let new_pub = B64.encode([0x07u8; 32]);
+    let new_pub = dev_pub_b64(new_client);
+    let (nonce, proof) = pop(&app, &email, new_client).await;
     let resp = post(
         &app,
         "/auth/login/finish",
@@ -381,7 +440,9 @@ async fn unknown_device_enrolls_pending_then_roster_promotes() {
             "auth_key": auth_key,
             "client_id": new_client,
             "ed25519_pub": new_pub,
-            "label": "new-laptop"
+            "label": "new-laptop",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
@@ -601,7 +662,8 @@ async fn pending_caller_put_roster_forbidden_active_accepted() {
 
     // A NEW device logs in -> enrolled PENDING; its access token carries new_client.
     let new_client = uuid::Uuid::new_v4();
-    let new_pub = B64.encode([0x07u8; 32]);
+    let new_pub = dev_pub_b64(new_client);
+    let (nonce, proof) = pop(&app, &email, new_client).await;
     let resp = post(
         &app,
         "/auth/login/finish",
@@ -610,7 +672,9 @@ async fn pending_caller_put_roster_forbidden_active_accepted() {
             "auth_key": auth_key,
             "client_id": new_client,
             "ed25519_pub": new_pub,
-            "label": "new-laptop"
+            "label": "new-laptop",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
@@ -776,6 +840,7 @@ async fn recovery_enrols_device_and_lets_it_rebootstrap_roster_once() {
 
     // The only device is lost. A NEW device recovers with the code and its identity.
     let new_client = uuid::Uuid::new_v4();
+    let (nonce, proof) = pop(&app, &email, new_client).await;
     let resp = post(
         &app,
         "/auth/recover",
@@ -783,9 +848,11 @@ async fn recovery_enrols_device_and_lets_it_rebootstrap_roster_once() {
             "email": email,
             "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
             "client_id": new_client,
-            "ed25519_pub": B64.encode([0x09u8; 32]),
+            "ed25519_pub": dev_pub_b64(new_client),
             "label": "replacement",
-            "platform": "macos"
+            "platform": "macos",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
@@ -1015,6 +1082,22 @@ async fn recovery_cannot_arm_a_grant_on_another_accounts_device() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // The attacker does not hold the victim device's key: it presents its own key and
+    // signs with it. Under the owner role the victim row is visible, so the proof is
+    // checked against the STORED key → 401 (A10); under a non-owner role the row is
+    // invisible and the tenant-scoped conflict arm refuses → 409. Either way: not armed.
+    let attacker_seed = [0x5Cu8; 32];
+    let attacker_pub = ed25519_dalek::SigningKey::from_bytes(&attacker_seed)
+        .verifying_key()
+        .to_bytes();
+    let (nonce, proof) = pop_with(
+        &app,
+        &t_email,
+        victim_pending,
+        &attacker_pub,
+        &attacker_seed,
+    )
+    .await;
     let resp = post(
         &app,
         "/auth/recover",
@@ -1022,13 +1105,17 @@ async fn recovery_cannot_arm_a_grant_on_another_accounts_device() {
             "email": t_email,
             "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
             "client_id": victim_pending,
-            "ed25519_pub": B64.encode([0x0Au8; 32]),
-            "label": "collide"
+            "ed25519_pub": B64.encode(attacker_pub),
+            "label": "collide",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
     assert!(
-        resp.status() == StatusCode::CONFLICT || resp.status().is_server_error(),
+        resp.status() == StatusCode::UNAUTHORIZED
+            || resp.status() == StatusCode::CONFLICT
+            || resp.status().is_server_error(),
         "colliding client_id must not be armed (got {})",
         resp.status()
     );
@@ -1204,6 +1291,7 @@ async fn change_password_requires_reauth_or_fresh_recovery_and_keeps_salt() {
 
     // Recovery on a fresh device, then a change WITHOUT the current key.
     let rec_client = uuid::Uuid::new_v4();
+    let (nonce, proof) = pop(&app, &email, rec_client).await;
     let resp = post(
         &app,
         "/auth/recover",
@@ -1211,8 +1299,10 @@ async fn change_password_requires_reauth_or_fresh_recovery_and_keeps_salt() {
             "email": email,
             "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
             "client_id": rec_client,
-            "ed25519_pub": B64.encode([0x0Bu8; 32]),
-            "label": "replacement"
+            "ed25519_pub": dev_pub_b64(rec_client),
+            "label": "replacement",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
@@ -1440,12 +1530,14 @@ async fn device_removal_revokes_access_and_requires_reapproval() {
 
     // A recovery-bootstrap caller may not remove anyone.
     let rec_client = uuid::Uuid::new_v4();
+    let (nonce, proof) = pop(&app, &email, rec_client).await;
     let resp = post(
         &app,
         "/auth/recover",
         json!({
             "email": email, "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
-            "client_id": rec_client, "ed25519_pub": B64.encode([0x0Cu8; 32]), "label": "rec"
+            "client_id": rec_client, "ed25519_pub": dev_pub_b64(rec_client), "label": "rec",
+            "nonce": nonce, "proof": proof
         }),
     )
     .await;
@@ -1513,12 +1605,14 @@ async fn device_removal_reauth_and_revoked_row_edges() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    let (nonce, proof) = pop(&app, &email, second).await;
     let resp = post(
         &app,
         "/auth/login/finish",
         json!({
             "email": email, "auth_key": auth_key, "client_id": second,
-            "ed25519_pub": B64.encode([0x07u8; 32]), "label": "device"
+            "ed25519_pub": dev_pub_b64(second), "label": "device",
+            "nonce": nonce, "proof": proof
         }),
     )
     .await;
@@ -1605,6 +1699,7 @@ async fn device_removal_reauth_and_revoked_row_edges() {
 
     // The removed device recovers with the code: re-enrolled PENDING, but NO grant — its
     // self-admission is refused; it needs approval like any new device.
+    let (nonce, proof) = pop(&app, &email, second).await;
     let resp = post(
         &app,
         "/auth/recover",
@@ -1612,8 +1707,10 @@ async fn device_removal_reauth_and_revoked_row_edges() {
             "email": email,
             "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
             "client_id": second,
-            "ed25519_pub": B64.encode([0x07u8; 32]),
-            "label": "device"
+            "ed25519_pub": dev_pub_b64(second),
+            "label": "device",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;
@@ -1649,6 +1746,197 @@ async fn device_removal_reauth_and_revoked_row_edges() {
     );
 }
 
+/// CRYPTO_SPEC A10: knowing the password is no longer enough to act as another device.
+/// A login that names an existing `client_id` must prove possession of THAT device's key;
+/// a request with no proof binds no device (read-only); a nonce is single-use and bound to
+/// its email.
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn password_holder_cannot_impersonate_another_device() {
+    let st = setup().await;
+    let pool = st.pool.clone();
+    let app = build_router(st);
+    let email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x2Au8; 16];
+    let auth_key = client_auth_key("correct horse battery staple", &salt_enc);
+    let first_client = uuid::Uuid::new_v4();
+    let resp = post(
+        &app,
+        "/auth/signup",
+        signup_body_with_client(&email, &salt_enc, &auth_key, first_client),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // An honest device enrols (pending) with its proof, establishing its stored key.
+    let (honest, _) = enroll_pending(&app, &email, &auth_key).await;
+
+    // Impersonation: the password holder presents `honest`'s client_id with a key it
+    // controls and a valid signature by THAT key → the relay checks against the STORED key
+    // → 401. Same with the signup device's id.
+    let evil_seed = [0x5Du8; 32];
+    let evil_pub = ed25519_dalek::SigningKey::from_bytes(&evil_seed)
+        .verifying_key()
+        .to_bytes();
+    for target in [honest, first_client] {
+        let (nonce, proof) = pop_with(&app, &email, target, &evil_pub, &evil_seed).await;
+        let resp = post(
+            &app,
+            "/auth/login/finish",
+            json!({
+                "email": email, "auth_key": auth_key, "client_id": target,
+                "ed25519_pub": B64.encode(evil_pub), "label": "evil",
+                "nonce": nonce, "proof": proof
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "stored key wins");
+    }
+
+    // No proof at all (older client): 200, but the token binds no device — writes refused.
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": first_client,
+            "ed25519_pub": dev_pub_b64(first_client), "label": "old-client"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bare = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = post_auth(
+        &app,
+        "/sync/push",
+        &bare,
+        json!({ "changes": [{
+        "client_id": first_client, "client_seq": 1, "ciphertext": B64.encode(b"x"),
+        "schema_version": 1, "engine_version": 16003 }]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "device-less token cannot write"
+    );
+
+    // A nonce is single-use, and bound to its email.
+    let (nonce, proof) = pop(&app, &email, honest).await;
+    let body = json!({
+        "email": email, "auth_key": auth_key, "client_id": honest,
+        "ed25519_pub": dev_pub_b64(honest), "label": "device",
+        "nonce": nonce, "proof": proof
+    });
+    let resp = post(&app, "/auth/login/finish", body.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = post(&app, "/auth/login/finish", body).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "nonce replay");
+    let other_email = format!("kat-{}@example.com", uuid::Uuid::new_v4());
+    let resp = post(&app, "/auth/login/begin", json!({ "email": other_email })).await;
+    let foreign_nonce = body_json(resp).await["nonce"].as_str().unwrap().to_string();
+    let msg = yapstack_crypto::sign::login_pop_message(
+        &B64.decode(&foreign_nonce).unwrap(),
+        honest.as_bytes(),
+        &dev_pub(honest),
+        &email.to_lowercase(),
+    );
+    let sig = yapstack_crypto::sign::sign_login_pop(&dev_seed(honest), &msg);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": honest,
+            "ed25519_pub": dev_pub_b64(honest), "label": "device",
+            "nonce": foreign_nonce, "proof": B64.encode(sig)
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "nonce bound to its email"
+    );
+
+    // Same on the RECOVERY path: presenting an existing device's id with a controlled key
+    // and the recovery code fails against the stored key (the grant is not armed).
+    let (nonce, proof) = pop_with(&app, &email, honest, &evil_pub, &evil_seed).await;
+    let resp = post(
+        &app,
+        "/auth/recover",
+        json!({
+            "email": email, "recovery_auth_key": client_recovery_auth_key(&RECOVERY_BYTES),
+            "client_id": honest, "ed25519_pub": B64.encode(evil_pub), "label": "evil",
+            "nonce": nonce, "proof": proof
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "recover: stored key wins"
+    );
+
+    // A failed proof BURNS the nonce: the honest device cannot reuse it afterwards.
+    let (nonce, _bad) = pop(&app, &email, honest).await;
+    let junk = B64.encode([0u8; 64]);
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": honest,
+            "ed25519_pub": dev_pub_b64(honest), "label": "device",
+            "nonce": nonce, "proof": junk
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let nonce_bytes = B64.decode(&nonce).unwrap();
+    let msg = yapstack_crypto::sign::login_pop_message(
+        &nonce_bytes,
+        honest.as_bytes(),
+        &dev_pub(honest),
+        &email.to_lowercase(),
+    );
+    let good = B64.encode(yapstack_crypto::sign::sign_login_pop(
+        &dev_seed(honest),
+        &msg,
+    ));
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": honest,
+            "ed25519_pub": dev_pub_b64(honest), "label": "device",
+            "nonce": nonce, "proof": good
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "burned nonce");
+
+    // An EXPIRED nonce (backdated) is refused.
+    let (nonce, proof) = pop(&app, &email, honest).await;
+    sqlx::query(
+        "UPDATE login_nonces SET issued_at = now() - interval '6 minutes' WHERE nonce = $1",
+    )
+    .bind(B64.decode(&nonce).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let resp = post(
+        &app,
+        "/auth/login/finish",
+        json!({
+            "email": email, "auth_key": auth_key, "client_id": honest,
+            "ed25519_pub": dev_pub_b64(honest), "label": "device",
+            "nonce": nonce, "proof": proof
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "expired nonce");
+}
+
 // =====================================================================================
 // PROVING TESTS for cluster `roster-approval` (SYNC_REVIEW_FINDINGS.md):
 //   #1  "Approval uses the cached roster counter, permanently 409-locking devices out"
@@ -1677,7 +1965,8 @@ async fn login_finish_as(
     auth_key: &str,
     client_id: uuid::Uuid,
 ) -> (String, i64) {
-    let pub_b64 = B64.encode([0x07u8; 32]);
+    let pub_b64 = dev_pub_b64(client_id);
+    let (nonce, proof) = pop(app, email, client_id).await;
     let resp = post(
         app,
         "/auth/login/finish",
@@ -1686,7 +1975,9 @@ async fn login_finish_as(
             "auth_key": auth_key,
             "client_id": client_id,
             "ed25519_pub": pub_b64,
-            "label": "device"
+            "label": "device",
+            "nonce": nonce,
+            "proof": proof
         }),
     )
     .await;

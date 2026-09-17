@@ -357,6 +357,40 @@ after computing `verifier` — it is never persisted.
    rotation + reuse detection per architecture §5/§10), plus `salt_enc`,
    `wrapped_vault_key_password`, and the signed `device_list` for bootstrap (§7).
 
+> **A10 — proof of possession at login and recovery (amendment to §3.2 and §7.5,
+> owner-ratified 2026-09-16; implemented the same day, independent review recorded in the
+> implementing commit).** As originally implemented, `login/finish` and `recover` took
+> the device's `client_id` and `ed25519_pub` from the request and bound `client_id` into
+> the tokens without any proof that the caller holds the matching private key; the
+> relay's write gate (§7.5) keyed on that `client_id`. Anyone holding the **password**
+> could therefore mint a token for **any** device's identity (ids are visible in the
+> device index and the signed roster) and write as it. The amendment:
+>
+> 1. `POST /auth/login/begin` additionally returns a fresh 32-byte CSPRNG `nonce`
+>    (base64), stored server-side bound to the lower-cased email, valid 5 minutes,
+>    single-use, issued identically for unknown emails (no oracle).
+> 2. `login/finish` and `recover` carry `nonce` and `proof`, where
+>    `proof = Ed25519.sign(device_sk, LP("yapstack.login.pop.v1", nonce, client_id(16),
+>    ed25519_pub(32), email_lower))` (§5 `LP`; strict verification, RFC 8032).
+> 3. The relay consumes the nonce (delete-as-check: exactly one fresh row for this nonce
+>    and this email) and verifies `proof` against the **stored** public key when a row
+>    for `client_id` exists in the tenant — so presenting a different key, or a
+>    `client_id` that belongs to another device, fails — and against the presented key
+>    when the device is new. Failure is a uniform 401.
+> 4. A request that names a device **without** a valid proof (an older client) is treated
+>    as device-less: the token carries no `client_id`, nothing is enrolled, and every
+>    write gate refuses it. The client **fails closed**: a relay that issues no nonce is
+>    refused ("update the relay"), never silently downgraded to a device-less sign-in;
+>    the relay's `protocol_version` is 2 from A10 on. A failed proof burns its nonce
+>    (single attempt); a wrong password never reaches the proof, so password retries do
+>    not. Every refresh family minted before A10 is revoked by the migration, so each
+>    device signs in again with proof.
+>
+> Signup is unchanged (the first device authors the roster itself and has nothing to
+> impersonate). Threat note: this restores the property the write gate assumed — that
+> the `client_id` in a token names the device that holds the key listed in the roster —
+> without touching the vault key or the roster construction.
+
 ### 3.3 OPAQUE — documented upgrade path (NOT v1)
 
 The above is a "salted-second-hash of a high-entropy verifier over TLS" — it exposes
@@ -1024,6 +1058,7 @@ items are retryable (e.g. after a key-state change or vault-key rotation).
 | Domain yapstack.snapshot.v1 (§5.2, shipped) | `796170737461636b2e736e617073686f742e7631` |
 | Wrap domain yapstack.wrap.snapshot.v1 (§5.2, shipped) | `796170737461636b2e777261702e736e617073686f742e7631` |
 | Domain yapstack.share.v1 | `796170737461636b2e73686172652e7631` |
+| Login PoP domain yapstack.login.pop.v1 (A10) | `796170737461636b2e6c6f67696e2e706f702e7631` |
 
 ---
 

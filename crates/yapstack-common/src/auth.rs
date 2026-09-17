@@ -91,6 +91,10 @@ pub struct LoginBeginRequest {
 pub struct LoginBeginResponse {
     /// base64 of the served `salt_enc`.
     pub salt_enc: String,
+    /// base64 of a fresh 32-byte login nonce (A10 proof of possession), valid 5 minutes,
+    /// single-use, bound to this email. Absent on relays that predate A10.
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 // ---------------------------------------------------------------- login finish
@@ -115,6 +119,15 @@ pub struct LoginFinishRequest {
     /// Operating system of the enrolling device (see `RosterEnvelope::platform`).
     #[serde(default)]
     pub platform: Option<String>,
+    /// A10 proof of possession: the `login/begin` nonce (base64) and the device's Ed25519
+    /// signature (base64, 64 bytes) over `login_pop_message(nonce, client_id, ed25519_pub,
+    /// email_lower)`. REQUIRED for the token to be bound to `client_id`; a request that
+    /// names a device without a valid proof is treated as device-less (older client): the
+    /// token carries no `client_id`, nothing is enrolled, and the write gate refuses it.
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub proof: Option<String>,
 }
 
 /// Round-2 success response: the token pair plus the bootstrap material — `salt_enc`,
@@ -167,6 +180,12 @@ pub struct RecoverRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub platform: Option<String>,
+    /// A10 proof of possession (see `LoginFinishRequest`): the nonce comes from a
+    /// preceding `login/begin` for the same email.
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub proof: Option<String>,
 }
 
 /// `POST /auth/recover` success (§6.2). Carries the RECOVERY-wrapped vault key — the

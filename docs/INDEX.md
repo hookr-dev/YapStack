@@ -52,4 +52,5 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 ## Plans (transient)
 
 - [`plans/`](plans/) — historical implementation plans, mostly archived. Browse only when researching prior approaches.
+- [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md) — **proposal** (2026-09-16): relay history compaction and snapshot bootstrap, awaiting owner ratification.
 - Sync plans — all executed and folded into [`SYNC_SPEC.md`](SYNC_SPEC.md) §13: [`plans/SYNC_REMEDIATION.md`](plans/SYNC_REMEDIATION.md), [`plans/SYNC_PAGE_REDESIGN.md`](plans/SYNC_PAGE_REDESIGN.md) (superseded by the setup wizard), [`plans/AUDIO_ROUND_TRIP.md`](plans/AUDIO_ROUND_TRIP.md), [`plans/LIVE_SESSION_STATE.md`](plans/LIVE_SESSION_STATE.md).
