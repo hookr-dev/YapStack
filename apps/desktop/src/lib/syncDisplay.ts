@@ -271,7 +271,7 @@ export function deriveSyncDisplay(input: SyncDisplayInput): SyncDisplay {
   //    "Up to date". This is the FINDING fix: the count must never read as green. It replaces
   //    ONLY the green caught-up state (see the precedence note above), never a busier state.
   if (cryptoQuarantined > 0) {
-    const noun = cryptoQuarantined === 1 ? "changeset" : "changesets";
+    const noun = cryptoQuarantined === 1 ? "change" : "changes";
     const label = `Synced — ${cryptoQuarantined} ${noun} unreadable`;
     return {
       state: "quarantined",

@@ -63,20 +63,23 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 
 Full specification: [`SYNC_SPEC.md`](SYNC_SPEC.md). Cryptographic terms are normative in [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md).
 
-- **Relay** — the self-hosted blind server (`crates/yapstack-server`). Stores ciphertext and opaque metadata; never decrypts, never merges, no outbound calls.
+- **Relay** — the self-hosted blind server (`crates/yapstack-server`). Stores ciphertext and opaque metadata; never decrypts, never merges; its only outbound calls are a metadata HEAD and a GC DELETE against the operator's own object storage.
 - **Vault key** — the per-account random key that (via per-item data keys) encrypts all content. Wrapped under the password-derived master key and, independently, the recovery code.
 - **Recovery code** — 160-bit system-generated code shown once at signup (`AAAA-BBBB-…`, 8×4). Unwraps the vault key when the password is lost. Lost password + lost code = unrecoverable data.
 - **Device identity** — per-install `client_id` (UUIDv4) + Ed25519 keypair, kept in the OS keychain; survives sign-out.
 - **Device fingerprint** — `SHA-256(ed25519_pub)` → base32, 4×4 groups. Shown on both screens during approval.
 - **Roster** — the signed device list (counter, epoch, members) authored by a vault-key holder; the cryptographic source of truth for membership. The relay stores it opaquely and enforces only that the counter strictly increases.
 - **Security code** — the roster fingerprint plus vault-key epoch ("Security code XXXX-… · key vN"), compared out-of-band at approval.
-- **Pending / active** — a device that has signed in but not yet been approved is *pending*; an approver's re-signed roster promotes it to *active*. Only active devices may write the roster or turn sync on.
+- **Pending / active / revoked** — the relay's device states. A device that has signed in but not yet been approved is *pending* (it may read, not write); an approver's re-signed roster promotes it to *active*; a device another device removed is *revoked* (its tokens are dead, its writes refused; signing in again re-enrols it pending). Only active devices may write the roster or turn sync on — with one exception, the recovery grant.
+- **Proof of possession** — at sign-in and recovery the device signs a one-time challenge (nonce) from the relay with its Ed25519 device key, so holding the password alone cannot act as another device (CRYPTO_SPEC A10; relay protocol version 2).
+- **Recovery grant** — a one-shot, 15-minute server-side mark set by a recovery-code sign-in that lets a still-pending device admit itself to the roster once, so a user who lost every other device can get back in (CRYPTO_SPEC A7).
+- **Removed device** — a device evicted from the account by another device's re-signed roster (state *revoked*). It keeps what it already synced; a password holder can still read new changes until the password is changed.
 - **Account anchor** — per-(server, email) keychain entry that survives sign-out and holds the salt and roster-counter baselines, so a returning device is *known*, not trust-on-first-use.
 - **Cutover** — turning the live database into the CRR-tracked database (staging copy, CRR migration, journaled file swap with backup and row-count oracle).
 - **Drain** — the background loop that pushes the outbox and pulls peer changesets every 5 s, plus SSE wakeups and local-write kicks.
 - **Outbox** — local table of encrypted, row-atomic changeset chunks awaiting relay acknowledgement.
 - **Watermark** — `push_watermark` (last captured local db_version) and `pull_watermark` (last merged relay `changeset_seq`).
-- **Quarantine** — two kinds: *schema quarantine* (rows for a column this device lacks; replayed after migration) and *crypto quarantine* (changesets that failed to decrypt; durable, surfaced as "N unreadable", retryable).
+- **Quarantine** — two kinds: *schema quarantine* (rows for a column this device lacks; replayed after migration) and *crypto quarantine* (changesets that failed to decrypt; durable, surfaced to the user as "N changes unreadable", retryable).
 - **Catching up** — outbox empty but the pull is still behind the relay tip; never rendered as "Up to date".
 - **Audio lane** — the independent upload queue + uploader for encrypted audio blobs (normal priority for new recordings, low priority for the library *backfill*), and the fetch-on-demand path with its local *fetch cache*.
 - **Remote-live session** — a session recording on another device, rendered read-only with a "Live on <device>" badge; "Interrupted" after 3 min without new segments.

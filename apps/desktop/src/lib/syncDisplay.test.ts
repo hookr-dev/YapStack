@@ -356,8 +356,8 @@ describe("deriveSyncDisplay — crypto-quarantine honesty (§11.3, the FINDING)"
     expect(d.tone).toBe("amber");
     expect(d.icon).toBe("cloud-alert");
     expect(d.motion).toBe(false);
-    expect(d.label).toBe("Synced — 3 changesets unreadable");
-    expect(d.tooltip).toBe("Synced — 3 changesets unreadable");
+    expect(d.label).toBe("Synced — 3 changes unreadable");
+    expect(d.tooltip).toBe("Synced — 3 changes unreadable");
     // Belt-and-suspenders: it is categorically not the green caught-up.
     expect(d.state).not.toBe("caught-up");
     expect(d.icon).not.toBe("cloud-check");
@@ -367,7 +367,7 @@ describe("deriveSyncDisplay — crypto-quarantine honesty (§11.3, the FINDING)"
     const d = derive({
       status: status({ phase: "connected", pendingEntries: 0, cryptoQuarantined: 1 }),
     });
-    expect(d.label).toBe("Synced — 1 changeset unreadable");
+    expect(d.label).toBe("Synced — 1 change unreadable");
   });
 
   it("a zero count is still plain-green caught-up (no false warning)", () => {
@@ -438,7 +438,7 @@ describe("deriveSyncDisplay — crypto-quarantine honesty (§11.3, the FINDING)"
     });
     expect(d.state).toBe("quarantined");
     expect(d.tone).toBe("amber");
-    expect(d.label).toBe("Synced — 2 changesets unreadable");
+    expect(d.label).toBe("Synced — 2 changes unreadable");
   });
 });
 

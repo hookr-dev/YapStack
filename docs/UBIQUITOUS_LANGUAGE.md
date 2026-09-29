@@ -320,6 +320,13 @@ Spec: [`SYNC_SPEC.md`](SYNC_SPEC.md). Definitions in [`GLOSSARY.md`](GLOSSARY.md
 | **Security code** | Roster fingerprint + key epoch shown on both screens at approval. | Fingerprint (that is the *device* fingerprint), hash |
 | **Recovery code** | The one-time 8×4 code that unwraps the vault key. | Backup key, secret key, password reset |
 | **Up to date** | Outbox empty, pull at the relay tip, no error, no unreadable changes, relay reachable. | Synced (as a durable badge), connected |
-| **Unreadable changes** | Crypto-quarantined peer changesets. | Corrupt, failed sync |
+| **Unreadable changes** | Crypto-quarantined peer changesets ("Synced — N changes unreadable"). | Corrupt, failed sync, changeset (in copy) |
+| **Pending / active / revoked** | The relay's three device states: signed in but unapproved; approved; removed by another device. | Unverified, trusted, banned, deleted |
+| **Turn off sync** | Stop syncing on this device while staying signed in (`sync_disable`); turning it back on resumes in place. | Pause, disconnect, disable account |
+| **Change password** | Re-wrap the vault key under a new password; every other device is signed out and asks for the new one. | Reset password (there is no reset), rotate key |
+| **Remove a device** | An active device re-signs the roster without another device; that device loses relay access and must be approved again to rejoin. | Revoke (in copy), unpair, kick |
+| **Recovery grant** | The one-shot permission a recovery-code sign-in gives a device to admit itself when no approver is left (A7). | Recovery token, bypass |
+| **Proof of possession** | The signed sign-in challenge that shows a device holds its own key (A10). | 2FA, device attestation |
+| **Account anchor** | The per-(relay, email) baseline a device keeps across sign-outs so it recognises the account. | Cache, trust store |
 | **Backed up** (audio) | The relay confirms it holds the blob. | Uploaded to the cloud, mirrored |
 | **Downloaded audio** | The local fetch cache of audio recorded elsewhere. | Cached, synced audio |

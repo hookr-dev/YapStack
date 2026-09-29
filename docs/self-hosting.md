@@ -4,7 +4,8 @@
 YapStack sync is **end-to-end encrypted**. The relay is a **blind store**: it holds
 only ciphertext and opaque metadata, runs no CRDT engine, decrypts nothing, and its
 only outbound calls are to the object storage and database **you** configure (one
-metadata-only HEAD per upload check; no telemetry, no check-ins, no kill switch).
+metadata-only HEAD per upload check and one DELETE per garbage-collected blob; no
+telemetry, no check-ins, no kill switch).
 There is **no admin key** and **no feature gating** in a self-host deployment —
 self-host is always the maximum tier (entitlements resolve to `AllowAll`). This is
 licensed **AGPL-3.0-only**; a fork of the server (or any crate) must share back under
@@ -16,7 +17,7 @@ The stack is four containers (one is a one-shot bucket initializer) wired by one
 |---|---|
 | `server` (`yapstack-server`) | the blind relay: auth, changeset store/fan-out, audio + snapshot presigning |
 | `postgres:16` | metadata + **ciphertext** blobs, tenant isolation via RLS |
-| `minio` | S3-compatible object storage for **encrypted** audio + the R2 bootstrap snapshot |
+| `minio` | S3-compatible object storage for **encrypted** audio (and, once compaction ships, encrypted bootstrap snapshots) |
 
 ## Install
 
@@ -85,9 +86,46 @@ watermark and **skips** the migrator when the schema is already current, so boot
   provider where even the migration owner is a plain non-superuser table owner subject to
   `FORCE` RLS, grant that owner `BYPASSRLS` (or run migrations as a role that has it) so
   the login lookup can bridge the pre-tenant read.
-- **Future schema upgrades:** re-run the one-shot migrate step as the owner
-  (`docker compose run --rm migrate`, or a fresh `docker compose up` which runs it
-  automatically), then restart the server.
+- **Schema upgrades:** see [Upgrading](#upgrading) below.
+
+## Upgrading
+
+Every relay upgrade is: **back up first**, pull the new image, run the one-shot migrate
+step as the database owner, restart the server, then update the apps.
+
+```sh
+cd deploy
+docker compose exec -T postgres pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB" > yapstack-pre-upgrade-$(date +%F).dump
+docker compose pull && docker compose build server
+docker compose run --rm migrate      # applies any new migrations as the owner
+docker compose up -d server
+```
+
+Migrations are additive and re-run safe (sqlx records what has been applied), so a
+second `migrate` run is a no-op. What the current set adds on top of a relay that was
+deployed before the device-lifecycle work:
+
+| Migration | Adds | Operator-visible effect |
+|---|---|---|
+| `0010` | `devices.recovery_grant_at` | none (enables recovery on a lost-only-device account) |
+| `0011` | `devices.recovered_at` | none (enables "set a new password" right after a recovery sign-in) |
+| `0012` | `revoked` device state | none until someone removes a device from Settings → Sync |
+| `0013` | `login_nonces` table; **revokes every device-bound refresh token** | **every device is asked to sign in once** after the upgrade; nothing else changes on the device (its encryption key and local data are untouched) |
+
+Two things to know about `0013`:
+
+- The relay's protocol version is **2** from this migration on. **App builds from
+  before it can still sign in but cannot sync** (their sign-in binds no device and every
+  write is refused), so update the apps right after the relay. A newer app against a
+  relay that has not been upgraded refuses to sign in with "update the relay".
+- The token revocation is an `UPDATE` on a table under `FORCE ROW LEVEL SECURITY`. It
+  takes effect when the migration runs as a role that bypasses RLS — the compose
+  default (`POSTGRES_USER` is the Postgres superuser). On a managed Postgres where the
+  migration owner is a plain non-superuser, grant it `BYPASSRLS` for the upgrade (see the
+  managed-Postgres caveat above); otherwise old sessions keep working until their
+  30-day refresh tokens expire, and devices are not forced to re-sign-in.
+
+Access tokens issued before the upgrade stay valid for at most 15 minutes.
 
 ## Reverse proxy (TLS)
 
@@ -154,9 +192,15 @@ securely: they contain the wrapped vault keys and auth verifiers.
 
 The first device creates the account (**Settings → Sync → Set up sync → Create
 account**) and must record the recovery code it is shown once. Every later device signs
-in with the same email and password, then **waits for approval**: one of your existing
-devices shows "Approve new device"; compare the device fingerprint and the security code
-on both screens, then approve. Only then can the new device turn sync on. Every device
+in with the same email and password (the app proves it holds its own device key at the
+same time), then **waits for approval**: one of your existing devices shows "Approve new
+device"; compare the device fingerprint and the security code on both screens, then
+approve. Only then can the new device turn sync on. From Settings → Sync a signed-in
+device can also **turn sync off** without signing out, **change the password** (every
+other device is asked to sign in again), and **remove** another device (it loses relay
+access and must be approved again to rejoin). If the password is lost, the **recovery
+code** signs a device in and, when no other device is left, lets it re-admit itself to
+the account. Every device
 captures its local library and merges what the relay holds. Because all synced records
 use random unique IDs, two **independently-grown** libraries merge as a lossless union —
 nothing is overwritten. The full flow and its edge cases are specified in
@@ -168,6 +212,6 @@ library edited on both sides share record IDs, and the merge resolves each confl
 field to one winner — the loser's edit is dropped silently. Sign the second machine in
 and let sync populate it instead.
 
-A snapshot-based **seed/join** flow (compact bootstrap for very large libraries, with
-surfaced conflict review) is designed and partially built but **not yet available in
-the app** — current builds always use the capture-and-merge path above.
+A snapshot-based bootstrap for very large libraries (relay history compaction) is a
+written proposal (`docs/plans/RELAY_COMPACTION.md`), **not built** — current builds
+always use the capture-and-merge path above.

@@ -1,6 +1,6 @@
 # API Reference
 
-Complete public API for all crates.
+Public API of the workspace crates, the Tauri command surface, the client SQLite schema, and the front-end modules. The sync engine, crypto and relay crates are covered by their specifications (`SYNC_SPEC.md`, `CRYPTO_SPEC.md`); their client-facing shapes are in the [Sync](#sync-yapstack-desktop-yapstack-common) section.
 
 ---
 
@@ -775,9 +775,106 @@ synthesized `{session_id}.{part_index}.{ext}` form would skip parts whose
 
 ---
 
+## Sync (yapstack-desktop, yapstack-common)
+
+The sync surface is specified in [`SYNC_SPEC.md`](SYNC_SPEC.md) (§3 component map, §5
+lifecycle, §9.1 relay routes) and its cryptography in [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md).
+This section is the exact shape of what the front end and the relay exchange. Every
+command below lives in `apps/desktop/src-tauri/src/sync.rs`, is registered only when the
+`sync` cargo feature is on, and is invoked through the hand-typed wrappers in
+`apps/desktop/src/lib/sync.ts`. `Result<_, String>` errors are surfaced verbatim to the
+user (posture: nothing auto-routes or falls back).
+
+### Sync Commands (`sync.rs`)
+| Command | Args | Returns | Notes |
+|---------|------|---------|-------|
+| `sync_probe` | `serverUrl: string` | `RelayProbeOk` / `RelayProbeError` | typed reachability probe of `GET /sync/info`; a version gap is advisory on success |
+| `sync_status` | — | `SyncStatusDto` | polled by the sidebar glyph and the Sync page; never touches the keychain (in-process cache) |
+| `sync_signup` | `{ serverUrl, email, password }` | `SignupResultDto` | creates the account and the epoch-0 roster; returns the recovery code **once** |
+| `sync_login_begin` | `serverUrl, email` | `LoginBeginResultDto` | fetches `salt_enc` and the sign-in challenge; `saltMismatch: true` stops the wizard |
+| `sync_login_finish` | `password` | `SyncStatusDto` | derives `auth_key`, signs the challenge with the device key (A10), verifies the served roster; the device is `pending` until approved |
+| `sync_recover` | `serverUrl, email, recoveryCode` | `SyncStatusDto` | recovery-code sign-in with proof of possession; re-admits this device to the roster once if it is not a member (A7) |
+| `sync_change_password` | `currentPassword: string \| null, newPassword` | `void` | `currentPassword` may be null within 15 min of a recovery sign-in on this device (A9 waiver); other devices are signed out by the relay |
+| `sync_enable` | — | `SyncStatusDto` | refuses a pending, removed or unlisted device; idempotent cutover, account binding, drain start |
+| `sync_disable` | — | `SyncStatusDto` | stops every lane and persists `syncEnabled = false`; the session and the CRR database are kept |
+| `sync_approve_device` | `fingerprint` | `SyncStatusDto` | re-anchors on the authoritative roster, admits the pending device, signs `counter + 1` |
+| `sync_remove_device` | `fingerprint, password` | `SyncStatusDto` | never this device; re-signs the roster without the target and re-authenticates with the current password |
+| `sync_sign_out` | — | `void` | deletes the session; keeps the device identity and the account anchor |
+| `sync_forget_account` | `serverUrl, email` | `void` | clears the account anchor (next sign-in is trust-on-first-use); no UI invokes it |
+| `sync_retry_crypto_quarantine` | — | `number` | re-attempts every stored unreadable change; returns how many merged |
+| `audio_enqueue_session` | `sessionId` | `number` | queues the session's parts for encrypted upload (NORMAL priority) |
+| `audio_enqueue_dictation` | `dictationId` | `number` | same for a dictation recording |
+| `audio_retry_failed_uploads` | — | `number` | re-arms `failed` upload rows |
+| `audio_prepare_part` | `partId, highPriority?: boolean` | `AudioPreparePartDto` | polled by the player; resolves local file → fetch cache → download |
+| `audio_cancel_part` | `partId` | `void` | cancels an in-flight download |
+| `audio_release_part` | `partId` | `boolean` | drops a still-queued part on navigate-away (an in-flight download completes into the cache) |
+| `audio_cache_stats` | — | `AudioCacheStatsDto` | size of the fetched-audio cache |
+| `audio_cache_clear` | — | `AudioCacheStatsDto` | clears it, skipping in-flight parts |
+
+### Sync DTOs (`sync.rs`, camelCase over IPC)
+```rust
+pub struct SyncStatusDto {
+    phase: String,                     // disconnected | connecting | connected | syncing | catching_up | auth_expired | unreachable | error
+    server_url: String,
+    email: Option<String>,
+    device_fingerprint: Option<String>,
+    roster: Vec<DeviceRosterEntryDto>, // { fingerprint, isSelf, pending, label?, platform? } from GET /devices
+    vault_key_epoch: Option<u32>,
+    roster_fingerprint: Option<String>,
+    sync_enabled: bool,
+    last_error: Option<String>,
+    pending_entries: u64, pending_bytes: u64, acked_this_session: u64, last_success: Option<String>,
+    pull_behind: u64,                  // changesets still behind the last-known relay tip
+    crypto_quarantined: u64,           // durable count of unreadable changes
+    audio_upload_outstanding: u64, audio_backfill_outstanding: u64, audio_upload_failed: u64,
+    audio_uploaded_total: u64, audio_backfill_complete: bool,
+    removed: bool,                     // this device was removed from the account by another device (SYNC_SPEC §5.7)
+}
+pub struct SignupResultDto { recovery_code: String, device_fingerprint: String }
+pub struct LoginBeginResultDto { salt_mismatch: bool }
+pub struct RelayProbeOk { engine_version: String, protocol_version: u32, latency_ms: u64, normalized_url: String, version_advisory: Option<VersionAdvisory> }
+pub enum RelayProbeError { Unreachable { raw }, TlsError { raw }, NotARelay { raw } }   // tagged `kind`, kebab-case
+pub enum AudioPreparePartDto { Ready { path }, Fetching { received, total }, Queued, NotOnServer, NoSpace { needed }, Unreachable, AuthExpired, VerificationFailed, Error { message } }   // tagged `state`, snake_case
+pub struct AudioCacheStatsDto { bytes: u64, files: u64 }
+```
+
+### Relay wire types (`crates/yapstack-common/src/auth.rs`, `sync.rs`)
+
+Shared by the desktop client and `yapstack-server`; the relay's route table is
+SYNC_SPEC §9.1. `protocol_version` is **2** since CRYPTO_SPEC A10.
+
+```rust
+// POST /auth/login/begin
+pub struct LoginBeginRequest  { email }
+pub struct LoginBeginResponse { salt_enc, nonce: Option<String> }          // nonce: 32 random bytes, 5 min, single-use (A10); a relay that omits it is refused by the client
+// POST /auth/login/finish
+pub struct LoginFinishRequest { email, auth_key, client_id: Option<Uuid>, ed25519_pub: Option<String>, label: Option<String>, platform: Option<String>, nonce: Option<String>, proof: Option<String> }
+pub struct LoginFinishResponse{ access_token, refresh_token, tenant_id, salt_enc, wrapped_vault_key_password, device_list: Option<Value>, signature: Option<String> }
+// POST /auth/recover — same device fields and proof as login/finish (A7 + A10)
+pub struct RecoverRequest     { email, recovery_auth_key, client_id: Option<Uuid>, ed25519_pub: Option<String>, label: Option<String>, platform: Option<String>, nonce: Option<String>, proof: Option<String> }
+pub struct RecoverResponse    { access_token, refresh_token, tenant_id, salt_enc, wrapped_vault_key_recovery, device_list: Option<Value>, signature: Option<String> }
+// PUT /auth/password (A9: salt_enc retained)
+pub struct ChangePasswordRequest { current_auth_key: Option<String>, auth_key, wrapped_vault_key_password }   // current_auth_key may be omitted within 15 min of a recovery sign-in on the calling device
+// PUT /devices/roster
+pub struct RosterUploadRequest { device_list: Value, signature, counter, vault_key_epoch, active_devices: Vec<Uuid>, revoked_devices: Vec<Uuid>, current_auth_key: Option<String> }   // revoked_devices non-empty ⇒ current_auth_key required (§15.D)
+pub struct RosterUploadResponse { counter, vault_key_epoch }
+pub struct RosterFetchResponse  { device_list, signature, counter, vault_key_epoch }  // GET /devices/roster
+pub struct DeviceInfo { client_id, ed25519_pub, label, platform, status: "pending" | "active" | "revoked", added_at }   // GET /devices
+// POST /sync/push, GET /sync/pull, GET /sync/completeness, POST /audio/presign
+pub struct PushChange { client_id, client_seq, ciphertext, schema_version, engine_version }
+pub struct PushRequest { changes: Vec<PushChange> }               // ≤ 1000 changes, ≤ 5 MiB raw
+pub struct PushResponse { acks: Vec<PushAck { client_id, client_seq, changeset_seq, deduplicated }>, max_changeset_seq }
+pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more }
+pub struct CompletenessResponse { max_changeset_seq, count, contiguous, per_client: Vec<ClientTail { client_id, max_client_seq }> }
+pub struct PresignResponse { already_exists, upload_url: Option<String>, object_key, content_length }
+```
+
+The exact field list of each struct (serde renames, optional fields) is the Rust source;
+this table is the contract summary.
+
 ## SQLite Schema (Frontend)
 
-Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Frontend types in `src/lib/db.ts`.
+Managed by the repo-owned command backend (`src-tauri/src/db_service.rs`, `src/lib/db-backend.ts`) with migrations in `src-tauri/src/db.rs`. Frontend types in `src/lib/db.ts`. When the `sync` feature is on and sync has been turned on, twelve of these tables are cr-sqlite CRRs (SYNC_SPEC §4.1).
 
 ### Tables
 
@@ -799,6 +896,7 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `wav_file_path` | TEXT | Nullable. Legacy column retained as a fallback duration source; `session_audio_parts.file_path` is the durable source of truth (and may point to `.wav` or `.mp3`). |
 | `wav_duration_seconds` | REAL | Nullable. Legacy fallback when no `session_audio_parts` rows exist. |
 | `sort_order` | INTEGER | Default 0 |
+| `recording_device_id` | TEXT | Nullable (v16). Fingerprint of the device that recorded the session; synced. Drives the read-only "Live on <device>" view and the ownership-gated boot sweep (SYNC_SPEC §4.4, §8). |
 
 **segments**
 | Column | Type | Notes |
@@ -816,7 +914,7 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `edited_at` | TEXT | Nullable |
 | `deleted_at` | TEXT | Nullable (soft delete) |
 | `hidden` | INTEGER | 0 or 1 |
-| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by the frontend's `getDb()` after `tauri-plugin-sql` migrations run (idempotent ALTER) to sidestep a ghost v11 entry on dev DBs. |
+| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by the frontend's `getDb()` after the Rust migrations run (idempotent ALTER) to sidestep a ghost v11 entry on dev DBs; on a CRR database the column is added through the sync engine's out-of-band ALTER path instead (SYNC_SPEC §4.3). |
 
 **folders**
 | Column | Type | Notes |
@@ -913,16 +1011,18 @@ Indexes: `idx_dictation_history_created(created_at)`, `idx_dictation_history_slo
 | 13 | `chat_messages.tool_calls` column (persisted tool-call stream for replay) |
 | 14 | `chat_messages` per-LLM-response columns (`send_id`, `sequence`, `tool_call_id`, `observation`, `status`) for accurate multi-turn replay |
 | 15 | `session_audio_parts` table (id, session_id, part_index, file_path, format, duration_seconds, sample_rate, created_at). Backfilled from legacy `wav_file_path` rows. Durable source of truth for session audio files; resumable sessions append a new row per resume. |
+| 16 | `sessions.recording_device_id` attribution column (synced; see SYNC_SPEC §4.4). |
+| 17 | `chat_context_settings` table in the versioned list (`CREATE TABLE IF NOT EXISTS`, so databases that already got it from the frontend patch are unaffected). |
 
-**Runtime schema patches** (in `db::ensure_runtime_schema()`, applied before `tauri-plugin-sql` initializes):
+**Runtime schema patches** (in `db::ensure_runtime_schema()`, applied at startup before the command backend serves queries):
 
 - Sweeps stale `recording`-status sessions left by a prior crash (recomputes duration from `session_audio_parts` or `segments`, marks them `completed`).
 - Creates `audio_save_locations` table (idempotent) — every directory the app has written audio into. Used by `scan_missing_audio_parts()` on next startup to recover orphan part files if a row insert was missed.
 
-Additional schema is created by the **frontend's** `getDb()` (`ensureRuntimeSchema`) after migrations run, deliberately kept out of the versioned Rust list to sidestep a "ghost" v11 entry that some local dev DBs picked up from another branch (which makes sqlx silently refuse later numbered migrations). See [ADR 0002](adr/0002-chat-context-settings-frontend-schema.md):
+Additional schema is also created by the **frontend's** `getDb()` (`ensureRuntimeSchema`) after migrations run, historically to sidestep a "ghost" v11 entry that some local dev DBs picked up from another branch (which makes sqlx silently refuse later numbered migrations). See [ADR 0002](adr/0002-chat-context-settings-frontend-schema.md):
 
-- `segments.speaker_id INTEGER` — Parakeet+Sortformer diarization.
-- `chat_context_settings` table (`context_key` PK, `profile_id` nullable, `updated_at`) — per-chat-context AI **Profile** override; `NULL`/absent means "use the live default Chat assignment". Created idempotently with `CREATE TABLE IF NOT EXISTS`.
+- `segments.speaker_id INTEGER` — Parakeet+Sortformer diarization. On a CRR-tracked database `addColumnIfMissing` refuses a bare ALTER and the sync engine's out-of-band ALTER list adds it instead.
+- `chat_context_settings` table (`context_key` PK, `profile_id` nullable, `updated_at`) — per-chat-context AI **Profile** override; `NULL`/absent means "use the live default Chat assignment". Created idempotently with `CREATE TABLE IF NOT EXISTS` (also migration v17).
 
 ### Settings Persistence (Zustand)
 

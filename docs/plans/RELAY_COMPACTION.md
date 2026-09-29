@@ -112,9 +112,11 @@ replaced; the precondition "outbox empty" is what guarantees it.
 
 ### D6 — Quota and metering
 
-Deleting changesets does not decrement `tenant_usage.storage_bytes` (metering is
-monotonic per the entitlements seam); snapshot uploads are metered like audio. On
-self-host this is invisible (AllowAll). Hosted policy is deferred with the hosted relay.
+Deleting changesets would not decrement `tenant_usage.storage_bytes` — unlike audio-blob
+GC, which does decrement it since the simplification pass (SYNC_SPEC §7.2, §14 D21);
+changeset metering would stay monotonic here because pruned history is replaced by a
+snapshot of comparable size. Snapshot uploads are metered like audio. On self-host this
+is invisible (AllowAll). Hosted policy is deferred with the hosted relay.
 
 ### D7 — Truncation recovery and hostile relay
 
@@ -133,7 +135,7 @@ Completeness' `contiguous` covers `(floor, max]`.
 | Q2 | Who publishes snapshots? | **Any caught-up active device**, size-triggered, ≤ 1/day/device (D3). |
 | Q3 | Trigger threshold N and snapshot retention | **N = 2 000** changesets above floor; keep the **newest two** generations. |
 | Q4 | Does compaction require re-authentication? | **No** (it only removes what every active device has). |
-| Q5 | Quota monotonicity | Keep `storage_bytes` monotonic; document (D6). |
+| Q5 | Quota metering | Prune does not decrement `storage_bytes` (audio GC does); document (D6). |
 | Q6 | Truncation recovery UX | Distinct "history unavailable" state + automatic bootstrap when preconditions hold; a manual "Re-sync this device" button otherwise (D7). |
 | Q7 | Bootstrap oracle | `integrity_check` + local-only row-count equality, never synced-row equality (D5.4). |
 

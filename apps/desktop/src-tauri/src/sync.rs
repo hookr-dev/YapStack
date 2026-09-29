@@ -5523,7 +5523,7 @@ pub async fn sync_remove_device(
                     .unwrap_or(false)
             })
             .cloned()
-            .ok_or_else(|| "No device with that fingerprint is in the roster.".to_string())?;
+            .ok_or_else(|| "No device with that fingerprint is in the device list.".to_string())?;
         if target.client_id == session.client_id {
             return Err("You can't remove the device you're using. Sign out instead.".to_string());
         }

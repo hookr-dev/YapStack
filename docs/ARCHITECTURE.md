@@ -36,10 +36,19 @@ yapstack-desktop
 │   └── yapstack-common
 ├── yapstack-transcription
 │   └── yapstack-common
-└── yapstack-common
+├── yapstack-common
+└── (feature `sync`) yapstack-sync
+    ├── yapstack-crypto
+    └── yapstack-common
+    (+ yapstack-crypto directly, for the auth ceremonies)
 
 yapstack-transcription-sidecar (standalone binary)
 └── yapstack-common
+
+yapstack-server (standalone binary, the relay)
+├── yapstack-common
+├── yapstack-crypto (verifier hashing, roster/proof verification — never decrypts content)
+└── yapstack-entitlements
 ```
 
 `yapstack-transcription-sidecar` is a separate binary, not linked into the desktop app. It communicates via JSON-line IPC over stdin/stdout.
@@ -420,11 +429,11 @@ Five `Arc<Mutex<T>>` (or `Arc<T>`) states managed by Tauri:
 - `LiveTranscriptionState` — `Arc<Mutex<LiveTranscriptionSlots>>` with `session` and `dictation` slots, each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. Same-kind double-start is rejected even during finalization.
 - `DictationOwnsMicState` — `Arc<DictationOwnsMic>` (mutex-protected window list). Records the open dictation window's start position and a list of closed `[start, end)` windows. Drives session mic suspension, WAV muting, and dictation-runtime cursor initialization.
 
-Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — it opens the SQLite DB directly via `rusqlite`, sweeps stale `recording`-status sessions left by a prior crash, and creates the `audio_save_locations` table used by reconciliation on next startup. The Parakeet+Sortformer `segments.speaker_id INTEGER` column is added separately by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
+Startup also runs `db::ensure_runtime_schema()` *before* the command backend serves queries — it opens the SQLite DB directly via `rusqlite`, sweeps stale `recording`-status sessions left by a prior crash, and creates the `audio_save_locations` table used by reconciliation on next startup. The Parakeet+Sortformer `segments.speaker_id INTEGER` column is added separately by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
 
 ### Frontend (TypeScript)
 - **State**: Zustand store (`stores/appStore.ts`) with persisted settings (**version 23**, migrations for schema changes). Settings include capture source, **selected engine** (`"Whisper" | "Parakeet"`, peers — Whisper is the upgrade-safe default), Whisper model size, **selected Parakeet variant**, **diarization enabled**, **per-session `speakerNames` map** (renames `Speaker N` → custom labels, persisted client-side), language, VAD params, prompt context, prompt decay silence, theme, sidebar state, buffer size, AI settings, shortcut bindings, audio save location, dictation settings, `showRecordingIndicator`. The store also caches the engine catalogue (`engineCatalogue: EngineDescriptorDto[]`) and Parakeet/Sortformer download status (`parakeetModels`, `sortformerStatus`) loaded on `autoSetup`.
-- **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, dictation history, tags, session_tags, FTS5 search tables, and `session_audio_parts`. DB file at app data dir. 15 SQL migration versions; `segments.speaker_id INTEGER` is added by the frontend's `getDb()` after migrations run.
+- **Persistence**: SQLite through the repo-owned command backend (`db_service.rs` + `lib/db-backend.ts`, consumed by `lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, dictation history, tags, session_tags, FTS5 search tables, and `session_audio_parts`. DB file at app data dir. 17 SQL migration versions; `segments.speaker_id INTEGER` is added by the frontend's `getDb()` after migrations run (or by the sync engine's out-of-band ALTER on a CRR database).
 - **Type generation**: Specta-generated types in `src/lib/types.ts` (auto-generated, excluded from tsconfig). Tauri command wrappers in `src/lib/tauri.ts`.
 - **Serialization queue**: `onLiveSegment` uses a promise queue (`segmentQueueTail`) to prevent concurrent backfill + live events from racing on DB writes.
 - **Hooks**: `useAutoSetup` (engine init), `useCaptureEvents` (backend status push), `useLiveTranscriptionEvents` (segment/phase/backfill/session-part-ready/session-wav-error events), `useCreateSession` (session creation guard), `useDownloadProgress` (model download), `useKeyboardShortcuts` (in-app capture-phase keydown in AppLayout), `useGlobalShortcuts` (Tauri global-shortcut plugin in App.tsx), `useDictation` (hold-to-talk or toggle mode voice dictation lifecycle in App.tsx; also registers Escape as a global hotkey while non-idle for cancel), `useDictationEntry` (per-row state for `DictationFeedEntry` and `DictationTrayItem` — copy/play/move-to-note/delete handlers), `useRecordingIndicator` (show/hide floating overlay when recording + unfocused, in App.tsx), `useTrayEvents` (listen for tray menu actions, in AppLayout), `useChatMessages` (chat message lifecycle: send, stream, tool execution, undo, DB persistence).
@@ -446,7 +455,7 @@ Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires 
 
 ### Primitives
 
-The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/db.ts`; the DB file lives in the app data dir.
+The persisted domain model. All writes flow through the repo-owned command backend via `lib/db.ts`; the DB file lives in the app data dir.
 
 - **Sessions** (`sessions`) — capture + transcription root. Owns a title, pinned flag, start/end timestamps, zero-or-more `session_audio_parts` rows (one per recording run; resumed sessions append a new part), and optional note via `notes.session_id` FK. `session_type` distinguishes `"transcription"` (recorded + transcribed) from `"manual"` (no transcript — note-only).
 - **Segments** (`segments`) — transcript rows keyed by session, with timestamps, text, and an optional `speaker_id`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by the frontend's `getDb()` after migrations run (outside the migration list — see API_REFERENCE schema note).
@@ -1003,8 +1012,9 @@ The full system specification — user contract, device lifecycle, drain and aud
 relay endpoints, invariants and their tests, and the register of where the design
 documents and the implementation differ — is [`SYNC_SPEC.md`](SYNC_SPEC.md). The
 cryptography is normative in [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md); running the relay is
-[`self-hosting.md`](self-hosting.md). Code comments that cite `architecture §N` refer
-to the original decision report; `SYNC_SPEC.md` §13 maps those section numbers.
+[`self-hosting.md`](self-hosting.md). `CRYPTO_SPEC.md` still cites `architecture §N`
+(the original decision report); `SYNC_SPEC.md` §13 maps those section numbers, and code
+comments now cite `SYNC_SPEC` / `CRYPTO_SPEC` sections directly.
 
 ## Key Design Decisions
 

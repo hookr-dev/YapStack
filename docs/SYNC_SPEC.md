@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # YapStack Sync — System Specification (v1, as built)
 
-> **Status:** Descriptive-normative, 2026-09-10. This document specifies the sync
-> system **as it exists on `feat/sync-relay-skeleton`** and is the single in-repo
+> **Status:** Descriptive-normative, 2026-09-10; aligned with the code as built for
+> merge on 2026-09-29 (§14 rows carry their landing commits, §17 is executed). This
+> document specifies the sync system **as it exists on `feat/sync-relay-skeleton`** and is the single in-repo
 > reference for what the system does, what it promises the user, and where the
 > implementation departs from the earlier design documents. Cryptographic
 > constructions remain normative in [`CRYPTO_SPEC.md`](CRYPTO_SPEC.md); this document
@@ -20,7 +21,8 @@
 > one subsystem per section, with file pointers. §12 lists the invariants the tests
 > pin. §13 maps the old documents onto this one. §14 is the divergence register.
 > §15 records the owner's decision on each edge case (ratified 2026-09-10) and §17 the
-> resulting plan: a fixed-scope simplification pass, then five feature slices.
+> resulting plan — a fixed-scope simplification pass, then the feature slices — with what
+> landed and what is still held for a decision.
 
 ---
 
@@ -47,7 +49,7 @@
 |---|---|---|
 | Create an account on a relay (email + password), forced recovery-code capture | Shipped | Setup wizard, `sync_signup` |
 | Point the app at a self-hosted relay (typed probe, advisory version gap, "use anyway") | Shipped | Wizard server step, `sync_probe` |
-| Sign a second device in; it waits as **pending** until an existing device approves it | Shipped | Wizard account + approval steps, `sync_login_*` |
+| Sign a second device in with a **proof of possession** of its device key; it waits as **pending** until an existing device approves it | Shipped | Wizard account + approval steps, `sync_login_*`, CRYPTO_SPEC A10 |
 | Approve a device by comparing the device fingerprint and the roster **security code** on both screens | Shipped | `DeviceApprovalDialog`, `sync_approve_device` |
 | Sign in with the recovery code when the password is lost; a new device admits itself to the roster (no approver needed) | Shipped | `sync_recover`, CRYPTO_SPEC A7 |
 | Turn sync on: the live database becomes CRDT-tracked, history is captured, the drain starts | Shipped | Wizard turn-on step, `sync_enable` |
@@ -59,14 +61,15 @@
 | See and retry **unreadable** (undecryptable) peer changes | Shipped | `UnreadableChangesWarning`, `sync_retry_crypto_quarantine` |
 | Clear downloaded (fetched) audio | Shipped | `audio_cache_clear` |
 | Sign out (keeps the account anchor so re-sign-in is not TOFU); change server (= sign out) | Shipped | `sync_sign_out` |
-| Forget an account on this device (clears the anchor) | Command only, no UI | `sync_forget_account` |
+| Forget an account on this device (clears the anchor, so the next sign-in is trust-on-first-use again) | Command only, no UI (nothing in the app invokes it) | `sync_forget_account` |
 | Turn sync **off** while staying signed in (and back on, resuming in place) | Shipped | `sync_disable`, Sync page "Turn off" |
 | Change password (from Account, or offered right after a recovery sign-in) | Shipped | `sync_change_password`, CRYPTO_SPEC §4.3 + A9 |
 | Remove another device from the account (it loses relay access; rejoining needs approval) | Shipped | `sync_remove_device`, tile "Remove" |
 | Regenerate the recovery code; rotate the vault key | **Not built** | — |
 | Sync settings or AI connection keys across devices | **Not built**; not planned (§4.5, §15.H) | — |
 | Share a note by private link | **Not built**; tables only | — |
-| Bootstrap a large library from a snapshot instead of replaying history | **Not available in the app**; server routes + engine modules exist (§14 D10) | — |
+| Bootstrap a large library from a snapshot instead of replaying history | **Not available in the app**; server routes + engine seam exist (§14 D10), design proposed (§15.F) | — |
+| Keep syncing from an app build older than the relay's protocol version 2 | **Refused**: the sign-in succeeds but binds no device, every write is rejected and the app must be updated (§11, A10) | — |
 | Use a hosted relay | **None exists**; default server URL is empty | `DEFAULT_SYNC_SERVER_URL` |
 
 ### 1.3 What the relay can and cannot see
@@ -78,7 +81,10 @@ self-contained:
   bytes, AI prompts, the password, any unwrapped key.
 - **Yes:** email, auth verifier (a second hash), KDF salt, wrapped vault keys (inert),
   the signed device roster as an opaque blob plus its integer counter and epoch, device
-  labels and platforms, changeset count/size/timing, audio blob hashes and sizes, IP.
+  labels, platforms and states (pending/active/revoked), which device authored each
+  changeset and its per-device sequence number, changeset count/size/timing, audio blob
+  hashes and sizes with the part and session ids they belong to, sign-in challenges
+  (random nonces bound to an email for five minutes), IP.
 - **Can do:** deny service (withhold, delay, delete). Cannot decrypt, forge an
   approval, or alter content without the change failing authentication and landing in
   quarantine.
@@ -95,7 +101,7 @@ self-contained:
 | Feature-absent behaviour | Every `sync_*` command is unregistered; the frontend detects `Command sync_status not found` by full string equality and shows a "Not in this build" placeholder, no polling |
 | Relay deploy | `deploy/docker-compose.yml`: `postgres:16`, `minio`, one-shot `minio-init`, one-shot `migrate` (owner DSN), `server` (serves as non-owner `yapstack_app`) |
 | Relay config | `yapstack-relay.toml` rendered by `entrypoint.sh` from `.env`; `[limits]` absent on self-host |
-| Client gate | `pnpm check` plus `cargo clippy -p yapstack-desktop --features sync --tests -- -D warnings` |
+| Client gate | `pnpm check`, `cargo clippy --workspace --all-targets --features yapstack-desktop/sync --tests -- -D warnings`, `cargo test -p yapstack-desktop --features sync` |
 | Server live tests | `DATABASE_URL=… cargo test -p yapstack-server -- --ignored` against a real Postgres (MinIO optional) |
 
 ---
@@ -438,11 +444,13 @@ note edit is in progress and draining the skip afterwards.
 ### 6.7 Status DTO
 
 `SyncStatusDto` (`lib/sync.ts` `SyncStatus`): `phase` ∈ `disconnected | connecting |
-connected | syncing | catching_up | auth_expired | unreachable | error` (the TS union
-also lists `preparing`, which Rust never emits), server URL, email, own fingerprint,
-roster (fingerprint, isSelf, pending, label, platform per device from `GET /devices`),
-epoch, roster fingerprint, `syncEnabled`, `lastError`, `billingUrl` (always null
-today), push progress, `pullBehind`, `cryptoQuarantined`, five audio-lane counters.
+connected | syncing | catching_up | auth_expired | unreachable | error`, server URL,
+email, own fingerprint, roster (fingerprint, isSelf, pending, label, platform per
+device from `GET /devices`), epoch, roster fingerprint, `syncEnabled`, `lastError`,
+push progress (`pendingEntries`, `pendingBytes`, `ackedThisSession`, `lastSuccess`),
+`pullBehind`, `cryptoQuarantined`, five audio-lane counters, and `removed` (§5.7: this
+device was removed from the account by another device). Field-level shapes are in
+[`API_REFERENCE.md`](API_REFERENCE.md#sync-yapstack-desktop-yapstack-common).
 
 ---
 
@@ -468,8 +476,8 @@ dictation_history.id`.
   via **Retry** in settings. Deleted parts drop silently.
 - The relay: within-tenant dedup on ciphertext hash, mapping-count refcount, a
   `released_at` stamp when refcount hits 0, and a GC sweep (default every 24 h,
-  7-day grace, storage object deleted **before** the row). `tenant_usage.storage_bytes`
-  is never decremented (known TODO).
+  7-day grace, storage object deleted **before** the row, then
+  `tenant_usage.storage_bytes` decremented in the same transaction, floored at 0).
 
 ### 7.3 Server completeness invariant (owner)
 
@@ -485,6 +493,9 @@ synced `file_path` **only** if it resolves under this device's audio directory �
 download per part, admits at most 2 concurrent downloads (FIFO, session views jump the
 queue at HIGH), prechecks disk space (256 MiB headroom), streams to a temp file,
 decrypts segment-by-segment verifying identity at unwrap, and promotes to the cache.
+A cache hit or a completed fetch registers the fetch-cache directory with the
+`audio-stream://` allow-list (`register_trusted_audio_dir`), which is how fetched audio
+becomes playable through the same protocol as locally recorded audio.
 Terminal states are distinct and honest: `not_on_server` (re-probed every 30 s, the
 fetch self-starts when the source device uploads), `unreachable`, `auth_expired`
 (self-healing via the drain's refresh), `no_space`, `verification_failed` (sticky
@@ -534,11 +545,15 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller) |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
-Push, audio presign and `PUT /devices/roster` are the only device-authored writes, and
-all three require the caller's device row to be `active` (`devices::require_active_caller`).
-Pull, audio GET and the roster GET are never gated.
+Every device-authored write is gated on the caller's device row: push, audio presign,
+snapshot presign and `PUT /auth/password` through `devices::require_active_caller`
+(active only), and `PUT /devices/roster` through its own gate in `put_roster` (active,
+or pending with a fresh recovery grant — A7; removal additionally re-authenticates).
+Pull, audio GET, the roster GET, completeness and the SSE stream are never gated. An
+access token outlives a revocation by at most its 15-minute TTL (reads only; writes are
+refused immediately).
 
-### 9.2 Schema (migrations 0001–0009)
+### 9.2 Schema (migrations 0001–0013)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
 `devices` (pubkey, label, platform, `status` pending|active|revoked, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
@@ -546,6 +561,18 @@ active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `login_nonces` (A10, non-RLS), `audio_blobs` (+ `released_at`),
 `audio_objects` keyed by part, `snapshots`, `admin_nonces`.
+
+Migrations 0010–0013 are the feature slices' additions, all additive: `0010`
+`devices.recovery_grant_at` (A7), `0011` `devices.recovered_at` (A9 waiver), `0012`
+widens the `devices.status` CHECK to admit `revoked` (§15.D), `0013` creates
+`login_nonces` and revokes every device-bound refresh family minted before A10 (so each
+device signs in again with proof). `0010`/`0011` use `ADD COLUMN IF NOT EXISTS`;
+re-run safety otherwise comes from sqlx's `_sqlx_migrations` ledger, as for every earlier
+migration. The one-shot `migrate` service runs them as the database owner; the
+`refresh_tokens` revocation in `0013` is a plain `UPDATE` on a FORCE-RLS table and only
+takes effect when that owner bypasses RLS (a superuser or a `BYPASSRLS` role — the
+compose default; see the managed-Postgres caveat in `self-hosting.md`). Operator steps
+are in [`self-hosting.md`](self-hosting.md#upgrading).
 
 ### 9.3 Isolation
 
@@ -577,9 +604,13 @@ pool under a semaphore.
   alert with the verbatim error (not when auth expired); an amber "Sign in again" row
   when expired; `UnreadableChangesWarning` with Retry; the **Your devices** grid
   (pending tiles with Review, device tiles with OS icon and "This device", an "Add a
-  device" tile opening a guide that shows this account's server and email); audio
-  backup row; downloaded-audio row with Clear; Server row (host only, Change = sign
-  out); Account row (Sign out); Plan row only when a billing URL exists.
+  device" tile opening a guide that shows this account's server and email, and **Remove**
+  on every other device's tile — confirmation asks for the password and says what removal
+  does and does not guarantee, §5.7); audio backup row; downloaded-audio row with Clear;
+  "Sync on this device" row with **Turn off** (confirmation; §5.9); Server row (host only,
+  Change = sign out); Account row (**Change password**, Sign out).
+- **Removed device:** "This device was removed" with Sign out — a banner when sync is on,
+  the hero when it is off; Remove is hidden and `sync_enable` refuses (§5.7).
 - Deep links: `settingsRequest` `"sync"` (glyph, toast) and `"sync-setup"` (onboarding,
   hero) open the tab and, for the latter, the wizard.
 
@@ -594,13 +625,17 @@ the approver's dialog.
 
 ### 10.3 One status derivation
 
-`deriveSyncDisplay(conn, status, signedIn, syncEnabled)` precedence:
+`deriveSyncDisplay({ conn, status, signedIn, syncEnabled, syncingSince? })` precedence
+(`SyncTab` feeds `signedIn`/`syncEnabled` from the live status DTO, the sidebar glyph from
+the persisted `syncConfig`; neither caller passes `syncingSince` today, so the 2 s motion
+gate is exercised only by its unit test):
 
 `off (signed out)` → `waiting-approval` → `approval-needed` → `off (not enabled)` →
 `unreachable` (probe failure or drain `unreachable`) → `auth-expired` → `error`
 (phase error or any `lastError`) → `syncing` (motion only past 3 entries or 2 s) →
 `catching-up` (phase or `pullBehind > 0`) → `pending` → `quarantined` (amber "Synced —
-N unreadable") → `caught-up` ("Up to date · synced Xm ago").
+N changes unreadable") → `caught-up` ("Up to date · synced Xm ago"). The `removed` flag
+is rendered by the Sync page alone (§10.1); the derivation does not consume it.
 
 The sidebar glyph, badge and status line all render this object. The glyph polls every
 5 s (2 s while syncing or catching up) once the user has ever signed in or enabled
@@ -625,6 +660,13 @@ onboarding completes.
   until the lagging device updates and retries — this is the v1 posture (§14 D9).
 - Relay `min_client_version` is advisory ("update this app"); there is no per-tenant
   floor and no device staleness lifecycle (§14 D5).
+- Relay `protocol_version` is **2** since A10 (the login challenge). The client checks
+  only that the field is present (the not-a-relay sentinel); the version itself is
+  informational. Compatibility is enforced by behaviour: a client older than A10 signs in
+  without a proof, binds no device and has every write refused (its drain shows the
+  verbatim HTTP 403), and a client newer than the relay refuses to sign in when no
+  challenge is issued ("update the relay"). The compose stack renders `protocol_version =
+  2` into `yapstack-relay.toml`.
 - Envelope version byte `0x01`, authenticated as the first AAD field (CRYPTO_SPEC C1).
 - Server migrations are additive; the migrate one-shot re-runs on upgrade.
 
@@ -656,6 +698,12 @@ onboarding completes.
 | I20 | One status derivation with the stated precedence; "Up to date" only when nothing is pending, behind, quarantined, failing or unreachable | `syncDisplay.test.ts`, `SyncStatusGlyph.test.tsx` |
 | I21 | Failing drain cycles surface after two in a row and clear on success; a rejected refresh expires the session without a hot loop | `sync.rs` unit tests (`fail_surface_step`, `classify_refresh_status`) |
 | I22 | The boot sweep never finalises or deletes a foreign recording | `db.rs` sweep matrix tests, `NoteDetailView.test.tsx` |
+| I23 | A pending device cannot push or reserve an audio upload; pull stays open (§15.B) | `auth_flow::pending_caller_cannot_push_or_presign_active_can` |
+| I24 | A recovery sign-in enrols the device and lets it re-bootstrap the roster exactly once; the grant never lands on another account's device (§15.A) | `auth_flow::recovery_enrols_device_and_lets_it_rebootstrap_roster_once`, `recovery_cannot_arm_a_grant_on_another_accounts_device` |
+| I25 | A password change needs an active device plus the current `auth_key` or a fresh recovery waiver, keeps `salt_enc`, and revokes every other device's refresh families (§15.C) | `auth_flow::change_password_requires_reauth_or_fresh_recovery_and_keeps_salt` |
+| I26 | Removing a device revokes its access, requires re-authentication, and re-enrols it pending with no grant; the removed device is told so and refuses to enable (§15.D) | `auth_flow::device_removal_revokes_access_and_requires_reapproval`, `device_removal_reauth_and_revoked_row_edges`, `SyncTab.test.tsx` ("a removed device is told so…") |
+| I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
+| I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
 
 ---
 
@@ -672,8 +720,17 @@ onboarding completes.
 | `docs/plans/LIVE_SESSION_STATE.md` | executed | §8 |
 | `SYNC_REVIEW_FINDINGS.md`, `SYNC_REMEDIATION_PLAN.md` (untracked, local) | every CONFIRMED finding has a landed fix commit; the PLAUSIBLE cutover race got only the no-CREATE guard | §14 D19, §15 |
 | `docs/goals/sync-backend-v1/` (local board) | closed | owner decisions listed in §14 |
+| `docs/plans/ENTITLEMENTS_SEAM.md` (local, not committed) | design source for the limits vocabulary, cited by the entitlements crate, the relay's admin/choke modules and migrations 0001/0002 | `crates/yapstack-entitlements` crate docs, this §9.4 (`[limits]`), §1.1 posture item 3 |
 
-**`architecture §N` cross-reference:** §4.2/4.3 key scheme → CRYPTO_SPEC §2–§4; §4.4
+**Other citation vocabularies in code comments:** `T0NN` are goal-board task ids and
+`RN` / `Item N` are remediation-round and review-finding numbers from the closed board and
+the untracked review files — historical provenance, not documents a reader can open. A
+bare `DN` outside this file refers to the decision list of the plan document the comment
+sits next to (`LIVE_SESSION_STATE.md` D1–D8, `AUDIO_ROUND_TRIP.md` D6–D10), never to this
+file's §14 register.
+
+**`architecture §N` cross-reference** (code comments were re-pointed to these targets in
+the merge cleanup; CRYPTO_SPEC keeps the original citations): §4.2/4.3 key scheme → CRYPTO_SPEC §2–§4; §4.4
 bootstrap → this §5.3; §4.6 settings → this §4.5; §5 stack → this §3, §9.3; §6
 migration → this §11; §6.3 quarantine → this §6.4; §6.4/6.5 floor and lifecycle →
 not implemented (§14 D5); §7a/7b protocol → this §6.3–§6.4, §9.1; §8 shares → not
@@ -684,9 +741,10 @@ built; §9 audio → this §7 (format per CRYPTO_SPEC §1.5); §10 guardrails �
 
 ## 14. Divergence register (documents vs. implementation)
 
-Each row states what a document says, what the code does, and the resolution this
-spec adopts. "Spec wins" means the document is now wrong and this file is the
-reference; "Decision" points to §15.
+Each row states what a document said, what the code did on 2026-09-10, and the
+resolution. Rows are resolved history: **Done (commit)** names the landing commit,
+"Spec wins" means the document was wrong and this file is the reference, "Decision"
+points to §15. Nothing in this table is still open.
 
 | # | Source says | Code does | Resolution |
 |---|---|---|---|
@@ -694,28 +752,28 @@ reference; "Decision" points to §15.
 | D2 | Decision report §4.2: two Argon2 passes with `salt_auth` and `salt_enc` | One pass + HKDF split (CRYPTO_SPEC §2.3) | CRYPTO_SPEC is authoritative; the report was a draft |
 | D3 | Decision report §7a: SSE events carry `(changeset_seq, ciphertext)` | Wakeup events carry the seq only; pull is the truth | Spec wins (the blind hint is the safer design) |
 | D4 | Decision report §9: `Content-MD5`, multipart > 100 MB, lazy re-hash, `GET /audio/{session_id}` | STREAM envelope, part-id addressing, pinned-length presigned PUT, AEAD tags as verification, no multipart | CRYPTO_SPEC §1.5 + this §7 are authoritative |
-| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns; no floor | Not implemented. Keep additive-only as the safety lever; **Decision §15.I** on whether to drop the columns |
+| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns; no floor | Not implemented, documented (§11). Additive-only stays the safety lever; the columns stay (**§15.I**) |
 | D6 | Decision report §8, CRYPTO_SPEC §8–§9: private-link shares and a JS share-viewer | `shares` table on both sides only; no routes, no UI, no JS stack | Not built; deferred. CRYPTO_SPEC §8/§9/§13.6 stay as the future contract |
-| D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` exist with no caller | **Done (pass):** `sync-policy.ts`, its test and the AI-wrap helpers deleted; the classification lives in §4.5 |
+| D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` existed with no caller | **Done (78e0bf3):** `sync-policy.ts`, its test and the AI-wrap helpers deleted; the classification lives in §4.5 |
 | D8 | Decision report Phase 3: default server URL is the hosted relay | `DEFAULT_SYNC_SERVER_URL = ""`; the hosted hostname does not resolve | Self-host only until a hosted relay exists (**§15.G**) |
 | D9 | Decision report §6.1: a v2 device's unknown column is applied-known / quarantined-rest by v1 | Both true, but because the changeset AAD binds the **sender's** schema/engine version, any bump of `SYNC_SCHEMA_VERSION` quarantines every changeset from the newer device wholesale until the older updates and retries | Documented v1 posture; a version bump is a coordinated update. **§15.J** |
-| D10 | `self-hosting.md`, SYNC_REMEDIATION §6b: snapshot seed/join "designed and partially built, not available" | Server `POST /snapshot/presign` + `GET /snapshot`, engine `snapshot.rs`/`reconcile.rs`, transport methods; no Tauri command | **Done (pass):** `reconcile.rs` and its tests deleted; `resite_as_fresh_peer` moved to `snapshot.rs` (the shared-ancestry test needs it); snapshot seam kept for compaction (§15.F) |
-| D11 | CRYPTO_SPEC §7.5 step 3: a pending device "may pull/read" | The client refuses `sync_enable` while pending; the relay gates only `PUT /devices/roster` — push, pull and audio are open to a pending token | **Done (pass):** `devices::require_active_caller` gates roster PUT, push and audio presign; pull and audio GET stay open. Client `sync_enable` also refuses an unenrolled (recovery-signed-in) device with an honest message until A7 lands |
-| D12 | CRYPTO_SPEC §4.3 password change (LOCKED flow) | No endpoint, no command, no UI | **Ratified: build after the pass** (§17 sequence) |
-| D13 | CRYPTO_SPEC §4.4 vault-key rotation, §6.3 recovery-code revocation | Epoch is always 0; nothing rotates or re-wraps | Not built; the anti-rollback plumbing (epoch in AADs, roster, session store) is in place |
-| D14 | CRYPTO_SPEC §7.5: recovery re-establishes the device | `sync_recover` sends no device identity; the token has no `client_id`; the device is neither enrolled nor able to write the roster | **Ratified: recovery enrols the device and may re-bootstrap the roster** (CRYPTO_SPEC §7.5 amendment A7, first slice after the pass) |
-| D15 | CRYPTO_SPEC §10: vault key and device key live in the OS keychain | Identity in the keychain; the session (vault key + tokens) sealed in `sync-session.enc` under a keychain-held wrapping key in release; plaintext dev file in debug | **Ratified: CRYPTO_SPEC §10 amended (A8) to describe the sealed session store**; recorded in §5.1 |
+| D10 | `self-hosting.md`, SYNC_REMEDIATION §6b: snapshot seed/join "designed and partially built, not available" | Server `POST /snapshot/presign` + `GET /snapshot`, engine `snapshot.rs`/`reconcile.rs`, transport methods; no Tauri command | **Done (78e0bf3):** `reconcile.rs` and its tests deleted; `resite_as_fresh_peer` moved to `snapshot.rs` (the shared-ancestry test needs it); snapshot seam kept for compaction (§15.F) |
+| D11 | CRYPTO_SPEC §7.5 step 3: a pending device "may pull/read" | The client refused `sync_enable` while pending; the relay gated only `PUT /devices/roster` — push, pull and audio were open to a pending token | **Done (78e0bf3, I23):** `devices::require_active_caller` gates push and audio presign (later also snapshot presign and password change); pull and audio GET stay open. `sync_enable` refuses a pending, removed or unlisted device with an honest message |
+| D12 | CRYPTO_SPEC §4.3 password change (LOCKED flow) | No endpoint, no command, no UI | **Done (7820584, A9, I25):** `PUT /auth/password`, `sync_change_password`, Account row + post-recovery offer (§5.6) |
+| D13 | CRYPTO_SPEC §4.4 vault-key rotation, §6.3 recovery-code revocation | Epoch is always 0; nothing rotates or re-wraps | Not built, deferred (§17); the anti-rollback plumbing (epoch in AADs, roster, session store) is in place |
+| D14 | CRYPTO_SPEC §7.5: recovery re-establishes the device | `sync_recover` sent no device identity; the token had no `client_id`; the device was neither enrolled nor able to write the roster | **Done (23202d2, A7, I24):** recovery enrols the device and may re-bootstrap the roster once (§5.5) |
+| D15 | CRYPTO_SPEC §10: vault key and device key live in the OS keychain | Identity in the keychain; the session (vault key + tokens) sealed in `sync-session.enc` under a keychain-held wrapping key in release; plaintext dev file in debug | **Done (c86d4eb):** CRYPTO_SPEC §10 amended (A8) to describe the sealed session store; recorded in §5.1 |
 | D16 | CRYPTO_SPEC §7.3 roster entries: `client_id, ed25519_pub, label, added_at` | Same; `platform` is device-index metadata, **not** in the signed roster | Accurate; `platform` is advisory like `label` |
-| D17 | `self-hosting.md`: "choose self-host, paste your relay URL"; "Settings → Sync → enable" on each device | The wizard has one server-address step (no hosted/self-host choice) and the second device must be approved before it can enable | Doc updated with this commit |
-| D18 | `CHANGELOG.md` Unreleased: sync "not yet included in official release builds" vs README "official releases include sync going forward" and `release.yml -f sync` | The release workflow on this branch builds with sync; no tag has shipped it yet | CHANGELOG wording updated with this commit |
-| D19 | SYNC_REMEDIATION §3 tree-shake list; SYNC_REVIEW_FINDINGS 21 findings | All listed removals landed (`sync_info` → `sync_probe`, seed/join unregistered, device_list/wrap_secret/repair_oversized/legacy migration gone); all 21 findings have fix commits between `15ed390` and `517c699`; the audio lane's uninterruptible idle sleep remains a deferred nit | Plans marked historical; **done (pass):** the audio lane's idle wait is now 250 ms slices that re-check stop |
+| D17 | `self-hosting.md`: "choose self-host, paste your relay URL"; "Settings → Sync → enable" on each device | The wizard has one server-address step (no hosted/self-host choice) and the second device must be approved before it can enable | **Done (c86d4eb):** doc updated |
+| D18 | `CHANGELOG.md` Unreleased: sync "not yet included in official release builds" vs README "official releases include sync going forward" and `release.yml -f sync` | The release workflow on this branch builds with sync; no tag has shipped it yet | **Done (c86d4eb):** CHANGELOG wording updated |
+| D19 | SYNC_REMEDIATION §3 tree-shake list; SYNC_REVIEW_FINDINGS 21 findings | All listed removals landed (`sync_info` → `sync_probe`, seed/join unregistered, device_list/wrap_secret/repair_oversized/legacy migration gone); all 21 findings have fix commits between `15ed390` and `517c699`; the audio lane's uninterruptible idle sleep remained a deferred nit | Plans marked historical; **Done (78e0bf3):** the audio lane's idle wait is 250 ms slices that re-check stop |
 | D20 | SYNC_PAGE_REDESIGN §0.6: "single adaptive page, not a wizard" | Wizard from Settings, ratified 2026-09-06 | Plan marked superseded |
-| D21 | AUDIO_ROUND_TRIP D10: blob GC deferred; S4 custom `audio_save_location` feeds the fetch cache | GC implemented (migration 0006, `gc.rs`); the fetch cache lives beside the database regardless of `audio_save_location`; `tenant_usage` never decremented | GC done; S4 not built; **done (pass):** the GC row-delete transaction decrements `tenant_usage.storage_bytes` (floored at 0) |
+| D21 | AUDIO_ROUND_TRIP D10: blob GC deferred; S4 custom `audio_save_location` feeds the fetch cache | GC implemented (migration 0006, `gc.rs`); the fetch cache lives beside the database regardless of `audio_save_location`; `tenant_usage` was never decremented | GC done; S4 not built; **Done (78e0bf3):** the GC row-delete transaction decrements `tenant_usage.storage_bytes` (floored at 0) |
 | D22 | Decision report §10: audit log of RLS denials; §15: nightly completeness check | Neither exists; completeness is read at drain spawn and its tips fold in per cycle; the dense cursor makes client-side gaps impossible | Not built; not needed for correctness. Drop from the contract |
-| D23 | `lib/sync.ts` `SyncPhase` includes `preparing`; `syncConfig.lastChangesetSeq` is persisted; `billingUrl` is a status field | Rust never emits `preparing`; `lastChangesetSeq` has no writer; `build_status_dto` always sets `billing_url: None` and the probe does not read it | **Done (pass):** removed |
-| D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (pass):** removed |
-| D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | **Ratified: after the feature slices** (§17) |
-| D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | Updated with this commit |
+| D23 | `lib/sync.ts` `SyncPhase` included `preparing`; `syncConfig.lastChangesetSeq` was persisted; `billingUrl` was a status field | Rust never emitted `preparing`; `lastChangesetSeq` had no writer; `build_status_dto` always set `billing_url: None` and the probe did not read it | **Done (78e0bf3):** removed (the relay's `GET /sync/info` still echoes an operator-configured `billing_url`; no client reads it) |
+| D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (78e0bf3):** removed |
+| D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | Design written up as [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md); **awaiting ratification** (§15.F) |
+| D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
 
 ---
 
@@ -731,10 +789,11 @@ before landing (findings folded in: tenant-scoped grant, 15-min TTL, no third-pa
 promotion, old-relay handling, anchor fingerprint check). Vault-key rotation on
 recovery stays deferred with §4.4. See §5.5 and §9.1.
 
-**B. Server-side gating of pending devices — DECIDED: gate push and audio presign.**
+**B. Server-side gating of pending devices — DONE (pass, 78e0bf3; I23).**
 The relay rejects `POST /sync/push` and `POST /audio/presign` when the token's
 `client_id` row is `pending`; `GET /sync/pull` and `GET /audio/part/{id}` stay open per
-§7.5 step 3. A stolen password alone can then no longer write to the relay. Pass scope.
+§7.5 step 3. The later slices put `POST /snapshot/presign` and `PUT /auth/password`
+behind the same gate. A stolen password alone can no longer write to the relay.
 
 **C. Password change — DONE (slice 2, CRYPTO_SPEC §4.3 + A9).** `PUT /auth/password`
 with the new `auth_key` and password wrap; `salt_enc` retained (A9) so every device's C3
@@ -753,7 +812,8 @@ review also surfaced §15.K. See §5.7.
 page with a confirmation, and the hero offers "Turn on sync" afterwards. "Return to a
 plain database" stays deferred.
 
-**F. Relay history compaction — PROPOSED, awaiting ratification.** The design with a
+**F. Relay history compaction — PROPOSED, awaiting the owner's ratification (not
+started).** The design with a
 recommendation per open question (sweep-first pruning below every active device's
 acknowledged pull position, any caught-up device publishes size-triggered snapshots,
 journaled bootstrap install that carries local-only tables) is
@@ -763,8 +823,8 @@ go because the bootstrap replaces a device's live database file.
 **G. Hosted relay default — DECIDED: unchanged.** Flip `DEFAULT_SYNC_SERVER_URL` and
 the wizard copy when a hosted relay launches.
 
-**H. Settings sync — DECIDED: delete all of it.** `lib/sync-policy.ts`, its test,
-`stripAiSecrets` and `prepareAiConfigForSync` go in the pass. The per-field
+**H. Settings sync — DONE (pass, 78e0bf3): deleted.** `lib/sync-policy.ts`, its test,
+`stripAiSecrets` and `prepareAiConfigForSync` are gone. The per-field
 classification is preserved as prose in §4.5; if settings sync is ever built it starts
 from that list.
 
@@ -772,13 +832,14 @@ from that list.
 `shares`, `snapshots` stay; additive columns are harmless and a v1 relay with real data
 does not earn a destructive migration.
 
-**K. Proof of possession at login — DONE (slice 5, CRYPTO_SPEC A10).** `login/begin`
+**K. Proof of possession at login — DONE (slice 5b, 16653dd, CRYPTO_SPEC A10; I27).** `login/begin`
 issues a single-use nonce; `login/finish` and `recover` carry a device-key signature over
 it that the relay verifies against the stored key for a known `client_id`. A password
 holder can no longer mint a token for another device's identity. Requests without a
 valid proof bind no device and cannot write.
 
-**L. Per-change `client_id` binding on push — OPEN (surfaced by the A10 review).** The
+**L. Per-change `client_id` binding on push — OPEN, documented follow-on (surfaced by the
+A10 review; not attempted in the merge passes).** The
 write gate keys on the token's `client_id`, but each change in a push batch carries its
 own `client_id`, which is the idempotency key and the stored author. An active device can
 therefore push changes attributed to another in-tenant device and pre-occupy its
@@ -816,9 +877,14 @@ bump. The AAD binding is not relaxed.
 
 ---
 
-## 17. Ratified plan (2026-09-10)
+## 17. Ratified plan (2026-09-10) — executed
 
-**Simplification pass (client + relay), fixed scope — executed 2026-09-10.** Cut
+Every item below has landed except the two marked as held. The merge-readiness passes of
+2026-09-29 (`refactor(sync): simplify pass before merge`, `chore(sync): cleanup pass
+before merge`, `docs(sync): align docs with as-built sync before merge`) cut against
+§12/§15 only and built nothing new.
+
+**Simplification pass (client + relay), fixed scope — executed 2026-09-10 (78e0bf3).** Cut
 against §12 so no load-bearing test disappeared; the general sweep's findings that were
 out of scope are listed in the pass commit message.
 
@@ -835,14 +901,18 @@ out of scope are listed in the pass commit message.
 
 **Feature slices after the pass, in order, each its own spec amendment + commit:**
 
-1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10.
-2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10.
-3. Turn off sync (§15.E) — done 2026-09-10.
-4. Remove a device (§15.D) — done 2026-09-10.
-5. Relay compaction (§15.F) — design proposed in `plans/RELAY_COMPACTION.md`; awaiting ratification.
+1. Recovery re-bootstrap (§15.A, CRYPTO_SPEC A7) — done 2026-09-10, `23202d2`.
+2. Password change (§15.C, CRYPTO_SPEC §4.3 + A9) — done 2026-09-10, `7820584`.
+3. Turn off sync (§15.E) — done 2026-09-10, `e8617ae`.
+4. Remove a device (§15.D) — done 2026-09-10, `afa3bf7`.
+5. Proof of possession at login (§15.K, CRYPTO_SPEC A10) — done 2026-09-16, `16653dd`
+   (relay migration 0013, protocol version 2).
+6. Relay compaction (§15.F) — design proposed in `plans/RELAY_COMPACTION.md`;
+   **held for the owner's ratification**.
+
+**Held as a documented follow-on:** §15.L per-change `client_id` binding on push (needs
+the relay's multi-device push fixtures re-authored with per-device tokens first).
 
 **Deferred, documented only:** D5 version floor and device staleness, D9 auto-retry
 until the first schema bump, D13 rotation and recovery-code revocation, D6 shares, D8
 hosted default.
-
-5b. Proof of possession at login (§15.K, CRYPTO_SPEC A10) — done 2026-09-16.

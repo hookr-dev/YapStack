@@ -98,7 +98,7 @@ If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine par
 ### Runtime env vars (sidecar)
 
 - **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: uses CoreML when compiled in *and* the model has no external `.onnx.data` initializers, otherwise CPU. Empirical RTFx on Apple Silicon for Parakeet TDT v3, 2-13 s chunks: CPU 4-8×, WebGPU 4-9× (similar mean, higher variance). CoreML doesn't load for TDT v3 (external-data bug); use Auto to silently fall through.
-- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` for our crates + `warn` for noisy upstream deps. Example: `RUST_LOG=debug,ort=warn npm run dev`.
+- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` with `yapstack_desktop`, `yapstack_transcription`, the frontend bridge and the sidecar at `debug` (so every sync trace line lands in the log file), `yapstack_audio` at `info`, and `warn` for noisy upstream deps (`tao`, `wry`, `hyper`, `reqwest`). Example: `RUST_LOG=debug,ort=warn npm run dev`.
 
 System audio capture is always compiled in via cpal loopback — no feature flag needed. Available on macOS (CoreAudio) and Windows (WASAPI). On Linux, `SystemAudioCapture::is_available()` returns false at runtime. On Windows, WASAPI loopback delivers zero packets during system silence (no audio playing) — this is normal and handled by the stream health watchdog.
 
@@ -157,7 +157,7 @@ The DTO pattern keeps `specta::Type` out of library crates:
 
 Key frontend dependencies beyond React 19 + Vite:
 - **Zustand** — State management with `persist` middleware for settings (version 23, with migrations — see `docs/API_REFERENCE.md` for the full v0→v23 history)
-- **tauri-plugin-sql** — SQLite via Tauri plugin. Session, segment, note, folder persistence in `src/lib/db.ts`
+- **rusqlite** (repo-owned command backend, `db_service.rs` + `lib/db-backend.ts`) — SQLite persistence for sessions, segments, notes, folders in `src/lib/db.ts`; cr-sqlite is loaded per connection only when the `sync` feature is on
 - **sonner** — Toast notifications for user feedback
 - **shadcn/ui** — Component library (button, card, tabs, select, popover, alert-dialog, dialog, dropdown-menu, context-menu, tooltip, slider, input, textarea, command, sheet, etc.)
 - **Tauri API** — `@tauri-apps/api` for IPC, events, and path resolution

@@ -5,8 +5,8 @@ This is the **operator runbook** for the self-hosted sync relay defined by
 `docker-compose.yml` in this directory. It is a companion to the full narrative in
 [`../docs/self-hosting.md`](../docs/self-hosting.md) (install, RLS/role hardening, reverse
 proxy/TLS, two-device onboarding); read that first. This file covers the day-two
-operational notes: **keeping the host awake**, the **port/env knobs**, and a **one-glance
-backup note**.
+operational notes: **keeping the host awake**, the **port/env knobs**, **upgrading**, and a
+**one-glance backup note**.
 
 The relay is a **blind store** — ciphertext + opaque metadata only, no CRDT engine, no
 outbound calls except to your own storage/database, no admin key. Self-host always
@@ -85,6 +85,18 @@ deliberately **no `[limits]` section and no admin key**.
 Changing a port or endpoint is a `.env` edit + `docker compose up -d` (recreates only the
 affected service). Changing `MINIO_PUBLIC_ENDPOINT` requires a server restart so new
 presigns carry the new hostname.
+
+## Upgrading, in one paragraph
+
+Back up first (`pg_dump` below), then `docker compose pull && docker compose build server
+&& docker compose run --rm migrate && docker compose up -d server`. Migrations are
+additive and re-run safe. Migrations `0010`–`0013` (device recovery, password change,
+device removal, sign-in challenge) need no configuration, but **`0013` signs every device
+out once** — each device asks for the password again and carries on — and raises the
+relay's protocol version to **2**: app builds older than the relay can sign in but cannot
+sync until updated, so update the apps right after the relay. The `0013` sign-out relies
+on the migration running as a role that bypasses RLS (the compose default); see the
+full note in [`../docs/self-hosting.md`](../docs/self-hosting.md#upgrading).
 
 ## Backup, in one paragraph
 

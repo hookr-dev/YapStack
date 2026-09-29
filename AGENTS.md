@@ -10,7 +10,7 @@ If you have one question, the answer is probably here. If not, follow the doc ro
 
 - **Goal**: real-time on-device audio capture + transcription, macOS-first.
 - **Engines**: Whisper (Metal, broad language) and Parakeet TDT v3 (NVIDIA, faster on Apple Silicon via WebGPU + int8). Pick at runtime.
-- **Stack**: Tauri v2 (Rust backend) + React 19/TypeScript frontend, SQLite via `tauri-plugin-sql`, sidecar binary for inference IPC over JSON-line stdin/stdout.
+- **Stack**: Tauri v2 (Rust backend) + React 19/TypeScript frontend, SQLite via a repo-owned rusqlite command backend, sidecar binary for inference IPC over JSON-line stdin/stdout.
 - **Verification**: `pnpm check` is the single command that gates merge. Run it before declaring work done.
 - **License**: AGPL-3.0. New code stays open under the same license.
 
