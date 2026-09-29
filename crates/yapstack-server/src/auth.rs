@@ -283,12 +283,10 @@ async fn verify_login_pop(
         nonce_b64,
         proof_b64,
     } = pop;
-    let presented = b64_decode("ed25519_pub", presented_pub_b64)?;
-    if presented.len() != 32 {
-        return Err(AppError::BadRequest(
-            "ed25519_pub: expected 32 bytes".into(),
-        ));
-    }
+    let presented: [u8; 32] = b64_decode("ed25519_pub", presented_pub_b64)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::BadRequest("ed25519_pub: expected 32 bytes".into()))?;
     let nonce = B64.decode(nonce_b64).map_err(|_| AppError::Unauthorized)?;
     let proof: [u8; 64] = B64
         .decode(proof_b64)
@@ -316,16 +314,17 @@ async fn verify_login_pop(
     .bind(client_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let key_bytes = stored.map_or(presented.clone(), |(k,)| k);
-    let key: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| AppError::Unauthorized)?;
-    let presented_arr: [u8; 32] = presented.as_slice().try_into().unwrap_or([0u8; 32]);
+    let key: [u8; 32] = match stored {
+        Some((k,)) => k
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::Unauthorized)?,
+        None => presented,
+    };
     let message = yapstack_crypto::sign::login_pop_message(
         &nonce,
         client_id.as_bytes(),
-        &presented_arr,
+        &presented,
         &email.to_lowercase(),
     );
     yapstack_crypto::sign::verify_login_pop(&key, &message, &proof)

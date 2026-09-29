@@ -4474,19 +4474,13 @@ fn unwrap_vault_key(k_root: &[u8; 32], blob: &[u8], domain: &[u8]) -> Result<[u8
         .map_err(|_| "unwrapped vault key has wrong length".to_string())
 }
 
-/// Device fingerprint (§7.5.5): `SHA-256(ed25519_pub)[..10]` → RFC4648 base32 (upper,
-/// no pad) → 16 chars. Returned ungrouped; the UI groups it 4×4 for display/compare.
-fn device_fingerprint(ed25519_pub: &[u8]) -> String {
+/// The CRYPTO_SPEC §7.5.5 fingerprint: `SHA-256(bytes)[..10]` → RFC4648 base32 (upper, no
+/// pad) → 16 chars, returned ungrouped (the UI groups it 4×4). Applied to a device's
+/// `ed25519_pub` (device fingerprint) and to a roster's canonical bytes (roster
+/// fingerprint / "security code", shown next to `vault_key_epoch`).
+fn sha256_fingerprint(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(ed25519_pub);
-    data_encoding::BASE32_NOPAD.encode(&hash[..10])
-}
-
-/// Roster fingerprint (§7.5.5): `SHA-256(canonical_bytes(roster))[..10]` → base32 4×4,
-/// shown next to `vault_key_epoch` for the out-of-band approval check.
-fn roster_fingerprint_from_canonical(canonical: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(canonical);
+    let hash = Sha256::digest(bytes);
     data_encoding::BASE32_NOPAD.encode(&hash[..10])
 }
 
@@ -4614,8 +4608,71 @@ fn verify_roster_signed(
             roster.counter
         ));
     }
-    let fp = roster_fingerprint_from_canonical(&canonical);
+    let fp = sha256_fingerprint(&canonical);
     Ok((roster, fp))
+}
+
+/// Tamper check on a fetched roster (§5.4): the relay's plaintext `counter` column must
+/// match the signature-bound counter inside the verified canonical roster. A mismatch means
+/// the advisory column diverged from the signed content (only possible via tampering or a
+/// relay bug) — refuse to sign on it and surface.
+fn check_relay_counter_matches_signed(plaintext: i64, verified: u64) -> Result<(), String> {
+    if plaintext as u64 != verified {
+        return Err(
+            "relay's plaintext roster counter disagrees with the signed \
+             roster — refusing to sign (possible tamper)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Re-anchor on the AUTHORITATIVE signed roster before authoring a new one (§5.4 approval,
+/// §5.7 removal; CRYPTO_SPEC §7.5 step 2 + §7.4 anti-rollback): GET + verify the current
+/// roster, hard-fail if the relay's plaintext counter disagrees with the signed one, then
+/// ratchet the anti-rollback floor forward to the verified counter and PERSIST it (session
+/// cache + per-account keychain anchor) BEFORE any mutation. Even if the caller aborts
+/// afterwards (target gone, PUT lost to a concurrent write) the floor has advanced, so a
+/// validly-signed OLDER roster can never be replayed against us. `verify_roster_signed`
+/// already proved the counter is >= our floor, so this only moves forward; `update_session`
+/// merges just the two roster fields under the lock (never clobbering a token the drain
+/// rotated during the round-trip). Returns the verified roster; its `counter` is the
+/// signature-bound value the caller bases `counter + 1` on — never the relay's plaintext.
+async fn reanchor_roster(
+    session: &mut Session,
+    vault_key: &[u8; 32],
+) -> Result<SignedRoster, String> {
+    let fetched = http_get_roster(session).await?;
+    let (prev_roster, prev_fp) = verify_roster_signed(
+        Some(&fetched.device_list),
+        Some(&fetched.signature),
+        vault_key,
+        session.roster_counter,
+    )?;
+    check_relay_counter_matches_signed(fetched.counter, prev_roster.counter)?;
+    let ratchet_counter = prev_roster.counter as i64;
+    let ratchet_fp = prev_fp;
+    *session = update_session(move |s| {
+        s.roster_counter = ratchet_counter;
+        s.roster_fingerprint = Some(ratchet_fp);
+    })?;
+    persist_account_anchor(session)?;
+    Ok(prev_roster)
+}
+
+/// Canonicalise and sign a roster with the vault-derived key (CRYPTO_SPEC §7.2), returning
+/// the JSON `device_list`, the base64 signature and the roster fingerprint (§7.5.5) that
+/// every upload path (signup, approval, removal, recovery re-bootstrap) sends and persists.
+fn sign_roster_for_upload(
+    roster: &SignedRoster,
+    vault_key: &[u8; 32],
+) -> Result<(serde_json::Value, String, String), String> {
+    let canonical = roster_canonical_bytes(roster)?;
+    let signature = yapstack_crypto::sign::sign_roster(vault_key, &canonical);
+    let roster_fp = sha256_fingerprint(&canonical);
+    let device_list_value =
+        serde_json::to_value(roster).map_err(|e| format!("roster encode: {e}"))?;
+    Ok((device_list_value, B64.encode(signature), roster_fp))
 }
 
 /// Build the NEW roster membership for an approval (§7.5 step 3), from the VERIFIED
@@ -4927,7 +4984,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
                 }
                 let pk = B64.decode(d.ed25519_pub.as_bytes()).unwrap_or_default();
                 roster.push(DeviceRosterEntryDto {
-                    fingerprint: device_fingerprint(&pk),
+                    fingerprint: sha256_fingerprint(&pk),
                     is_self: d.client_id == session.client_id,
                     pending: d.status == "pending",
                     label: if d.label.is_empty() {
@@ -5028,20 +5085,18 @@ fn normalize_relay_url(input: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
-/// Parse `major.minor.patch` plus a "has pre-release tag" flag from a semver-ish string,
-/// tolerating a missing minor/patch. Build metadata (`+…`) is ignored. Returns `None` on a
-/// non-numeric core so an unparseable value yields NO advisory rather than a fake one.
-fn parse_semver_core(v: &str) -> Option<(u64, u64, u64, bool)> {
+/// Parse the `major.minor.patch` release core from a semver-ish string, tolerating a
+/// missing minor/patch. A pre-release tag (`-…`) and build metadata (`+…`) are ignored (see
+/// the POLICY on `client_is_older`). Returns `None` on a non-numeric core so an unparseable
+/// value yields NO advisory rather than a fake one.
+fn parse_semver_core(v: &str) -> Option<(u64, u64, u64)> {
     let core = v.split('+').next().unwrap_or(v);
-    let (core, has_pre) = match core.split_once('-') {
-        Some((c, pre)) => (c, !pre.is_empty()),
-        None => (core, false),
-    };
+    let core = core.split_once('-').map_or(core, |(c, _)| c);
     let mut parts = core.split('.');
     let major = parts.next()?.trim().parse().ok()?;
     let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
     let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((major, minor, patch, has_pre))
+    Some((major, minor, patch))
 }
 
 /// True when `app_version` is strictly older than the relay's published
@@ -5063,8 +5118,7 @@ fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
     ) else {
         return false;
     };
-    // Release cores only; the parsed pre-release flag is deliberately ignored (see POLICY).
-    (a.0, a.1, a.2) < (m.0, m.1, m.2)
+    a < m
 }
 
 /// Build the version advisory when this client is behind the relay's minimum. Advisory
@@ -5455,29 +5509,8 @@ pub async fn sync_remove_device(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let fetched = http_get_roster(&session).await?;
-        let (prev_roster, prev_fp) = verify_roster_signed(
-            Some(&fetched.device_list),
-            Some(&fetched.signature),
-            &vault_key,
-            session.roster_counter,
-        )?;
+        let prev_roster = reanchor_roster(&mut session, &vault_key).await?;
         let verified_counter = prev_roster.counter;
-        if fetched.counter as u64 != verified_counter {
-            return Err(
-                "relay's plaintext roster counter disagrees with the signed \
-                 roster — refusing to sign (possible tamper)"
-                    .to_string(),
-            );
-        }
-        session.roster_counter = verified_counter as i64;
-        session.roster_fingerprint = Some(prev_fp);
-        let (rc, rf) = (session.roster_counter, session.roster_fingerprint.clone());
-        session = update_session(move |s| {
-            s.roster_counter = rc;
-            s.roster_fingerprint = rf;
-        })?;
-        persist_account_anchor(&session)?;
 
         // The target is located in the VERIFIED roster by fingerprint — never in the
         // relay's advisory index.
@@ -5486,7 +5519,7 @@ pub async fn sync_remove_device(
             .iter()
             .find(|d| {
                 B64.decode(d.ed25519_pub.as_bytes())
-                    .map(|pk| device_fingerprint(&pk) == fingerprint)
+                    .map(|pk| sha256_fingerprint(&pk) == fingerprint)
                     .unwrap_or(false)
             })
             .cloned()
@@ -5509,16 +5542,13 @@ pub async fn sync_remove_device(
             counter: new_counter as u64,
             devices: entries,
         };
-        let canonical = roster_canonical_bytes(&roster)?;
-        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
-        let roster_fp = roster_fingerprint_from_canonical(&canonical);
-        let device_list_value =
-            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        let (device_list_value, signature_b64, roster_fp) =
+            sign_roster_for_upload(&roster, &vault_key)?;
         match http_put_roster(
             &session,
             &RosterUploadRequest {
                 device_list: device_list_value,
-                signature: B64.encode(signature),
+                signature: signature_b64,
                 counter: new_counter,
                 vault_key_epoch: session.epoch as i64,
                 active_devices: active_ids,
@@ -6205,11 +6235,8 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
             added_at,
         }],
     };
-    let canonical = roster_canonical_bytes(&roster)?;
-    let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
-    let roster_fp = roster_fingerprint_from_canonical(&canonical);
-    let device_list_value =
-        serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+    let (device_list_value, signature_b64, roster_fp) =
+        sign_roster_for_upload(&roster, &vault_key)?;
 
     let body = SignupRequest {
         email: req.email.clone(),
@@ -6220,7 +6247,7 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
         wrapped_vault_key_recovery: B64.encode(&wrapped_rec),
         device_list: RosterEnvelope {
             device_list: device_list_value,
-            signature: B64.encode(signature),
+            signature: signature_b64,
             counter: 0,
             vault_key_epoch: 0,
             client_id,
@@ -6233,7 +6260,7 @@ pub async fn sync_signup(req: SignupArgs) -> Result<SignupResultDto, String> {
     let url = format!("{server_url}/auth/signup");
     let tokens: TokenResponse = send_json(reqwest::Client::new().post(&url).json(&body)).await?;
 
-    let device_fingerprint = device_fingerprint(&dev_pub);
+    let device_fingerprint = sha256_fingerprint(&dev_pub);
     let session = Session {
         server_url,
         email: req.email,
@@ -6418,7 +6445,7 @@ pub async fn sync_login_finish(password: String) -> Result<SyncStatusDto, String
     let served_salt = B64
         .decode(resp.salt_enc.as_bytes())
         .map_err(|_| "relay salt_enc: invalid base64".to_string())?;
-    let device_fingerprint = device_fingerprint(&dev_pub);
+    let device_fingerprint = sha256_fingerprint(&dev_pub);
     let session = Session {
         server_url: pending.server_url,
         email: pending.email,
@@ -6505,9 +6532,11 @@ pub async fn sync_recover(
         .decode(resp.wrapped_vault_key_recovery.as_bytes())
         .map_err(|_| "wrapped_vault_key_recovery: invalid base64".to_string())?;
     let vault_key = unwrap_vault_key(&recovery_key, &wrapped_rec, WRAP_VAULT_REC_DOMAIN)?;
-    // Item 1: §7.4 anti-rollback floor from the per-account anchor (survives sign-out) first,
+    // §7.4 anti-rollback floor from the per-account anchor (survives sign-out) first,
     // falling back to the live session.
-    let cached_counter = load_account_anchor(&server_url, &email)?
+    let anchor = load_account_anchor(&server_url, &email)?;
+    let cached_counter = anchor
+        .as_ref()
         .map(|a| a.roster_counter)
         .or_else(|| {
             load_session().ok().flatten().and_then(|s| {
@@ -6527,7 +6556,7 @@ pub async fn sync_recover(
     // it cannot tell a stale-but-validly-signed roster from the live one (§7.4 C2). When
     // this install DOES hold an anchor for the account, a served roster at the SAME counter
     // with a DIFFERENT fingerprint is a substitution, not a refresh: refuse to sign on it.
-    if let Some(anchor) = load_account_anchor(&server_url, &email)? {
+    if let Some(anchor) = anchor.as_ref() {
         if anchor.roster_counter == prev_roster.counter as i64 {
             if let Some(known_fp) = anchor.roster_fingerprint.as_deref() {
                 if known_fp != prev_fp {
@@ -6553,7 +6582,7 @@ pub async fn sync_recover(
         tenant_id: resp.tenant_id,
         bearer: resp.access_token,
         refresh_token: Some(resp.refresh_token),
-        device_fingerprint: Some(device_fingerprint(&dev_pub)),
+        device_fingerprint: Some(sha256_fingerprint(&dev_pub)),
         sync_enabled: false,
         client_id,
         device_sk_b64: B64.encode(dev_seed),
@@ -6578,15 +6607,21 @@ pub async fn sync_recover(
     // counter advance. A 409 means a concurrent approval moved the counter: surface it
     // (the user can simply sign in again with the code) rather than skipping ahead.
     // An older relay ignores the identity fields and enrols nothing; `GET /devices` then
-    // lacks this device, and we skip the upload it would refuse.
-    let enrolled_here = http_get_devices(&session)
-        .await?
-        .devices
-        .iter()
-        .any(|d| d.client_id == client_id);
+    // lacks this device, and we skip the upload it would refuse. A device that is already
+    // a roster member has nothing to admit and never consults the index.
+    let enrolled_here = if already_member {
+        false
+    } else {
+        http_get_devices(&session)
+            .await?
+            .devices
+            .iter()
+            .any(|d| d.client_id == client_id)
+    };
     if !already_member && !enrolled_here {
         tracing::warn!(
-            "sync recover: relay did not enrol this device (older relay?) — signed in,              cannot self-admit; another device must approve it"
+            "sync recover: relay did not enrol this device (older relay?) — signed in, \
+             cannot self-admit; another device must approve it"
         );
     }
     if !already_member && enrolled_here {
@@ -6606,16 +6641,13 @@ pub async fn sync_recover(
             counter: new_counter as u64,
             devices: entries,
         };
-        let canonical = roster_canonical_bytes(&roster)?;
-        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
-        let roster_fp = roster_fingerprint_from_canonical(&canonical);
-        let device_list_value =
-            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        let (device_list_value, signature_b64, roster_fp) =
+            sign_roster_for_upload(&roster, &vault_key)?;
         let put = http_put_roster(
             &session,
             &RosterUploadRequest {
                 device_list: device_list_value,
-                signature: B64.encode(signature),
+                signature: signature_b64,
                 counter: new_counter,
                 vault_key_epoch: epoch as i64,
                 active_devices: active_ids,
@@ -6766,44 +6798,10 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
     loop {
         attempts += 1;
 
-        // (a) GET + (b) verify the authoritative roster (§7.5 step 2, §7.4 anti-rollback).
-        let fetched = http_get_roster(&session).await?;
-        let (prev_roster, prev_fp) = verify_roster_signed(
-            Some(&fetched.device_list),
-            Some(&fetched.signature),
-            &vault_key,
-            session.roster_counter,
-        )?;
-        // The anti-rollback counter comes from the SIGNATURE-BOUND value inside the verified
-        // canonical roster — never the untrusted plaintext `RosterFetchResponse.counter`, which
-        // is not read at all past verification.
+        // (a) GET + (b) verify + ratchet-and-persist (`reanchor_roster`). The counter we
+        // build on is the SIGNATURE-BOUND one — never the relay's plaintext column.
+        let prev_roster = reanchor_roster(&mut session, &vault_key).await?;
         let verified_counter = prev_roster.counter;
-        // Tamper check: the relay's plaintext counter must match the signature-bound one. A
-        // mismatch means the relay's advisory column diverged from the signed content (only
-        // possible via tampering or a relay bug) — refuse to sign and surface.
-        if fetched.counter as u64 != verified_counter {
-            return Err(
-                "relay's plaintext roster counter disagrees with the signed \
-                 roster — refusing to sign (possible tamper)"
-                    .to_string(),
-            );
-        }
-        // Ratchet the anti-rollback floor forward to the verified counter and PERSIST it (session
-        // cache + per-account keychain anchor) BEFORE attempting the mutation. Even if we abort
-        // below (target fingerprint gone, or the PUT loses to a concurrent approval) the floor has
-        // advanced, so a validly-signed OLDER roster can never be replayed against us afterwards.
-        // `verify_roster_signed` already proved verified_counter >= our floor, so this only moves
-        // forward. `update_session` merges just our two fields under the lock (never clobbering a
-        // token the drain may have rotated during the network round-trips).
-        session.roster_counter = verified_counter as i64;
-        session.roster_fingerprint = Some(prev_fp);
-        let ratchet_counter = session.roster_counter;
-        let ratchet_fp = session.roster_fingerprint.clone();
-        session = update_session(move |s| {
-            s.roster_counter = ratchet_counter;
-            s.roster_fingerprint = ratchet_fp;
-        })?;
-        persist_account_anchor(&session)?;
 
         // (c) GET /devices ONLY to discover the pending target by its out-of-band-verified
         // fingerprint (§7.5 step 4) — never as the membership source.
@@ -6815,7 +6813,7 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
                 d.status == "pending"
                     && B64
                         .decode(d.ed25519_pub.as_bytes())
-                        .map(|pk| device_fingerprint(&pk) == fingerprint)
+                        .map(|pk| sha256_fingerprint(&pk) == fingerprint)
                         .unwrap_or(false)
             })
             .ok_or_else(|| "No pending device with that fingerprint.".to_string())?;
@@ -6834,17 +6832,14 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
             counter: new_counter as u64,
             devices: entries,
         };
-        let canonical = roster_canonical_bytes(&roster)?;
-        let signature = yapstack_crypto::sign::sign_roster(&vault_key, &canonical);
-        let roster_fp = roster_fingerprint_from_canonical(&canonical);
-        let device_list_value =
-            serde_json::to_value(&roster).map_err(|e| format!("roster encode: {e}"))?;
+        let (device_list_value, signature_b64, roster_fp) =
+            sign_roster_for_upload(&roster, &vault_key)?;
 
         let outcome = http_put_roster(
             &session,
             &RosterUploadRequest {
                 device_list: device_list_value,
-                signature: B64.encode(signature),
+                signature: signature_b64,
                 counter: new_counter,
                 vault_key_epoch: session.epoch as i64,
                 active_devices: active_ids,
@@ -7069,6 +7064,17 @@ mod tests {
             "1e5ad1dbc106f5791bb28d514097f462fece2837b3b5a02b6708364d6655db8b",
             "recovery_auth_key drifted from the LOCKED §13.7 vector"
         );
+    }
+
+    #[test]
+    fn relay_plaintext_counter_must_match_the_signed_one() {
+        // §5.4: the relay's advisory `counter` column is never trusted, but a value that
+        // disagrees with the signature-bound counter is a tamper signal and stops the
+        // ceremony before anything is signed.
+        assert!(check_relay_counter_matches_signed(7, 7).is_ok());
+        assert!(check_relay_counter_matches_signed(6, 7).is_err());
+        assert!(check_relay_counter_matches_signed(8, 7).is_err());
+        assert!(check_relay_counter_matches_signed(-1, 0).is_err());
     }
 
     #[test]
