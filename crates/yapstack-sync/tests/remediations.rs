@@ -205,7 +205,7 @@ fn r5_uniqueness_deterministic_resolution() {
 
 /// R7: device A adds a column and writes it; device B (still at the base schema)
 /// quarantines the unknown-column changes, migrates with the wrapped ALTER, replays,
-/// and converges with NO data loss (architecture §6.3/§15).
+/// and converges with NO data loss (SYNC_SPEC §6.4, §12 I14).
 #[test]
 fn r7_quarantine_replay_across_schema_gap() {
     // Two independent devices at the SAME base schema `doc(id, a)`.

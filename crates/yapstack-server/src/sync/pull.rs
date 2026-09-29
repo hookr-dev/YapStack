@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `GET /sync/pull?since=&limit=` — the SOURCE OF TRUTH for cursor advancement
-//! (architecture §7a). Returns opaque ciphertext blobs after the cursor in dense
+//! (SYNC_SPEC §6.4, §9.1). Returns opaque ciphertext blobs after the cursor in dense
 //! commit order. NEVER gated by entitlements (a read must never be locked out).
 
 use axum::extract::{Query, State};

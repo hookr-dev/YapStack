@@ -25,7 +25,7 @@ pub struct AppState {
     pub limits: Arc<dyn TenantLimitSource>,
     /// In-process SSE wakeup fan-out (wakeup-only; pull is source of truth).
     pub sse: Arc<SseHub>,
-    /// Per-(tenant, ip) push rate limiter (architecture §10).
+    /// Per-(tenant, ip) push rate limiter (SYNC_SPEC §9.4).
     pub ratelimit: Arc<RateLimiter>,
     /// Per-IP throttle on `POST /auth/login/finish` (nil workspace key).
     pub login_ratelimit: Arc<RateLimiter>,

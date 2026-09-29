@@ -1989,22 +1989,18 @@ async fn login_finish_as(
     (access, counter)
 }
 
-/// FINDING #1 — the cached-counter approval deadlock, end to end against a live relay.
+/// FINDING #1 (historical) — the cached-counter approval deadlock, end to end against a
+/// live relay.
 ///
-/// This test models the client's `sync_approve_device` counter algorithm EXACTLY
-/// (apps/desktop/src-tauri/src/sync.rs:5550 `new_counter = session.roster_counter + 1`,
-/// write-back only on success at :5579; the cache is re-anchored ONLY by
-/// signup/login/recover/successful-approve — never by `sync_status`/`GET /devices`,
-/// which carry no counter). A device whose cache lags by one — a perfectly ordinary
-/// state the moment ANOTHER active device performs an approval — computes `stale + 1`,
-/// which equals the stored counter, and `put_roster` returns 409. The write-back never
-/// runs, so the cache stays stale and EVERY retry sends the same value: a permanent lock.
-///
-/// NOTE ON RED/GREEN: the 409 here is the relay behaving CORRECTLY (anti-rollback is by
-/// design, pinned by `roster_counter_anti_rollback_rejects_stale_or_equal`). The defect
-/// is client-side (stale cache + no re-anchor). So this test DEMONSTRATES the lockout
-/// mechanism and STAYS GREEN; the genuinely-red gate for the fix is the companion test
-/// `finding1_no_get_roster_route_to_reanchor_counter` below.
+/// This test models the ORIGINAL client counter algorithm (`new_counter = cached + 1`,
+/// write-back only on success, no re-anchor and no 409 handling). A device whose cache
+/// lagged by one — ordinary the moment ANOTHER active device performed an approval —
+/// computed `stale + 1`, which equalled the stored counter, and `put_roster` returned
+/// 409 forever. The relay side is CORRECT (anti-rollback by design, pinned by
+/// `roster_counter_anti_rollback_rejects_stale_or_equal`); the fix was client-side and
+/// has landed: `sync_approve_device` / `sync_remove_device` re-anchor from
+/// `GET /devices/roster` and retry once on 409 (SYNC_SPEC §5.4). This test stays as the
+/// demonstration of the lockout mechanism the relay's guard produces.
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn finding1_cached_counter_permanently_409_locks_lagging_approver() {
@@ -2089,12 +2085,12 @@ async fn finding1_cached_counter_permanently_409_locks_lagging_approver() {
         StatusCode::CONFLICT,
         "lagging approver sending stale+1 is rejected by anti-rollback"
     );
-    // The client write-back (sync.rs:5579) only runs on a 2xx; the cache stays 1.
+    // The original client's write-back only ran on a 2xx; the cache stays 1.
     // d1_cache is UNCHANGED here, modelling that the stale value is never advanced.
     assert_eq!(d1_cache, 1, "stale cache is never advanced after a 409");
 
-    // Retry: the client recomputes the SAME stale+1 (there is no 409 handling in
-    // sync.rs — grep 409/Conflict yields nothing) -> 409 again. Permanent lock.
+    // Retry: the original client recomputed the SAME stale+1 -> 409 again. Permanent
+    // lock (the shipped client re-anchors instead; see the doc comment above).
     let (roster, sig) = signed_roster(&vault_key, d1_cache + 1, 0);
     let resp = put_auth(
         &app,
@@ -2111,12 +2107,9 @@ async fn finding1_cached_counter_permanently_409_locks_lagging_approver() {
     );
 }
 
-/// FINDING #1 (RED GATE) — the relay exposes NO route to re-anchor the roster counter,
-/// which is why the lockout above is permanent. The finding's FIX is to "expose the
-/// current roster (counter + device_list + signature) on a GET" so the client can
-/// re-anchor before signing. This test asserts that endpoint exists and returns the
-/// current counter. It FAILS on the reviewed tree (no such route: `/devices/roster`
-/// has only a PUT handler, lib.rs:67) and PASSES once the re-anchor GET is added.
+/// FINDING #1 (regression guard) — `GET /devices/roster` exists and returns the current
+/// signed roster with its counter (SYNC_SPEC §9.1), which is what lets the client
+/// re-anchor before signing and ends the lockout demonstrated above.
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn finding1_no_get_roster_route_to_reanchor_counter() {

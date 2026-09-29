@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! In-process SSE wakeup hub (architecture §7a "Live push").
+//! In-process SSE wakeup hub (SYNC_SPEC §6.2, §9.1).
 //!
 //! **Wakeup-only, by contract.** Events carry ONLY the tenant's latest `changeset_seq`
 //! — never ciphertext, never a value a client could treat as authoritative. SSE MUST

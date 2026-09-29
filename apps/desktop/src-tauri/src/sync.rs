@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Desktop integration of the `yapstack-sync` runtime (Gate 5B, T010b).
+//! Desktop integration of the `yapstack-sync` runtime (SYNC_SPEC §3, §5–§7).
 //!
 //! This whole module is behind the off-by-default `sync` cargo feature. That is
 //! the deliberate **isolation** of two hazards the vendored cr-sqlite CRR engine
-//! carries (see notes/T010-sync-runtime.md CAVEATS). (1) the build needs the
+//! carries. (1) the build needs the
 //! pinned `nightly-2023-10-05` for the vendored bundle; (2) the bundle ships
 //! `panic = "abort"` / a shadow `eh_personality`, so any binary that links it
 //! aborts (not unwinds) on a Rust panic. Keeping it feature-gated means the
@@ -176,8 +176,9 @@ const DRAIN_FAIL_SURFACE_THRESHOLD: u32 = 2;
 
 /// The signed-in session held in the OS keychain (macOS Keychain / Windows
 /// Credential Manager via `keyring`). Holds the vault key and bearer token —
-/// the secrets that must NEVER touch the webview or the plaintext DB.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// the secrets that must NEVER touch the webview or the plaintext DB. No `Debug`:
+/// a `{:?}` of this struct would dump the vault key and tokens into the log file.
+#[derive(Clone, Serialize, Deserialize)]
 struct Session {
     server_url: String,
     email: String,
@@ -235,8 +236,8 @@ impl Session {
 /// SURVIVES sign-out. `client_id` is the stable §7.1 UUIDv4; `device_sk_b64` is the private
 /// Ed25519 signing seed — kept in the keychain, NEVER transmitted (only the public key is
 /// listed in the roster, §7.5). The session entry may still carry a convenience copy, but
-/// THIS entry is the single source of truth for identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// THIS entry is the single source of truth for identity. No `Debug` (holds the seed).
+#[derive(Clone, Serialize, Deserialize)]
 struct DeviceIdentity {
     client_id: Uuid,
     /// base64 of this device's 32-byte Ed25519 signing seed (§7.1).
@@ -659,8 +660,6 @@ mod win_creds {
         Ok(())
     }
 }
-
-// ----- Backing-store (de)serialisation of the two logical entries -----
 
 // ----- Key-wrapped session store (T029: Windows credential-blob overflow fix) -----
 //
@@ -4675,16 +4674,6 @@ fn sign_roster_for_upload(
     Ok((device_list_value, B64.encode(signature), roster_fp))
 }
 
-/// Build the NEW roster membership for an approval (§7.5 step 3), from the VERIFIED
-/// previous roster carried forward + the single fingerprint-verified target device.
-///
-/// The relay's `GET /devices` index is used ONLY to discover the pending target's public
-/// material; it is NEVER the membership source (a compromised relay can flip any row's
-/// advisory `status` to `active`, so folding on that value would sign a membership the
-/// vault-key holder never intended — the finding-#2 defect). Existing members are copied
-/// verbatim from the last VERIFIED roster (no v1 eviction: every prior member carries
-/// forward), so their keys come solely from the signed roster and the relay's `/devices`
-/// view of them is never consulted.
 /// Whether deterministic maintenance (`cascade_gc` / `enforce_uniqueness`) may run this drain
 /// cycle. It runs ONLY on a clean, fully-drained pull (`pull_error_none`): the proven-guards make
 /// it safe against synthetic-default partial rows, but a proven-but-STALE editable LWW winner read
@@ -4702,6 +4691,16 @@ fn maintenance_ready(merged: bool, pull_error_none: bool, pending: &mut bool) ->
     false
 }
 
+/// Build the NEW roster membership for an approval (§7.5 step 3), from the VERIFIED
+/// previous roster carried forward + the single fingerprint-verified target device.
+///
+/// The relay's `GET /devices` index is used ONLY to discover the pending target's public
+/// material; it is NEVER the membership source (a compromised relay can flip any row's
+/// advisory `status` to `active`, so folding on that value would sign a membership the
+/// vault-key holder never intended). Existing members are copied verbatim from the last
+/// VERIFIED roster (no v1 eviction: every prior member carries forward), so their keys
+/// come solely from the signed roster and the relay's `/devices` view of them is never
+/// consulted.
 fn build_roster_membership(
     verified_prev: &[RosterDeviceEntry],
     get_devices: &[DeviceInfo],
@@ -5381,11 +5380,12 @@ pub async fn sync_enable(
                 );
             }
             Some(_) => {}
-            // Not in the device index at all: a recovery-code sign-in (the recovery token
-            // carries no device identity and enrols nothing). The relay refuses pushes and
-            // audio uploads from an unenrolled device, so turning sync on would only surface
-            // a permanent error; say so instead. Recovery re-bootstrap (SYNC_SPEC §15.A,
-            // CRYPTO_SPEC A7) is the slice that closes this.
+            // Not in the device index at all. Since A7 a recovery sign-in enrols the device
+            // and since A10 a sign-in without a valid proof binds no device at all, so the
+            // only ways here are a relay older than this app (it ignored the identity
+            // fields) or a device row that vanished. The relay refuses pushes and audio
+            // uploads from an unenrolled device, so turning sync on would only surface a
+            // permanent error; say so instead.
             None => {
                 return Err(
                     "The relay doesn't list this device, so it can't sync yet. This usually \
@@ -6561,7 +6561,9 @@ pub async fn sync_recover(
             if let Some(known_fp) = anchor.roster_fingerprint.as_deref() {
                 if known_fp != prev_fp {
                     return Err(
-                        "The device list the relay served does not match the one this                          device last verified at the same version — refusing to continue                          (possible tamper)."
+                        "The device list the relay served does not match the one this \
+                         device last verified at the same version — refusing to continue \
+                         (possible tamper)."
                             .to_string(),
                     );
                 }
@@ -7880,13 +7882,14 @@ mod tests {
         // Cutover step 6a/6b: the two renames. Neither touches a -wal.
         std::fs::rename(&live, &backup).unwrap();
         // ---- WINDOW (a): finalize lands BETWEEN the two renames — the live path does NOT
-        // exist, so open_managed CREATEs a fresh empty yapstack.db (+ -wal) and the INSERT
-        // fails ("no such table"). This is the finding's stray-empty-DB vector.
+        // exist. `open_managed` refuses to CREATE a database (the no-CREATE guard), so the
+        // INSERT fails with SQLITE_CANTOPEN and no stray empty yapstack.db (+ -wal) appears;
+        // before the guard this window created one, which was the finding's vector.
         let ins_a = crate::db::insert_audio_part_row(&live, &part(1));
         eprintln!("CUTOVER-RACE (a): live existed before finalize = false (renamed to backup)");
         eprintln!("CUTOVER-RACE (a): insert result = {ins_a:?}");
         eprintln!(
-            "CUTOVER-RACE (a): a fresh yapstack.db was CREATEd by open_managed = {}",
+            "CUTOVER-RACE (a): a yapstack.db exists after finalize (no-CREATE guard ⇒ false) = {}",
             live.exists()
         );
         eprintln!(
@@ -9428,19 +9431,14 @@ mod tests {
             }
         }
 
-        /// PROVING — signout-lifecycle #3 (LOW, structural demo): "Re-enable permanently
-        /// disarms local-write kicks (KICK_ARMED cleared after re-arm)."
-        ///
-        /// `KICK_ARMED` is a process-global with no per-thread ownership: every debouncer
-        /// stores `true` on entry (sync.rs:2542) and `false` as its LAST statement
-        /// (sync.rs:2569). `sync_enable` spawns the NEW debouncer (inside `spawn_drain`,
-        /// sync.rs:4596) BEFORE it joins the OLD handle's debouncer (`prev.stop()`,
-        /// sync.rs:4610-4611). The store order is therefore new=true, then old=false — leaving
-        /// `KICK_ARMED == false` with a LIVE new debouncer, so `note_local_write`
-        /// (sync.rs:2499-2506) becomes a permanent no-op and every push-kick is dropped.
+        /// Regression guard for the re-enable disarm bug: `sync_enable` spawns the NEW
+        /// debouncer (inside `spawn_drain`) BEFORE it joins the OLD handle's debouncer
+        /// (`prev.stop()`). Without generation ownership (`KICK_GEN`) the stale debouncer's
+        /// final `KICK_ARMED = false` clobbered the flag the live one had just set, turning
+        /// `note_local_write` into a permanent no-op so every push-kick was dropped.
         ///
         /// This reproduces the exact ordering with the REAL `spawn_write_kick_debouncer` +
-        /// stop/join, then asserts the DESIRED invariant (a live debouncer stays armed). RED.
+        /// stop/join, then asserts the invariant: a live debouncer stays armed.
         #[test]
         fn stale_debouncer_shutdown_disarms_the_live_debouncer() {
             use std::sync::atomic::Ordering;

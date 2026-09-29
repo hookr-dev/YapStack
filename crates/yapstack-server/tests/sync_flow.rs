@@ -641,7 +641,7 @@ fn minio_env() -> Option<(String, String, String, String, String, String)> {
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn cross_tenant_reads_are_denied_at_the_api() {
-    // §15 row 5 (Gap 3 / audit R5) — NEGATIVE cross-tenant isolation at the API surface, not
+    // SYNC_SPEC §12 I2 — NEGATIVE cross-tenant isolation at the API surface, not
     // just in-schema. Two independent signups mint two workspaces; neither JWT can read the
     // other's changesets through /sync/pull or /sync/completeness, and — because the tenant is
     // taken ONLY from the validated JWT (never request-shaped) — a push authenticated as B can
@@ -796,7 +796,7 @@ fn encrypt_canary_changeset(
 #[tokio::test]
 #[ignore = "requires a live Postgres via DATABASE_URL"]
 async fn plaintext_sentinel_never_appears_in_stored_server_bytes() {
-    // §15 row 3 (Gap 4 / audit R3) — AUTOMATED no-plaintext regression gate, replacing the
+    // SYNC_SPEC §12 I1 — AUTOMATED no-plaintext regression gate, replacing the
     // manual sweep. Push a changeset whose PLAINTEXT carries a distinctive random canary, then
     // scan EVERY user-table column of the relay DB (bytea rendered via both encode(...,'escape')
     // and encode(...,'hex'); everything else cast ::text) for the canary. The relay is a blind

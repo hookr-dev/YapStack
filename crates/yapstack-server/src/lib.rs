@@ -2,15 +2,15 @@
 #![forbid(unsafe_code)]
 //! # yapstack-server
 //!
-//! The YapStack blind relay (architecture §5, World B). Gate 3 scope: auth
-//! (CRYPTO_SPEC §3), RLS metadata isolation with the standard pooling guards, the
-//! entitlements seam wiring, and the informational endpoints. It NEVER runs the CRDT
-//! engine, NEVER decrypts content, and makes ZERO outbound calls.
-//!
-//! Gate 4 (T008) adds the changeset relay (push/pull/completeness/SSE), audio presign,
-//! the single ingestion choke point, per-tenant usage metering, the admin entitlements
-//! endpoints, and push rate limiting — all still blind (opaque ciphertext, zero
-//! outbound calls, never decrypts).
+//! The YapStack blind relay (SYNC_SPEC §1.1 posture, §9 as built): auth ceremonies
+//! (CRYPTO_SPEC §3, A7–A10), the device index and signed roster (§7.5), RLS metadata
+//! isolation with the standard pooling guards, the changeset relay
+//! (push/pull/completeness/SSE), audio and snapshot presigning with the single
+//! ingestion choke point and per-tenant usage metering, blob GC, push rate limiting,
+//! the entitlements seam and admin endpoints, and the informational endpoints. It
+//! NEVER runs the CRDT engine, NEVER decrypts content, and makes no outbound calls
+//! except to the operator's own object storage (a metadata-only HEAD and the GC's
+//! DELETE — never blob bytes).
 
 pub mod admin;
 pub mod audio;

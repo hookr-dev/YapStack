@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `POST /sync/push` — accept a drained outbox batch (architecture §7a).
+//! `POST /sync/push` — accept a drained outbox batch (SYNC_SPEC §6.3, §9.1).
 //!
 //! ## The commit-ordered sequence primitive (LOAD-BEARING, §7a)
 //!
@@ -43,12 +43,12 @@ pub async fn push(
     ClientIp(ip): ClientIp,
     Json(req): Json<PushRequest>,
 ) -> Result<Json<PushResponse>, AppError> {
-    // Guardrail: per-(tenant, ip) rate limit (architecture §10).
+    // Guardrail: per-(tenant, ip) rate limit (SYNC_SPEC §9.4).
     if !st.ratelimit.check(auth.tenant_id, &ip) {
         return Err(AppError::RateLimited);
     }
 
-    // Guardrail: max batch (architecture §10).
+    // Guardrail: max batch (SYNC_SPEC §9.1, §16).
     if req.changes.len() > MAX_PUSH_CHANGES {
         return Err(AppError::BadRequest(format!(
             "batch exceeds {MAX_PUSH_CHANGES} changes"

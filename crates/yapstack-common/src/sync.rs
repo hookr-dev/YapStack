@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Sync-protocol wire DTOs shared by the desktop client and the blind relay
-//! (architecture §7a/§7b, §9, §14).
+//! (SYNC_SPEC §6.3–§6.4, §7, §9.1).
 //!
 //! These types are the JSON contract for changeset push/pull, the completeness
 //! (anti-entropy) endpoint, and audio presign. They carry **only ciphertext and
@@ -12,9 +12,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Max changes accepted in one `POST /sync/push` (architecture §10 guardrail).
+/// Max changes accepted in one `POST /sync/push` (SYNC_SPEC §9.1, §16).
 pub const MAX_PUSH_CHANGES: usize = 1000;
-/// Max total ciphertext bytes accepted in one `POST /sync/push` (architecture §10).
+/// Max total ciphertext bytes accepted in one `POST /sync/push` (SYNC_SPEC §9.1, §16).
 pub const MAX_PUSH_BYTES: usize = 5 * 1024 * 1024;
 
 // ------------------------------------------------------------------ push
@@ -96,7 +96,7 @@ pub struct ClientTail {
     pub max_client_seq: i64,
 }
 
-/// `GET /sync/completeness` (architecture §7b): verifiable without reading content.
+/// `GET /sync/completeness` (SYNC_SPEC §9.1): verifiable without reading content.
 /// `contiguous` is arithmetic over the dense cursor (`max == count`, seqs start at 1).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompletenessResponse {

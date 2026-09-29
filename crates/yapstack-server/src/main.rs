@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #![forbid(unsafe_code)]
 //! Relay entry point. Loads `yapstack-relay.toml`, connects Postgres, runs
-//! migrations, and serves. Zero outbound calls.
+//! migrations, and serves.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;

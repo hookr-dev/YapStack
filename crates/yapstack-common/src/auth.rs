@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Auth-ceremony wire DTOs shared by the desktop client and the blind relay
-//! (architecture §14, CRYPTO_SPEC §3/§4/§6/§7).
+//! (SYNC_SPEC §3 — DTOs shared by client and relay; CRYPTO_SPEC §3/§4/§6/§7).
 //!
 //! ONE definition, both stacks: the relay (`yapstack-server`) and the desktop
 //! sync client compile against these exact shapes so the JSON contract can never
@@ -149,7 +149,7 @@ pub struct LoginFinishResponse {
 
 // --------------------------------------------------------------------- refresh
 
-/// `POST /auth/refresh` body — rotation + reuse detection (architecture §5/§10).
+/// `POST /auth/refresh` body — rotation + reuse detection (SYNC_SPEC §5.8, §9.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
@@ -210,7 +210,8 @@ pub struct RecoverResponse {
 /// `auth_key'`/`master_key'` from the NEW password under the account's EXISTING
 /// `salt_enc` (A9: the salt is retained so every known device's C3 baseline stays valid),
 /// re-wraps the vault key under `master_key'`, and uploads the new second-hash input plus
-/// the new wrap. No content is re-encrypted; other devices are unaffected.
+/// the new wrap. No content is re-encrypted. The relay revokes every OTHER device's refresh
+/// families, so they sign in again with the new password (SYNC_SPEC §5.6).
 ///
 /// Authorization: the caller must be an ACTIVE device, and must EITHER present the
 /// `current_auth_key` (re-authentication — a stolen 15-minute access token alone cannot

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! # yapstack-sync
 //!
-//! On-device sync runtime for World B (blind-relay E2E sync). It statically links
+//! On-device sync runtime for the blind-relay E2E sync (SYNC_SPEC §1.1, §6). It statically links
 //! the pinned cr-sqlite v0.16.3 CRR engine (R6, `build.rs` + [`crsqlite`]), migrates
 //! the local schema to CRR-compatible form (R3, [`schema`]), reinstates the stripped
 //! FK cascade/SET-NULL semantics as CRDT tombstone GC (R4, [`cascade`]) and the

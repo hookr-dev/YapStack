@@ -21,7 +21,7 @@ jwt_secret = "CHANGE-ME-to-a-long-random-secret"
 server_pepper = "CHANGE-ME-to-a-long-random-pepper"
 
 [sync]
-protocol_version = 1
+protocol_version = 2
 min_client_version = "1.0.0"
 engine_version = "0.16.3"
 # billing_url = "https://yapstack.cloud/billing"   # hosted only; self-host omits it

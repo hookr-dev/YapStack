@@ -13,10 +13,10 @@
 //! or [`Limit::Unlimited`] when unset). Selection is by config value only — no
 //! compiled-in private impl (decision 1/6, AGPL one-artifact covenant).
 //!
-//! **DTO placement (T007 decision).** The admin PUT / usage GET wire types live in
-//! this crate ([`wire`]), because ENTITLEMENTS_SEAM.md makes the admin+usage OpenAPI
-//! part of *this* seam contract. The sync-protocol DTOs (changeset push/pull) remain
-//! destined for `yapstack-common` per architecture §14 and are a T008 deliverable.
+//! **DTO placement.** The admin PUT / usage GET wire types live in this crate
+//! ([`wire`]) because the admin+usage OpenAPI is part of the entitlements seam
+//! contract. The sync-protocol DTOs (changeset push/pull, auth ceremonies) live in
+//! `yapstack-common` (SYNC_SPEC §3).
 
 pub mod source;
 pub mod types;

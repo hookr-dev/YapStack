@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `GET /sync/stream` — SSE WAKEUP stream (architecture §7a "Live push").
+//! `GET /sync/stream` — SSE WAKEUP stream (SYNC_SPEC §6.2, §9.1).
 //!
 //! Each event is `event: wakeup\ndata: <changeset_seq>` and carries ONLY the latest
 //! seq — never ciphertext. It is a hint to call `GET /sync/pull`; the SSE value is NOT

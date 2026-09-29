@@ -106,7 +106,7 @@ mod tests {
         let msg = b"authentic control-plane request";
         let sig = sk.sign(msg).to_bytes();
 
-        // Tampered message (e.g. an attacker retargeted the tenant in the path).
+        // Tampered message (e.g. a relay altered one roster entry).
         assert!(verify_roster(&pk, b"tampered request", &sig).is_err());
 
         // Wrong signer.

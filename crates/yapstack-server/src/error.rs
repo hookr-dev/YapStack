@@ -23,7 +23,7 @@ pub enum AppError {
     /// `quota_exceeded` shape (ENTITLEMENTS_SEAM.md) verbatim.
     #[error("quota exceeded")]
     Quota(Box<QuotaExceeded>),
-    /// Push rate limit (architecture §10) — distinct from a quota breach.
+    /// Push rate limit (SYNC_SPEC §9.4) — distinct from a quota breach.
     #[error("rate limited")]
     RateLimited,
     /// A required subsystem (e.g. object storage) is not configured. NEVER used to

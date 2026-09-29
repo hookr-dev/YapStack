@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! S3/MinIO SigV4 **presigning** (architecture §9). This is pure local HMAC — the relay
+//! S3/MinIO SigV4 **presigning** (SYNC_SPEC §7.2). This is pure local HMAC — the relay
 //! computes a signed URL and hands it to the client; it NEVER uploads, downloads,
 //! re-hashes, or otherwise touches blob bytes. The client PUTs the ciphertext directly to
 //! object storage, which verifies the pinned content-length.
 //!
-//! The single exception is the **metadata-only HEAD** in [`object_exists`] (audio D8): it
-//! reads only object existence/metadata (never bytes, never plaintext), gating the
-//! `already_exists` vs. fresh-`upload_url` decision so a dead PUT can never be mistaken for
-//! a stored blob. This is the only outbound call the relay makes.
+//! The two exceptions are the **metadata-only HEAD** in [`object_exists`] (audio D8), which
+//! reads only object existence/metadata (never bytes, never plaintext) so a dead PUT can
+//! never be mistaken for a stored blob, and the GC sweep's presigned **DELETE** in
+//! [`delete_object`] (SYNC_SPEC §7.2). Those are the only outbound calls the relay makes.
 //!
 //! Presigned URLs are BEARER CAPABILITIES: callers must never log them.
 
@@ -25,7 +25,7 @@ const SERVICE: &str = "s3";
 const AWS4_REQUEST: &str = "aws4_request";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
-/// Build the object key for a tenant's ciphertext blob (architecture §9):
+/// Build the object key for a tenant's ciphertext blob (SYNC_SPEC §7.1):
 /// `tenants/{workspace_id}/blobs/{ciphertext_sha256_hex}`.
 #[must_use]
 pub fn object_key(workspace_id: uuid::Uuid, ciphertext_sha256_hex: &str) -> String {
@@ -214,7 +214,9 @@ async fn signed_request(
         .request(method.clone(), &signed.url)
         .send()
         .await
-        .map_err(|e| AppError::Unavailable(format!("storage {method} failed: {e}")))?;
+        .map_err(|e| {
+            AppError::Unavailable(format!("storage {method} failed: {}", e.without_url()))
+        })?;
     Ok(resp.status().as_u16())
 }
 

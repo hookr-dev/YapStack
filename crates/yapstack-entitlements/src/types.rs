@@ -23,15 +23,6 @@ impl Limit {
             Limit::Max(max) => current.saturating_add(additional) <= max,
         }
     }
-
-    /// Remaining headroom, or `None` when unlimited.
-    #[must_use]
-    pub fn remaining(self, current: u64) -> Option<u64> {
-        match self {
-            Limit::Unlimited => None,
-            Limit::Max(max) => Some(max.saturating_sub(current)),
-        }
-    }
 }
 
 /// Control-plane-supplied warn thresholds (fractions of the limit, e.g. `0.8`),

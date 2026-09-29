@@ -219,8 +219,7 @@ const DEFAULT_FILTER: &str = "info,\
     tao=warn,\
     wry=warn,\
     hyper=warn,\
-    reqwest=warn,\
-    sqlx=warn";
+    reqwest=warn";
 
 /// Install the global tracing subscriber with three layers:
 ///   1. stderr fmt (developer console)

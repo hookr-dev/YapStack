@@ -178,11 +178,6 @@ pub struct AudioLaneStatus {
 }
 
 impl AudioLaneStatus {
-    /// The distinct lane label the status surface renders (never merged with changeset sync).
-    #[must_use]
-    pub const fn lane_label(&self) -> &'static str {
-        "audio-upload"
-    }
     /// Outstanding work (not yet `done` and not `failed`).
     #[must_use]
     pub const fn outstanding(&self) -> u64 {
@@ -864,7 +859,7 @@ impl FetchProgress {
     }
     /// Whether a cancel has been requested.
     #[must_use]
-    pub fn is_cancelled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 }

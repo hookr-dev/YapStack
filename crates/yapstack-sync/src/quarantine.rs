@@ -8,7 +8,7 @@
 //! `_yapstack_pending_changes` table. After the device runs the matching schema
 //! migration (`schema::crsql_alter`, which adds the column and rebuilds the clock),
 //! we REPLAY the stashed change. Because the clock is byte-preserved, LWW converges
-//! exactly as if the change had arrived after the migration (architecture §6.3/§15).
+//! exactly as if the change had arrived after the migration (SYNC_SPEC §6.4, §12 I14).
 //!
 //! This is the load-bearing case the T003 spike deferred; the crate test
 //! `quarantine_replay_across_schema_gap` exercises A-has-column / B-lacks-column →
@@ -22,7 +22,7 @@ use crate::SyncError;
 
 /// Create the local quarantine table. Prefixed `_yapstack_` and never CRRified, so
 /// it never syncs.
-pub fn ensure_pending_table(conn: &Connection) -> Result<(), SyncError> {
+fn ensure_pending_table(conn: &Connection) -> Result<(), SyncError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _yapstack_pending_changes (\
             id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -61,7 +61,7 @@ fn stash(conn: &Connection, r: &ChangeRow) -> Result<(), SyncError> {
 
 /// Apply a change, or quarantine it if its column is unknown locally. Returns true
 /// if the change was quarantined (deferred), false if applied.
-pub fn apply_or_quarantine(conn: &Connection, r: &ChangeRow) -> Result<bool, SyncError> {
+fn apply_or_quarantine(conn: &Connection, r: &ChangeRow) -> Result<bool, SyncError> {
     if is_unknown_column(conn, r)? {
         stash(conn, r)?;
         Ok(true)

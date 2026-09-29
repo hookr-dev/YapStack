@@ -308,15 +308,15 @@ export interface OnboardingState {
 }
 
 /**
- * Persisted sync slice (YAPSTACK_SYNC §14). Deliberately holds NO secrets: the
- * vault key and auth tokens live in the OS keychain (Rust side), never here.
- * Only the non-sensitive handles the UI needs to render connection state are
- * persisted — the server URL, whether sync is enabled, the last-seen changeset
- * cursor, and this device's public fingerprint. Everything else is fetched live
- * via `syncCommands.status()`.
+ * Persisted sync slice (SYNC_SPEC §3, §5.1). Deliberately holds NO secrets: the
+ * vault key and auth tokens live in the sealed session store / OS keychain (Rust
+ * side), never here. Only the non-sensitive handles the UI needs to render
+ * connection state are persisted — the server URL, whether sync is enabled, the
+ * account email, and this device's public fingerprint. Everything else is fetched
+ * live via `syncCommands.status()`.
  */
 export interface SyncConfig {
-  /** Relay base URL — default hosted, or a pasted self-host URL. */
+  /** Relay base URL — empty until the user pastes a self-hosted relay (§15.G). */
   serverUrl: string;
   /** True once crr_migrate has run and the user opted into sync. */
   syncEnabled: boolean;
@@ -580,8 +580,8 @@ interface AppState {
    *  errors verbatim into `syncStatus.lastError` — never auto-routes or falls
    *  back (repo posture: the user fixes a broken connection). */
   refreshSyncStatus: () => Promise<void>;
-  /** Probe `url` (the Test-connection button and the one-shot blur/paste in
-   *  T027 both call this). Single-flight via a monotonic token: a stale
+  /** Probe `url` (the wizard's server step calls this on blur/paste/Enter).
+   *  Single-flight via a monotonic token: a stale
    *  response from a superseded probe is discarded. On success auto-persists
    *  `syncConfig.serverUrl = normalizedUrl` — but ONLY when signed out (a
    *  signed-in URL is locked; changing it is an explicit sign-out flow). */

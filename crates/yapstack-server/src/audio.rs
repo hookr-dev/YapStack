@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Audio E2E blobs (architecture §9, audio round-trip tranche D6/D8). The relay presigns
+//! Audio E2E blobs (SYNC_SPEC §7, CRYPTO_SPEC §1.5; audio round-trip tranche D6/D8). The relay presigns
 //! direct-to-object-storage uploads/downloads and tracks a dedup REFCOUNT; it never sees
 //! plaintext, never re-hashes, and no blob bytes flow through it. Presigned URLs are bearer
 //! capabilities and are NEVER logged.

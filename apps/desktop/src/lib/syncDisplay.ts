@@ -27,7 +27,7 @@ import {
 export const SMALL_N = 3;
 
 /** Continuous-syncing window (ms) that also unlocks motion, independent of N. */
-export const SYNC_MOTION_MS = 2000;
+const SYNC_MOTION_MS = 2000;
 
 /** The mutually-exclusive display states (plan §3 table; `catching-up` added R12;
  *  `quarantined` added for the §11.3 crypto-quarantine honesty fix). */

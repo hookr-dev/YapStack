@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 //! # yapstack-crypto
 //!
-//! RustCrypto implementation of `docs/CRYPTO_SPEC.md` (World B). This is the Rust
+//! RustCrypto implementation of `docs/CRYPTO_SPEC.md`. This is the Rust
 //! half of the "one spec, two stacks" contract: byte-for-byte identical
 //! constructions to the JS/`@noble` share-viewer stack, proven by the §13 KAT
 //! vectors reproduced in `tests/kat.rs` (which FAIL CLOSED on any mismatch).

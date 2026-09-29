@@ -76,7 +76,6 @@ async fn enqueue_is_idempotent_and_durable() {
     assert!(!audio::enqueue_on_save(&conn, PART_1, "/a.wav", SESSION_A).unwrap());
     let s = audio::lane_status(&conn).unwrap();
     assert_eq!(s.pending, 1);
-    assert_eq!(s.lane_label(), "audio-upload");
 }
 
 #[tokio::test]

@@ -104,9 +104,9 @@ pub const FETCH_CANCELLED: &str = "fetch cancelled by caller";
 
 // ---- snapshot endpoint wire DTOs (client side) --------------------------------
 //
-// Defined here rather than in `yapstack-common` for now (T011 allowed-files scope); the
-// field names mirror the server's `snapshot` handler exactly. T012 may hoist them into
-// `yapstack-common` alongside the other sync DTOs (arch §14) — a mechanical move.
+// Client-side mirror of the relay's snapshot handler DTOs (the compaction seam, SYNC_SPEC
+// §15.F); the field names match `crates/yapstack-server/src/snapshot.rs` exactly. Hoisting
+// them into `yapstack-common` is a mechanical move for the compaction slice.
 
 #[derive(Debug, Clone, Serialize)]
 struct SnapshotPresignRequest {
@@ -149,9 +149,12 @@ fn classify_status(status: StatusCode) -> Option<SyncError> {
 /// relay is UNREACHABLE (mirrors the T025 probe's `is_connect()`/`is_timeout()` split), so it
 /// becomes the distinct [`SyncError::Network`] the drain maps to the amber "can't reach relay"
 /// state. Every other reqwest error (body decode, or an HTTP status surfaced via
-/// `error_for_status`) stays a generic [`SyncError::Http`]. The reqwest display carries the
-/// relay URL only — never the bearer, which is sent as a header and is absent from the error.
+/// `error_for_status`) stays a generic [`SyncError::Http`]. The URL is stripped from the
+/// error (`without_url`): the audio PUT targets a presigned object-storage URL whose query
+/// string is a bearer capability, and this string reaches the log file and the UI. The
+/// bearer token is a header and never part of a reqwest error.
 fn map_send_error(e: reqwest::Error) -> SyncError {
+    let e = e.without_url();
     if e.is_connect() || e.is_timeout() {
         SyncError::Network(e.to_string())
     } else {
@@ -442,7 +445,7 @@ impl SyncTransport for HttpTransport {
 /// The value is ONLY a hint to pull — never authoritative (see `sse.rs` on the
 /// server) — so a garbled `data:` line is safely dropped rather than trusted.
 #[must_use]
-pub fn parse_sse_data_seq(line: &str) -> Option<i64> {
+fn parse_sse_data_seq(line: &str) -> Option<i64> {
     // SSE permits `data:<v>` and `data: <v>`; trim either. Other fields/comments → None.
     let rest = line.strip_prefix("data:")?;
     rest.trim().parse::<i64>().ok()

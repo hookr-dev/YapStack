@@ -4,7 +4,7 @@
 //! `tenant_id` is bound INTO the token at issuance from server-validated state; it is
 //! never taken from the request body. Every tenant-scoped handler derives the RLS
 //! `app.tenant_id` from the *validated* access token, closing the confused-deputy /
-//! IDOR path (architecture §5).
+//! IDOR path (SYNC_SPEC §9.3).
 
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};

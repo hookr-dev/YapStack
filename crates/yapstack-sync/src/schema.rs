@@ -135,7 +135,7 @@ fn emit_default(dflt: &str) -> String {
 ///
 /// CRYPTO/architecture invariant: sync assumes a UUID TEXT primary key. Every PK column
 /// is asserted to have TEXT affinity; a table whose PK is anything else fails loudly.
-pub fn derive_rebuild_body(conn: &Connection, table: &str) -> Result<String, SyncError> {
+fn derive_rebuild_body(conn: &Connection, table: &str) -> Result<String, SyncError> {
     let cols = table_columns(conn, table)?;
     if cols.is_empty() {
         return Err(SyncError::UnknownTable(table.to_string()));
@@ -213,7 +213,7 @@ pub fn is_crr(conn: &Connection, table: &str) -> Result<bool, SyncError> {
 /// Rebuild one table into its CRR-compatible shape (preserving app triggers such as
 /// the FTS sync triggers) then `crsql_as_crr` it. Idempotent: a table already
 /// converted is skipped.
-pub fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError> {
+fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError> {
     if is_crr(conn, table)? {
         return Ok(());
     }

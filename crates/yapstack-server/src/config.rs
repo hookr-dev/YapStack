@@ -6,8 +6,9 @@
 //! self-host default is the max tier. Present ⇒ `StoredLimits` + admin API
 //! (ENTITLEMENTS_SEAM.md config seam).
 //!
-//! The relay makes ZERO outbound calls; nothing here can point it at a remote
-//! service. `billing_url` is a passive string echoed to clients in `/sync/info`.
+//! Nothing here can point the relay at a remote service beyond the operator's own
+//! object storage (`[storage]`, presigning plus a metadata HEAD and the GC's DELETE).
+//! `billing_url` is a passive string echoed to clients in `/sync/info`.
 
 use serde::Deserialize;
 use yapstack_entitlements::LimitDefaults;
@@ -30,10 +31,11 @@ pub struct Config {
     pub limits: Option<LimitsConfig>,
     /// Object-storage (S3/MinIO) presigning target. Absent ⇒ audio presign disabled
     /// (the relay still stores no bytes; it only signs URLs). Presigning is pure local
-    /// HMAC — the relay makes ZERO outbound calls.
+    /// HMAC; the only requests the relay sends here are a metadata-only HEAD and the
+    /// GC's DELETE, never blob bytes.
     #[serde(default)]
     pub storage: Option<StorageConfig>,
-    /// Per-`(workspace_id, ip)` push rate limit (architecture §10). Defaulted.
+    /// Per-`(workspace_id, ip)` push rate limit (SYNC_SPEC §9.4, §16). Defaulted.
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
     /// IPs of trusted reverse proxies (e.g. the local Caddy/nginx terminating TLS).

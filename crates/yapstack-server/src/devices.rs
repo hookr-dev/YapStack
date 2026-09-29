@@ -118,11 +118,14 @@ pub async fn get_roster(
 /// The relay's write-authorization gate (§7.5 defense-in-depth): the caller — identified
 /// ONLY by the `client_id` bound into its access token — must have an `active` row in the
 /// tenant's device index. A PENDING (awaiting approval) device, an unknown device, or a
-/// token without a device identity (a login that carried no valid proof, A10) is refused. Applied to every route
-/// that writes on behalf of a device: `PUT /devices/roster`, `POST /sync/push`, and
-/// `POST /audio/presign` (SYNC_SPEC §15.B). Reads (`pull`, audio `GET`, the roster `GET`)
-/// are deliberately NOT gated — a pending device may still read (§7.5 step 3). The lookup
-/// runs inside the caller's tenant transaction so it is RLS-scoped.
+/// token without a device identity (a login that carried no valid proof, A10) is refused.
+/// Applied to every route that writes on behalf of a device: `POST /sync/push`,
+/// `POST /audio/presign`, `POST /snapshot/presign` and `PUT /auth/password` (SYNC_SPEC
+/// §15.B, §5.6). `PUT /devices/roster` carries its own gate in `put_roster` (an active
+/// caller, or a pending caller holding a fresh recovery grant — CRYPTO_SPEC A7). Reads
+/// (`pull`, audio `GET`, the roster `GET`) are deliberately NOT gated — a pending device
+/// may still read (§7.5 step 3). The lookup runs inside the caller's tenant transaction so
+/// it is RLS-scoped.
 ///
 /// # Errors
 /// [`AppError::Forbidden`] when the caller is not an active device; a DB error otherwise.

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `GET /sync/completeness` — anti-entropy on opaque blobs (architecture §7b).
+//! `GET /sync/completeness` — anti-entropy on opaque blobs (SYNC_SPEC §9.1).
 //!
 //! The relay verifies COMPLETENESS without reading content: per tenant it exposes
 //! `(max_changeset_seq, count, contiguous?)`. Because the cursor is dense and starts at
-//! 1, `contiguous == (max == count)` — pure arithmetic; a client nightly checks it
-//! holds every seq up to `max` and re-pulls any gap.
+//! 1, `contiguous == (max == count)` — pure arithmetic. The client reads `max` once at
+//! drain spawn to seed its catch-up counter (SYNC_SPEC §6.6) and re-seeds its per-client
+//! push counter from the tails after a 409; there is no periodic audit (§14 D22).
 //!
 //! Advisory A3: the response ALSO returns, per `client_id`, the max `client_seq` the
 //! server holds. A client compares this against the `client_seq` it last pushed from

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! §15 row 1 — RANDOMIZED CRDT convergence proptest (Gap 1 / audit R1).
+//! SYNC_SPEC §12 I12 — RANDOMIZED CRDT convergence proptest.
 //!
 //! The deterministic tests (`runtime::two_devices_converge_through_relay`,
-//! `merge_semantics`, `reconcile`) pin specific hand-authored schedules. This harness
+//! `merge_semantics`) pin specific hand-authored schedules. This harness
 //! complements them with a property test: across N∈[2,5] simulated cr-sqlite peers on one
 //! CRR schema, a RANDOM program of inserts/updates/deletes attributed to random peers is
 //! interleaved with RANDOM sync-exchange points. Because each peer pulls from the shared

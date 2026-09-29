@@ -3,7 +3,7 @@
 // The crypto ceremonies (Argon2id stretch, envelope wrapping, roster signing)
 // and the vault key at rest run in Rust (`yapstack-crypto` + OS keychain), NOT
 // in the webview: keeping the master/vault keys out of the JS heap and out of
-// localStorage is the whole point (CRYPTO_SPEC §10, arch §11.1). This module is
+// localStorage is the whole point (CRYPTO_SPEC §10 and A8). This module is
 // the thin, hand-typed `invoke` boundary the Rust `sync` commands implement,
 // plus the pure formatting helpers the key-management UI renders.
 //
@@ -254,15 +254,16 @@ export const syncCommands = {
   ): Promise<SyncStatus> =>
     invoke("sync_recover", { serverUrl, email, recoveryCode }),
 
-  /** Change the account password (CRYPTO_SPEC §4.3 / A9). `currentPassword` is required
-   *  unless this device signed in with the recovery code in the last 15 minutes. The salt,
-   *  vault key and tokens are unchanged; other devices are unaffected. */
+  /** Change the account password (CRYPTO_SPEC §4.3 / A9, SYNC_SPEC §5.6). `currentPassword`
+   *  is required unless this device signed in with the recovery code in the last 15
+   *  minutes. The salt, vault key and this device's tokens are unchanged; every other
+   *  device is signed out by the relay and must sign in with the new password. */
   changePassword: (currentPassword: string | null, newPassword: string): Promise<void> =>
     invoke("sync_change_password", { currentPassword, newPassword }),
 
-  /** Enable sync: run crr_migrate ONCE against a `.backup` COPY of the live DB,
-   *  gated on SYNC_SCHEMA_VERSION, then start the drain. Long-running;
-   *  drives the "preparing your library for sync" state. */
+  /** Turn sync on (SYNC_SPEC §6.1): refuse while pending/removed, run the idempotent
+   *  cutover (the live DB becomes CRR-tracked, with a `.backup` kept), bind the account,
+   *  then start the drain. Long-running on first enable. */
   enable: (): Promise<SyncStatus> => invoke("sync_enable"),
 
   /** Approve a pending device by fingerprint: bump the roster counter, re-assert
@@ -679,8 +680,8 @@ export function formatSecurityCode(
 
 /**
  * Validate that a normalized recovery-code entry is a plausible 32-char base32
- * string (RFC 4648 uppercase alphabet). Used by the recovery-confirm step to
- * gate the "I saved it" flow before we let the user proceed.
+ * string (RFC 4648 uppercase alphabet). Gates the wizard's recovery-code sign-in
+ * step before the code is sent.
  */
 export function isValidRecoveryCode(input: string): boolean {
   const clean = normalizeCode(input);

@@ -887,9 +887,10 @@ function DownloadedAudioRow() {
 }
 
 /**
- * Change the account password from the Account row (CRYPTO_SPEC §4.3 / A9). Asks for
- * the current password (re-authentication) and the new one twice. Nothing else changes:
- * the encryption key, this device's sign-in, and other devices are unaffected.
+ * Change the account password from the Account row (CRYPTO_SPEC §4.3 / A9, SYNC_SPEC
+ * §5.6). Asks for the current password (re-authentication) and the new one twice. The
+ * encryption key and this device's sign-in are unchanged; every other device is signed
+ * out by the relay and asks for the new password (its local data is untouched).
  */
 function ChangePasswordDialog() {
   const [open, setOpen] = useState(false);

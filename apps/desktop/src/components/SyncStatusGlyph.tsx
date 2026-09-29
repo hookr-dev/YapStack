@@ -82,8 +82,8 @@ export function SyncStatusGlyph() {
     syncEnabled,
   });
 
-  // "off" means signed-out / disabled — never engaged from the glyph's view, so
-  // show nothing (belt-and-suspenders with the `engaged` gate above).
+  // The `engaged` gate above admits a signed-in device whose sync is turned off; that
+  // derives "off", and the glyph shows nothing for it (the Sync page owns that state).
   if (display.state === "off") return null;
 
   return (

@@ -45,8 +45,8 @@ fn migrated(populate: bool) -> CrsqlDb {
 /// `session_audio_parts` row split right after `session_id` materializes via
 /// cr-sqlite's per-column merge_insert with `part_index` at its CRR-rebuild synthetic
 /// default `0` (schema.rs synthetic_default). That collides with the session's
-/// genuine part 0, and the drain runs `enforce_uniqueness` unconditionally after any
-/// applied>0 merge (sync.rs:3549-3557) — deleting one of the two through the CRR
+/// genuine part 0, and the drain ran `enforce_uniqueness` unconditionally after any
+/// applied>0 merge (now gated by `maintenance_ready`, SYNC_SPEC §6.5) — deleting one of the two through the CRR
 /// delete trigger (tombstone at causal length 2). When the split row's real columns
 /// arrive later (cl 1) they are dropped against the cl-2 tombstone, so a genuine,
 /// distinct audio part is destroyed permanently on every device.
@@ -100,8 +100,8 @@ fn dedup_must_not_destroy_a_partially_merged_audio_part() {
         "precondition: partial merge yields a transient (session_id, part_index=0) collision"
     );
 
-    // The drain runs `enforce_uniqueness` after any applied>0 merge — on this
-    // NON-converged, mid-row state (sync.rs:3549-3557).
+    // The drain ran `enforce_uniqueness` after any applied>0 merge — on this
+    // NON-converged, mid-row state (the proven-guards below are what make that safe).
     enforce_uniqueness(b.conn()).unwrap();
 
     // Pull page 2 delivers `ap-zzz`'s real columns (part_index=5, file_path, ...).
@@ -148,11 +148,11 @@ fn dedup_must_not_destroy_a_partially_merged_audio_part() {
 /// `pull_direction` deliberately ADVANCES past any changeset it cannot decrypt/decode
 /// (outbox.rs:940-962, quarantine-and-advance), so a device can hold a session's
 /// children while the session's own insert sits in `_yapstack_crypto_quarantine`.
-/// The drain then runs `cascade_gc` on any applied>0 merge (sync.rs:3549-3554,
-/// `crypto_quarantined` never consulted), and `DELETE FROM child WHERE fk NOT IN
+/// The drain then ran `cascade_gc` on any applied>0 merge (`crypto_quarantined` never
+/// consulted), and `DELETE FROM child WHERE fk NOT IN
 /// (SELECT pk FROM parent)` (cascade.rs:69-88) treats "parent never merged" as
 /// "parent deleted". The children are tombstoned at cl 2. A later
-/// `retry_crypto_quarantine` (sync.rs:4701) restores the parent, but the children's
+/// `sync_retry_crypto_quarantine` restores the parent, but the children's
 /// cl-1 inserts are dropped against the cl-2 tombstone — permanent, global loss.
 ///
 /// This test constructs the exact DB state the quarantine-and-advance produces

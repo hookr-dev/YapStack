@@ -3,8 +3,8 @@
 //! `[limits].admin_public_key` is configured; absent ⇒ these routes are not mounted.
 //!
 //! The control plane PUSHES per-tenant limits INBOUND over a published HTTP contract;
-//! the relay makes ZERO outbound calls and has zero runtime dependency on the control
-//! plane. Each request is Ed25519-signed by the control plane over
+//! the relay never calls the control plane and has zero runtime dependency on it.
+//! Each request is Ed25519-signed by the control plane over
 //! `timestamp \n nonce \n method \n path \n hex(sha256(body))`, carried in headers:
 //!
 //! - `X-YapStack-Timestamp`: unix seconds (±300s replay window)

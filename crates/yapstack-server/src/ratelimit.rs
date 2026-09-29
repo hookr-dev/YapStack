@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! In-process rolling-window rate limiter per `(workspace_id, ip)` for push
-//! (architecture §10). Single-process only; horizontal scale needs a shared store
+//! (SYNC_SPEC §9.4). Single-process only; horizontal scale needs a shared store
 //! (Redis) — noted, not a v1 blocker. This gates INGESTION only, never reads.
 
 use std::collections::HashMap;

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 // The auth request/response DTOs are the ONE shared definition in
-// `yapstack-common` (architecture §14): the desktop client and this relay compile
+// `yapstack-common` (SYNC_SPEC §3): the desktop client and this relay compile
 // against the same shapes so the wire contract can never skew. The handler logic —
 // second-hash verifier, decoy salt, two-round login, JWT rotation/reuse — is
 // unchanged; only the DTO's home moved.
@@ -257,11 +257,6 @@ pub async fn login_begin(
     }))
 }
 
-/// A10 proof of possession. Consumes the nonce (single-use, 5 min, bound to this email)
-/// and verifies the device's signature over `login_pop_message` against the STORED public
-/// key when a row for `client_id` exists in this tenant (identity substitution fails even
-/// if the request presents a different key) or the presented key when the device is new.
-/// Returns the decoded public key on success. Any failure is a uniform 401.
 /// The A10 proof-of-possession fields a login/recover request carries (all base64).
 struct LoginPop<'a> {
     client_id: Uuid,
@@ -270,6 +265,11 @@ struct LoginPop<'a> {
     proof_b64: &'a str,
 }
 
+/// A10 proof of possession. Consumes the nonce (single-use, 5 min, bound to this email)
+/// and verifies the device's signature over `login_pop_message` against the STORED public
+/// key when a row for `client_id` exists in this tenant (identity substitution fails even
+/// if the request presents a different key) or the presented key when the device is new.
+/// Returns the decoded public key on success. Any failure is a uniform 401.
 async fn verify_login_pop(
     pool: &sqlx::PgPool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -731,8 +731,9 @@ pub async fn change_password(
     .bind(&new_wrap)
     .execute(&mut *tx)
     .await?;
-    // A password change is the one lever the owner has against a device enrolled with
-    // the OLD password (device removal and vault-key rotation are later slices): revoke
+    // A password change is the lever against a device enrolled with the OLD password
+    // (removal, SYNC_SPEC §15.D, evicts one known device; vault-key rotation, CRYPTO_SPEC
+    // §4.4, is deferred): revoke
     // every OTHER device's refresh families so they must sign in again — with the new
     // password. Devices that already unwrapped the vault key keep what they hold (E2E
     // cannot take that back); what they lose is continued relay access. The caller's own
@@ -761,7 +762,7 @@ pub async fn change_password(
 // --------------------------------------------------------------------- refresh
 
 /// `POST /auth/refresh` — rotation + reuse detection, per-device families
-/// (architecture §5/§10). `tenant` comes from the validated token, never the request.
+/// (SYNC_SPEC §5.8, §9.3). `tenant` comes from the validated token, never the request.
 pub async fn refresh(
     State(st): State<AppState>,
     Json(req): Json<RefreshRequest>,

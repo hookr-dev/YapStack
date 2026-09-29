@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Limit, TenantState, WarnThresholds};
+use crate::types::{Limit, TenantState};
 
 /// One limit dimension on the wire: `{ "limit": u64, "unlimited": bool }`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,15 +59,6 @@ pub struct WarnAtWire {
     pub storage_bytes: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_bytes_period: Option<f64>,
-}
-
-impl From<WarnAtWire> for WarnThresholds {
-    fn from(w: WarnAtWire) -> Self {
-        WarnThresholds {
-            storage_bytes: w.storage_bytes,
-            upload_bytes_period: w.upload_bytes_period,
-        }
-    }
 }
 
 /// `PUT /admin/v1/tenants/{tenant_id}/limits` body. The control plane pushes this;

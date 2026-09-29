@@ -210,7 +210,7 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
 /// (CRYPTO_SPEC §5.4 — decrypt first; the version that authenticated is the truth). Also stores
 /// the short non-sensitive `detail` naming the stage that failed. No key, nonce, or plaintext
 /// material is stored.
-pub fn ensure_crypto_quarantine_table(conn: &Connection) -> Result<(), SyncError> {
+fn ensure_crypto_quarantine_table(conn: &Connection) -> Result<(), SyncError> {
     // §5.4 C4: `schema_version`/`engine_version` are the server's plaintext hints, retained for
     // the not-yet-implemented hint-vs-AAD mismatch check — never read as AAD inputs.
     conn.execute_batch(

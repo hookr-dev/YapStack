@@ -255,7 +255,7 @@ function BackNext({
 }
 
 /** The one place a code is shown for a person to compare: large, spaced, centered. */
-export function CodeBlock({
+function CodeBlock({
   label,
   code,
   footnote,
