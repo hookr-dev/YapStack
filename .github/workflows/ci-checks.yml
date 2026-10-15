@@ -145,7 +145,12 @@ jobs:
       - name: Run tests
         # WASAPI COM tests are #[cfg_attr(target_os = "windows", ignore)], so
         # the crashing ones don't run here.
+        # /FORCE:MULTIPLE: the vendored cr-sqlite no_std bundle (crsql_bundle)
+        # defines its own `rust_eh_personality`, which collides with libstd's on
+        # the MSVC linker in yapstack-sync's test binaries (same as release.yml).
         run: cargo test --all
+        env:
+          RUSTFLAGS: "-Clink-arg=/FORCE:MULTIPLE"
 
   frontend:
     name: Frontend
@@ -156,7 +161,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          # 24: db-runtime-schema.test.ts imports node:sqlite, which Node 22's
+          # Vite can't resolve as a built-in.
+          node-version: 24
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
