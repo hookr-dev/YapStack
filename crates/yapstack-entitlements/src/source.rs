@@ -13,6 +13,9 @@ use crate::TenantId;
 /// resolution failure resolves to the deployment default (or unlimited), never a
 /// lockout (ENTITLEMENTS_SEAM.md: the Cal.com fail-closed bug class is structurally
 /// absent).
+// async_trait copies `TenantLimits`' `#[must_use]` onto the boxed future it
+// generates, which clippy ≥1.99 flags as double_must_use in macro output.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TenantLimitSource: Send + Sync {
     async fn limits(&self, tenant: TenantId) -> TenantLimits;

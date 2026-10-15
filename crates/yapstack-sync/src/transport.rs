@@ -22,6 +22,9 @@ use yapstack_common::sync::{
 use crate::snapshot::SnapshotMeta;
 use crate::SyncError;
 
+// async_trait copies `Result`'s `#[must_use]` onto the boxed futures it
+// generates, which clippy ≥1.99 flags as double_must_use in macro output.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SyncTransport: Send + Sync {
     async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError>;
