@@ -94,7 +94,7 @@ jobs:
     env:
       APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install cmake
         run: brew install cmake
@@ -220,7 +220,7 @@ jobs:
     env:
       APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Check cmake
         run: cmake --version
