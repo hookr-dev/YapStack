@@ -1,6 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use tauri_plugin_sql::{Migration, MigrationKind};
+/// A single schema migration. Repo-owned (replaces `tauri_plugin_sql::Migration`
+/// after the Option A′ backend swap); applied by [`crate::db_service::run_migrations`],
+/// which preserves continuity with the plugin's `_sqlx_migrations` bookkeeping.
+/// All migrations are `Up`, so there is no `kind` discriminant.
+pub struct Migration {
+    pub version: i64,
+    pub description: &'static str,
+    pub sql: &'static str,
+}
 
 /// Row to insert into `session_audio_parts`. Mirrors the columns in the v15
 /// migration; constructed by both the live finalize path and reconciliation.
@@ -13,17 +21,29 @@ pub struct AudioPartRow {
     pub sample_rate: u32,
 }
 
+/// The `audio_save_locations` DDL, issued verbatim by both
+/// [`ensure_runtime_schema`] and [`register_audio_save_location`] so the two
+/// sites can never drift apart.
+const AUDIO_SAVE_LOCATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+    dir TEXT PRIMARY KEY,\
+    registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+)";
+
 /// Pre-migration runtime patches. Currently only sweeps stale `recording`
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
 /// live in the frontend's `getDb()` so they run after migrations on fresh installs.
-pub fn ensure_runtime_schema(db_path: &Path) {
-    use rusqlite::Connection;
-
+/// `me` = this device's `device_fingerprint` (LIVE_SESSION_STATE.md D7), threaded from the
+/// boot call site via `sync::current_device_fingerprint()`. `None` when sync is
+/// unconfigured, the identity is unloadable, or the build has no `sync` feature. It flows
+/// straight into [`close_orphaned_recordings`], which owner-scopes the sweep.
+pub fn ensure_runtime_schema(db_path: &Path, me: Option<&str>) {
     if !db_path.exists() {
         return;
     }
 
-    let conn = match Connection::open(db_path) {
+    // Routed through the shared connection helper so it runs on a
+    // cr-sqlite-initialized connection under the `sync` feature (A3-ready).
+    let managed = match crate::db_service::open_managed(db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -33,23 +53,18 @@ pub fn ensure_runtime_schema(db_path: &Path) {
             return;
         }
     };
+    let conn = managed.conn();
 
-    if !table_exists(&conn, "segments") {
+    if !table_exists(conn, "segments") {
         return;
     }
 
     // Out-of-band of the migration list so dev DBs whose `_sqlx_migrations`
     // history is ahead of schema can still pick this up. Idempotent; no-op
     // if already created.
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS audio_save_locations (\
-            dir TEXT PRIMARY KEY,\
-            registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
-        )",
-        [],
-    );
+    let _ = conn.execute(AUDIO_SAVE_LOCATIONS_DDL, []);
 
-    close_orphaned_recordings(&conn);
+    close_orphaned_recordings(conn, me);
 }
 
 /// Records `dir` in `audio_save_locations`. Called at recording start with
@@ -60,19 +75,12 @@ pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
     if !db_path.exists() {
         return;
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return;
     };
-    if !table_exists(&conn, "audio_save_locations") {
-        // Should already exist via ensure_runtime_schema; create if not.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
-                dir TEXT PRIMARY KEY,\
-                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
-            )",
-            [],
-        );
-    }
+    let conn = managed.conn();
+    // Should already exist via ensure_runtime_schema; create if not.
+    let _ = conn.execute(AUDIO_SAVE_LOCATIONS_DDL, []);
     let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let _ = conn.execute(
         "INSERT OR IGNORE INTO audio_save_locations (dir) VALUES (?)",
@@ -80,77 +88,176 @@ pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
     );
 }
 
-/// At startup the app cannot have a real in-flight recording session, so any
-/// row left at status='recording' is from a prior crash or force-quit. Empty
-/// ones (no segments, no audio parts) are deleted; the rest are marked
-/// completed with duration recomputed from their parts (or, as a final
-/// fallback, from their segments' max offset).
-fn close_orphaned_recordings(conn: &rusqlite::Connection) {
-    // Newly-installed databases may not yet have the parts table; gate on
-    // its presence so this sweep is forward- and backward-compatible.
+/// Flat liveness threshold (LIVE_SESSION_STATE.md D5 / resolved Q2). A
+/// `status='recording'` row is "stale" — treated as a crashed session rather than a
+/// live one — once its heartbeat (the max `segments.created_at`, falling back to the
+/// session's own `created_at` at zero segments) is older than this. Named constant per
+/// Q2 ("flat 3 minutes, a named constant; revisit only if UAT shows flapping").
+const RECORDING_STALE_THRESHOLD_MINUTES: i64 = 3;
+
+/// True once the live DB has EVER been CRR-prepared, i.e. cr-sqlite converted the
+/// `sessions` table and left its clock shadow table (`sessions__crsql_clock`) behind.
+///
+/// This mirrors `yapstack_sync::schema::is_crr(conn, "sessions")`
+/// (crates/yapstack-sync/src/schema.rs:212) but is evaluated here as a plain
+/// `sqlite_master` probe so the boot sweep can decide on a bare rusqlite connection —
+/// no crsql extension is needed for a table-existence check — and so it behaves
+/// identically in `sync` and `no-sync` builds (a `no-sync` DB never grows this table, so
+/// it reads false). It is deliberately NOT `device_fingerprint IS NULL`: a credential
+/// clear / fresh keychain over a *retained* CRR DB has a NULL fingerprint yet still holds
+/// foreign synced rows, and a fingerprint predicate would let the interim finalize a
+/// peer's stale-at-receiver live row and LWW-propagate `'completed'` back after
+/// re-enrollment. The DB-level check cannot be fooled that way
+/// (LIVE_SESSION_STATE.md "Sweep rules — interim").
+fn db_was_crr_prepared(conn: &rusqlite::Connection) -> bool {
+    table_exists(conn, "sessions__crsql_clock")
+}
+
+/// Production boot-sweep entry (LIVE_SESSION_STATE.md D1-final, "Sweep rules — final",
+/// sequencing step 3). Called from [`ensure_runtime_schema`] on the CRR (`open_managed`)
+/// connection.
+///
+/// `me` = this device's `device_fingerprint` (`sync::current_device_fingerprint()`),
+/// threaded in from the boot call site now the sweep is owner-aware. It separates an OWN
+/// crashed row (finalize) from a FOREIGN live row (never touch, D6):
+///
+/// - **`me = Some(fp)`** — sync is configured and the identity loaded. Run the full
+///   owner-scoped final rule ([`sweep_orphaned_recordings`] with `Some(fp)`) regardless of
+///   CRR state: foreign rows are never touched, own crashed rows finalize, own/sync-off
+///   empties delete per the delete rule, and NULL-owner rows finalize only when stale. This
+///   is the real P0-close path — on a CRR-prepared DB it now performs the deferred
+///   own-crash finalization safely because the ownership predicate protects every foreign
+///   row.
+/// - **`me = None` on a never-CRR-prepared DB** — a pure pre-sync / `no-sync` single-device
+///   DB that *cannot* hold another device's rows. `me` is genuinely NULL (sync-off), so run
+///   the full final rule with `me = None`: today's delete-empties + stale-finalize
+///   semantics, exactly per spec for a NULL column on a sync-off device.
+/// - **`me = None` on a CRR-prepared DB** — a synced DB with no loadable identity (sync
+///   never configured over a synced DB, or a credential clear / fresh keychain over a
+///   retained CRR DB). Ownership is ambiguous: a `status='recording'` row may be a peer's
+///   genuinely-live session, and this sweep runs on the CRR connection so any write
+///   LWW-propagates. Never guess — TOUCH NOTHING (foreign-safe; own-crash finalization
+///   waits until an identity is loadable). This matches the slice-1 interim behavior for
+///   synced DBs and keeps P0 fully closed in the ambiguous case.
+///
+/// The full owner-scoped rule itself is [`sweep_orphaned_recordings`], exercised across
+/// the complete spec matrix by the unit tests with synthetic `me` values.
+fn close_orphaned_recordings(conn: &rusqlite::Connection, me: Option<&str>) {
+    match me {
+        // Sync configured + identity loaded: the real owner-scoped final rule. Safe on a
+        // CRR-prepared DB — the ownership predicate never touches a foreign row.
+        Some(_) => sweep_orphaned_recordings(conn, me),
+        None if db_was_crr_prepared(conn) => {
+            // Synced DB, no loadable fingerprint → ambiguous ownership. Never guess.
+            tracing::info!(
+                "close_orphaned_recordings: CRR-prepared DB with no loadable device \
+                 fingerprint (sync unconfigured or identity unloadable); touching nothing \
+                 (foreign-safe, own-crash finalize deferred). deleted 0, completed 0"
+            );
+        }
+        // Never CRR-prepared: `me` is genuinely NULL (single-device / sync-off semantics).
+        None => sweep_orphaned_recordings(conn, None),
+    }
+}
+
+/// Owner-scoped final boot sweep (LIVE_SESSION_STATE.md "Sweep rules — final").
+///
+/// `me` = this device's `device_fingerprint`, NULL when sync is unconfigured.
+/// `foreign` = `recording_device_id IS NOT NULL AND recording_device_id != me`.
+/// `empty` = no `segments` AND no `session_audio_parts` rows.
+/// `stale` = heartbeat (`max(segments.created_at)`, fallback `session.created_at`) older
+/// than [`RECORDING_STALE_THRESHOLD_MINUTES`] (D5).
+///
+/// - **Foreign rows are NEVER touched** (D6: a non-owner has no finalization authority).
+/// - **DELETE** non-foreign, delete-eligible empties:
+///   `status='recording' AND empty AND (owner IS NULL OR owner = me) AND (me IS NULL OR owner = me)`.
+///   Sync-off (`me IS NULL`) → today's delete-empties (only the DB's own NULL-owner rows;
+///   a foreign owner still fails the not-foreign predicate). Sync-on → only `owner = me`.
+///   A NULL-owner row on a sync-ON device is never delete-eligible — it may be a peer's
+///   legacy row whose DELETE would sync back.
+/// - **FINALIZE** the remaining non-foreign rows not deleted above; the NULL-owner branch
+///   additionally requires `stale` (a fresh NULL-owner row can be a not-yet-updated live
+///   peer during rollout). Owned rows are always crashes at the owner's own boot, so they
+///   finalize regardless of staleness.
+///
+/// The ownership predicate `(recording_device_id IS NULL OR recording_device_id = ?1)`
+/// matches own + NULL rows and excludes foreign in BOTH the `me`-set and `me`-NULL cases
+/// (`owner = NULL` is SQL-unknown → falsy), so foreign rows are protected even sync-off.
+fn sweep_orphaned_recordings(conn: &rusqlite::Connection, me: Option<&str>) {
+    // A brand-new DB whose parts table hasn't landed yet: `empty`/duration key off
+    // segments alone.
     let has_parts_table = table_exists(conn, "session_audio_parts");
+    let stale_modifier = format!("-{RECORDING_STALE_THRESHOLD_MINUTES} minutes");
 
-    let deleted = if has_parts_table {
-        conn.execute(
-            "DELETE FROM sessions \
-             WHERE status = 'recording' \
-               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
-               AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)",
-            [],
-        )
+    let empty_clause = if has_parts_table {
+        "NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
+         AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)"
     } else {
-        conn.execute(
-            "DELETE FROM sessions \
-             WHERE status = 'recording' \
-               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)",
-            [],
-        )
-    }
-    .unwrap_or_else(|e| {
-        tracing::warn!("close_orphaned_recordings: delete failed: {e}");
-        0
-    });
+        "NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)"
+    };
+    // ?1 = me (may be NULL). Reused across both predicates. The NULL-safe `IS`
+    // operator is deliberate: with plain `=`, `recording_device_id = ?1` yields SQL
+    // NULL (not FALSE) whenever the column is NULL, and `FALSE OR NULL = NULL` /
+    // `TRUE AND NULL = NULL` would silently drop a NULL-owner row from the WHERE.
+    // `IS` compares NULL as a value, so every branch resolves to a definite bool.
+    let not_foreign = "(recording_device_id IS NULL OR recording_device_id IS ?1)";
+    let delete_eligible = "(?1 IS NULL OR recording_device_id IS ?1)";
+    // ?2 = the '-N minutes' modifier.
+    let stale_clause = "datetime(COALESCE( \
+            (SELECT MAX(created_at) FROM segments WHERE session_id = sessions.id), \
+            created_at \
+        )) <= datetime('now', ?2)";
 
-    let completed = if has_parts_table {
-        conn.execute(
-            "UPDATE sessions SET \
-                status = 'completed', \
-                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
-                duration_seconds = COALESCE( \
-                    (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
-                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
-                     FROM segments WHERE session_id = sessions.id), \
-                    duration_seconds \
-                ), \
-                updated_at = datetime('now') \
-             WHERE status = 'recording'",
-            [],
-        )
+    let delete_sql = format!(
+        "DELETE FROM sessions \
+         WHERE status = 'recording' \
+           AND ({empty_clause}) \
+           AND {not_foreign} \
+           AND {delete_eligible}"
+    );
+    let deleted = conn
+        .execute(&delete_sql, rusqlite::params![me])
+        .unwrap_or_else(|e| {
+            tracing::warn!("sweep_orphaned_recordings: delete failed: {e}");
+            0
+        });
+
+    let duration_expr = if has_parts_table {
+        "COALESCE( \
+            (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
+            (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+             FROM segments WHERE session_id = sessions.id), \
+            duration_seconds \
+        )"
     } else {
-        conn.execute(
-            "UPDATE sessions SET \
-                status = 'completed', \
-                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
-                duration_seconds = COALESCE( \
-                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
-                     FROM segments WHERE session_id = sessions.id), \
-                    duration_seconds \
-                ), \
-                updated_at = datetime('now') \
-             WHERE status = 'recording'",
-            [],
-        )
-    }
-    .unwrap_or_else(|e| {
-        tracing::warn!("close_orphaned_recordings: update failed: {e}");
-        0
-    });
+        "COALESCE( \
+            (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+             FROM segments WHERE session_id = sessions.id), \
+            duration_seconds \
+        )"
+    };
+    let update_sql = format!(
+        "UPDATE sessions SET \
+            status = 'completed', \
+            total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
+            duration_seconds = {duration_expr}, \
+            updated_at = datetime('now') \
+         WHERE status = 'recording' \
+           AND {not_foreign} \
+           AND NOT (({empty_clause}) AND {delete_eligible}) \
+           AND ((?1 IS NOT NULL AND recording_device_id IS ?1) OR ({stale_clause}))"
+    );
+    let completed = conn
+        .execute(&update_sql, rusqlite::params![me, stale_modifier])
+        .unwrap_or_else(|e| {
+            tracing::warn!("sweep_orphaned_recordings: finalize failed: {e}");
+            0
+        });
 
-    if deleted > 0 || completed > 0 {
-        tracing::info!(
-            "close_orphaned_recordings: deleted {deleted} empty, completed {completed} stale"
-        );
-    }
+    tracing::info!(
+        sync_off = me.is_none(),
+        "sweep_orphaned_recordings: deleted {deleted}, completed {completed}"
+    );
 }
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
@@ -165,13 +272,34 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
 /// Inserts a `session_audio_parts` row. Uses INSERT OR IGNORE so a partial
 /// crash that leaves a row already inserted is recoverable on retry.
 pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
+    // Cutover guard: `open_managed` opens with CREATE, so a finalize racing the A3 CRR
+    // enable-cutover file-swap (live path momentarily absent between renames) would
+    // otherwise resurrect a stray empty `yapstack.db`. Precheck existence like the sibling
+    // read/reconcile callers and refuse rather than create; the finalize caller already
+    // logs the Err and relies on the FE refresh to recover the row.
+    if !db_path.exists() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!(
+                "insert_audio_part_row: {} does not exist (cutover swap window); \
+                 refusing to create a stray DB",
+                db_path.display()
+            )),
+        ));
+    }
+    let managed = crate::db_service::open_managed(db_path)?;
+    insert_audio_part_row_on(managed.conn(), row)
+}
+
+/// [`insert_audio_part_row`] on a connection the caller already holds. Each
+/// INSERT still runs in its own autocommit transaction, so the cr-sqlite
+/// `db_version` grouping is identical either way.
+fn insert_audio_part_row_on(
+    conn: &rusqlite::Connection,
+    row: &AudioPartRow,
+) -> rusqlite::Result<()> {
     use rusqlite::params;
-    let conn = rusqlite::Connection::open(db_path)?;
-    let id = format!(
-        "{:016x}{:016x}",
-        rand_u64_from_clock(),
-        rand_u64_from_clock()
-    );
+    let id = mint_part_id(conn)?;
     let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     conn.execute(
         "INSERT OR IGNORE INTO session_audio_parts (
@@ -192,13 +320,43 @@ pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Re
     Ok(())
 }
 
-fn rand_u64_from_clock() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-    n ^ (n.wrapping_mul(6364136223846793005).rotate_left(13))
+/// Mint a fresh `session_audio_parts.id` as a **CSPRNG UUIDv4** (audio round-trip D6).
+///
+/// Blobs are addressed cross-device by this row id (server `audio_objects` key + the
+/// crypto wrap AAD's `part_id`), so it MUST be collision-free across independent devices.
+/// The prior clock-derived id was NOT: two NTP-synced LAN devices minting at the same
+/// nanosecond could collide, and a cross-device PK collision under cr-sqlite would merge
+/// two distinct parts. Entropy comes from SQLite's OS-seeded `randomblob` (the same CSPRNG
+/// the v15 backfill already uses), formatted as a **32-hex simple-format** UUIDv4 (no
+/// dashes: version nibble = 4, variant nibble ∈ {8,9,a,b}) — the format the table already
+/// stores and the server's `/audio/part/{part_id}` route accepts.
+fn mint_part_id(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
+    let raw: String = conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+    // A short id would both index out of bounds below and break the collision-free
+    // contract, so it is an error, never a fallback: any substitute value this
+    // function could invent is by definition NOT collision-free.
+    if raw.len() != 32 {
+        return Err(mint_part_id_error("randomblob(16) hex must be 32 chars"));
+    }
+    let mut b = raw.into_bytes();
+    b[12] = b'4'; // RFC 4122 version 4
+                  // Variant nibble → 10xx (8..b): keep the low 2 random bits, force the top 2 to `10`.
+    let v = (b[16] as char).to_digit(16).unwrap_or(0) as u8;
+    let v = (v & 0x3) | 0x8;
+    b[16] = std::char::from_digit(u32::from(v), 16)
+        .map(|c| c as u8)
+        .unwrap_or(b'8');
+    String::from_utf8(b).map_err(|_| mint_part_id_error("part id not ascii hex"))
+}
+
+/// `rusqlite::Error` for a `mint_part_id` invariant breach. Returned rather than
+/// panicked: release builds are `panic=abort` and this sits on the live recording
+/// finalize path, where the caller logs and degrades gracefully.
+fn mint_part_id_error(msg: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(msg.to_string()),
+    )
 }
 
 /// Returns canonicalized parent directories of every `session_audio_parts.file_path`,
@@ -215,12 +373,10 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     if !db_path.exists() {
         return out.into_iter().collect();
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return out.into_iter().collect();
     };
-    if !table_exists(&conn, "session_audio_parts") {
-        return out.into_iter().collect();
-    }
+    let conn = managed.conn();
     if let Ok(mut stmt) = conn
         .prepare("SELECT DISTINCT file_path FROM session_audio_parts WHERE file_path IS NOT NULL")
     {
@@ -239,14 +395,12 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     // a brand-new custom dir whose first run has not yet committed). It
     // closes the gap where reconciliation would otherwise never visit a
     // newly-chosen audioSaveLocation.
-    if table_exists(&conn, "audio_save_locations") {
-        if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
-            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-                for dir in rows.flatten() {
-                    let p = Path::new(&dir);
-                    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                    out.insert(canon);
-                }
+    if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for dir in rows.flatten() {
+                let p = Path::new(&dir);
+                let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                out.insert(canon);
             }
         }
     }
@@ -261,10 +415,11 @@ pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
     if !db_path.exists() {
         return;
     }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(managed) = crate::db_service::open_managed(db_path) else {
         return;
     };
-    if !table_exists(&conn, "session_audio_parts") || !table_exists(&conn, "sessions") {
+    let conn = managed.conn();
+    if !table_exists(conn, "session_audio_parts") || !table_exists(conn, "sessions") {
         return;
     }
 
@@ -313,7 +468,7 @@ pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
                 duration_seconds: duration,
                 sample_rate,
             };
-            if insert_audio_part_row(db_path, &row).is_ok() {
+            if insert_audio_part_row_on(conn, &row).is_ok() {
                 recovered += 1;
             }
         }
@@ -463,7 +618,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_segments_offset ON segments(session_id, audio_offset_seconds);
             CREATE INDEX idx_sessions_created ON sessions(created_at DESC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 2,
@@ -485,7 +639,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_sessions_folder ON sessions(folder_id);
             CREATE INDEX idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 3,
@@ -496,7 +649,6 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE segments ADD COLUMN deleted_at TEXT;
             ALTER TABLE segments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 4,
@@ -521,7 +673,6 @@ pub fn migrations() -> Vec<Migration> {
 
             ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'transcription';
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 5,
@@ -530,7 +681,6 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN wav_file_path TEXT;
             ALTER TABLE sessions ADD COLUMN wav_duration_seconds REAL;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 6,
@@ -549,7 +699,6 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_shares_folder ON shares(folder_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 7,
@@ -566,7 +715,6 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id, created_at ASC);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 8,
@@ -589,7 +737,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 9,
@@ -613,7 +760,6 @@ pub fn migrations() -> Vec<Migration> {
             INSERT INTO session_folders (session_id, folder_id)
             SELECT id, folder_id FROM sessions WHERE folder_id IS NOT NULL;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 10,
@@ -636,7 +782,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_dictation_history_created ON dictation_history(created_at DESC);
             CREATE INDEX idx_dictation_history_slot ON dictation_history(slot_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 11,
@@ -663,7 +808,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_session_tags_tag ON session_tags(tag_id);
             CREATE INDEX idx_session_tags_session ON session_tags(session_id);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 12,
@@ -777,7 +921,6 @@ pub fn migrations() -> Vec<Migration> {
                     VALUES (new.id, new.output_text, new.input_text);
             END;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 13,
@@ -785,7 +928,6 @@ pub fn migrations() -> Vec<Migration> {
             sql: r#"
             ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT;
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 14,
@@ -823,7 +965,6 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_chat_messages_send
                 ON chat_messages(context_key, send_id, sequence);
         "#,
-            kind: MigrationKind::Up,
         },
         Migration {
             version: 15,
@@ -879,7 +1020,39 @@ pub fn migrations() -> Vec<Migration> {
             FROM sessions
             WHERE wav_file_path IS NOT NULL;
         "#,
-            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 16,
+            description: "sessions.recording_device_id attribution column (LIVE_SESSION_STATE D2)",
+            // The recorder's `device_fingerprint`; NULL = legacy/pre-attribution OR
+            // sync-not-configured. ONE `ALTER TABLE sessions …` statement so
+            // `db_service::run_migrations` auto-wraps it through `crsql_alter`
+            // (crsql_begin_alter/commit_alter, backfilling col_version=1) on a
+            // CRR-prepared DB, and applies it plainly on a fresh / no-sync DB. A
+            // device that CRRified at the base schema version picks the column up via
+            // OUT_OF_BAND_ALTERS (yapstack-sync schema.rs) at cutover / boot self-heal.
+            sql: r#"
+            ALTER TABLE sessions ADD COLUMN recording_device_id TEXT;
+        "#,
+        },
+        Migration {
+            version: 17,
+            description: "chat_context_settings table (per-chat-context Profile override)",
+            // Folds the former frontend-only runtime CREATE (lib/db.ts) into the
+            // migration list so a fresh DB gets the table from the ordered migrations
+            // rather than the idempotent getDb() bootstrap. `profile_id` NULL means
+            // "use the live default Chat Assignment"; a non-null row is an explicit
+            // per-context override. CREATE TABLE IF NOT EXISTS keeps it idempotent and
+            // harmless on any DB that already has the table (dev DBs whose
+            // `_sqlx_migrations` history is misaligned still carry the db.ts copy — the
+            // db.ts CREATE stays as a belt-and-suspenders no-op for exactly that case).
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS chat_context_settings (
+                context_key TEXT PRIMARY KEY,
+                profile_id  TEXT NULL,
+                updated_at  TEXT NOT NULL
+            );
+        "#,
         },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
@@ -893,102 +1066,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_migrations_not_empty() {
-        let m = migrations();
-        assert!(!m.is_empty());
-    }
-
-    #[test]
-    fn test_migrations_sequential_versions() {
-        let m = migrations();
-        let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=15).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_migrations_have_descriptions() {
-        for m in migrations() {
-            assert!(
-                !m.description.is_empty(),
-                "migration v{} should have a description",
-                m.version
-            );
-        }
-    }
-
-    #[test]
-    fn test_migrations_sql_not_empty() {
-        for m in migrations() {
-            let sql = m.sql.trim();
-            assert!(
-                !sql.is_empty(),
-                "migration v{} should have non-empty SQL",
-                m.version
-            );
-        }
-    }
-
-    #[test]
-    fn test_migrations_sql_contains_expected_keywords() {
-        let m = migrations();
-
-        // v1 should create sessions and segments
-        assert!(m[0].sql.contains("CREATE TABLE sessions"));
-        assert!(m[0].sql.contains("CREATE TABLE segments"));
-
-        // v2 should create folders and alter sessions
-        assert!(m[1].sql.contains("CREATE TABLE folders"));
-        assert!(m[1].sql.contains("ALTER TABLE sessions"));
-
-        // v4 should create notes
-        assert!(m[3].sql.contains("CREATE TABLE notes"));
-        assert!(m[3].sql.contains("CREATE TABLE note_versions"));
-
-        // v7 should create chat_messages
-        assert!(m[6].sql.contains("CREATE TABLE chat_messages"));
-
-        // v9 should create session_folders junction table
-        assert!(m[8].sql.contains("CREATE TABLE session_folders"));
-
-        // v10 should create dictation_history
-        assert!(m[9].sql.contains("CREATE TABLE dictation_history"));
-
-        // v11 should create tags and session_tags
-        assert!(m[10].sql.contains("CREATE TABLE tags"));
-        assert!(m[10].sql.contains("CREATE TABLE session_tags"));
-    }
-
-    #[test]
-    fn test_all_migrations_are_up() {
-        for m in migrations() {
-            assert!(
-                matches!(m.kind, MigrationKind::Up),
-                "migration v{} should be an Up migration",
-                m.version
-            );
-        }
-    }
-
-    #[test]
-    fn test_migration_count() {
-        assert_eq!(
-            migrations().len(),
-            15,
-            "v1-v15; segments.speaker_id is patched at runtime by the frontend's getDb()"
+    fn test_migrations_versions_strictly_increase_from_one() {
+        let versions: Vec<i64> = migrations().iter().map(|x| x.version).collect();
+        assert_eq!(versions.first(), Some(&1), "the chain must start at v1");
+        // Strictly increasing, not merely non-decreasing: `run_migrations_list`
+        // treats every version already in `_sqlx_migrations` as applied, so a
+        // REPEATED version number silently skips a migration on every existing DB —
+        // the same shape as the "ghost" v11 entry noted on the migration list.
+        assert!(
+            versions.windows(2).all(|w| w[1] > w[0]),
+            "migration versions must strictly increase: {versions:?}"
         );
     }
 
     #[test]
-    fn test_migration_v15_creates_session_audio_parts() {
+    fn test_migration_v16_adds_recording_device_id_column() {
         let m = migrations();
-        let v15 = &m[14];
-        assert_eq!(v15.version, 15);
-        assert!(v15
-            .sql
-            .contains("CREATE TABLE IF NOT EXISTS session_audio_parts"));
-        assert!(v15
-            .sql
-            .contains("INSERT OR IGNORE INTO session_audio_parts"));
+        let v16 = &m[15];
+        assert_eq!(v16.version, 16);
+        // Apply the whole chain and confirm the column materializes and defaults NULL.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('s16', 't', 'MicOnly', 'recording')",
+            [],
+        )
+        .unwrap();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT recording_device_id FROM sessions WHERE id = 's16'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None, "new column defaults NULL (pre-attribution)");
+    }
+
+    #[test]
+    fn test_migration_v17_creates_chat_context_settings() {
+        let m = migrations();
+        let v17 = &m[16];
+        assert_eq!(v17.version, 17);
+        // Apply the whole chain and confirm the table materializes with the right shape.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        conn.execute(
+            "INSERT INTO chat_context_settings (context_key, profile_id, updated_at) \
+             VALUES ('ctx-a', NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let pid: Option<String> = conn
+            .query_row(
+                "SELECT profile_id FROM chat_context_settings WHERE context_key = 'ctx-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid, None, "NULL profile_id means 'use the live default'");
+        // Idempotent: re-running the v17 CREATE IF NOT EXISTS is a clean no-op.
+        conn.execute_batch(v17.sql).unwrap();
     }
 
     #[test]
@@ -1190,7 +1334,9 @@ mod tests {
             [],
         )
         .unwrap();
-        let v15_sql = migrations()[14].sql;
+        let v15 = &migrations()[14];
+        assert_eq!(v15.version, 15, "index 14 must still be the v15 migration");
+        let v15_sql = v15.sql;
         // Re-applying the migration must not error or double-insert.
         conn.execute_batch(v15_sql).unwrap();
         conn.execute_batch(v15_sql).unwrap();
@@ -1209,8 +1355,41 @@ mod tests {
         let m = migrations();
         let v13 = &m[12];
         assert_eq!(v13.version, 13);
-        assert!(v13.sql.contains("ALTER TABLE chat_messages"));
-        assert!(v13.sql.contains("tool_calls"));
+
+        // Shape contract, not decoration: `run_migrations` only routes a migration
+        // through `crsql_alter` when it is ONE `ALTER TABLE <sync_table>` statement.
+        // Split v13 into a batch and a CRR DB desyncs its shadow tables (or, since
+        // F3, fails the migration loudly).
+        let stmt = v13.sql.trim().trim_end_matches(';').trim();
+        assert!(
+            !stmt.contains(';'),
+            "v13 must stay a single statement so the crsql alter-wrap applies"
+        );
+        let target = stmt
+            .strip_prefix("ALTER TABLE ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("v13 must be a single ALTER TABLE");
+        assert_eq!(target, "chat_messages");
+        #[cfg(feature = "sync")]
+        assert!(
+            yapstack_sync::schema::SYNC_TABLES.contains(&target),
+            "chat_messages must stay a synced table or the alter-wrap does not apply"
+        );
+
+        // And the column actually lands on the migrated chain.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for mig in migrations() {
+            conn.execute_batch(mig.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", mig.version, e));
+        }
+        let has_col: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'tool_calls'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        assert!(has_col, "v13 must add chat_messages.tool_calls");
     }
 
     #[test]
@@ -1239,19 +1418,394 @@ mod tests {
         }
     }
 
+    // --- Boot-sweep interim ownership gate (LIVE_SESSION_STATE.md slice 1) ---------
+
+    /// Migrated in-memory DB (never CRR-prepared).
+    fn migrated_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        conn
+    }
+
+    /// Simulate a DB that has been CRR-prepared by planting the `sessions` clock
+    /// shadow table cr-sqlite leaves behind — no real crsql extension needed, matching
+    /// the DB-level `is_crr(conn, "sessions")` probe the sweep uses.
+    fn mark_crr_prepared(conn: &rusqlite::Connection) {
+        conn.execute_batch("CREATE TABLE sessions__crsql_clock (x INTEGER);")
+            .unwrap();
+    }
+
+    /// Insert a `status='recording'` session with a NULL `recording_device_id` whose
+    /// `created_at` is the given SQL expression (e.g. `datetime('now')` or
+    /// `datetime('now', '-1 hour')`).
+    fn insert_recording(conn: &rusqlite::Connection, id: &str, created_at_sql: &str) {
+        insert_recording_owned(conn, id, created_at_sql, None);
+    }
+
+    /// Insert a `status='recording'` session stamped with `owner` (`None` → NULL
+    /// `recording_device_id`), used to drive the owner-scoped sweep matrix.
+    fn insert_recording_owned(
+        conn: &rusqlite::Connection,
+        id: &str,
+        created_at_sql: &str,
+        owner: Option<&str>,
+    ) {
+        conn.execute(
+            &format!(
+                "INSERT INTO sessions \
+                    (id, title, source, status, created_at, updated_at, recording_device_id) \
+                 VALUES ('{id}', 't', 'MicOnly', 'recording', {created_at_sql}, {created_at_sql}, ?1)"
+            ),
+            rusqlite::params![owner],
+        )
+        .unwrap();
+    }
+
+    fn insert_segment(
+        conn: &rusqlite::Connection,
+        seg_id: &str,
+        session_id: &str,
+        created_at_sql: &str,
+    ) {
+        conn.execute(
+            &format!(
+                "INSERT INTO segments \
+                    (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, created_at) \
+                 VALUES ('{seg_id}', '{session_id}', 'mic', 'hi', 0.0, 1.0, {created_at_sql})"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    fn session_status(conn: &rusqlite::Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn session_exists(conn: &rusqlite::Connection, id: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n == 1
+    }
+
+    #[test]
+    fn db_was_crr_prepared_detects_clock_shadow_table() {
+        let conn = migrated_conn();
+        assert!(
+            !db_was_crr_prepared(&conn),
+            "a freshly-migrated DB has never been CRR-prepared"
+        );
+        mark_crr_prepared(&conn);
+        assert!(
+            db_was_crr_prepared(&conn),
+            "presence of sessions__crsql_clock means the DB was CRR-prepared"
+        );
+    }
+
+    // --- Owner-scoped FINAL sweep rule matrix (LIVE_SESSION_STATE.md "Sweep rules —
+    // final"): {owned, foreign, NULL} × {empty, has-segments} × {fresh, stale} ×
+    // {sync-on, sync-off}. `me` = "A".
+
+    const ME: &str = "AAAABBBBCCCCDDDD";
+    const PEER: &str = "EEEEFFFFGGGGHHHH";
+
+    #[test]
+    fn final_foreign_rows_are_never_touched_sync_on() {
+        // The P0 fix (D6): a peer's synced row — in EVERY shape — must never be
+        // deleted or finalized, so no 'completed'/DELETE LWW-propagates onto the
+        // recorder. Includes the stale-at-receiver-but-live-at-source case.
+        let conn = migrated_conn();
+        insert_recording_owned(&conn, "f-empty-fresh", "datetime('now')", Some(PEER));
+        insert_recording_owned(
+            &conn,
+            "f-empty-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_recording_owned(&conn, "f-full-fresh", "datetime('now')", Some(PEER));
+        insert_segment(&conn, "sf1", "f-full-fresh", "datetime('now')");
+        insert_recording_owned(
+            &conn,
+            "f-full-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_segment(&conn, "sf2", "f-full-stale", "datetime('now', '-1 hour')");
+
+        sweep_orphaned_recordings(&conn, Some(ME));
+
+        for id in [
+            "f-empty-fresh",
+            "f-empty-stale",
+            "f-full-fresh",
+            "f-full-stale",
+        ] {
+            assert!(
+                session_exists(&conn, id),
+                "{id}: foreign row must not be deleted"
+            );
+            assert_eq!(
+                session_status(&conn, id),
+                "recording",
+                "{id}: foreign row must not be finalized"
+            );
+        }
+    }
+
+    #[test]
+    fn final_foreign_rows_are_never_touched_even_sync_off() {
+        // A credential-clear over a retained CRR DB leaves `me = NULL` while foreign
+        // synced rows remain: the not-foreign predicate still excludes them (`owner =
+        // NULL` is SQL-unknown), so a stale-at-receiver peer row is never finalized —
+        // "including when B's fingerprint is NULL" (spec Verification matrix).
+        let conn = migrated_conn();
+        insert_recording_owned(&conn, "peer-live", "datetime('now', '-1 hour')", Some(PEER));
+        insert_segment(&conn, "sp", "peer-live", "datetime('now', '-1 hour')");
+
+        sweep_orphaned_recordings(&conn, None);
+
+        assert!(session_exists(&conn, "peer-live"));
+        assert_eq!(session_status(&conn, "peer-live"), "recording");
+    }
+
+    #[test]
+    fn final_owned_rows_finalize_regardless_of_stale_and_empties_delete() {
+        let conn = migrated_conn();
+        // Owned non-empty: finalize whether fresh (own crash at own boot) or stale.
+        insert_recording_owned(&conn, "own-full-fresh", "datetime('now')", Some(ME));
+        insert_segment(&conn, "of1", "own-full-fresh", "datetime('now')");
+        insert_recording_owned(
+            &conn,
+            "own-full-stale",
+            "datetime('now', '-1 hour')",
+            Some(ME),
+        );
+        insert_segment(&conn, "of2", "own-full-stale", "datetime('now', '-1 hour')");
+        // Owned empty: deleted (own empties, sync-on).
+        insert_recording_owned(&conn, "own-empty", "datetime('now')", Some(ME));
+
+        sweep_orphaned_recordings(&conn, Some(ME));
+
+        assert_eq!(session_status(&conn, "own-full-fresh"), "completed");
+        assert_eq!(session_status(&conn, "own-full-stale"), "completed");
+        assert!(
+            !session_exists(&conn, "own-empty"),
+            "an owned empty recording row is delete-eligible on a sync-on device"
+        );
+    }
+
+    #[test]
+    fn final_null_owner_sync_on_never_deleted_finalized_only_when_stale() {
+        let conn = migrated_conn();
+        // NULL-owner empties on a SYNC-ON device are NEVER deleted (could be a peer's
+        // legacy row whose DELETE would sync back) — but ARE finalized when stale.
+        insert_recording(&conn, "null-empty-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "null-empty-fresh", "datetime('now')");
+        // NULL-owner non-empty: finalize only when stale (fresh could be a rollout
+        // peer still recording with a NULL owner).
+        insert_recording(&conn, "null-full-stale", "datetime('now', '-1 hour')");
+        insert_segment(
+            &conn,
+            "nfs",
+            "null-full-stale",
+            "datetime('now', '-1 hour')",
+        );
+        insert_recording(&conn, "null-full-fresh", "datetime('now')");
+        insert_segment(&conn, "nff", "null-full-fresh", "datetime('now')");
+
+        sweep_orphaned_recordings(&conn, Some(ME));
+
+        assert!(
+            session_exists(&conn, "null-empty-stale"),
+            "NULL-owner row on sync-on must never be DELETEd"
+        );
+        assert!(session_exists(&conn, "null-empty-fresh"));
+        assert_eq!(session_status(&conn, "null-empty-stale"), "completed");
+        assert_eq!(session_status(&conn, "null-empty-fresh"), "recording");
+        assert_eq!(session_status(&conn, "null-full-stale"), "completed");
+        assert_eq!(
+            session_status(&conn, "null-full-fresh"),
+            "recording",
+            "a fresh NULL-owner row may be a not-yet-updated live peer"
+        );
+    }
+
+    #[test]
+    fn final_sync_off_deletes_empties_and_finalizes_stale() {
+        // me = NULL: today's single-device semantics — delete empties, finalize stale
+        // non-empties, leave fresh non-empties (a genuine in-flight recording).
+        let conn = migrated_conn();
+        insert_recording(&conn, "off-empty-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "off-empty-fresh", "datetime('now')");
+        insert_recording(&conn, "off-full-stale", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "ofs", "off-full-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "off-full-fresh", "datetime('now')");
+        insert_segment(&conn, "off", "off-full-fresh", "datetime('now')");
+
+        sweep_orphaned_recordings(&conn, None);
+
+        assert!(
+            !session_exists(&conn, "off-empty-stale"),
+            "sync-off empties delete"
+        );
+        assert!(
+            !session_exists(&conn, "off-empty-fresh"),
+            "sync-off empties delete"
+        );
+        assert_eq!(session_status(&conn, "off-full-stale"), "completed");
+        assert_eq!(session_status(&conn, "off-full-fresh"), "recording");
+    }
+
+    #[test]
+    fn close_orphaned_recordings_never_crr_runs_sync_off_rule() {
+        // Production entry on a never-CRR DB: me is genuinely NULL → full sync-off rule.
+        let conn = migrated_conn();
+        insert_recording(&conn, "e", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "s", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "sseg", "s", "datetime('now', '-1 hour')");
+
+        close_orphaned_recordings(&conn, None);
+
+        assert!(
+            !session_exists(&conn, "e"),
+            "sync-off empty deleted at boot"
+        );
+        assert_eq!(session_status(&conn, "s"), "completed");
+    }
+
+    #[test]
+    fn close_orphaned_recordings_crr_prepared_no_fingerprint_touches_nothing() {
+        // Production entry on a CRR-prepared DB with `me = None` (sync unconfigured /
+        // identity unloadable): ownership is ambiguous, so it must touch NOTHING
+        // (foreign-safe; own-crash finalize deferred). Every shape stays untouched.
+        let conn = migrated_conn();
+        mark_crr_prepared(&conn);
+        insert_recording_owned(&conn, "own-stale", "datetime('now', '-1 hour')", Some(ME));
+        insert_segment(&conn, "os", "own-stale", "datetime('now', '-1 hour')");
+        insert_recording_owned(
+            &conn,
+            "peer-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_recording(&conn, "null-empty-stale", "datetime('now', '-1 hour')");
+
+        close_orphaned_recordings(&conn, None);
+
+        for id in ["own-stale", "peer-stale", "null-empty-stale"] {
+            assert!(session_exists(&conn, id), "{id} must not be deleted");
+            assert_eq!(
+                session_status(&conn, id),
+                "recording",
+                "{id} must stay 'recording' on a CRR-prepared DB with no fingerprint"
+            );
+        }
+    }
+
+    #[test]
+    fn close_orphaned_recordings_crr_prepared_with_fingerprint_runs_owner_scoped_rule() {
+        // Production entry on a CRR-prepared DB with `me = Some(fp)`: the real owner-scoped
+        // final rule now runs. Foreign rows stay untouched (D6); the device's OWN crashed
+        // row finalizes; an owned empty deletes; a NULL-owner row finalizes only when stale.
+        let conn = migrated_conn();
+        mark_crr_prepared(&conn);
+        // Own crashed non-empty → finalize.
+        insert_recording_owned(&conn, "own-stale", "datetime('now', '-1 hour')", Some(ME));
+        insert_segment(&conn, "os", "own-stale", "datetime('now', '-1 hour')");
+        // Own empty → delete (sync-on own empties are delete-eligible).
+        insert_recording_owned(&conn, "own-empty", "datetime('now')", Some(ME));
+        // Peer's live-at-source row → never touched.
+        insert_recording_owned(
+            &conn,
+            "peer-stale",
+            "datetime('now', '-1 hour')",
+            Some(PEER),
+        );
+        insert_segment(&conn, "ps", "peer-stale", "datetime('now', '-1 hour')");
+        // NULL-owner stale → finalize; NULL-owner fresh → left (possible live rollout peer).
+        insert_recording(&conn, "null-stale", "datetime('now', '-1 hour')");
+        insert_segment(&conn, "ns", "null-stale", "datetime('now', '-1 hour')");
+        insert_recording(&conn, "null-fresh", "datetime('now')");
+        insert_segment(&conn, "nf", "null-fresh", "datetime('now')");
+
+        close_orphaned_recordings(&conn, Some(ME));
+
+        assert_eq!(
+            session_status(&conn, "own-stale"),
+            "completed",
+            "own crashed row must finalize"
+        );
+        assert!(
+            !session_exists(&conn, "own-empty"),
+            "own empty recording row must delete on a sync-on device"
+        );
+        assert!(
+            session_exists(&conn, "peer-stale"),
+            "foreign row must never be deleted"
+        );
+        assert_eq!(
+            session_status(&conn, "peer-stale"),
+            "recording",
+            "foreign row must never be finalized (D6)"
+        );
+        assert_eq!(session_status(&conn, "null-stale"), "completed");
+        assert_eq!(
+            session_status(&conn, "null-fresh"),
+            "recording",
+            "a fresh NULL-owner row may be a not-yet-updated live peer"
+        );
+    }
+
     #[test]
     fn test_migration_v12_creates_fts_tables() {
-        let m = migrations();
-        let v12 = &m[11];
-        assert_eq!(v12.version, 12);
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE segments_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE notes_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE sessions_fts"));
-        assert!(v12.sql.contains("CREATE VIRTUAL TABLE dictations_fts"));
-        assert!(v12.sql.contains("USING fts5"));
-        assert!(v12.sql.contains("INSERT INTO segments_fts"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_ai"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_ad"));
-        assert!(v12.sql.contains("CREATE TRIGGER segments_au"));
+        assert_eq!(migrations()[11].version, 12);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        // Rows written AFTER the chain only reach the mirrors through v12's
+        // triggers, which `test_all_migrations_execute_against_sqlite` cannot see
+        // (it only counts the empty tables) and which the CRR rebuild re-creates
+        // from whatever triggers it finds.
+        conn.execute_batch(
+            "INSERT INTO sessions (id, title, source, status) \
+                 VALUES ('s12', 'kickoff call', 'MicOnly', 'completed'); \
+             INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds) \
+                 VALUES ('seg12', 's12', 'Mic', 'quarterly revenue', 0.0, 1.0); \
+             INSERT INTO notes (id, session_id, content) VALUES ('n12', 's12', 'follow up thursday'); \
+             INSERT INTO dictation_history (id, slot_id, slot_name, input_text, output_text, output_action) \
+                 VALUES ('d12', 'slot', 'Slot', 'raw words', 'polished words', 'Clipboard');",
+        )
+        .unwrap();
+
+        for (table, id_col, id, term) in [
+            ("sessions_fts", "session_id", "s12", "kickoff"),
+            ("segments_fts", "segment_id", "seg12", "revenue"),
+            ("notes_fts", "note_id", "n12", "thursday"),
+            ("dictations_fts", "dictation_id", "d12", "polished"),
+        ] {
+            let hit: String = conn
+                .query_row(
+                    &format!("SELECT {id_col} FROM {table} WHERE {table} MATCH ?"),
+                    [term],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{table} did not index the inserted row: {e}"));
+            assert_eq!(hit, id, "{table} indexed the wrong row");
+        }
     }
 }

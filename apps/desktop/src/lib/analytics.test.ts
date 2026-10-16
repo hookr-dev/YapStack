@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockTrackEvent = vi.fn().mockResolvedValue(undefined);
 vi.mock("@aptabase/tauri", () => ({
@@ -6,6 +6,8 @@ vi.mock("@aptabase/tauri", () => ({
 }));
 
 import {
+  setAnalyticsEnabled,
+  isAnalyticsEnabled,
   trackAppLaunched,
   trackSessionCreated,
   trackSessionStopped,
@@ -206,5 +208,58 @@ describe("analytics", () => {
     mockTrackEvent.mockRejectedValueOnce(new Error("network error"));
     // Should not throw
     expect(() => trackSessionDeleted()).not.toThrow();
+  });
+});
+
+describe("analytics opt-out gate", () => {
+  // Every test above ran with the gate untouched, so this also pins that the
+  // module ships OPEN — the toggle changes nothing until a user flips it.
+  it("is open by default so existing behavior is unchanged", () => {
+    expect(isAnalyticsEnabled()).toBe(true);
+  });
+
+  // Restore the default for any test that runs after this block.
+  afterEach(() => setAnalyticsEnabled(true));
+
+  it("suppresses every event helper while closed — one gate, not per-callsite", () => {
+    setAnalyticsEnabled(false);
+    expect(isAnalyticsEnabled()).toBe(false);
+
+    // A spread across the event families: lifecycle, sessions, dictation, chat,
+    // navigation, engine errors, settings. All funnel through the same `track`.
+    trackAppLaunched({
+      capture_source: "Mixed",
+      model_size: "Small",
+      dictation_enabled: 1,
+      dictation_slot_count: 2,
+      theme: "dark",
+      ai_connection_count: 1,
+    });
+    trackSessionCreated({ source: "MicOnly", backfill_seconds: 30, trigger: "button" });
+    trackSessionDeleted();
+    trackDictationStarted({
+      slot_id: "slot-1",
+      slot_name: "Slot 1",
+      ai_enabled: 0,
+      has_prompt: 0,
+      output_action: "paste",
+    });
+    trackChatMessageSent({ context: "session", has_action: 0, action_id: "" });
+    trackSearchUsed();
+    trackEngineError({ error: "boom", phase: "initializing" });
+    trackSettingChanged({ setting_name: "theme", new_value: "dark" });
+
+    expect(mockTrackEvent).not.toHaveBeenCalled();
+  });
+
+  it("emits again once reopened", () => {
+    setAnalyticsEnabled(false);
+    trackSessionDeleted();
+    expect(mockTrackEvent).not.toHaveBeenCalled();
+
+    setAnalyticsEnabled(true);
+    trackSessionDeleted();
+    expect(mockTrackEvent).toHaveBeenCalledTimes(1);
+    expect(mockTrackEvent).toHaveBeenCalledWith("session_deleted", undefined);
   });
 });

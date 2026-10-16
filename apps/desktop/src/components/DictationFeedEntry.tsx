@@ -4,8 +4,18 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { Bot, Play, Pause, Trash2, Copy, FileText, FolderSearch } from "lucide-react";
+import {
+  Bot,
+  Play,
+  Pause,
+  Trash2,
+  Copy,
+  FileText,
+  FolderSearch,
+  Loader2,
+} from "lucide-react";
 import { useDictationEntry } from "@/hooks/useDictationEntry";
+import { deriveFetchGlyph } from "@/lib/sync";
 import type { DbDictationHistory } from "@/lib/db";
 
 function formatTime12h(dateStr: string): string {
@@ -33,6 +43,7 @@ export function DictationFeedEntry({
 }) {
   const {
     playing,
+    fetchState,
     handleCopy,
     handlePlayAudio,
     handleMoveToNote,
@@ -40,6 +51,10 @@ export function DictationFeedEntry({
     handleDelete,
     handleShowFile,
   } = useDictationEntry(entry);
+  // The hook has always tracked this entry's sync-fetch state; nothing rendered it, so a
+  // row whose audio lives on another device showed a plain Play button that did nothing
+  // visible for as long as the download took.
+  const glyph = deriveFetchGlyph(fetchState);
 
   return (
     <ContextMenu>
@@ -90,10 +105,29 @@ export function DictationFeedEntry({
               <>
                 <button
                   onClick={handlePlayAudio}
-                  className={`rounded p-1 transition-colors ${playing ? "text-primary hover:text-primary/80 hover:bg-accent" : "text-muted-foreground hover:text-foreground hover:bg-accent"}`}
-                  aria-label={playing ? "Pause audio" : "Play audio"}
+                  disabled={glyph.kind === "busy"}
+                  title={glyph.kind === "idle" ? undefined : glyph.label}
+                  className={`rounded p-1 transition-colors ${
+                    glyph.kind === "busy"
+                      ? "text-muted-foreground"
+                      : glyph.kind === "blocked"
+                        ? "text-amber-600 hover:bg-accent dark:text-amber-400"
+                        : playing
+                          ? "text-primary hover:bg-accent hover:text-primary/80"
+                          : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                  }`}
+                  aria-label={
+                    glyph.kind === "busy"
+                      ? glyph.label
+                      : playing
+                        ? "Pause audio"
+                        : "Play audio"
+                  }
                 >
-                  {playing ? (
+                  {/* Same 12px box in every state, so the row never re-flows. */}
+                  {glyph.kind === "busy" ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : playing ? (
                     <Pause className="h-3 w-3" />
                   ) : (
                     <Play className="h-3 w-3" />
@@ -154,13 +188,22 @@ export function DictationFeedEntry({
         </ContextMenuItem>
         {entry.wav_file_path && (
           <>
-            <ContextMenuItem onClick={handlePlayAudio}>
-              {playing ? (
+            <ContextMenuItem
+              onClick={handlePlayAudio}
+              disabled={glyph.kind === "busy"}
+            >
+              {glyph.kind === "busy" ? (
+                <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+              ) : playing ? (
                 <Pause className="h-3.5 w-3.5 mr-2" />
               ) : (
                 <Play className="h-3.5 w-3.5 mr-2" />
               )}
-              {playing ? "Pause Audio" : "Play Audio"}
+              {glyph.kind === "busy"
+                ? glyph.label
+                : playing
+                  ? "Pause Audio"
+                  : "Play Audio"}
             </ContextMenuItem>
             <ContextMenuItem onClick={handleShowFile}>
               <FolderSearch className="h-3.5 w-3.5 mr-2" />

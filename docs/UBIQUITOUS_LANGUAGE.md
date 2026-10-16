@@ -306,3 +306,27 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - **"Tick"** vs **"Fire"**: an **Insight tick** is the cheap ~1 s scheduler evaluation (no LLM); an **Insight fire** is the LLM call a tick may trigger. Don't conflate them — most ticks do not fire. "Tick" stays reserved for this Insight sense; qualify any other periodic mechanism (e.g. "metrics tick").
 - **Insight type** (content) vs **cadence** (timing) are orthogonal and must not be conflated. "Summary", "Glossary", "Jargon" name a *type* (what it extracts) — never a cadence. The earlier presets ("summary" / "jargon" / "topic") wrongly labeled the *timing* lever with content nouns; cadence tiers are now `responsive` / `balanced` / `relaxed` (a tempo scale), and content lives in **Insight type**. Picking a type seeds a prompt + recommended cadence but the two remain independently editable.
 - **"Overlay"** alone is ambiguous; prefer **Overlay window** when referring to one of the three Tauri NSPanels and qualify with the specific window name (**Recording indicator** / **Dictation bubble** / **Insight overlay**) when context matters.
+
+## Sync
+
+Spec: [`SYNC_SPEC.md`](SYNC_SPEC.md). Definitions in [`GLOSSARY.md`](GLOSSARY.md#sync).
+
+| Term | Definition | Avoid |
+|---|---|---|
+| **Relay** | The blind sync server the user hosts. | Cloud, backend, "the server" (ambiguous with the AI server) |
+| **Set up sync** | The wizard: server → account → approval → turn on. | Connect, link, pair |
+| **Turn on sync** | Cutover + drain start on this device (`sync_enable`). Distinct from signing in. | Enable account, activate |
+| **Approve a device** | An active device re-signs the roster to admit a pending one after the out-of-band code comparison. | Trust, verify, pair |
+| **Security code** | Roster fingerprint + key epoch shown on both screens at approval. | Fingerprint (that is the *device* fingerprint), hash |
+| **Recovery code** | The one-time 8×4 code that unwraps the vault key. | Backup key, secret key, password reset |
+| **Up to date** | Outbox empty, pull at the relay tip, no error, no unreadable changes, relay reachable. | Synced (as a durable badge), connected |
+| **Unreadable changes** | Crypto-quarantined peer changesets ("Synced — N changes unreadable"). | Corrupt, failed sync, changeset (in copy) |
+| **Pending / active / revoked** | The relay's three device states: signed in but unapproved; approved; removed by another device. | Unverified, trusted, banned, deleted |
+| **Turn off sync** | Stop syncing on this device while staying signed in (`sync_disable`); turning it back on resumes in place. | Pause, disconnect, disable account |
+| **Change password** | Re-wrap the vault key under a new password; every other device is signed out and asks for the new one. | Reset password (there is no reset), rotate key |
+| **Remove a device** | An active device re-signs the roster without another device; that device loses relay access and must be approved again to rejoin. | Revoke (in copy), unpair, kick |
+| **Recovery grant** | The one-shot permission a recovery-code sign-in gives a device to admit itself when no approver is left (A7). | Recovery token, bypass |
+| **Proof of possession** | The signed sign-in challenge that shows a device holds its own key (A10). | 2FA, device attestation |
+| **Account anchor** | The per-(relay, email) baseline a device keeps across sign-outs so it recognises the account. | Cache, trust store |
+| **Backed up** (audio) | The relay confirms it holds the blob. | Uploaded to the cloud, mirrored |
+| **Downloaded audio** | The local fetch cache of audio recorded elsewhere. | Cached, synced audio |

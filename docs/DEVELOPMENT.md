@@ -91,14 +91,14 @@ cargo build -p yapstack-transcription-sidecar                                   
 | `metal` | Metal GPU acceleration for whisper-rs (Apple). |
 | `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
 | `coreml` | Adds the ORT-CoreML execution provider for Parakeet on Apple. Strict superset of `parakeet`. The Parakeet backend's "Auto" policy will skip CoreML at load time if the model dir contains external `.onnx.data` files (known ORT bug); set `YAPSTACK_PARAKEET_ACCEL=coreml` to force-attempt. |
-| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows; shipping on macOS, planned for Windows behind `YAPSTACK_PARAKEET_ACCEL=webgpu` per ADR 0004). Whisper stays CPU on Windows. Set `YAPSTACK_PARAKEET_ACCEL=webgpu` to opt in. |
+| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows). Compiled into both the macOS and Windows sidecars, and selected by `Auto` on both since Gate C passed (ADR 0004); EP-init failure falls back to CPU with an honest `accel` label. Whisper stays CPU on Windows. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. |
 
 If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`. The dispatcher in `main.rs` is engine-agnostic and unconditional.
 
 ### Runtime env vars (sidecar)
 
 - **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: uses CoreML when compiled in *and* the model has no external `.onnx.data` initializers, otherwise CPU. Empirical RTFx on Apple Silicon for Parakeet TDT v3, 2-13 s chunks: CPU 4-8×, WebGPU 4-9× (similar mean, higher variance). CoreML doesn't load for TDT v3 (external-data bug); use Auto to silently fall through.
-- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` for our crates + `warn` for noisy upstream deps. Example: `RUST_LOG=debug,ort=warn npm run dev`.
+- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` with `yapstack_desktop`, `yapstack_transcription`, the frontend bridge and the sidecar at `debug` (so every sync trace line lands in the log file), `yapstack_audio` at `info`, and `warn` for noisy upstream deps (`tao`, `wry`, `hyper`, `reqwest`). Example: `RUST_LOG=debug,ort=warn npm run dev`.
 
 System audio capture is always compiled in via cpal loopback — no feature flag needed. Available on macOS (CoreAudio) and Windows (WASAPI). On Linux, `SystemAudioCapture::is_available()` returns false at runtime. On Windows, WASAPI loopback delivers zero packets during system silence (no audio playing) — this is normal and handled by the stream health watchdog.
 
@@ -157,7 +157,7 @@ The DTO pattern keeps `specta::Type` out of library crates:
 
 Key frontend dependencies beyond React 19 + Vite:
 - **Zustand** — State management with `persist` middleware for settings (version 23, with migrations — see `docs/API_REFERENCE.md` for the full v0→v23 history)
-- **tauri-plugin-sql** — SQLite via Tauri plugin. Session, segment, note, folder persistence in `src/lib/db.ts`
+- **rusqlite** (repo-owned command backend, `db_service.rs` + `lib/db-backend.ts`) — SQLite persistence for sessions, segments, notes, folders in `src/lib/db.ts`; cr-sqlite is loaded per connection only when the `sync` feature is on
 - **sonner** — Toast notifications for user feedback
 - **shadcn/ui** — Component library (button, card, tabs, select, popover, alert-dialog, dialog, dropdown-menu, context-menu, tooltip, slider, input, textarea, command, sheet, etc.)
 - **Tauri API** — `@tauri-apps/api` for IPC, events, and path resolution

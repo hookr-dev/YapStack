@@ -1,0 +1,11 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Password change after recovery (CRYPTO_SPEC §4.3 / amendment A9, SYNC_SPEC §15.C).
+--
+-- `PUT /auth/password` normally requires the CURRENT auth key (re-authentication), so a
+-- stolen short-lived access token cannot change the password on its own. A user who
+-- recovered with the recovery code has no current password to present; the relay
+-- therefore remembers WHEN a device last authenticated with the recovery code and waives
+-- the current-key requirement for that device within 15 minutes of it. Stamped only by a
+-- successful `POST /auth/recover` carrying the device's identity, onto a row of the same
+-- account. Additive; existing rows read NULL.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS recovered_at timestamptz;

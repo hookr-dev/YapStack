@@ -1,7 +1,12 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { toast } from "sonner";
 import { AudioPlayer } from "./AudioPlayer";
+
+vi.mock("sonner", () => ({
+  toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+}));
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -30,6 +35,18 @@ describe("AudioPlayer", () => {
     const playBtn = buttons[0];
     await userEvent.click(playBtn);
     expect(HTMLAudioElement.prototype.play).toHaveBeenCalled();
+  });
+
+  it("surfaces a factual toast when playback fails (missing/unreadable file)", async () => {
+    HTMLAudioElement.prototype.play = vi
+      .fn()
+      .mockRejectedValue(new DOMException("no supported source", "NotSupportedError"));
+    render(<AudioPlayer parts={ONE_PART} />);
+    const playBtn = screen.getAllByRole("button")[0];
+    await userEvent.click(playBtn);
+    expect(toast.error).toHaveBeenCalledWith(
+      "Couldn't play audio — file missing or unreadable",
+    );
   });
 
   it("cycles through playback speeds", async () => {

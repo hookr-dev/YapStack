@@ -197,6 +197,38 @@ export function useChatMessages(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contextKey]);
 
+  const reloadFromDb = useCallback(async () => {
+    if (!contextKey) return;
+    try {
+      const rows = await getChatMessages(contextKey);
+      setMessages(dbRowsToChatMessages(rows));
+    } catch (e) {
+      console.error(`[chat] failed to reload messages after sync: ${e}`);
+    }
+  }, [contextKey]);
+
+  /**
+   * B2: chat_messages is a synced table, but this hook only ever read it on
+   * context change — a conversation continued on another device never appeared
+   * until the chat was reopened. `syncAppliedSeq` is the store's counter of
+   * committed sync-applied batches, so we re-read on exactly those batches.
+   *
+   * Never while a send is in flight: the streaming bubble lives in React state
+   * and is persisted only after the round completes, so a mid-send reload would
+   * wipe the visible response. The skipped reload is remembered and drained in
+   * `handleSend`'s finally.
+   */
+  const syncAppliedSeq = useAppStore((s) => s.syncAppliedSeq);
+  const pendingSyncReloadRef = useRef(false);
+  useEffect(() => {
+    if (!contextKey || syncAppliedSeq === 0) return;
+    if (sendingRef.current) {
+      pendingSyncReloadRef.current = true;
+      return;
+    }
+    void reloadFromDb();
+  }, [syncAppliedSeq, contextKey, reloadFromDb]);
+
   // Abort streaming on unmount
   useEffect(() => {
     return () => {
@@ -844,10 +876,16 @@ export function useChatMessages(
         setIsStreaming(false);
         abortRef.current = null;
         sendingRef.current = false;
+        // Drain a sync-applied reload this send suppressed (B2).
+        if (pendingSyncReloadRef.current) {
+          pendingSyncReloadRef.current = false;
+          void reloadFromDb();
+        }
       }
     },
     [
       contextKey,
+      reloadFromDb,
       sessionId,
       isSessionContext,
       sources,

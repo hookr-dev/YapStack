@@ -11,9 +11,9 @@ export function useTrayEvents() {
       if (enginePhase !== "ready") return;
       if (captureStatus?.state !== "Capturing") return;
       if (activeSessionId) return;
-      createAndStartSession(payload || undefined, "tray").catch((err) =>
-        console.error("Tray: failed to start session:", err),
-      );
+      // Fire-and-forget: `createAndStartSession` never rejects and reports its own
+      // failures with a toast (a console.error alone was invisible to the user).
+      void createAndStartSession(payload || undefined, "tray");
     });
 
     const unlistenAll = listenEvent(EVENTS.TRAY_NEW_SESSION_ALL, () => {
@@ -31,9 +31,7 @@ export function useTrayEvents() {
       const sysAvail = bufferInfo?.system?.available_seconds ?? 0;
       const maxAvail = Math.max(micAvail, sysAvail);
       if (maxAvail <= 0) return;
-      createAndStartSession(Math.ceil(maxAvail), "tray").catch((err) =>
-        console.error("Tray: failed to start session with all backfill:", err),
-      );
+      void createAndStartSession(Math.ceil(maxAvail), "tray");
     });
 
     const unlistenStop = listenEvent(EVENTS.TRAY_STOP_SESSION, () => {

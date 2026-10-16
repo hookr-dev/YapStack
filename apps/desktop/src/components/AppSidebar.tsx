@@ -23,6 +23,7 @@ import {
   PenLine,
   ChevronDown,
   ChevronRight,
+  Loader2,
 } from "lucide-react";
 import { useCreateSession } from "@/hooks/useCreateSession";
 import { RecordingBeacon } from "@/components/RecordingBeacon";
@@ -35,6 +36,7 @@ import { getBinding } from "@/lib/shortcuts";
 import { YapStackIcon } from "@/components/YapStackIcon";
 import { BackfillDropdown } from "@/components/BackfillDropdown";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { SyncStatusGlyph } from "@/components/SyncStatusGlyph";
 
 export function AppSidebar() {
   const navigateTo = useAppStore((s) => s.navigateTo);
@@ -52,7 +54,7 @@ export function AppSidebar() {
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
   const dictationEnabled = useAppStore((s) => s.settings.dictation.enabled);
   const dictationHistory = useAppStore((s) => s.dictationHistory);
-  const { canCreate, handleNew } = useCreateSession();
+  const { canCreate, creatingSession, handleNew } = useCreateSession();
 
   const [dictationOpen, setDictationOpen] = useState(true);
   const recentDictations = useMemo(() => dictationHistory.slice(0, 5), [dictationHistory]);
@@ -92,10 +94,16 @@ export function AppSidebar() {
                 disabled={!canCreate}
                 onClick={() => handleNew()}
               >
-                <Plus className="h-3.5 w-3.5" />
+                {creatingSession ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>New session</TooltipContent>
+            <TooltipContent>
+              {creatingSession ? "Starting session…" : "New session"}
+            </TooltipContent>
           </Tooltip>
           <BackfillDropdown
             availableSeconds={availableSeconds}
@@ -229,14 +237,17 @@ export function AppSidebar() {
       {/* Footer */}
       <div className="border-t border-sidebar-border px-2 py-2">
         <UpdateBanner />
-        <button
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground transition-all duration-150"
-          onClick={() => navigateTo("settings")}
-          aria-label="Settings"
-        >
-          <Settings className="h-3.5 w-3.5 shrink-0" />
-          Settings
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            className="flex flex-1 min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground transition-all duration-150"
+            onClick={() => navigateTo("settings")}
+            aria-label="Settings"
+          >
+            <Settings className="h-3.5 w-3.5 shrink-0" />
+            Settings
+          </button>
+          <SyncStatusGlyph />
+        </div>
       </div>
 
       {/* New folder dialog */}

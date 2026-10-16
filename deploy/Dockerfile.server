@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Multi-stage build for the YapStack blind relay (crates/yapstack-server).
+#
+# STABLE RUST: the server binary does NOT link the vendored cr-sqlite CRR bundle
+# (yapstack-sync is a CLIENT crate and is not a dependency of yapstack-server), so this
+# image builds on stable Rust with no nightly toolchain. `cargo build -p yapstack-server`
+# only compiles the server's dependency graph — yapstack-sync and its nightly build.rs
+# are never touched. The relay runs no CRDT engine and decrypts nothing.
+
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /build
+
+# System deps for the server's crates (rustls => no OpenSSL needed at build time).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the workspace. All member manifests must be present for the workspace to resolve,
+# but `-p yapstack-server` builds ONLY the server's dependency graph.
+COPY . .
+
+# Build just the server, in release, against the workspace-pinned STABLE toolchain.
+RUN cargo build --release -p yapstack-server --bin yapstack-server
+
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /app yapstack
+
+COPY --from=builder /build/target/release/yapstack-server /usr/local/bin/yapstack-server
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && chown -R yapstack:yapstack /app
+
+USER yapstack
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

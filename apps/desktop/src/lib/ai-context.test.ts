@@ -27,7 +27,7 @@ vi.mock("@/lib/db", () => ({
   listTags: vi.fn().mockResolvedValue([]),
   listFolders: vi.fn().mockResolvedValue([]),
 }));
-vi.mock("@tauri-apps/plugin-sql", () => ({
+vi.mock("@/lib/db-backend", () => ({
   default: { load: vi.fn() },
 }));
 
@@ -148,6 +148,7 @@ function makeSession(overrides: Partial<DbSession> = {}): DbSession {
     pinned_at: null,
     session_type: "transcription",
     sort_order: 0,
+    recording_device_id: null,
     ...overrides,
   };
 }

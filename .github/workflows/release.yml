@@ -1,3 +1,16 @@
+# Production release: signed macOS + Windows desktop artifacts and a draft GitHub
+# release, cut from a `v*` tag.
+#
+# Both platform builds enable the `sync` cargo feature (`-f sync`), so shipped
+# releases INCLUDE end-to-end encrypted sync. That needs three extras, each mirrored
+# verbatim from the proven sync-test-build.yml invocation (keep the two workflows in
+# step): the pinned nightly-2023-10-05 toolchain for the vendored cr-sqlite bundle,
+# CARGO_PROFILE_RELEASE_LTO=false, and — on Windows only — /FORCE:MULTIPLE on the app
+# link. Each is commented at its step.
+#
+# sync-test-build.yml still exists for on-demand test artifacts from an arbitrary ref;
+# it does not create releases.
+
 name: Release
 
 on:
@@ -14,6 +27,13 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Required by the `-f sync` build. The root [profile.release] uses lto="thin", but the
+  # vendored cr-sqlite static bundle is compiled by the pinned nightly-2023-10-05 rustc —
+  # its objects lack a bitcode section the host rustc's thin-LTO expects ("failed to get
+  # bitcode from object file for LTO / Can't find section __bitcode"), so a thin-LTO link
+  # hard-fails. Overriding the profile here (not in Cargo.toml) keeps local/dev builds
+  # untouched. Cost is size/perf only. Same override as sync-test-build.yml.
+  CARGO_PROFILE_RELEASE_LTO: "false"
 
 jobs:
   build-macos:
@@ -37,6 +57,13 @@ jobs:
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           targets: aarch64-apple-darwin
+
+      - name: Install pinned nightly for the vendored cr-sqlite bundle
+        # Required by the `-f sync` build: crates/yapstack-sync/build.rs nested-builds
+        # vendor/cr-sqlite/core/rs/bundle_static, whose rust-toolchain.toml pins
+        # nightly-2023-10-05 (channel only, no components) — installing the toolchain is
+        # all the runner needs.
+        run: rustup toolchain install nightly-2023-10-05 --profile minimal
 
       - name: Xcode fingerprint for cache key
         # Same rationale as ci-checks.yml: caches embed absolute Xcode
@@ -100,8 +127,12 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           rm certificate.p12
 
-      - name: Build Tauri app
-        working-directory: apps/desktop
+      - name: Build Tauri app (--features sync, signed + notarized)
+        # `-f sync` forwards the cargo feature to the app crate
+        # (apps/desktop/src-tauri/Cargo.toml [features] sync) so the release ships
+        # end-to-end encrypted sync. Command form is byte-for-byte the proven
+        # sync-test-build.yml signed invocation (pnpm --filter from the repo root, no
+        # working-directory) — the bundle paths below are repo-root relative either way.
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -109,7 +140,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri build --target aarch64-apple-darwin
+        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
 
       - name: Generate checksum
         run: |
@@ -157,6 +188,11 @@ jobs:
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      - name: Install pinned nightly for the vendored cr-sqlite bundle
+        # Required by the `-f sync` build — same rationale as the macOS job: the
+        # vendored cr-sqlite static bundle pins nightly-2023-10-05 (channel only).
+        run: rustup toolchain install nightly-2023-10-05 --profile minimal
 
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
@@ -215,17 +251,25 @@ jobs:
           echo "Authenticode signing is gated on the WINDOWS_CERTIFICATE secret (T005)."
           echo "This step is a placeholder and is skipped until that secret is wired."
 
-      - name: Build Tauri app
-        working-directory: apps/desktop
+      - name: Build Tauri app (--features sync)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Required by the `-f sync` app link ONLY (the sidecar step above must NOT set
+          # it): the vendored cr-sqlite no_std bundle (crsql_bundle) defines its own
+          # `rust_eh_personality`, which collides with libstd's on the MSVC linker
+          # (LNK2005 -> LNK1169). Both definitions are equivalent no-ops under
+          # panic="abort" (this repo's release profile), so first-wins is safe.
+          RUSTFLAGS: "-Clink-arg=/FORCE:MULTIPLE"
         # Restrict to NSIS: tauri.conf.json bundle.targets is "all", but on
         # Windows that also builds MSI/WiX, which hard-fails on the non-numeric
         # pre-release version (tauri-bundler rejects "1.0.0-alpha.NN" for MSI).
         # Updater artifacts (*.nsis.zip[.sig]) come from createUpdaterArtifacts
         # in tauri.conf.json and are emitted alongside the nsis bundle.
-        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        #
+        # `-f sync` ships end-to-end encrypted sync in the release. Command form is
+        # byte-for-byte the proven sync-test-build.yml Windows invocation.
+        run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync
 
       - name: Generate checksum
         shell: bash

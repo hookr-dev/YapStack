@@ -12,6 +12,10 @@ import { vi } from "vitest";
 
 export const tauriCoreMock = () => ({
   invoke: vi.fn().mockResolvedValue(null),
+  // Identity passthrough — tests only need a deterministic string, not a real
+  // asset URL, and components (e.g. NoteDetailView) call this to build
+  // `audio-stream://` sources.
+  convertFileSrc: vi.fn((path: string) => path),
 });
 
 export const tauriEventMock = () => ({
@@ -195,6 +199,9 @@ export const tauriCommandsMock = () => ({
     deleteSessionWav: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
+    // Infallible command: resolves a plain boolean[] parallel to the input.
+    // Default to "all present" so unrelated tests keep the normal player.
+    audioFilesExist: vi.fn().mockResolvedValue([]),
     peekCaptureEnergy: vi.fn().mockResolvedValue({
       status: "ok",
       data: { mic_rms: 0, system_rms: 0 },

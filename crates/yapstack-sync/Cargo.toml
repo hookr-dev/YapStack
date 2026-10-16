@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "yapstack-sync"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "YapStack on-device sync runtime: statically-linked cr-sqlite CRR engine, encrypted outbox, and background push/pull drain for the World B blind relay."
+
+[lib]
+name = "yapstack_sync"
+
+[dependencies]
+yapstack-crypto = { path = "../yapstack-crypto" }
+yapstack-common = { path = "../yapstack-common" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Audio round-trip S1: stream the encrypted temp file to object storage (O(chunk) memory,
+# not a buffered vec) and stream the fetched blob to disk.
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { workspace = true }
+tempfile = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"

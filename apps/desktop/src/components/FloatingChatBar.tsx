@@ -117,7 +117,7 @@ export function FloatingChatBar() {
           mergedHtml = html;
         }
         await saveNote(sessionId, mergedHtml);
-        incrementNoteRefresh();
+        incrementNoteRefresh(sessionId);
         toast.success("Saved to notes");
       } catch (e) {
         console.error("Failed to save to notes:", e);

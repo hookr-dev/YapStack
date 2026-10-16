@@ -56,32 +56,8 @@ import {
 } from "lucide-react";
 import { commands, type CaptureSourceDto } from "@/lib/tauri";
 import { YapStackIcon } from "@/components/YapStackIcon";
-
-// --- Progress Dots ---
-
-function ProgressDots({ current, total }: { current: number; total: number }) {
-  return (
-    <div className="flex items-center justify-center gap-2 mb-6">
-      {Array.from({ length: total }, (_, i) => (
-        <div
-          key={i}
-          className="rounded-full transition-all duration-300"
-          style={{
-            width: i === current ? 10 : i < current ? 8 : 6,
-            height: i === current ? 10 : i < current ? 8 : 6,
-            backgroundColor:
-              i === current
-                ? "var(--primary)"
-                : i < current
-                  ? "color-mix(in oklch, var(--primary) 50%, transparent)"
-                  : "var(--muted)",
-            transform: i === current ? "scale(1.1)" : "scale(1)",
-          }}
-        />
-      ))}
-    </div>
-  );
-}
+import { ProgressDots } from "@/components/ProgressDots";
+import { DevicesIllustration } from "@/components/sync/DevicesIllustration";
 
 // --- Step 1: Welcome ---
 
@@ -883,16 +859,60 @@ function ReadyStep({ onFinish }: { onFinish: () => void }) {
   );
 }
 
+// --- Step: Sync (optional) ---
+
+/**
+ * Optional: offer multi-device sync. "Set up sync" only records the intent — the
+ * wizard itself opens in Settings → Sync once onboarding finishes, so first-run
+ * stays short and a user without a server yet loses nothing by skipping.
+ */
+function SyncStep({
+  onChoose,
+  onBack,
+}: {
+  onChoose: (wantsSync: boolean) => void;
+  onBack: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-center text-center">
+      <DevicesIllustration className="mb-5" />
+      <h2 className="text-lg font-semibold mb-0.5">Use YapStack on more than one device?</h2>
+      <p className="text-sm text-muted-foreground mb-6">
+        Sync keeps your notes and recordings the same everywhere, encrypted
+        end-to-end on a server you run. You can set it up now or any time from
+        Settings.
+      </p>
+      <Button className="w-full mb-2" onClick={() => onChoose(true)}>
+        Set up sync after this
+        <ChevronRight className="ml-1.5 h-4 w-4" />
+      </Button>
+      <div className="flex w-full gap-2">
+        <Button variant="outline" className="flex-1" onClick={onBack}>
+          <ChevronLeft className="mr-1.5 h-4 w-4" />
+          Back
+        </Button>
+        <Button variant="outline" className="flex-1" onClick={() => onChoose(false)}>
+          Not now
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 // --- Main Modal ---
 
 export function OnboardingModal() {
   const onboarding = useAppStore((s) => s.settings.onboarding);
   const completeFlow = useAppStore((s) => s.completeFlow);
+  const navigateTo = useAppStore((s) => s.navigateTo);
+  const setSettingsRequest = useAppStore((s) => s.setSettingsRequest);
 
   const activeFlow = getActiveFlow(onboarding);
 
   const [currentStep, setCurrentStep] = useState(0);
   const [direction, setDirection] = useState<"forward" | "backward">("forward");
+  // Chosen on the sync step; acted on at finish (Settings → Sync opens the wizard).
+  const [wantsSync, setWantsSync] = useState(false);
 
   // Reset step when active flow changes
   const activeFlowId = activeFlow?.id ?? null;
@@ -917,6 +937,10 @@ export function OnboardingModal() {
 
   function handleFinish() {
     completeFlow(activeFlow!.id);
+    if (wantsSync) {
+      setSettingsRequest("sync-setup");
+      navigateTo("settings");
+    }
   }
 
   function handleDismiss() {
@@ -936,6 +960,17 @@ export function OnboardingModal() {
       break;
     case "ai":
       stepContent = <AIStep onNext={nav.onNext} onBack={nav.onBack} />;
+      break;
+    case "sync":
+      stepContent = (
+        <SyncStep
+          onBack={nav.onBack}
+          onChoose={(wants) => {
+            setWantsSync(wants);
+            nav.onNext();
+          }}
+        />
+      );
       break;
     case "ready":
       stepContent = <ReadyStep onFinish={nav.onFinish} />;

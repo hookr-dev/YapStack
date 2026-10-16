@@ -152,8 +152,15 @@ async fn send_error(id: u64, message: String) {
 
 #[tokio::main]
 async fn main() {
+    // Default filter. `ort=warn` silences the ONNX Runtime tracing firehose at
+    // the SOURCE: `ort`'s tracing bridge otherwise emits thousands of INFO lines
+    // per model load (`ort::logging: Add MemcpyToHost before ...`, GraphTransformer
+    // "modified: N with status: OK", "Saving initialized tensors", ...) that get
+    // captured by the desktop and drown every real diagnostic. WARN keeps ORT's
+    // genuine warnings/errors visible. Overridable via RUST_LOG for deep debugging
+    // (e.g. `RUST_LOG=info,ort=info` restores the full ORT trace).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,yapstack_transcription_sidecar=debug")
+        tracing_subscriber::EnvFilter::new("info,yapstack_transcription_sidecar=debug,ort=warn")
     });
     // No ANSI colors: desktop captures this stderr into its log UI where
     // raw escape codes render as garbage.

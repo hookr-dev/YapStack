@@ -202,13 +202,16 @@ export function useGlobalShortcuts() {
         const s = useAppStore.getState();
 
         switch (id) {
+          // Both new-session cases are fire-and-forget: `createAndStartSession`
+          // never rejects and toasts its own failures (it used to reject unhandled
+          // here, so a start that lost the DB write lock showed the user nothing).
           case "global.new-session": {
             if (
               s.enginePhase === "ready" &&
               s.captureStatus?.state === "Capturing" &&
               !s.activeSessionId
             ) {
-              focusWindow().then(() => s.createAndStartSession(0, "shortcut"));
+              void focusWindow().then(() => s.createAndStartSession(0, "shortcut"));
             }
             break;
           }
@@ -218,12 +221,12 @@ export function useGlobalShortcuts() {
               s.captureStatus?.state === "Capturing" &&
               !s.activeSessionId
             ) {
-              focusWindow().then(() => {
+              void focusWindow().then(() => {
                 const avail = Math.max(
                   s.bufferInfo?.mic?.available_seconds ?? 0,
                   s.bufferInfo?.system?.available_seconds ?? 0,
                 );
-                s.createAndStartSession(avail, "shortcut");
+                return s.createAndStartSession(avail, "shortcut");
               });
             }
             break;

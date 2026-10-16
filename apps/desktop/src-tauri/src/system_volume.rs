@@ -418,6 +418,9 @@ mod stub {
 }
 
 #[cfg(test)]
+// DeviceId is Copy (u32) off Windows but String on Windows, so the mock's
+// .clone() calls are only redundant on macOS/Linux.
+#[allow(clippy::clone_on_copy)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

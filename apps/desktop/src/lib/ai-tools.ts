@@ -330,6 +330,10 @@ registerTool({
     if (title === sctx.currentTitle) return null;
     const previousTitle = await captureUndoSnapshot(() => sctx.currentTitle);
     await updateSessionTitle(sctx.sessionId, title);
+    // Adjacent to the write (no await between) so an open title edit yields
+    // instead of misattributing this local rename as a peer edit. Sync never
+    // bumps this (D4). pin_session and other non-title meta tools do NOT bump it.
+    useAppStore.getState().incrementSessionMetaRefresh(sctx.sessionId);
     return {
       name: "update_title",
       label: "Title",
@@ -340,6 +344,7 @@ registerTool({
   },
   undo: async (undoData, ctx) => {
     await updateSessionTitle(ctx.sessionId, String(undoData));
+    useAppStore.getState().incrementSessionMetaRefresh(ctx.sessionId);
   },
 });
 
@@ -526,6 +531,11 @@ If you're unsure between append and replace, choose append. The user's manual no
     }
 
     await saveNote(sctx.sessionId, mergedHtml);
+    // Announce the local write ADJACENT to it (no await between) so an open note
+    // editor's in-flight save yields to it instead of clobbering — the atomic
+    // signal a post-hoc refresh in handleToolsExecuted could race. Sync never
+    // bumps this (D4), so it stays a local-vs-remote discriminator.
+    useAppStore.getState().incrementNoteRefresh(sctx.sessionId);
 
     const wordCount = content.split(/\s+/).filter(Boolean).length;
     return {
@@ -543,6 +553,7 @@ If you're unsure between append and replace, choose append. The user's manual no
     } else {
       await saveNote(ctx.sessionId, String(undoData));
     }
+    useAppStore.getState().incrementNoteRefresh(ctx.sessionId);
   },
 });
 

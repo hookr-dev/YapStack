@@ -13,8 +13,6 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "shell:allow-open",
-    "sql:default",
-    "sql:allow-execute",
     "dialog:default",
     "fs:default",
     "fs:allow-read-text-file",

@@ -77,6 +77,8 @@ export const DEFAULT_AI_CONFIG: AIConfig = {
   },
 };
 
+// ----- Vault-wrapping AI connection secrets (CRYPTO_SPEC §4, sync deliverable E) -----
+
 export type ToolExecutionStatus = "running" | "done" | "error";
 
 export interface ToolExecution {

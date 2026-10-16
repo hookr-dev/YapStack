@@ -14,7 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { formatShortcutDisplay, isMac } from "@/lib/utils";
 import { getBinding } from "@/lib/shortcuts";
-import { Search, PanelLeftClose, PanelLeftOpen, Plus, PenLine, Minus, Square, X } from "lucide-react";
+import { Search, PanelLeftClose, PanelLeftOpen, Plus, PenLine, Minus, Square, X, Loader2 } from "lucide-react";
 import { SearchCommand } from "@/components/SearchCommand";
 import { BackfillDropdown } from "@/components/BackfillDropdown";
 import { StatusPopover } from "@/components/StatusPopover";
@@ -48,7 +48,7 @@ export function TitleBar() {
     ),
   );
   const [searchOpen, setSearchOpen] = useState(false);
-  const { canCreate, handleNew } = useCreateSession();
+  const { canCreate, creatingSession, handleNew } = useCreateSession();
 
   const onCreateSession = useCallback(() => handleNew(), [handleNew]);
 
@@ -138,10 +138,16 @@ export function TitleBar() {
                   onClick={() => handleNew()}
                   className="text-muted-foreground"
                 >
-                  <Plus className="h-3.5 w-3.5" />
+                  {creatingSession ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Plus className="h-3.5 w-3.5" />
+                  )}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>New session</TooltipContent>
+              <TooltipContent>
+                {creatingSession ? "Starting session…" : "New session"}
+              </TooltipContent>
             </Tooltip>
             <BackfillDropdown
               availableSeconds={availableSeconds}

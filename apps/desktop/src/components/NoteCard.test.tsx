@@ -18,7 +18,7 @@ vi.mock("@tauri-apps/api/event", () => tauriEventMock());
 vi.mock("@tauri-apps/api/window", () => tauriWindowMock());
 vi.mock("@tauri-apps/api/dpi", () => tauriDpiMock());
 vi.mock("@tauri-apps/api/webviewWindow", () => tauriWebviewWindowMock());
-vi.mock("@tauri-apps/plugin-sql", () => tauriSqlMock());
+vi.mock("@/lib/db-backend", () => tauriSqlMock());
 vi.mock("@/lib/tauri", () => tauriCommandsMock());
 vi.mock("@dnd-kit/core", () => ({
   useDraggable: () => ({
@@ -50,6 +50,7 @@ function makeSession(overrides?: Partial<DbSession>): DbSession {
     pinned_at: null,
     session_type: "transcription",
     sort_order: 0,
+    recording_device_id: null,
     ...overrides,
   };
 }

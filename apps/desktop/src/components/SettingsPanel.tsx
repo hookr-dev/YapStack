@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -10,16 +10,32 @@ import { ShortcutsTab } from "@/components/settings/ShortcutsTab";
 import { AITab } from "@/components/settings/AITab";
 import { DictationTab } from "@/components/settings/DictationTab";
 import { InsightsTab } from "@/components/settings/InsightsTab";
+import { SyncTab } from "@/components/sync/SyncTab";
 
 export function SettingsPanel() {
   const navigateTo = useAppStore((s) => s.navigateTo);
-  // Seed the initial tab from a one-shot settingsRequest. AITab is responsible
-  // for clearing the request once it's consumed (so the request doesn't fire
-  // again on the next mount).
-  const initialTab = useAppStore.getState().settingsRequest === "ai-add-connection"
-    ? "ai"
-    : "general";
+  const settingsRequest = useAppStore((s) => s.settingsRequest);
+  const setSettingsRequest = useAppStore((s) => s.setSettingsRequest);
+  // Seed the initial tab from a one-shot settingsRequest. The AI request is
+  // consumed+cleared by AITab (it needs the tab mounted first); the `"sync"`
+  // request (ambient sidebar glyph) is cleared here.
+  const initialTab =
+    settingsRequest === "ai-add-connection"
+      ? "ai"
+      : settingsRequest === "sync" || settingsRequest === "sync-setup"
+        ? "sync"
+        : "general";
   const [tab, setTab] = useState(initialTab);
+
+  // Handle a sync request that arrives while the panel is already open: switch to
+  // the Sync tab. `"sync"` is consumed here; `"sync-setup"` is left for SyncTab,
+  // which needs to be mounted to open the wizard from it.
+  useEffect(() => {
+    if (settingsRequest === "sync" || settingsRequest === "sync-setup") {
+      setTab("sync");
+      if (settingsRequest === "sync") setSettingsRequest(null);
+    }
+  }, [settingsRequest, setSettingsRequest]);
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
@@ -48,6 +64,7 @@ export function SettingsPanel() {
           <TabsTrigger value="ai">AI</TabsTrigger>
           <TabsTrigger value="dictation">Dictation</TabsTrigger>
           <TabsTrigger value="insights">Insights</TabsTrigger>
+          <TabsTrigger value="sync">Sync</TabsTrigger>
           <TabsTrigger value="shortcuts">Shortcuts</TabsTrigger>
         </TabsList>
 
@@ -95,6 +112,14 @@ export function SettingsPanel() {
           <ScrollArea className="h-full">
             <div className="space-y-5 p-4">
               <InsightsTab />
+            </div>
+          </ScrollArea>
+        </TabsContent>
+
+        <TabsContent value="sync" className="flex-1 min-h-0">
+          <ScrollArea className="h-full">
+            <div className="space-y-5 p-4">
+              <SyncTab />
             </div>
           </ScrollArea>
         </TabsContent>

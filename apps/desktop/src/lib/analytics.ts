@@ -2,7 +2,37 @@ import { trackEvent } from "@aptabase/tauri";
 
 type Props = Record<string, string | number>;
 
+/**
+ * The single emit gate. Defaults to ON so behavior is unchanged until something
+ * says otherwise — it matches `defaultSettings.analyticsEnabled`, and the store
+ * pushes the persisted value in during rehydration (before any event can fire).
+ *
+ * This is a mechanism, not a policy: this module never reads the settings store
+ * (that would be an import cycle — `appStore` already imports from here). The
+ * caller decides when to flip it. See feedback_naming_mechanism_vs_policy.
+ */
+let emitEnabled = true;
+
+/** Open or close the emit gate. Called by `appStore` on rehydrate + on toggle. */
+export function setAnalyticsEnabled(enabled: boolean): void {
+  emitEnabled = enabled;
+}
+
+/** Current gate state — for tests and for UI that wants to reflect reality. */
+export function isAnalyticsEnabled(): boolean {
+  return emitEnabled;
+}
+
+/**
+ * Every `track*` helper in this file funnels through here, and this file is the
+ * ONLY importer of `@aptabase/tauri` in the app, so this single check is a
+ * complete gate on outbound analytics. The Rust side generates no events of its
+ * own: `tauri-plugin-aptabase` registers only the `track_event` command, and its
+ * dispatcher's flush is a no-op while the queue is empty — so with the gate shut,
+ * nothing is enqueued and nothing is sent.
+ */
 function track(name: string, props?: Props): void {
+  if (!emitEnabled) return;
   trackEvent(name, props).catch(() => {});
 }
 

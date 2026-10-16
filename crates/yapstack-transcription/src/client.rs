@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn, Level};
 use yapstack_common::types::{EngineKind, SidecarRequest, SidecarResponse, TranscriptSegment};
 
 use crate::error::TranscriptionError;
@@ -119,6 +119,47 @@ mod strip_ansi_tests {
     #[test]
     fn preserves_unicode() {
         assert_eq!(strip_ansi("héllo — world"), "héllo — world");
+    }
+}
+
+#[cfg(test)]
+mod parse_sidecar_level_tests {
+    use super::parse_sidecar_level;
+    use tracing::Level;
+
+    #[test]
+    fn parses_leveled_sidecar_line() {
+        let line =
+            "2026-07-07T12:00:00.123456Z  INFO yapstack_transcription_sidecar: sidecar ready";
+        assert_eq!(parse_sidecar_level(line), Some(Level::INFO));
+    }
+
+    #[test]
+    fn parses_warn_and_error() {
+        assert_eq!(
+            parse_sidecar_level("2026-07-07T12:00:00Z  WARN ort::x: heads up"),
+            Some(Level::WARN)
+        );
+        assert_eq!(
+            parse_sidecar_level("2026-07-07T12:00:00Z ERROR foo: boom"),
+            Some(Level::ERROR)
+        );
+    }
+
+    #[test]
+    fn native_line_without_level_returns_none() {
+        // Dawn / whisper.cpp raw output — no tracing level token up front.
+        assert_eq!(
+            parse_sidecar_level("whisper_init_state: loading model"),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_match_level_word_deep_in_message() {
+        // "INFO" appears only in the message body, past the scanned prefix.
+        let line = "2026-07-07T12:00:00Z DEBUG t: user typed the word INFO here";
+        assert_eq!(parse_sidecar_level(line), Some(Level::DEBUG));
     }
 }
 
@@ -385,6 +426,15 @@ impl TranscriptionClient {
     /// Strips ANSI escape sequences defensively — the sidecar itself disables
     /// ANSI but native libraries (ORT, Dawn, whisper.cpp) may still emit
     /// colored output that would render as boxes in the desktop log UI.
+    ///
+    /// Forwarding is **level-aware**: the sidecar formats its own lines as
+    /// `<timestamp> LEVEL target: message`, so we recover that LEVEL and re-log
+    /// at the matching level instead of flattening everything to INFO. That
+    /// keeps sidecar WARN/ERROR distinguishable in the desktop log/grep, and
+    /// keeps sidecar DEBUG lines at DEBUG. Raw native framework chatter (Dawn,
+    /// whisper.cpp) carries no level token and is demoted to DEBUG so it stays
+    /// off the default INFO log — the old unconditional `info!` re-log turned
+    /// every one of those into an INFO line, amplifying the noise.
     async fn stderr_reader_task(stderr: tokio::process::ChildStderr) {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
@@ -394,7 +444,16 @@ impl TranscriptionClient {
                 Ok(Some(line)) => {
                     let stripped = strip_ansi(&line);
                     if !stripped.trim().is_empty() {
-                        info!(target: "yapstack_transcription_sidecar", "{}", stripped);
+                        const T: &str = "yapstack_transcription_sidecar";
+                        match parse_sidecar_level(&stripped) {
+                            Some(Level::ERROR) => error!(target: T, "{}", stripped),
+                            Some(Level::WARN) => warn!(target: T, "{}", stripped),
+                            Some(Level::INFO) => info!(target: T, "{}", stripped),
+                            Some(Level::DEBUG) => debug!(target: T, "{}", stripped),
+                            Some(Level::TRACE) => trace!(target: T, "{}", stripped),
+                            // No recognizable level token = raw native output.
+                            None => debug!(target: T, "{}", stripped),
+                        }
                     }
                 }
                 Ok(None) => {
@@ -718,6 +777,25 @@ impl TranscriptionClient {
         );
         Ok(())
     }
+}
+
+/// Best-effort parse of the tracing level a sidecar stderr line carries.
+///
+/// The sidecar's `tracing_subscriber::fmt` output is `<timestamp> LEVEL
+/// target: message`, so the level appears as an early whitespace-delimited
+/// token. We scan only the first few tokens (level is token index 1 after the
+/// single-token RFC3339 timestamp) to avoid matching the word "INFO" inside a
+/// message body. Native library output (Dawn, whisper.cpp) has no such token
+/// and returns `None`, so the caller can demote it to DEBUG.
+fn parse_sidecar_level(line: &str) -> Option<Level> {
+    line.split_whitespace().take(3).find_map(|tok| match tok {
+        "ERROR" => Some(Level::ERROR),
+        "WARN" => Some(Level::WARN),
+        "INFO" => Some(Level::INFO),
+        "DEBUG" => Some(Level::DEBUG),
+        "TRACE" => Some(Level::TRACE),
+        _ => None,
+    })
 }
 
 /// Extract the request id from any `SidecarResponse` variant. Used by the
