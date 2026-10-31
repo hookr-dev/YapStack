@@ -27,6 +27,13 @@
 //! transparently. (writer-writer `SQLITE_BUSY` is thus possible only if a peer
 //! held the write lock for >10s, which no code path does.)
 //!
+//! `busy_timeout` alone is not fair: a writer running transactions back to back
+//! (sync capture chunks, pull merges) re-takes the lock before a parked waiter's
+//! next poll. So this writer, the sync capture/merge transactions and the audio
+//! queue enqueues also take a turn on the process-wide
+//! [`WriteTurnstile`](yapstack_common::write_turnstile::WriteTurnstile), which
+//! serves them in arrival order.
+//!
 //! ## Read-your-writes
 //! `execute` always uses the writer and fully commits (autocommit per command)
 //! before its promise resolves; each `select` starts a fresh read transaction on
@@ -50,6 +57,7 @@ use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
 use rusqlite::{Connection, ToSql};
 use serde_json::Value as JsonValue;
 use tauri::State;
+use yapstack_common::write_turnstile::WriteTurnstile;
 
 /// How long a contended connection waits before giving up with `SQLITE_BUSY`.
 /// Matches the sync runtime's generous timeout so a brief writer/reader overlap
@@ -185,6 +193,11 @@ impl Pool {
 
     fn execute(&self, query: &str, values: &[JsonValue]) -> rusqlite::Result<DbExecuteResult> {
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Every command is one autocommit statement, so the write turn brackets the whole
+        // write transaction. It makes the sync drain's back-to-back capture/merge transactions
+        // hand the lock to this writer in arrival order (see `WriteTurnstile`); reads never
+        // take it.
+        let _turn = WriteTurnstile::process().acquire();
         let conn = guard.conn();
         let mut stmt = conn.prepare(query)?;
         bind_all(&mut stmt, values)?;
@@ -1052,6 +1065,37 @@ mod tests {
         let rows = svc.select("SELECT i, r FROM t", &[]).unwrap();
         assert_eq!(rows[0]["i"], json!(7)); // integer, not 7.0
         assert_eq!(rows[0]["r"], json!(2.5));
+    }
+
+    #[test]
+    fn writes_wait_for_the_write_turn_and_reads_do_not() {
+        let (_dir, path) = temp_db();
+        let svc = Arc::new(DbService::open(&path).unwrap());
+        let held = WriteTurnstile::process().acquire();
+        let writer = {
+            let svc = svc.clone();
+            std::thread::spawn(move || {
+                svc.execute(
+                    "INSERT INTO sessions (id, source) VALUES ('turn', 'Mic')",
+                    &[],
+                )
+                .unwrap();
+            })
+        };
+        while WriteTurnstile::process().waiting() < 1 {
+            std::thread::yield_now();
+        }
+        // A read is served while the turn is held, and the queued write has not landed.
+        let rows = svc
+            .select("SELECT id FROM sessions WHERE id = 'turn'", &[])
+            .unwrap();
+        assert!(rows.is_empty());
+        drop(held);
+        writer.join().unwrap();
+        let rows = svc
+            .select("SELECT id FROM sessions WHERE id = 'turn'", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
