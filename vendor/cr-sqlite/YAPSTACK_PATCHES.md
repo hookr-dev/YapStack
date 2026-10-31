@@ -39,6 +39,24 @@ APIs newer than the pinned nightly toolchain.
   pass that pointer across the FFI boundary. Interior-NUL names (impossible for
   real SQL identifiers) are rejected with a clear error instead of truncating.
 
+### 3. No `eh_personality` in the static bundle
+
+- File: `core/rs/bundle/src/lib.rs`
+- Item: `#[lang = "eh_personality"] extern "C" fn eh_personality() {}`
+- Problem: the bundle defines a no-op exception-handling personality for its
+  no_std build. In the `static` archive that YapStack links into std binaries,
+  it collides with std's `rust_eh_personality`. Apple's linker keeps the first
+  definition (the no-op), so any unwinding panic in the host process (for
+  example a failing `#[test]` in `yapstack-sync`) aborts with
+  `fatal runtime error: failed to initiate panic, error 3` instead of reporting
+  the panic. On MSVC the duplicate is accepted via `/FORCE:MULTIPLE` in CI and
+  release builds.
+- Fix: compile the item only when the `static` feature is off. The bundle is
+  built `panic = "abort"` and never unwinds, so it does not need its own
+  personality; the archive now references std's instead of defining one.
+- `crates/yapstack-sync/build.rs` now watches `rs/bundle/src`, so edits here
+  rebuild the archive.
+
 ## Investigated — NO patch needed
 
 ### `crsql_commit_alter` DOES regenerate the update trigger (2026-07-29)

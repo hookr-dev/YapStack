@@ -473,6 +473,26 @@ pub fn enqueue_local(
     schema_version: i32,
     engine_version: i32,
 ) -> Result<Vec<i64>, SyncError> {
+    enqueue_local_with(
+        conn,
+        cipher,
+        client_id,
+        schema_version,
+        engine_version,
+        || {},
+    )
+}
+
+/// [`enqueue_local`] with a hook that runs after each chunk's transaction commits — i.e. at
+/// exactly the points where the write lock is released and another writer can take it.
+pub(crate) fn enqueue_local_with(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    client_id: uuid::Uuid,
+    schema_version: i32,
+    engine_version: i32,
+    mut after_chunk_commit: impl FnMut(),
+) -> Result<Vec<i64>, SyncError> {
     state::ensure_meta_table(conn)?;
     ensure_outbox_table(conn)?;
     let wm = state::push_watermark(conn)?;
@@ -515,6 +535,7 @@ pub fn enqueue_local(
         if let Some(v) = next_wm {
             committed_wm = v;
         }
+        after_chunk_commit();
     }
     Ok(assigned)
 }
@@ -3122,12 +3143,13 @@ mod tests {
         // The owner-visible bug: while capture held ONE transaction across the whole backlog,
         // every other writer on the file (the app's db_service writer, the audio backfill
         // walk) sat on its busy_timeout and eventually failed with "database is locked".
-        // Modelled with a competing writer that keeps trying THROUGHOUT the capture: with
-        // per-chunk commits it wins the lock repeatedly in the gaps; with a single capture
-        // transaction it could not win until the whole capture finished.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
+        //
+        // Deterministic model: after EVERY chunk commit, an independent connection with NO
+        // busy wait must be able to take the write lock and commit, and must see the outbox
+        // and push watermark advance chunk by chunk. Under the old single-transaction capture
+        // the first such write fails immediately with SQLITE_BUSY. (An earlier version raced a
+        // probe thread against the capture; SQLite's busy handler is not fair, so that version
+        // was timing-dependent and flaked on CI runners.)
         let dir = std::env::temp_dir().join(format!("yapstack-capture-lock-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.db");
@@ -3153,75 +3175,54 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(
-            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len() >= 8,
-            "fixture must be a MULTI-chunk backlog"
-        );
-
-        // The stand-in for db_service's writer: an independent connection that, THROUGHOUT the
-        // capture, both watches the outbox and tries to write. Its observations are attributed
-        // to the mid-capture window by what it can SEE, not by wall-clock timing: an
-        // uncommitted capture is invisible to it, so a staged count strictly between 1 and the
-        // final chunk count can only be observed while capture is still running. Under the old
-        // single-transaction capture that window never existed — other connections saw 0 rows
-        // until the very end and lost every write-lock race in between.
         let total_chunks =
-            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len() as i64;
-        static STOP: AtomicBool = AtomicBool::new(false);
-        STOP.store(false, Ordering::SeqCst);
-        /// (staged outbox entries, push watermark, whether a competing write won the lock)
-        type Observation = (i64, i64, bool);
-        let seen: Arc<Mutex<Vec<Observation>>> = Arc::new(Mutex::new(Vec::new()));
-        let probe_seen = seen.clone();
-        let probe_path = path.clone();
-        let probe = std::thread::spawn(move || {
-            let c = Connection::open(&probe_path).unwrap();
-            // Deliberately IMPATIENT: enough to wait out one chunk's commit, far too little to
-            // wait out a backlog. A long timeout would let ONE lost race consume the whole
-            // observation window and tell us nothing.
-            c.busy_timeout(std::time::Duration::from_millis(25))
+            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len();
+        assert!(total_chunks >= 8, "fixture must be a MULTI-chunk backlog");
+
+        // The stand-in for db_service's writer: zero patience, so it only succeeds if the
+        // capture has genuinely released the write lock.
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut seen: Vec<(i64, i64)> = Vec::new();
+        enqueue_local_with(conn, &cipher, cid, sv, ev, || {
+            let n = seen.len() as i64;
+            other
+                .execute_batch(&format!(
+                    "BEGIN IMMEDIATE; INSERT INTO probe_t(n) VALUES({n}); COMMIT;"
+                ))
+                .expect("another writer must win the write lock between capture chunks");
+            let staged: i64 = other
+                .query_row("SELECT count(*) FROM _yapstack_outbox", [], |r| r.get(0))
                 .unwrap();
-            let mut n = 0i64;
-            while !STOP.load(Ordering::SeqCst) {
-                let staged: i64 = c
-                    .query_row("SELECT count(*) FROM _yapstack_outbox", [], |r| r.get(0))
-                    .unwrap_or(0);
-                if staged < 1 || staged >= total_chunks {
-                    continue; // not provably inside the capture
-                }
-                let wm = state::push_watermark(&c).unwrap_or(-1);
-                let won = c.execute("INSERT INTO probe_t(n) VALUES(?1)", [n]).is_ok();
-                n += 1;
-                probe_seen
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((staged, wm, won));
-            }
-        });
+            let wm = state::push_watermark(&other).unwrap();
+            seen.push((staged, wm));
+        })
+        .unwrap();
 
-        enqueue_local(conn, &cipher, cid, sv, ev).unwrap();
-        STOP.store(true, Ordering::SeqCst);
-        probe.join().unwrap();
-
-        let obs = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let staged_seen: std::collections::BTreeSet<i64> = obs.iter().map(|o| o.0).collect();
-        let watermarks_seen: std::collections::BTreeSet<i64> = obs.iter().map(|o| o.1).collect();
-        let wins = obs.iter().filter(|o| o.2).count();
-        assert!(
-            staged_seen.len() >= 3,
-            "another connection must see the outbox fill up CHUNK BY CHUNK (saw {staged_seen:?})"
+        assert_eq!(
+            seen.len(),
+            total_chunks,
+            "the hook runs once per committed chunk"
         );
+        let staged: Vec<i64> = seen.iter().map(|o| o.0).collect();
         assert!(
-            watermarks_seen.len() >= 2,
+            staged.windows(2).all(|w| w[1] > w[0]),
+            "another connection must see the outbox fill up CHUNK BY CHUNK (saw {staged:?})"
+        );
+        let watermarks: std::collections::BTreeSet<i64> = seen.iter().map(|o| o.1).collect();
+        assert!(
+            watermarks.len() >= 2,
             "the push watermark must advance WITH the committed chunks, visibly to another \
-             connection (saw {watermarks_seen:?})"
+             connection (saw {watermarks:?})"
         );
-        assert!(
-            wins >= 2,
-            "a competing writer must WIN the write lock while capture is still running (won \
-             {wins} of {} attempts inside the window)",
-            obs.len()
+        let wins: i64 = other
+            .query_row("SELECT count(*) FROM probe_t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            wins as usize, total_chunks,
+            "every interleaved write committed"
         );
+        drop(other);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
