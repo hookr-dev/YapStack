@@ -23,6 +23,9 @@ export interface ProfilePickerProps {
   /** Show a "Use default" option that resolves to null. Used by Chat composer
    * to clear a per-chat override and fall back to the global assignment. */
   defaultLabel?: string;
+  /** Secondary line under the "Use default" option, e.g. naming which
+   * Profiles the defaults resolve to. */
+  defaultSublabel?: string;
   variant?: "pill" | "inline";
   /** Optional label shown in the picker when value is null and neither
    * allowNone nor defaultLabel applies (e.g. an assignment with no Profile). */
@@ -37,6 +40,7 @@ export function ProfilePicker({
   allowNone = false,
   noneLabel = "None — no AI cleanup",
   defaultLabel,
+  defaultSublabel,
   variant = "inline",
   unassignedLabel = "No profile assigned",
 }: ProfilePickerProps) {
@@ -129,6 +133,7 @@ export function ProfilePicker({
           <div className="mb-1">
             <PickerItem
               label={defaultLabel ?? noneLabel}
+              sublabel={defaultLabel ? defaultSublabel : undefined}
               selected={value === null}
               onClick={() =>
                 selectValue(defaultLabel ? DEFAULT_SENTINEL : NONE_SENTINEL)

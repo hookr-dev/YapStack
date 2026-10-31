@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
 import { ProfilePicker } from "@/components/ai/ProfilePicker";
 import {
@@ -10,8 +11,8 @@ import {
 /**
  * Chat composer's per-conversation Profile picker. Reads the override row
  * from chat_context_settings; writes through setChatContextProfileId.
- * The "Use default" option clears the row so the live Chat Assignment
- * takes over again.
+ * The "Default" option clears the row so the live assignments (Chat for
+ * typed messages, AI actions for actions) take over again.
  *
  * Async DB read is local — there's no other consumer of the override and
  * caching it in Zustand would just be a second source of truth. State
@@ -39,21 +40,35 @@ export function ChatProfilePickerPill({ contextKey }: { contextKey: string }) {
     };
   }, [contextKey]);
 
-  // Effective value: if an override is set we show that profile; otherwise
-  // surface the global Chat assignment so the trigger label is meaningful
-  // ("GPT-5 Mini" rather than "Use default") while still letting "Use
-  // default" appear in the menu to clear the override.
-  const effectiveValue = override ?? aiConfig.assignments.chatProfileId;
+  // Pass the raw override so "Default" is checked (and shown on the
+  // trigger) whenever no override row exists. Showing the Chat default's
+  // name here would be misleading: actions sent from this bar fall back to
+  // the AI-actions default, not the Chat one.
+  const { chatProfileId, aiActionsProfileId } = aiConfig.assignments;
+  const nameOf = (id: string | null) =>
+    aiConfig.profiles.find((p) => p.id === id)?.name ?? "none";
+  // A dangling override (Profile deleted) is ignored by the send path, which
+  // falls back to the defaults, so display it as Default too.
+  const value =
+    override !== null && aiConfig.profiles.some((p) => p.id === override)
+      ? override
+      : null;
+  const defaultSublabel = `Chat: ${nameOf(chatProfileId)} · Actions: ${nameOf(aiActionsProfileId)}`;
 
+  // Persist before updating local state: the send path reads the DB row, so
+  // the pill must never show a pick the next send won't use.
   async function handleChange(next: string | null) {
-    if (next === null) {
-      // "Use default" picked — clear any override and revert to the live
-      // global assignment.
-      setOverride(null);
-      await clearChatContextProfile(contextKey).catch(() => {});
-    } else {
+    try {
+      if (next === null) {
+        await clearChatContextProfile(contextKey);
+      } else {
+        await setChatContextProfileId(contextKey, next);
+      }
       setOverride(next);
-      await setChatContextProfileId(contextKey, next).catch(() => {});
+    } catch (err) {
+      toast.error(
+        `Couldn't save the model choice: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -61,9 +76,10 @@ export function ChatProfilePickerPill({ contextKey }: { contextKey: string }) {
     <ProfilePicker
       profiles={aiConfig.profiles}
       connections={aiConfig.connections}
-      value={effectiveValue}
+      value={value}
       onChange={handleChange}
-      defaultLabel="Use default"
+      defaultLabel="Default"
+      defaultSublabel={defaultSublabel}
       variant="pill"
       unassignedLabel="No profile"
     />
