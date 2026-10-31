@@ -383,7 +383,11 @@ impl ModelManager {
             hasher.update(&buf[..n]);
         }
 
-        let result = format!("{:x}", hasher.finalize());
+        let result: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
 
         if result != expected_sha256 {
             warn!(
