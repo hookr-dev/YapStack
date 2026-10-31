@@ -8,10 +8,10 @@ Canonical instruction file for AI coding agents working on YapStack. Read by **a
 
 If you have one question, the answer is probably here. If not, follow the doc router below.
 
-- **Goal**: real-time on-device audio capture + transcription, macOS-first.
+- **Goal**: real-time on-device audio capture + transcription on macOS and Windows.
 - **Engines**: Whisper (Metal, broad language) and Parakeet TDT v3 (NVIDIA, faster on Apple Silicon via WebGPU + int8). Pick at runtime.
 - **Stack**: Tauri v2 (Rust backend) + React 19/TypeScript frontend, SQLite via a repo-owned rusqlite command backend, sidecar binary for inference IPC over JSON-line stdin/stdout.
-- **Verification**: `pnpm check` is the single command that gates merge. Run it before declaring work done.
+- **Verification**: `pnpm check` is the local gate. Run it before declaring work done. CI also runs Rust checks on Windows, which a Mac can't reproduce; see [Keeping CI green](#keeping-ci-green).
 - **License**: AGPL-3.0. New code stays open under the same license.
 
 ## Doc router (read these on demand)
@@ -168,5 +168,24 @@ Run through this before declaring a task done.
 
 - **macOS Apple Silicon** is the primary target. Code must work there.
 - **Intel Mac** is best-effort: don't break it, don't optimize for it.
-- **Windows** is unsupported officially; Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Whisper stays CPU on Windows. Don't delete platform-specific branches without an ADR.
+- **Windows (x64)** is supported: CI runs clippy and tests on Windows, and releases ship a Windows installer. Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Whisper stays CPU on Windows. Don't delete platform-specific branches without an ADR.
+- **Linux** is not a target yet (the relay server is the exception: it is deployed on Linux).
 - **Tauri secret signing**: the `tauri.conf.json` `pubkey` is the **public** half of an Ed25519 minisign keypair. The private key lives in GitHub Actions Secrets. Do not regenerate without user direction — rotation invalidates auto-update for every existing install.
+
+## Keeping CI green
+
+CI (`.github/workflows/ci-checks.yml`) runs more than `pnpm check` does on one machine:
+
+| Job | Runner | What it runs |
+|---|---|---|
+| Rust Format | Ubuntu | `cargo fmt --all -- --check` |
+| Frontend | Ubuntu, Node 24 | ESLint, typecheck, vitest (pnpm 10.28.2) |
+| Rust (macos-latest) | macOS | `cargo clippy --all -- -D warnings`, `cargo test --all` |
+| Rust (windows-latest) | Windows | `cargo clippy --all -- -D warnings`, clippy on the sidecar with `--features webgpu`, `cargo test --all` |
+
+- **Windows-only code compiles only in CI.** Anything behind `#[cfg(windows)]` / `cfg(target_os = "windows")` is never built on a Mac. Review those paths by reading them, keep them small, and expect the Windows leg to be the first to catch mistakes.
+- **The Rust toolchain is pinned** in `rust-toolchain.toml`. Bump it in its own PR; new releases routinely add clippy lints, and CI runs clippy with `-D warnings`.
+- **PR CI doesn't build the desktop `sync` feature.** Release builds do. If you touch sync integration in the desktop crate, run `cargo test -p yapstack-desktop --features sync` locally (it needs `rustup toolchain install nightly-2023-10-05` for the vendored cr-sqlite bundle).
+- **Tests must be deterministic.** Don't assert on thread timing or lock races; SQLite's busy handler isn't fair, so a race that passes locally can starve on a slower runner. Use hooks, channels, or explicit ordering instead.
+- **Never make CI green by retrying, sleeping, or `#[ignore]`-ing a failing test.** Find the cause. If a test is genuinely flaky and blocking, say so and ask before quarantining it.
+- **Dependabot PRs fail for real reasons too.** Check whether the failure reproduces on `main` before blaming the bump, and vice versa.
