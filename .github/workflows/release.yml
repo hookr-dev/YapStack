@@ -17,13 +17,20 @@ on:
   push:
     tags: ['v*']
   # Canary builds: dispatching on a branch runs ONLY build-windows and
-  # uploads the NSIS/updater artifacts to the run — no release is created
-  # and build-macos (signing/notarization) is skipped. Used to hand the
-  # Windows canary machine an installer without cutting a release.
+  # uploads the NSIS installer to the run — no release is created and
+  # build-macos (signing/notarization) is skipped. Used to hand the Windows
+  # canary machine an installer without cutting a release. Canary builds run
+  # in the `canary` environment WITHOUT the updater signing key and emit no
+  # updater artifacts (tauri.no-updater.conf.json).
   workflow_dispatch:
 
 # Minimal top-level permissions — jobs elevate as needed
 permissions: {}
+
+# Never cancel a release mid-upload; a second run for the same ref waits its turn.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,12 +43,60 @@ env:
   CARGO_PROFILE_RELEASE_LTO: "false"
 
 jobs:
+  verify-ci:
+    name: Verify CI passed on the tagged commit
+    # A release must be cut from a commit whose push CI on main passed. This waits for
+    # the Quality Checks on github.sha (a tag pushed right after the merge commit lands
+    # before CI finishes) and fails the release if any of them did not succeed.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      checks: read
+    steps:
+      - name: Wait for Quality Checks on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          required=(
+            "Quality Checks / Rust Format"
+            "Quality Checks / Rust (macos-latest)"
+            "Quality Checks / Rust (windows-latest)"
+            "Quality Checks / Frontend"
+          )
+          for _ in $(seq 1 85); do
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?filter=latest&per_page=100" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
+            pending=0
+            for name in "${required[@]}"; do
+              line=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n' | head -1)
+              if [ -z "$line" ]; then pending=1; continue; fi
+              status=$(cut -f2 <<<"$line"); conclusion=$(cut -f3 <<<"$line")
+              if [ "$status" != "completed" ]; then pending=1; continue; fi
+              if [ "$conclusion" != "success" ]; then
+                echo "::error::'$name' concluded '$conclusion' on $SHA"
+                exit 1
+              fi
+            done
+            if [ "$pending" -eq 0 ]; then
+              echo "All required checks passed on $SHA"
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "::error::Timed out waiting for CI on $SHA. Tags must point at a commit pushed to main."
+          exit 1
+
   build-macos:
     name: Build macOS
     # Tag pushes only — a workflow_dispatch canary run needs just the
     # Windows artifact; skipping macOS avoids a wasted sign+notarize pass.
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: [verify-ci]
     runs-on: macos-latest
+    timeout-minutes: 120
     environment: release
     permissions:
       contents: read
@@ -86,7 +141,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
@@ -157,6 +212,7 @@ jobs:
             target/aarch64-apple-darwin/release/bundle/dmg/checksums-macos.txt
 
       - name: Upload updater artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-updater
@@ -166,8 +222,13 @@ jobs:
 
   build-windows:
     name: Build Windows
+    # Tag pushes need verify-ci to pass; canary dispatches skip it.
+    needs: [verify-ci]
+    if: ${{ !cancelled() && (needs.verify-ci.result == 'success' || (needs.verify-ci.result == 'skipped' && !startsWith(github.ref, 'refs/tags/'))) }}
     runs-on: windows-latest
-    environment: release
+    timeout-minutes: 120
+    # Only tag builds get the `release` environment (updater signing key).
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || 'canary' }}
     permissions:
       contents: read
     env:
@@ -205,7 +266,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
@@ -252,6 +313,7 @@ jobs:
           echo "This step is a placeholder and is skipped until that secret is wired."
 
       - name: Build Tauri app (--features sync)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -271,6 +333,14 @@ jobs:
         # byte-for-byte the proven sync-test-build.yml Windows invocation.
         run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync
 
+      - name: Build Tauri app (--features sync, canary — no updater artifacts)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        # Same build as above, minus the updater signing key: canaries are installed by
+        # hand and must never be able to sign updates that installed clients accept.
+        env:
+          RUSTFLAGS: "-Clink-arg=/FORCE:MULTIPLE"
+        run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync --config src-tauri/tauri.no-updater.conf.json
+
       - name: Generate checksum
         shell: bash
         run: |
@@ -287,6 +357,7 @@ jobs:
             target/x86_64-pc-windows-msvc/release/bundle/nsis/checksums-windows.txt
 
       - name: Upload updater artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-updater
@@ -301,6 +372,7 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
