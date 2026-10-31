@@ -78,35 +78,54 @@ jobs:
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       S3_REGION: us-east-1
+      # Last upstream MinIO release (the upstream repository is archived).
+      MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Start MinIO
-        # Not a `services:` container: service containers cannot override the image
-        # command, and MinIO needs `server /data`. Same image as deploy/docker-compose.yml.
+      - name: Cache MinIO binary
+        id: minio-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .minio-bin
+          key: minio-${{ runner.os }}-${{ env.MINIO_VERSION }}
+
+      - name: Build MinIO from source
+        # deploy/docker-compose.yml uses minio/minio:latest, but MinIO no longer publishes
+        # container images or release binaries (Docker Hub/quay.io pulls fail, dl.min.io
+        # returns 410). Build the last upstream release tag from source instead, in the
+        # official Go image, and cache the binary keyed by version.
+        if: steps.minio-cache.outputs.cache-hit != 'true'
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER="$S3_ACCESS_KEY" \
-            -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
-            --health-cmd "mc ready local || exit 1" \
-            --health-interval 2s --health-timeout 5s --health-retries 30 \
-            minio/minio:latest server /data
+          mkdir -p .minio-bin
+          docker run --rm -v "$PWD/.minio-bin:/out" -e GOBIN=/out -e CGO_ENABLED=0 \
+            golang:1.24 go install "github.com/minio/minio@${MINIO_VERSION}"
+          ls -l .minio-bin
+
+      - name: Start MinIO
+        run: |
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          MINIO_ROOT_USER="$S3_ACCESS_KEY" MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
+            nohup .minio-bin/minio server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 \
+            > "$RUNNER_TEMP/minio.log" 2>&1 &
           for _ in $(seq 1 60); do
-            status="$(docker inspect -f '{{.State.Health.Status}}' minio)"
-            if [ "$status" = "healthy" ]; then echo "minio healthy"; exit 0; fi
-            sleep 2
+            if curl -fsS "$S3_ENDPOINT/minio/health/live" >/dev/null; then echo "minio healthy"; exit 0; fi
+            sleep 1
           done
-          docker logs minio
+          cat "$RUNNER_TEMP/minio.log"
           echo "::error::MinIO did not become healthy"
           exit 1
 
       - name: Create bucket
-        # Mirrors the compose `minio-init` one-shot.
+        # Mirrors the compose `minio-init` one-shot (`mc mb`), using the runner's AWS CLI.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.S3_SECRET_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.S3_REGION }}
         run: |
-          docker run --rm --network host --entrypoint /bin/sh minio/mc:latest -c "
-            mc alias set yap \"$S3_ENDPOINT\" \"$S3_ACCESS_KEY\" \"$S3_SECRET_KEY\" &&
-            mc mb --ignore-existing yap/\"$S3_BUCKET\""
+          aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket "$S3_BUCKET"
+          aws --endpoint-url "$S3_ENDPOINT" s3api head-bucket --bucket "$S3_BUCKET"
 
       - name: Initialize Postgres roles
         # Runs the same first-boot init script the compose stack mounts into
@@ -158,4 +177,4 @@ jobs:
 
       - name: MinIO logs on failure
         if: failure()
-        run: docker logs minio || true
+        run: cat "$RUNNER_TEMP/minio.log" || true
