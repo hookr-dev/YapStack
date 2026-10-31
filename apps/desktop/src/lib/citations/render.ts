@@ -67,15 +67,52 @@ function isKeepable(token: CitationToken): boolean {
   return token.kind === "time" || ID_SHAPED.test(token.segmentId);
 }
 
-// Not a citation at all: a word with no digits (`[seg: intro]`). Left as
-// literal text rather than removed or kept as a pill.
+// Not a citation at all: a word (`[seg: intro]`), i.e. letters beyond hex
+// and no digits. Left as literal text rather than removed or kept as a pill.
+// Hex-only fragments (`abcd`) are citation attempts, however short.
 function isLiteral(token: CitationToken): boolean {
   return (
     token.kind === "segment" &&
-    token.segmentId !== "" &&
-    !/\d/.test(token.segmentId) &&
-    !ID_SHAPED.test(token.segmentId)
+    /[g-z]/i.test(token.segmentId) &&
+    !/\d/.test(token.segmentId)
   );
+}
+
+interface ResolvedRun {
+  start: number;
+  end: number;
+  tokens: CitationToken[];
+  refs: (TranscriptRef | null)[];
+}
+
+// Resolve each marker and split runs around literal markers, so a literal
+// marker and the prose beside it stay in the text byte for byte.
+function resolveRuns(
+  text: string,
+  index: SegmentIndex | null,
+): ResolvedRun[] {
+  const out: ResolvedRun[] = [];
+  for (const run of parseCitations(text)) {
+    let current: ResolvedRun | null = null;
+    for (const marker of run.markers) {
+      const refs = marker.tokens.map((t) =>
+        index ? resolveCitation(t, index) : null,
+      );
+      if (marker.tokens.every((t, i) => !refs[i] && isLiteral(t))) {
+        current = null;
+        continue;
+      }
+      if (current) {
+        current.end = marker.end;
+        current.tokens.push(...marker.tokens);
+        current.refs.push(...refs);
+      } else {
+        current = { start: marker.start, end: marker.end, tokens: [...marker.tokens], refs };
+        out.push(current);
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -92,7 +129,7 @@ export function splitCitations(
   index: SegmentIndex | null,
   { keepUnresolved }: { keepUnresolved: boolean },
 ): SplitResult {
-  const runs = parseCitations(text);
+  const runs = resolveRuns(text, index);
   if (runs.length === 0) return { parts: [{ kind: "text", text }], invalidCount: 0 };
 
   const parts: CitationPart[] = [];
@@ -110,10 +147,8 @@ export function splitCitations(
   for (const run of runs) {
     const seen = new Set<string>();
     const rendered: CitationPart[] = [];
-    const refs = run.tokens.map((t) => (index ? resolveCitation(t, index) : null));
-    if (run.tokens.every((t, i) => !refs[i] && isLiteral(t))) continue;
     run.tokens.forEach((token, i) => {
-      const ref = refs[i];
+      const ref = run.refs[i];
       if (!ref) {
         invalidCount++;
         if (keepUnresolved && isKeepable(token)) {

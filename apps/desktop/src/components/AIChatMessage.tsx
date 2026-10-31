@@ -12,7 +12,10 @@ import type { DbSegment } from "@/lib/db";
 import { getAction } from "@/lib/ai-actions";
 import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 import { formatTime } from "@/lib/utils";
-import { trimPartialCitation } from "@/lib/citations/parse";
+import {
+  splitTrailingPartial,
+  trimPartialCitation,
+} from "@/lib/citations/parse";
 import {
   createSegmentIndex,
   findSegment,
@@ -82,25 +85,37 @@ interface MdNode {
   children?: MdNode[];
 }
 
-function lastLeaf(node: MdNode): MdNode {
+const isLink = (node: MdNode) =>
+  node.type === "link" || node.type === "linkReference";
+
+// The document's final leaf, or `null` when it sits inside a link (a
+// completed link is never a marker still being typed).
+function lastLeaf(node: MdNode): MdNode | null {
   let leaf = node;
-  while (leaf.children?.length) leaf = leaf.children[leaf.children.length - 1];
+  while (leaf.children?.length) {
+    if (isLink(leaf)) return null;
+    leaf = leaf.children[leaf.children.length - 1];
+  }
   return leaf;
 }
 
 function rewriteCitationText(node: MdNode, index: SegmentIndex | null): void {
   // Text inside a link can't hold another link.
-  if (!node.children || node.type === "link" || node.type === "linkReference") {
-    return;
-  }
-  node.children = node.children.flatMap((child): MdNode[] => {
+  if (!node.children || isLink(node)) return;
+  const siblings = node.children;
+  node.children = siblings.flatMap((child, i): MdNode[] => {
     if (child.type !== "text") {
       rewriteCitationText(child, index);
       return [child];
     }
-    const { parts } = splitCitations(child.value ?? "", index, {
-      keepUnresolved: false,
-    });
+    // A marker cut off by formatting (`[[seg:` then `code` or `strong`)
+    // stays literal rather than being parsed, and half-dropped, from one piece.
+    const [head, tail] =
+      i < siblings.length - 1
+        ? splitTrailingPartial(child.value ?? "")
+        : [child.value ?? "", ""];
+    const { parts } = splitCitations(head, index, { keepUnresolved: false });
+    const tailNode: MdNode[] = tail ? [{ type: "text", value: tail }] : [];
     return parts.flatMap((part): MdNode[] => {
       if (part.kind === "text") return [{ type: "text", value: part.text }];
       if (part.kind !== "ref") return [];
@@ -111,7 +126,7 @@ function rewriteCitationText(node: MdNode, index: SegmentIndex | null): void {
           children: [{ type: "text", value: toPlainLabel(part.ref) }],
         },
       ];
-    });
+    }).concat(tailNode);
   });
 }
 
@@ -127,7 +142,7 @@ function remarkCitations(index: SegmentIndex | null, isStreaming: boolean) {
     const root = tree as MdNode;
     if (isStreaming) {
       const leaf = lastLeaf(root);
-      if (leaf.type === "text" && leaf.value) {
+      if (leaf?.type === "text" && leaf.value) {
         const kept = trimPartialCitation(leaf.value);
         if (kept !== leaf.value) leaf.value = kept.trimEnd();
       }

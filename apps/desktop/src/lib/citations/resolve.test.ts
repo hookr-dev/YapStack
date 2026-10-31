@@ -206,6 +206,30 @@ describe("pending pills", () => {
     expect(rewriteCitations(html, index, toPlainLabel).text).toBe(expected);
   });
 
+  it("keeps a literal token and the prose around it in a mixed run", () => {
+    const html = `<p>See [seg: intro], [[seg:${A.id}]].</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(
+      `<p>See [seg: intro], ${toPillHtml(refA)}.</p>`,
+    );
+    expect(
+      rewriteCitations(`[[seg:${A.id}]], [seg: intro] and more`, index, toPlainLabel).text,
+    ).toBe("2:07, [seg: intro] and more");
+  });
+
+  it.each(["abcd", "abcde", "2cb"])(
+    "drops the short hex fragment %s",
+    (frag) => {
+      expect(convertCitationsInHtml(`<p>x [[seg:${frag}]].</p>`, index)).toBe(
+        "<p>x.</p>",
+      );
+    },
+  );
+
+  it("leaves a marker split by formatting literal, never half-dropped", () => {
+    const html = `<p>x [[seg:<code>${A.id}</code>]] y</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(html);
+  });
+
   it("drops a short hex fragment instead of keeping a pending pill", () => {
     expect(convertCitationsInHtml("<p>x [[seg:48e2...]].</p>", index)).toBe(
       "<p>x.</p>",

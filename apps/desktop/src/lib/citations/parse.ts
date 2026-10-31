@@ -59,11 +59,11 @@ function parseItem(raw: string): CitationToken {
 export function parseCitations(text: string): ParsedCitation[] {
   const runs: ParsedCitation[] = [];
   for (const m of text.matchAll(MARKER_REGEX)) {
-    const marker = m[1] ?? m[3] ?? "seg";
+    const word = m[1] ?? m[3] ?? "seg";
     const body = m[2] ?? m[4] ?? m[5] ?? "";
     // "segment" is an ordinary word ("[segment: 3 of the talk]"); only treat
     // it as a marker when an ID or a timestamp follows.
-    if (marker.length > 3) {
+    if (word.length > 3) {
       const value = body.replace(QUOTES, "").trim();
       if (!ID_LIKE.test(value) && parseTimestamp(value) === null) continue;
     }
@@ -71,12 +71,14 @@ export function parseCitations(text: string): ParsedCitation[] {
     const start = m.index;
     const end = start + m[0].length;
     const tokens = body.split(ITEM_SPLIT).map(parseItem);
+    const marker = { start, end, tokens };
     const prev = runs[runs.length - 1];
     if (prev && RUN_GAP.test(text.slice(prev.end, start))) {
       prev.end = end;
       prev.tokens.push(...tokens);
+      prev.markers.push(marker);
     } else {
-      runs.push({ start, end, tokens });
+      runs.push({ start, end, tokens: [...tokens], markers: [marker] });
     }
   }
   return runs;
@@ -96,4 +98,16 @@ const PARTIAL_TAIL = new RegExp(
 export function trimPartialCitation(text: string): string {
   const m = PARTIAL_TAIL.exec(text);
   return m ? text.slice(0, m.index) : text;
+}
+
+/**
+ * Split `text` into the part before a trailing unclosed marker and the
+ * marker itself (`["x ", "[[seg:"]`); the tail is `""` when `text` doesn't
+ * end mid-marker. For text that continues in a following node (`[[seg:` then
+ * a code or bold node), the tail must be kept literal: the marker can't be
+ * parsed from one piece without dropping half of it.
+ */
+export function splitTrailingPartial(text: string): [string, string] {
+  const head = trimPartialCitation(text);
+  return [head, text.slice(head.length)];
 }

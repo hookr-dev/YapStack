@@ -455,7 +455,7 @@ describe("AIChatMessage", () => {
         <AIChatMessage
           message={makeMessage({
             role: "assistant",
-            content: "Across sessions [[seg:seg-1]], [[seg:other]] this held.",
+            content: "Across sessions [[seg:seg-1]], [[seg:ffffff00]] this held.",
           })}
         />,
       );
@@ -479,6 +479,20 @@ describe("AIChatMessage", () => {
       );
       expect(container.querySelector("code")?.textContent?.trim()).toBe(literal);
       expect(screen.queryByRole("button", { name: "1:05" })).not.toBeInTheDocument();
+    });
+
+    it.each([
+      ["backtick", "x [[seg:`seg-1`]] y"],
+      ["bold", "x [[seg:**seg-1**]] y"],
+    ])("leaves a %s-split marker whole", (_label, content) => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content })}
+          segments={[makeSegment()]}
+        />,
+      );
+      const bubble = container.querySelector(".ai-chat-markdown");
+      expect(bubble?.textContent).toBe("x [[seg:seg-1]] y");
     });
 
     it("keeps ordinary markdown links as links", () => {
@@ -528,6 +542,19 @@ describe("AIChatMessage", () => {
       expect(container.querySelector("code")?.textContent?.trim()).toBe(
         "[[seg:89ea",
       );
+    });
+
+    it.each([
+      ["link text", "See [seg_abcdef](https://example.com)", "seg_abcdef"],
+      ["autolink", "See <https://example.com/seg_abcdef>", "https://example.com/seg_abcdef"],
+    ])("does not trim inside a completed %s", (_label, content, linkText) => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content, isStreaming: true })}
+          segments={[makeSegment()]}
+        />,
+      );
+      expect(screen.getByRole("link").textContent).toBe(linkText);
     });
 
     it("renders the chip once the citation closes", () => {

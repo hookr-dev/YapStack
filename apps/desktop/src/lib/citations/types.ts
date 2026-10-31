@@ -30,6 +30,13 @@ export type CitationToken =
   | { kind: "segment"; segmentId: string; atSeconds?: number }
   | { kind: "time"; atSeconds: number };
 
+/** One marker (`[[seg:A]]`, or `[[seg:A, seg:B]]`) and the tokens it holds. */
+export interface CitationMarker {
+  start: number;
+  end: number;
+  tokens: CitationToken[];
+}
+
 /**
  * A run of citation markers found in a string. Adjacent markers separated
  * only by whitespace or commas (`[[seg:A]], [[seg:B]]`) form one run, so the
@@ -40,5 +47,7 @@ export interface ParsedCitation {
   start: number;
   /** Index one past the last character of the run. */
   end: number;
+  /** Every token in the run, in order (the union of `markers[].tokens`). */
   tokens: CitationToken[];
+  markers: CitationMarker[];
 }

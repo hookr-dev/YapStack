@@ -1,4 +1,4 @@
-import { parseCitations } from "./parse";
+import { parseCitations, splitTrailingPartial } from "./parse";
 import { resolveCitation, type SegmentIndex } from "./resolve";
 import {
   pendingPillToken,
@@ -81,7 +81,14 @@ export function convertCitationsInHtml(
   }
 
   for (const node of citationTextNodes(doc)) {
-    const { parts } = splitCitations(node.data, index, { keepUnresolved: true });
+    // A marker cut off by a following element (`[[seg:<code>…`) stays literal.
+    const [head, tail] = node.nextSibling
+      ? splitTrailingPartial(node.data)
+      : [node.data, ""];
+    const { parts } = splitCitations(head, index, { keepUnresolved: true });
+    if (parts.length === 1 && parts[0].kind === "text" && parts[0].text === head) {
+      continue;
+    }
     const frag = doc.createDocumentFragment();
     for (const part of parts) {
       if (part.kind === "text") {
@@ -97,6 +104,7 @@ export function convertCitationsInHtml(
         );
       }
     }
+    if (tail) frag.append(doc.createTextNode(tail));
     node.replaceWith(frag);
     changed = true;
   }
