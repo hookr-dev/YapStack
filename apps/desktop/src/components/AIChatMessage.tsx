@@ -18,8 +18,7 @@ import {
   findSegment,
   type SegmentIndex,
 } from "@/lib/citations/resolve";
-import { rewriteCitations, toPlainLabel } from "@/lib/citations/render";
-import type { TranscriptRef } from "@/lib/citations/types";
+import { splitCitations, toPlainLabel } from "@/lib/citations/render";
 
 interface ToolBadge {
   tool: string;
@@ -70,27 +69,71 @@ function parseToolBadges(content: string): {
   };
 }
 
-// Resolved citations are rewritten into markdown links with this href so
-// react-markdown places them in every inline context (bold, headings, table
-// cells), and the `a` override below turns them into chips.
+// Resolved citations become mdast link nodes with this href, and the `a`
+// override below turns them into chips. Rewriting at the markdown AST means
+// code (fenced, tilde, indented, inline) is never touched: it isn't a `text`
+// node.
 const CITATION_HREF_PREFIX = "#yapstack-citation:";
 
-function toCitationLink(ref: TranscriptRef): string {
-  return `[${toPlainLabel(ref)}](${CITATION_HREF_PREFIX}${ref.segmentId})`;
+interface MdNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: MdNode[];
 }
 
-// Fenced blocks (closed, or still open mid-stream) and inline code spans.
-// Captured so `split` keeps them at odd indices.
-const CODE_REGEX = /(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g;
+function lastLeaf(node: MdNode): MdNode {
+  let leaf = node;
+  while (leaf.children?.length) leaf = leaf.children[leaf.children.length - 1];
+  return leaf;
+}
 
-/** Rewrite citations outside code; code stays literal. */
-function rewriteChatCitations(text: string, index: SegmentIndex | null): string {
-  return text
-    .split(CODE_REGEX)
-    .map((part, i) =>
-      i % 2 === 1 ? part : rewriteCitations(part, index, toCitationLink).text,
-    )
-    .join("");
+function rewriteCitationText(node: MdNode, index: SegmentIndex | null): void {
+  // Text inside a link can't hold another link.
+  if (!node.children || node.type === "link" || node.type === "linkReference") {
+    return;
+  }
+  node.children = node.children.flatMap((child): MdNode[] => {
+    if (child.type !== "text") {
+      rewriteCitationText(child, index);
+      return [child];
+    }
+    const { parts } = splitCitations(child.value ?? "", index, {
+      keepUnresolved: false,
+    });
+    return parts.flatMap((part): MdNode[] => {
+      if (part.kind === "text") return [{ type: "text", value: part.text }];
+      if (part.kind !== "ref") return [];
+      return [
+        {
+          type: "link",
+          url: CITATION_HREF_PREFIX + part.ref.segmentId,
+          children: [{ type: "text", value: toPlainLabel(part.ref) }],
+        },
+      ];
+    });
+  });
+}
+
+/**
+ * Remark plugin: resolve citations in chat text nodes. Without a transcript
+ * in scope (folder or multi-session chat) markers can't resolve, so they're
+ * removed rather than printed raw; chat rows keep the original text. While
+ * streaming, a trailing marker that hasn't closed yet is held back, but only
+ * when the tail is prose, never inside code.
+ */
+function remarkCitations(index: SegmentIndex | null, isStreaming: boolean) {
+  return () => (tree: unknown) => {
+    const root = tree as MdNode;
+    if (isStreaming) {
+      const leaf = lastLeaf(root);
+      if (leaf.type === "text" && leaf.value) {
+        const kept = trimPartialCitation(leaf.value);
+        if (kept !== leaf.value) leaf.value = kept.trimEnd();
+      }
+    }
+    rewriteCitationText(root, index);
+  };
 }
 
 function CitationChip({
@@ -169,6 +212,11 @@ export const AIChatMessage = memo(function AIChatMessage({
     }),
     [index, onCitationClick],
   );
+  const isStreaming = !!message.isStreaming;
+  const remarkPlugins = useMemo(
+    () => [remarkCitations(index, isStreaming)],
+    [index, isStreaming],
+  );
 
   const isUser = message.role === "user";
 
@@ -206,13 +254,6 @@ export const AIChatMessage = memo(function AIChatMessage({
 
   const hasLiveExecs = message.toolExecutions && message.toolExecutions.length > 0;
   const { badges, text } = parseToolBadges(message.content);
-  // Without a transcript in scope (folder or multi-session chat) markers can't
-  // resolve, so they're stripped rather than printed raw. While streaming, a
-  // marker that hasn't closed yet is held back until it can be resolved.
-  const displayText = rewriteChatCitations(
-    message.isStreaming ? trimPartialCitation(text) : text,
-    index,
-  );
 
   const toolExecsFromBadges = !hasLiveExecs && badges.length > 0
     ? badges.map((b) => ({
@@ -234,8 +275,11 @@ export const AIChatMessage = memo(function AIChatMessage({
       )}
       {(text.trim() || message.isStreaming) && (
         <div className="max-w-[95%] rounded-2xl rounded-bl-md bg-muted/80 border border-border/50 px-3 py-2 text-xs ai-chat-markdown">
-          <ReactMarkdown components={markdownComponents}>
-            {displayText}
+          <ReactMarkdown
+            components={markdownComponents}
+            remarkPlugins={remarkPlugins}
+          >
+            {text}
           </ReactMarkdown>
           {message.isStreaming && (
             <span className="inline-block w-1.5 h-4 bg-foreground/60 animate-pulse ml-0.5 align-text-bottom" />

@@ -466,6 +466,9 @@ describe("AIChatMessage", () => {
     it.each([
       ["inline code", "Write `[[seg:seg-1]]` to cite.", "[[seg:seg-1]]"],
       ["fenced code", "```\n[[seg:seg-1]]\n```", "[[seg:seg-1]]"],
+      ["tilde fence", "~~~\n[[seg:seg-1]]\n~~~", "[[seg:seg-1]]"],
+      ["indented code", "Example:\n\n    [[seg:seg-1]]", "[[seg:seg-1]]"],
+      ["double-backtick span", "Write ``a ` [[seg:seg-1]]`` here.", "a ` [[seg:seg-1]]"],
     ])("keeps citations literal inside %s", (_label, content, literal) => {
       const { container } = renderWithTooltip(
         <AIChatMessage
@@ -509,6 +512,22 @@ describe("AIChatMessage", () => {
       );
       const bubble = container.querySelector(".ai-chat-markdown");
       expect(bubble?.textContent).toBe("Hiring is costly");
+    });
+
+    it("does not hold back a marker inside an open code block", () => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "```\n[[seg:89ea",
+            isStreaming: true,
+          })}
+          segments={[makeSegment()]}
+        />,
+      );
+      expect(container.querySelector("code")?.textContent?.trim()).toBe(
+        "[[seg:89ea",
+      );
     });
 
     it("renders the chip once the citation closes", () => {

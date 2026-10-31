@@ -255,6 +255,35 @@ describe("NoteEditor — citation whose segment hasn't synced", () => {
   });
 });
 
+describe("NoteEditor — every citation shape converts on load", () => {
+  it("converts a single-bracket citation with no [[seg: in the note", async () => {
+    const id = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+    getNoteMock.mockResolvedValue({ content: `<p>Tooling [seg:${id} 2:07].</p>` });
+    getSessionSegmentsMock.mockResolvedValue([
+      {
+        id,
+        session_id: "s1",
+        source: "Mic",
+        text: "t",
+        audio_offset_seconds: 127,
+        chunk_duration_seconds: 5,
+        confidence: 0.9,
+        created_at: "",
+        chunk_index: 0,
+        original_text: null,
+        edited_at: null,
+        deleted_at: null,
+        hidden: 0,
+      },
+    ]);
+    renderEditor();
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    expect(saveNoteMock.mock.calls[0][1]).toContain(
+      `data-segment-id="${id}" data-timestamp="2:07"`,
+    );
+  });
+});
+
 describe("NoteEditor — save guards (A1a/A1d)", () => {
   it("writes nothing on blur when the content is unchanged", async () => {
     renderEditor();

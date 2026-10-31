@@ -2,22 +2,29 @@ import type { CitationToken, ParsedCitation } from "./types";
 
 // Grammar for one marker, case-insensitive:
 //  - bracketed and closed: `[[seg:ID]]`, `[seg:ID m:ss]`, `(seg:ID)`,
-//    `[[seg:ID?]]`, `[[seg:A, seg:B]]`, mismatched `[[seg:ID]`. The body runs
-//    to the first closing bracket and may hold hedges or junk (`2cb? nope`).
-//  - unclosed or unbracketed: `[[seg:ID` / `seg_ID]]`. The body is limited to
-//    ID-ish characters so an unterminated marker can't swallow a sentence.
+//    `[[seg:"ID"]]`, `[[seg:ID?]]`, `[[seg:A, seg:B]]`, mismatched
+//    `[[seg:ID]`. The body runs to the first closing bracket and may hold
+//    hedges or junk (`2cb? nope`).
+//  - bracketed but unclosed: `[[seg:ID`. The body is limited to ID-ish
+//    characters so an unterminated marker can't swallow a sentence.
+//  - bare: `seg_ID` / `seg:ID]]`, only with no space after the marker and an
+//    ID of 6+ hex characters, so prose like "seg: 12" never matches.
 // `<`/`>` are excluded so a marker never spans HTML tags.
 const MARKER = String.raw`\b(seg(?:ment)?)\s*[:_]`;
 const OPEN = String.raw`(?:\[\[|\[|\()`;
+const TIME_SRC = String.raw`\d{1,2}(?::\d{2}){1,2}\b`;
 const CLOSED = String.raw`${OPEN}\s*${MARKER}([^\[\]()<>\n]{0,200}?)\s*(?:\]\]|\]|\))`;
-const UNCLOSED = String.raw`(?:${OPEN}\s*)?${MARKER}\s*([A-Za-z0-9_\-.…?:]*(?:\s+\d{1,2}(?::\d{2}){1,2}\b)?)(?:\s*\]{1,2})?`;
-const MARKER_REGEX = new RegExp(`${CLOSED}|${UNCLOSED}`, "gi");
+const UNCLOSED = String.raw`${OPEN}\s*${MARKER}\s*([A-Za-z0-9_\-.…?:"'\x60]*(?:\s+${TIME_SRC})?)`;
+const BARE = String.raw`\bseg[:_]([0-9a-f][0-9a-f-]{5,})(?![\w-])(?:\]{1,2})?`;
+const MARKER_REGEX = new RegExp(`${CLOSED}|${UNCLOSED}|${BARE}`, "gi");
 
 const TIME = /^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$/;
 const TIME_IN_TEXT = /(?:^|\s)((?:\d{1,2}:)?\d{1,2}:\d{2})(?=\s|$)/;
 const ITEM_SPLIT = /[,;]|\s+and\s+/i;
 const ITEM_MARKER = /^\s*seg(?:ment)?\s*[:_]\s*/i;
+const QUOTES = /["'\x60\u2018\u2019\u201C\u201D]/g;
 const ID_HEAD = /^[A-Za-z0-9_-]+/;
+const ID_LIKE = /^[0-9a-f][0-9a-f-]{5,}/i;
 const RUN_GAP = /^[\s,;]*$/;
 
 /** Parse `m:ss` or `h:mm:ss` into seconds, or `null`. */
@@ -30,7 +37,7 @@ export function parseTimestamp(text: string): number | null {
 }
 
 function parseItem(raw: string): CitationToken {
-  const item = raw.replace(ITEM_MARKER, "").trim();
+  const item = raw.replace(ITEM_MARKER, "").replace(QUOTES, "").trim();
   const asTime = parseTimestamp(item);
   if (asTime !== null) return { kind: "time", atSeconds: asTime };
   const segmentId = ID_HEAD.exec(item)?.[0] ?? "";
@@ -52,12 +59,14 @@ function parseItem(raw: string): CitationToken {
 export function parseCitations(text: string): ParsedCitation[] {
   const runs: ParsedCitation[] = [];
   for (const m of text.matchAll(MARKER_REGEX)) {
-    const marker = m[1] ?? m[3];
-    const body = m[2] ?? m[4] ?? "";
-    // "segment", and "seg:" outside brackets, can be ordinary prose; only
-    // treat them as markers when an ID or timestamp follows.
-    const bracketed = m[0][0] === "[" || m[0][0] === "(";
-    if ((marker.length > 3 || !bracketed) && !/\d/.test(body)) continue;
+    const marker = m[1] ?? m[3] ?? "seg";
+    const body = m[2] ?? m[4] ?? m[5] ?? "";
+    // "segment" is an ordinary word ("[segment: 3 of the talk]"); only treat
+    // it as a marker when an ID or a timestamp follows.
+    if (marker.length > 3) {
+      const value = body.replace(QUOTES, "").trim();
+      if (!ID_LIKE.test(value) && parseTimestamp(value) === null) continue;
+    }
 
     const start = m.index;
     const end = start + m[0].length;
@@ -75,7 +84,7 @@ export function parseCitations(text: string): ParsedCitation[] {
 
 // A trailing marker still being typed: `[`, `[[se`, `(seg:89ea`, `seg_4`.
 const PARTIAL_TAIL = new RegExp(
-  String.raw`(?:${OPEN}\s*(?:s(?:e(?:g(?:m(?:e(?:n(?:t)?)?)?)?)?)?)?(?:\s*[:_][^\[\]()<>\n]{0,200})?|\bseg(?:ment)?\s*[:_][A-Za-z0-9_\-.…?:]{0,60})$`,
+  String.raw`(?:${OPEN}\s*(?:s(?:e(?:g(?:m(?:e(?:n(?:t)?)?)?)?)?)?)?(?:\s*[:_][^\[\]()<>\n]{0,200})?|\bseg[:_][0-9a-f-]{0,60})$`,
   "i",
 );
 

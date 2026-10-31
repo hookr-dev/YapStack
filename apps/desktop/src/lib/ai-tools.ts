@@ -31,12 +31,7 @@ import {
 } from "./ai";
 import { formatTime, stripHtml } from "./utils";
 import { createSegmentIndex } from "./citations/resolve";
-import {
-  resolvePendingPills,
-  rewriteCitations,
-  toPendingPillHtml,
-  toPillHtml,
-} from "./citations/render";
+import { convertCitationsInHtml } from "./citations/html";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
 
@@ -214,17 +209,14 @@ export interface ToolDefinition {
  * renders as pills. The result is persisted, so a marker that doesn't resolve
  * to one of `segments` is kept as an unlabelled pending pill (shown as an
  * unavailable source) rather than removed, and pending pills already in
- * `html` are re-resolved (see `lib/citations`).
+ * `html` are re-resolved. Only visible text outside code is touched (see
+ * `lib/citations/html.ts`).
  */
 export function convertCitationsToSegmentRefs(
   html: string,
   segments: DbSegment[],
 ): string {
-  const index = createSegmentIndex(segments);
-  return resolvePendingPills(
-    rewriteCitations(html, index, toPillHtml, toPendingPillHtml).text,
-    index,
-  );
+  return convertCitationsInHtml(html, createSegmentIndex(segments));
 }
 
 // --- Registry ---

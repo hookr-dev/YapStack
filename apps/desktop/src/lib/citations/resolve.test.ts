@@ -1,13 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { createSegmentIndex, resolveCitation } from "./resolve";
 import {
-  hasPendingPills,
-  resolvePendingPills,
   rewriteCitations,
+  splitCitations,
   toPendingPillHtml,
   toPillHtml,
   toPlainLabel,
 } from "./render";
+import { convertCitationsInHtml, hasUnconvertedCitations } from "./html";
 import type { DbSegment } from "@/lib/db";
 
 function seg(
@@ -98,13 +98,23 @@ describe("resolveCitation", () => {
     expect(resolveCitation({ kind: "time", atSeconds: 133 }, index)).toBeNull();
   });
 
-  it("falls back to the timestamp beside an unresolvable id", () => {
+  it("never swaps an unresolvable id for the segment at its timestamp", () => {
     expect(
       resolveCitation(
         { kind: "segment", segmentId: "nope", atSeconds: 1026 },
         index,
-      )?.segmentId,
-    ).toBe(B.id);
+      ),
+    ).toBeNull();
+  });
+
+  it("repairs prefixes only within a single-session scope", () => {
+    const mixed = createSegmentIndex([A, seg("other", 5, { session_id: "s2" })]);
+    expect(
+      resolveCitation({ kind: "segment", segmentId: "89ea3e" }, mixed),
+    ).toBeNull();
+    expect(
+      resolveCitation({ kind: "segment", segmentId: A.id }, mixed)?.segmentId,
+    ).toBe(A.id);
   });
 
   it("refuses time-only lookup across sessions", () => {
@@ -138,8 +148,8 @@ describe("render", () => {
 
   it("strips the following space for a dropped marker at line start", () => {
     expect(
-      rewriteCitations("<p>[[seg:nope]] Leading</p>", index, toPlainLabel).text,
-    ).toBe("<p>Leading</p>");
+      rewriteCitations("[[seg:nope]] Leading\n[[seg:nope]] Next", index, toPlainLabel).text,
+    ).toBe("Leading\nNext");
   });
 
   it("collapses duplicate refs within a run", () => {
@@ -161,21 +171,35 @@ describe("render", () => {
 
 describe("pending pills", () => {
   it("re-resolves a pending pill and leaves labelled pills untouched", () => {
-    const pending = toPendingPillHtml({ kind: "segment", segmentId: A.id })!;
+    const pending = toPendingPillHtml({ kind: "segment", segmentId: A.id });
     const dead = `<span data-segment-ref="" data-segment-id="deadbeef" data-timestamp="deadbeef" data-offset="0">deadbeef</span>`;
     const html = `<p>${pending} ${dead}</p>`;
-    expect(hasPendingPills(html)).toBe(true);
-    expect(resolvePendingPills(html, index)).toBe(
+    expect(hasUnconvertedCitations(html)).toBe(true);
+    expect(convertCitationsInHtml(html, index)).toBe(
       `<p>${toPillHtml(refA)} ${dead}</p>`,
     );
   });
 
   it("leaves a pending pill as-is while its segment is still missing", () => {
-    const pending = toPendingPillHtml({ kind: "segment", segmentId: "late" })!;
-    expect(resolvePendingPills(pending, index)).toBe(pending);
+    const pending = toPendingPillHtml({ kind: "segment", segmentId: "late" });
+    expect(convertCitationsInHtml(pending, index)).toBe(pending);
   });
 
-  it("keeps nothing for an empty id", () => {
-    expect(toPendingPillHtml({ kind: "segment", segmentId: "" })).toBeNull();
+  it("re-resolves a pending time-only pill", () => {
+    const pending = toPendingPillHtml({ kind: "time", atSeconds: 1026 });
+    expect(convertCitationsInHtml(pending, index)).toContain(
+      `data-segment-id="${B.id}"`,
+    );
+  });
+
+  it("never keeps a token with an empty id", () => {
+    expect(
+      splitCitations("x [[seg:]] y", index, { keepUnresolved: true }).parts,
+    ).toEqual([{ kind: "text", text: "x y" }]);
+  });
+
+  it("finds nothing to convert in plain notes", () => {
+    expect(hasUnconvertedCitations("<p>segment 3 of the talk</p>")).toBe(false);
+    expect(hasUnconvertedCitations(`<p>${toPillHtml(refA)}</p>`)).toBe(false);
   });
 });

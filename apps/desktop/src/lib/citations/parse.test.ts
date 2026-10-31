@@ -47,6 +47,9 @@ describe("parseCitations", () => {
     ["F9 underscore", `x seg_${A}`, [{ kind: "segment", segmentId: A }]],
     ["F9 segment: prefix", `x [segment:${A}]`, [{ kind: "segment", segmentId: A }]],
     ["F9 parentheses", `x (seg:${A})`, [{ kind: "segment", segmentId: A }]],
+    ["quoted id", `x [[seg:"${A}"]]`, [{ kind: "segment", segmentId: A }]],
+    ["single-quoted id", `x [[seg:'${A}']]`, [{ kind: "segment", segmentId: A }]],
+    ["backticked id", "x [[seg:`" + A + "`]]", [{ kind: "segment", segmentId: A }]],
   ])("%s", (_label, text, expected) => {
     expect(tokensOf(text)).toEqual(expected);
   });
@@ -70,6 +73,16 @@ describe("parseCitations", () => {
     ["bare timestamp", "At [2:07] we agreed."],
     ["word containing seg", "The myseg:12 value"],
     ["markdown link", "[docs](https://example.com)"],
+    ["segment: with minutes", "The segment: 12 minutes long."],
+    ["segment N of", "This was segment 3 of the talk."],
+    ["bracketed segment prose", "See [segment: 3 of the talk]."],
+    ["parenthesised segment", "(segment 2) covers pricing."],
+    ["footnote number", "As noted [3] earlier."],
+    ["clock time", "We meet at 12:30 pm."],
+    ["bracketed clock time", "Agenda [12:30] lunch."],
+    ["seg: with a small number", "Set seg: 12 in the config."],
+    ["seg_ identifier", "Call seg_fault_handler() here."],
+    ["seg_ with short number", "the seg_2 column"],
   ])("ignores %s", (_label, text) => {
     expect(parseCitations(text)).toEqual([]);
   });

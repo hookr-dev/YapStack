@@ -102,3 +102,45 @@ describe("unresolved citations in notes are kept, not destroyed", () => {
     expect(pills(html)).toEqual([{ id: "", ts: "", off: "599" }]);
   });
 });
+
+describe("explicit ids are never lost or swapped", () => {
+  it("keeps a quoted unresolved id on a pending pill", () => {
+    const missing = "aaaaaaaa-6adb-45f5-b0e5-7ca605644c60";
+    const html = convertCitationsToSegmentRefs(`<p>x [[seg:"${missing}"]].</p>`, SEGMENTS);
+    expect(pills(html)).toEqual([{ id: missing, ts: "", off: "0" }]);
+  });
+
+  it("keeps an unresolved id with its time instead of resolving by time", () => {
+    const missing = "aaaaaaaa-6adb-45f5-b0e5-7ca605644c60";
+    const html = convertCitationsToSegmentRefs(`<p>x [seg:${missing} 2:07].</p>`, SEGMENTS);
+    expect(pills(html)).toEqual([{ id: missing, ts: "", off: "127" }]);
+  });
+});
+
+describe("conversion touches visible text only", () => {
+  it("leaves attribute values alone", () => {
+    const html = `<p><a href="https://x.test/?q=[[seg:${A.id}]]">link</a></p>`;
+    expect(convertCitationsToSegmentRefs(html, SEGMENTS)).toBe(html);
+  });
+
+  it("leaves code and pre blocks alone", () => {
+    const html = `<pre><code>[[seg:${A.id}]]</code></pre><p><code>[[seg:${A.id}]]</code></p>`;
+    expect(convertCitationsToSegmentRefs(html, SEGMENTS)).toBe(html);
+  });
+
+  it("is stable on its own output", () => {
+    const once = convertCitationsToSegmentRefs(
+      `<p>a [[seg:${A.id}]] b [[seg:missing-id-123]] c</p>`,
+      SEGMENTS,
+    );
+    expect(convertCitationsToSegmentRefs(once, SEGMENTS)).toBe(once);
+  });
+
+  it("converts text inside formatting", () => {
+    const html = convertCitationsToSegmentRefs(
+      `<p><strong>Key [[seg:${A.id}]]</strong></p>`,
+      SEGMENTS,
+    );
+    expect(html).toContain(`<strong>Key <span data-segment-ref=""`);
+  });
+});

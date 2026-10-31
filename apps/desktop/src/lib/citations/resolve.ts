@@ -50,8 +50,10 @@ function toRef(s: DbSegment): TranscriptRef {
   };
 }
 
+// Prefix repair needs a single-session scope: across sessions a short prefix
+// is far more likely to collide, so only exact IDs resolve there.
 function byUniquePrefix(index: SegmentIndex, id: string): DbSegment | null {
-  if (id.length < MIN_PREFIX_LENGTH) return null;
+  if (index.sessionId === null || id.length < MIN_PREFIX_LENGTH) return null;
   const prefix = id.toLowerCase();
   let found: DbSegment | null = null;
   for (const s of index.visible) {
@@ -78,24 +80,23 @@ function byTime(index: SegmentIndex, atSeconds: number): DbSegment | null {
 
 /**
  * Resolve one token, or return `null` when no segment matches with certainty.
- * Order: exact ID (case-insensitive); a truncated ID that is a unique prefix
- * of `MIN_PREFIX_LENGTH`+ characters; then the timestamp, matched to the
- * segment that spans it, only when the index holds a single session.
+ * A token with an ID resolves by exact ID (case-insensitive), or, within a
+ * single-session index, as a unique prefix of `MIN_PREFIX_LENGTH`+
+ * characters. A time-only token resolves to the segment that spans it, again
+ * only within a single session.
  *
- * IDs are never matched by edit distance: a mis-copied UUID resolves to
- * nothing, because a link to the wrong moment is worse than no link.
+ * An ID that doesn't resolve is never swapped for the segment at its
+ * timestamp, and IDs are never matched by edit distance: a link to the wrong
+ * moment is worse than no link.
  */
 export function resolveCitation(
   token: CitationToken,
   index: SegmentIndex,
 ): TranscriptRef | null {
-  if (token.kind === "segment") {
-    const segment =
-      findSegment(index, token.segmentId) ??
-      byUniquePrefix(index, token.segmentId) ??
-      (token.atSeconds !== undefined ? byTime(index, token.atSeconds) : null);
-    return segment ? toRef(segment) : null;
-  }
-  const segment = byTime(index, token.atSeconds);
+  const segment =
+    token.kind === "segment"
+      ? (findSegment(index, token.segmentId) ??
+        byUniquePrefix(index, token.segmentId))
+      : byTime(index, token.atSeconds);
   return segment ? toRef(segment) : null;
 }
