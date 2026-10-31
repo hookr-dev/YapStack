@@ -142,57 +142,8 @@ describe("NoteEditor — sync-down of an open note (A1c)", () => {
   });
 });
 
-describe("NoteEditor — citation conversion on load", () => {
-  const SEG_ID = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
-  const STORED = `<p>Hiring is costly [[seg:${SEG_ID}]].</p>`;
-
-  it("leaves citations untouched and saves nothing until segments are loaded", async () => {
-    getNoteMock.mockResolvedValue({ content: STORED });
-
-    renderEditor();
-    await waitFor(() =>
-      expect(editorDom()?.textContent).toContain("Hiring is costly"),
-    );
-    expect(getSessionSegmentsMock).toHaveBeenCalledWith("s1");
-    expect(editorDom().textContent).toContain(`[[seg:${SEG_ID}]]`);
-    expect(saveNoteMock).not.toHaveBeenCalled();
-
-    // Segments arrive (e.g. synced after the note); the next load converts.
-    cleanup();
-    getSessionSegmentsMock.mockResolvedValue([
-      {
-        id: SEG_ID,
-        session_id: "s1",
-        source: "Mic",
-        text: "t",
-        audio_offset_seconds: 127,
-        chunk_duration_seconds: 5,
-        confidence: 0.9,
-        created_at: "",
-        chunk_index: 0,
-        original_text: null,
-        edited_at: null,
-        deleted_at: null,
-        hidden: 0,
-      },
-    ]);
-    renderEditor();
-
-    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
-    const saved = saveNoteMock.mock.calls[0][1] as string;
-    expect(saved).toContain(`data-segment-id="${SEG_ID}"`);
-    expect(saved).not.toContain("[[seg:");
-    await waitFor(() =>
-      expect(editorDom().querySelector("[data-segment-ref]")?.textContent).toBe(
-        "2:07",
-      ),
-    );
-  });
-});
-
-describe("NoteEditor — citation whose segment hasn't synced", () => {
-  const LATE_ID = "48e2014f-ac1c-4c13-bb83-f4c2799df9dc";
-  const segRow = (id: string, audio_offset_seconds: number) => ({
+function segRow(id: string, audio_offset_seconds: number) {
+  return {
     id,
     session_id: "s1",
     source: "Mic",
@@ -206,9 +157,67 @@ describe("NoteEditor — citation whose segment hasn't synced", () => {
     edited_at: null,
     deleted_at: null,
     hidden: 0,
+  };
+}
+
+/** A real user edit that keeps the existing content: add a paragraph. */
+async function addParagraph(text: string) {
+  const dom = editorDom();
+  const p = document.createElement("p");
+  p.textContent = text;
+  dom.appendChild(p);
+  fireEvent.input(dom, { bubbles: true });
+  await waitFor(() =>
+    expect(useAppStore.getState().noteEditingSessionId).toBe("s1"),
+  );
+}
+
+function pillEl(): HTMLElement | null {
+  return editorDom()?.querySelector("[data-segment-ref]") ?? null;
+}
+
+// Notes are never rewritten on load (notes.content is last-writer-wins, so a
+// background write could clobber a concurrent edit on another device).
+// Conversion happens in the editor only and is saved with the next real edit.
+describe("NoteEditor — citations convert in the editor, never saved on load", () => {
+  const ID = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+  const LATE_ID = "48e2014f-ac1c-4c13-bb83-f4c2799df9dc";
+
+  it("leaves citations untouched while the session has no segments", async () => {
+    getNoteMock.mockResolvedValue({ content: `<p>Hiring is costly [[seg:${ID}]].</p>` });
+
+    renderEditor();
+    await waitFor(() =>
+      expect(editorDom()?.textContent).toContain(`[[seg:${ID}]]`),
+    );
+    expect(getSessionSegmentsMock).toHaveBeenCalledWith("s1");
+    expect(saveNoteMock).not.toHaveBeenCalled();
   });
 
-  it("saves it with the full id, shows it unavailable, and resolves once the segment exists", async () => {
+  it.each([
+    ["legacy [[seg:]]", `<p>Hiring is costly [[seg:${ID}]].</p>`],
+    ["single-bracket shape", `<p>Tooling [seg:${ID} 2:07].</p>`],
+  ])("converts %s on load without saving, then saves it with the next edit", async (_label, content) => {
+    getNoteMock.mockResolvedValue({ content });
+    getSessionSegmentsMock.mockResolvedValue([segRow(ID, 127)]);
+
+    renderEditor();
+    await waitFor(() => expect(pillEl()?.textContent).toBe("2:07"));
+    expect(saveNoteMock).not.toHaveBeenCalled();
+
+    await addParagraph("my edit");
+    fireEvent.blur(editorDom());
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    const saved = saveNoteMock.mock.calls[0][1] as string;
+    expect(saved).toContain(`data-segment-id="${ID}" data-timestamp="2:07"`);
+    expect(saved).toContain("my edit");
+    expect(saved).not.toContain("seg:");
+    // Converting on load is not a remote edit: no conflict toast.
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it("shows a citation to an unsynced segment as unavailable, resolves it once the segment exists, and never saves on load", async () => {
     getNoteMock.mockResolvedValue({
       content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
     });
@@ -216,70 +225,40 @@ describe("NoteEditor — citation whose segment hasn't synced", () => {
     getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
 
     renderEditor();
-    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
-    const saved = saveNoteMock.mock.calls[0][1] as string;
-    expect(saved).toContain(`data-segment-id="${LATE_ID}" data-timestamp=""`);
-    expect(saved).not.toContain("[[seg:");
-
-    const pill = await waitFor(() => {
-      const el = editorDom().querySelector("[data-segment-ref]");
-      expect(el).not.toBeNull();
-      return el as HTMLElement;
-    });
+    await waitFor(() => expect(pillEl()).not.toBeNull());
+    const pill = pillEl()!;
     expect(pill.getAttribute("aria-disabled")).toBe("true");
     expect(pill.getAttribute("aria-label")).toBe("Source unavailable");
+    expect(pill.getAttribute("data-segment-id")).toBe(LATE_ID);
     expect(pill.textContent).toBe("");
+    expect(saveNoteMock).not.toHaveBeenCalled();
 
-    // The segment syncs in; the next load resolves the stored pending pill.
+    // The segment syncs in; the next load resolves it, still without a save.
     cleanup();
-    saveNoteMock.mockClear();
-    getNoteMock.mockResolvedValue({ content: saved });
     getSessionSegmentsMock.mockResolvedValue([
       segRow("other-seg", 3),
       segRow(LATE_ID, 1025),
     ]);
     renderEditor();
-
-    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
-    expect(saveNoteMock.mock.calls[0][1]).toContain(
-      `data-segment-id="${LATE_ID}" data-timestamp="17:05"`,
-    );
-    await waitFor(() =>
-      expect(editorDom().querySelector("[data-segment-ref]")?.textContent).toBe(
-        "17:05",
-      ),
-    );
-    expect(
-      editorDom().querySelector("[data-segment-ref]")?.getAttribute("aria-disabled"),
-    ).toBeNull();
+    await waitFor(() => expect(pillEl()?.textContent).toBe("17:05"));
+    expect(pillEl()?.getAttribute("aria-disabled")).toBeNull();
+    expect(saveNoteMock).not.toHaveBeenCalled();
   });
-});
 
-describe("NoteEditor — every citation shape converts on load", () => {
-  it("converts a single-bracket citation with no [[seg: in the note", async () => {
-    const id = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
-    getNoteMock.mockResolvedValue({ content: `<p>Tooling [seg:${id} 2:07].</p>` });
-    getSessionSegmentsMock.mockResolvedValue([
-      {
-        id,
-        session_id: "s1",
-        source: "Mic",
-        text: "t",
-        audio_offset_seconds: 127,
-        chunk_duration_seconds: 5,
-        confidence: 0.9,
-        created_at: "",
-        chunk_index: 0,
-        original_text: null,
-        edited_at: null,
-        deleted_at: null,
-        hidden: 0,
-      },
-    ]);
+  it("saves a pending pill with its full id when the user edits", async () => {
+    getNoteMock.mockResolvedValue({
+      content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
+    });
+    getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
+
     renderEditor();
+    await waitFor(() => expect(pillEl()).not.toBeNull());
+    await addParagraph("my edit");
+    fireEvent.blur(editorDom());
+
     await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
     expect(saveNoteMock.mock.calls[0][1]).toContain(
-      `data-segment-id="${id}" data-timestamp="2:07"`,
+      `data-segment-id="${LATE_ID}" data-timestamp=""`,
     );
   });
 });

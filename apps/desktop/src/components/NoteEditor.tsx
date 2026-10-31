@@ -362,7 +362,7 @@ export function NoteEditor({
     if (loadedSessionRef.current !== id) return false;
     const gen = loadGenRef.current;
     // A LOCAL writer of this note (the AI `save_to_notes` tool, the chat's
-    // save-to-notes, the citation conversion) announces itself by bumping
+    // save-to-notes) announces itself by bumping
     // `noteRefreshCounter` (the sync path never does — D4). Captured here so we can
     // tell a same-machine local write apart from a genuine peer edit below.
     const localRefreshAtStart = useAppStore.getState().noteRefreshCounter;
@@ -559,7 +559,10 @@ export function NoteEditor({
    * a save that writes the just-loaded content straight back.
    */
   const applyContent = useCallback(
-    (content: string) => {
+    // `stored` is the DB row when the editor shows a derived version of it
+    // (citations converted on load): the conflict baseline must stay the row
+    // we read, while the dirty baseline is what's on screen.
+    (content: string, stored: string = content) => {
       if (!editor) return;
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
@@ -570,7 +573,7 @@ export function NoteEditor({
       // back over the baselines we set here.
       loadGenRef.current += 1;
       editor.commands.setContent(content, { emitUpdate: false });
-      lastSavedContent.current = content;
+      lastSavedContent.current = stored;
       docBaseline.current = editor.getHTML();
     },
     [editor],
@@ -590,25 +593,23 @@ export function NoteEditor({
         useAppStore.getState().remoteNoteUpdate?.seq ?? 0;
       const note = await getNote(sessionId);
       if (cancelled) return;
-      let content = note?.content ?? "";
-      // Convert citation markers (any shape the parser accepts) to
-      // <span data-segment-ref> nodes, and re-resolve pending pills whose
-      // segment wasn't here last time (a synced note can land before its
-      // transcript). Skipped while the session has no segments locally, so
-      // the stored text is left as-is.
-      if (hasUnconvertedCitations(content)) {
+      const stored = note?.content ?? "";
+      let content = stored;
+      // Convert citation markers (any shape the parser accepts) to pills and
+      // re-resolve pending pills whose segment has since synced, in the
+      // editor only. Notes are never rewritten on load: `notes.content` is a
+      // last-writer-wins cell, so a background write could overwrite a
+      // concurrent edit from another device. The converted pills are saved
+      // with the user's next real edit. Skipped while the session has no
+      // segments locally.
+      if (hasUnconvertedCitations(stored)) {
         const segments = await getSessionSegments(sessionId);
         if (cancelled) return;
         if (segments.length > 0) {
-          content = convertCitationsToSegmentRefs(content, segments);
-        }
-        // Persist the converted content so future loads don't need re-conversion
-        if (note && content !== note.content) {
-          await saveNote(sessionId, content);
-          if (cancelled) return;
+          content = convertCitationsToSegmentRefs(stored, segments);
         }
       }
-      applyContent(content);
+      applyContent(content, stored);
       loadedSessionRef.current = sessionId;
     }
     load();

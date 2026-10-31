@@ -706,6 +706,7 @@ Both paths go through `lib/citations/` (parse → resolve → render), the one o
 - `render.ts` `splitCitations` is the core; never a raw code or a hex-labelled pill:
   - **Display (chat)** rewrites mdast `text` nodes in a remark plugin (so code of any kind is untouched) and removes unresolved markers; chat rows keep the original text. With no index (folder / multi-session chat) every marker is removed.
   - **Persisted (notes)**: `html.ts` `convertCitationsInHtml` walks DOM text nodes (skipping `code`, `pre`, existing pills and all attributes) and keeps each unresolved marker as a *pending pill* (`toPendingPillHtml`: `span[data-segment-ref]` with the original ID and timestamp and an empty `data-timestamp`), rendered as a muted "Source unavailable" node. Pending pills re-resolve on note load once the segment exists. Persisting never destroys a citation.
+- **Notes are never rewritten on load**: `notes.content` is a last-writer-wins cell, so a background write could overwrite a concurrent edit on another device. Load-time conversion and pending-pill resolution happen in the editor only, and reach the DB with the user's next real edit. `save_to_notes` converts at write time, because that write is an explicit user action.
 
 ### Tool Badge Persistence
 
