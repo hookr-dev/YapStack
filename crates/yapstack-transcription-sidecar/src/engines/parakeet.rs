@@ -439,10 +439,10 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
     }
 }
 
-/// Apple Silicon Auto attempts WebGPU (Dawn → Metal), but only for encoder
-/// graphs that pass [`gpu_placement_ok`]; anything else runs on CPU, which
-/// is both honest and faster than a GPU session doing its heavy ops on
-/// CPU. CoreML is not the Auto path: parakeet-rs hardcodes
+/// Auto attempts WebGPU (Dawn → Metal on macOS, Vulkan/D3D12 on
+/// Windows/Linux), but only for encoder graphs that pass
+/// [`gpu_placement_ok`]; anything else runs on CPU, which is both honest
+/// and faster than a GPU session doing its heavy ops on CPU. CoreML is not the Auto path: parakeet-rs hardcodes
 /// `ComputeUnits::CPUAndGPU` and the dynamic input shapes leave the heavy
 /// ops on CPU anyway. The CoreML-only fallback build keeps skipping models
 /// with external `.onnx.data` (ORT's `model_path must not be empty` bug on
@@ -450,8 +450,8 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 /// so it is safe with external data).
 ///
 /// Non-macOS targets (Windows/Linux) attempt WebGPU under Auto since Gate C
-/// passed (2026-07-05: the Windows canary validated WebGPU correct AND
-/// clearly faster than CPU per ADR 0004's validation gate).
+/// passed (2026-07-05, ADR 0004); the placement gate narrows that to the
+/// graphs whose heavy ops WebGPU can actually run.
 ///
 /// Every WebGPU registration is strict, so an EP-init failure surfaces
 /// through `load_model_with`'s explicit, logged CPU fallback (honest
@@ -463,7 +463,9 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 // combo — and the early `return`s let each read as a self-contained arm.
 #[allow(clippy::needless_return)]
 fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
-    #[cfg(all(target_os = "macos", feature = "webgpu"))]
+    // Whether the EP has kernels for a graph's ops does not depend on the
+    // OS, so the placement gate applies on every platform.
+    #[cfg(feature = "webgpu")]
     {
         _ = model.has_external_data;
         return if model.gpu_placement_ok {
@@ -481,18 +483,7 @@ fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
             AccelTarget::CoreMl
         };
     }
-    // Gate C measured int8 + WebGPU faster than CPU on the Windows canary,
-    // so the placement gate is not applied here; a non-macOS placement
-    // measurement is what would change that.
-    #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
-    {
-        _ = (model.has_external_data, model.gpu_placement_ok);
-        return AccelTarget::WebGpu;
-    }
-    #[cfg(not(any(
-        all(target_os = "macos", any(feature = "webgpu", feature = "coreml")),
-        all(not(target_os = "macos"), feature = "webgpu")
-    )))]
+    #[cfg(not(any(feature = "webgpu", all(target_os = "macos", feature = "coreml"))))]
     {
         _ = (model.has_external_data, model.gpu_placement_ok);
         AccelTarget::Cpu
@@ -920,10 +911,13 @@ mod tests {
         assert_eq!(resolve_accel(AccelChoice::Auto, FP32).label(), "webgpu");
     }
 
-    #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
+    /// The Windows/Linux case: the same Auto arm applies on every OS, so
+    /// int8 resolves to CPU there too while fp32 still attempts WebGPU.
+    #[cfg(feature = "webgpu")]
     #[test]
-    fn non_macos_auto_keeps_attempting_webgpu() {
-        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "webgpu");
+    fn auto_applies_the_placement_gate_on_every_platform() {
+        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "cpu");
+        assert_eq!(resolve_accel(AccelChoice::Auto, FP32).label(), "webgpu");
     }
 
     #[cfg(not(feature = "webgpu"))]
