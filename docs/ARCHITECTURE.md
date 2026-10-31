@@ -700,6 +700,11 @@ Segments are passed to the AI with IDs embedded in the timestamp: `[seg:abc123 0
 
 In saved notes (via `save_to_notes` tool), citations are converted to `<span data-segment-ref>` elements that the Tiptap `SegmentReference` extension renders as interactive pills.
 
+Both paths go through `lib/citations/` (parse → resolve → render), the one owner of citation handling:
+- `parse.ts` tolerates the shapes models actually emit (truncated or hedged IDs, `[[seg:m:ss]]`, several IDs per bracket, `[seg:ID m:ss]`, missing brackets, case/spacing variants). `trimPartialCitation` holds back an unclosed marker while a reply streams.
+- `resolve.ts` resolves against a `SegmentIndex`: exact ID, then a unique prefix of 6+ characters, then the timestamp (single-session index only). It never matches IDs by edit distance.
+- `render.ts` `rewriteCitations(text, index, render)` replaces resolved markers and **removes unresolved ones** — a citation is either a working reference or absent, never a raw code or a hex-labelled pill. With no index (folder / multi-session chat) every marker is removed.
+
 ### Tool Badge Persistence
 
 When tools execute, badge lines are prepended to the assistant message content for DB persistence:

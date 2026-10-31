@@ -1152,7 +1152,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `executeTool` | `(name, args, ctx) → Promise<ExecutedTool \| null>` | Executes a tool by name. Returns `null` if the tool is a no-op (e.g., title unchanged). |
 | `captureUndoSnapshot` | `<T>(loader: () => Promise<T>) → Promise<T>` | Helper that loads pre-mutation state for the executor's `undoData`, used by mutating tools so undo restores the prior value. |
 | `undoToolCalls` | `(executed, ctx) → Promise<void>` | Reverses tool executions in LIFO order |
-| `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces `[[seg:ID]]` text citations with `<span data-segment-ref>` HTML nodes for Tiptap rendering |
+| `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces citation markers with `<span data-segment-ref>` HTML nodes for Tiptap rendering; markers that don't resolve to `segments` are removed (delegates to `lib/citations/`) |
 
 **Registered Tools**
 | Tool Name | Parameters | DB Operations | Effects |

@@ -9,29 +9,6 @@ import type { DbSegment } from "@/lib/db";
 vi.mock("@/lib/db", () => ({}));
 vi.mock("@/lib/db-backend", () => ({ default: { load: vi.fn() } }));
 
-// Mock ReactMarkdown: passes children to custom `p` component as an array
-// of strings (matching how real ReactMarkdown works). The leading empty string
-// resets the global CITE_REGEX lastIndex (after the hasCitations .test() call
-// in the component advances it), so processCitationsInChildren sees lastIndex=0
-// when processing the actual text.
-vi.mock("react-markdown", () => ({
-  default: ({
-    children,
-    components,
-  }: {
-    children: string;
-    components?: Record<string, (props: { children: React.ReactNode }) => React.ReactNode>;
-  }) => {
-    if (components?.p) {
-      const P = components.p as (props: { children: React.ReactNode }) => React.ReactNode;
-      // Pass an array: ["", actualText]. The "" causes a .test() failure that
-      // resets the global regex lastIndex to 0 before the real text is tested.
-      return <P>{["", children]}</P>;
-    }
-    return <p>{children}</p>;
-  },
-}));
-
 // Mock getAction to return a known action definition for "summarize"
 const MockIcon = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="mock-action-icon" {...props} />
@@ -365,19 +342,6 @@ describe("AIChatMessage", () => {
   // ---- Citations ----
 
   describe("citations", () => {
-    // The component uses a module-level CITE_REGEX with the 'g' flag.
-    // The .test() method on a global regex advances lastIndex, which persists
-    // across renders. Rendering a non-citation assistant message resets
-    // lastIndex to 0 (failed .test() on non-matching text resets it).
-    beforeEach(() => {
-      const { unmount } = renderWithTooltip(
-        <AIChatMessage
-          message={makeMessage({ role: "assistant", content: "reset regex" })}
-        />,
-      );
-      unmount();
-    });
-
     it("renders [[seg:id]] as clickable timestamp chips", () => {
       const segment = makeSegment({
         id: "seg-abc",
@@ -417,18 +381,133 @@ describe("AIChatMessage", () => {
       expect(onClick).toHaveBeenCalledWith("seg-xyz");
     });
 
-    it("renders fallback ref chip when segment not found", () => {
-      renderWithTooltip(
+    it("drops an unresolvable citation instead of a ref chip", () => {
+      const { container } = renderWithTooltip(
         <AIChatMessage
           message={makeMessage({
             role: "assistant",
             content: "See [[seg:missing-id]] here",
           })}
-          segments={[]}
+          segments={[makeSegment()]}
           onCitationClick={vi.fn()}
         />,
       );
-      expect(screen.getByText("ref")).toBeInTheDocument();
+      expect(screen.queryByText("ref")).not.toBeInTheDocument();
+      const bubble = container.querySelector(".ai-chat-markdown");
+      expect(bubble?.textContent).toBe("See here");
+    });
+
+    it("repairs a truncated id to its unique segment", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "Hiring is costly [[seg:89ea3e1d]].",
+          })}
+          segments={[
+            makeSegment({
+              id: "89ea3e1d-6adb-45f5-b0e5-7ca605644c60",
+              audio_offset_seconds: 127,
+            }),
+          ]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("2:07")).toBeInTheDocument();
+    });
+
+    it.each([
+      ["bold", "**Key point [[seg:seg-1]]**", "strong"],
+      ["heading", "## Decisions [[seg:seg-1]]", "h2"],
+      ["emphasis", "_Aside [[seg:seg-1]]_", "em"],
+      ["blockquote", "> Quoted [[seg:seg-1]]", "blockquote"],
+    ])("renders a chip inside %s", (_label, content, tag) => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content })}
+          segments={[makeSegment()]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: "1:05" });
+      expect(chip.closest(tag)).not.toBeNull();
+      expect(container.textContent).not.toMatch(/seg:/);
+    });
+
+    it("renders a non-interactive chip when segments are known without a click handler", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "Fact [[seg:seg-1]].",
+          })}
+          segments={[makeSegment()]}
+        />,
+      );
+      expect(screen.getByText("1:05")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "1:05" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("strips markers when no transcript is in scope (folder chat)", () => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "Across sessions [[seg:seg-1]], [[seg:other]] this held.",
+          })}
+        />,
+      );
+      const bubble = container.querySelector(".ai-chat-markdown");
+      expect(bubble?.textContent).toBe("Across sessions this held.");
+    });
+
+    it("keeps ordinary markdown links as links", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "See [the docs](https://example.com).",
+          })}
+          segments={[makeSegment()]}
+        />,
+      );
+      expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+        "href",
+        "https://example.com",
+      );
+    });
+  });
+
+  describe("streaming citations", () => {
+    it("holds back a citation that hasn't closed yet", () => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "Hiring is costly [[seg:89ea",
+            isStreaming: true,
+          })}
+          segments={[makeSegment()]}
+        />,
+      );
+      const bubble = container.querySelector(".ai-chat-markdown");
+      expect(bubble?.textContent).toBe("Hiring is costly");
+    });
+
+    it("renders the chip once the citation closes", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "Hiring is costly [[seg:seg-1]]",
+            isStreaming: true,
+          })}
+          segments={[makeSegment()]}
+        />,
+      );
+      expect(screen.getByText("1:05")).toBeInTheDocument();
     });
   });
 

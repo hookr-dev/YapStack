@@ -30,6 +30,8 @@ import {
   isVisibleSegment,
 } from "./ai";
 import { formatTime, stripHtml } from "./utils";
+import { createSegmentIndex } from "./citations/resolve";
+import { rewriteCitations, toPillHtml } from "./citations/render";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
 
@@ -201,24 +203,17 @@ export interface ToolDefinition {
 
 // --- Citation conversion ---
 
-const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/g;
-
 /**
- * Replace [[seg:ID]] text citations with <span data-segment-ref> HTML nodes
- * that the Tiptap SegmentReference extension can render as interactive pills.
+ * Replace citation markers in model-authored HTML with the
+ * `<span data-segment-ref>` nodes the Tiptap SegmentReference extension
+ * renders as pills. Markers that don't resolve to one of `segments` are
+ * removed (see `lib/citations`).
  */
 export function convertCitationsToSegmentRefs(
   html: string,
   segments: DbSegment[],
 ): string {
-  return html.replace(CITE_REGEX, (_match, segId: string) => {
-    const segment = segments.find((s) => s.id === segId);
-    const ts = segment
-      ? formatTime(Math.max(0, segment.audio_offset_seconds))
-      : segId.slice(0, 8);
-    const offset = segment ? segment.audio_offset_seconds : 0;
-    return `<span data-segment-ref="" data-segment-id="${segId}" data-timestamp="${ts}" data-offset="${offset}">${ts}</span>`;
-  });
+  return rewriteCitations(html, createSegmentIndex(segments), toPillHtml).text;
 }
 
 // --- Registry ---

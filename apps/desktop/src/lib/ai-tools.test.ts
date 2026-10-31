@@ -76,13 +76,13 @@ describe("convertCitationsToSegmentRefs", () => {
     expect(result).toContain('data-offset="65"');
   });
 
-  it("uses truncated ID for unmatched segment", () => {
+  it("drops an unmatched citation instead of rendering a dead pill", () => {
     const result = convertCitationsToSegmentRefs(
-      "See [[seg:unknown123]]",
-      [],
+      "See [[seg:unknown123]] here",
+      [makeSegment({ id: "abc123", audio_offset_seconds: 5 })],
     );
-    expect(result).toContain('data-segment-id="unknown123"');
-    expect(result).toContain(">unknown1</span>");
+    expect(result).toBe("See here");
+    expect(result).not.toContain("data-segment-ref");
   });
 
   it("replaces multiple citations", () => {
