@@ -24,6 +24,7 @@ import {
 import {
   resolveAndCreateClient,
   streamChatWithTools,
+  chatContextTypeFromKey,
   DEFAULT_AI_CONFIG,
 } from "@/lib/ai";
 import { GENERAL_DIRECTIVE } from "@/lib/ai-prompts";
@@ -344,7 +345,8 @@ export function useChatMessages(
       setIsStreaming(true);
       setIsExpanded(true);
       trackChatMessageSent({
-        context: contextKey.split(":")[0] ?? "unknown",
+        // The type only — a session context's key is the session id itself.
+        context: chatContextTypeFromKey(contextKey),
         has_action: actionDef ? 1 : 0,
         action_id: actionId,
       });

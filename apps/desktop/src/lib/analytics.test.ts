@@ -31,6 +31,7 @@ import {
   trackSettingChanged,
   trackSegmentEdited,
   trackSessionMovedToFolder,
+  scrubIdentifiers,
 } from "./analytics";
 
 beforeEach(() => {
@@ -87,7 +88,6 @@ describe("analytics", () => {
   it("trackDictationStarted sends slot props", () => {
     trackDictationStarted({
       slot_id: "slot-1",
-      slot_name: "Slot 1",
       ai_enabled: 0,
       has_prompt: 0,
       output_action: "paste",
@@ -136,6 +136,29 @@ describe("analytics", () => {
       context: "session",
       has_action: 1,
       action_id: "summarize",
+    });
+  });
+
+  it("scrubIdentifiers removes UUIDs and home-directory account names", () => {
+    expect(scrubIdentifiers("global.dictation-3f2b8c1e-9d4a-4e7b-8a6f-1c2d3e4f5a6b")).toBe(
+      "global.dictation-<id>",
+    );
+    expect(scrubIdentifiers("open /Users/jane/Library/x.wav failed")).toBe(
+      "open /Users/<user>/Library/x.wav failed",
+    );
+    expect(scrubIdentifiers("C:\\Users\\Jane Doe\\AppData")).toBe("C:\\Users\\<user> Doe\\AppData");
+    expect(scrubIdentifiers("/home/jane/.cache")).toBe("/home/<user>/.cache");
+    expect(scrubIdentifiers("no identifiers here")).toBe("no identifiers here");
+  });
+
+  it("scrubs identifiers from every string prop before sending", () => {
+    trackDictationFailed({
+      slot_id: "3f2b8c1e-9d4a-4e7b-8a6f-1c2d3e4f5a6b",
+      error_reason: "ENOENT /Users/jane/x.wav",
+    });
+    expect(mockTrackEvent).toHaveBeenCalledWith("dictation_failed", {
+      slot_id: "<id>",
+      error_reason: "ENOENT /Users/<user>/x.wav",
     });
   });
 
@@ -239,7 +262,6 @@ describe("analytics opt-out gate", () => {
     trackSessionDeleted();
     trackDictationStarted({
       slot_id: "slot-1",
-      slot_name: "Slot 1",
       ai_enabled: 0,
       has_prompt: 0,
       output_action: "paste",

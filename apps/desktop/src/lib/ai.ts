@@ -20,6 +20,18 @@ export type ChatContext =
   | { type: "pinned" }
   | { type: "dictation" };
 
+/**
+ * Inverse of `chatContextKey` for the context *type* only — the id is dropped.
+ * A session context's key is the bare session id, so anything that isn't one
+ * of the fixed keys or a `folder:` key is a session.
+ */
+export function chatContextTypeFromKey(key: string): ChatContext["type"] {
+  if (key === "global") return "all";
+  if (key === "pinned" || key === "dictation") return key;
+  if (key.startsWith("folder:")) return "folder";
+  return "session";
+}
+
 export function chatContextKey(ctx: ChatContext): string {
   switch (ctx.type) {
     case "session":

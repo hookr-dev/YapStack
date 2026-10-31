@@ -247,7 +247,6 @@ export function useDictation() {
 
       trackDictationStarted({
         slot_id: slot.id,
-        slot_name: slot.name,
         ai_enabled: slot.profileId !== null ? 1 : 0,
         has_prompt: slot.prompt ? 1 : 0,
         output_action: slot.outputAction ?? "paste",
