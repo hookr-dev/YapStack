@@ -61,6 +61,7 @@ impl TranscriptionBackend for WhisperBackend {
         self.last_engine_info = Some(EngineInfo {
             accel,
             model_dir: model_path.display().to_string(),
+            accel_fallback: None,
         });
         Ok(())
     }

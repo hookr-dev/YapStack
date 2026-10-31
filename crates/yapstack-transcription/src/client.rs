@@ -74,20 +74,24 @@ fn log_sidecar_response(response: &SidecarResponse) {
             id,
             accel,
             model_dir,
+            accel_fallback,
         } => debug!(
             id = id,
             accel = accel.as_deref(),
             model_dir = model_dir.as_deref(),
+            accel_fallback = accel_fallback.as_deref(),
             "sidecar response: model_loaded"
         ),
         SidecarResponse::EngineInfo {
             id,
             accel,
             model_dir,
+            accel_fallback,
         } => debug!(
             id = id,
             accel = accel.as_deref(),
             model_dir = model_dir.as_deref(),
+            accel_fallback = accel_fallback.as_deref(),
             "sidecar response: engine_info"
         ),
         SidecarResponse::Error { id, message } => debug!(
@@ -179,6 +183,9 @@ pub struct TranscriptionResult {
 pub struct EngineInfo {
     pub accel: Option<String>,
     pub model_dir: Option<String>,
+    /// Why the attempted accelerator failed to load, when `accel` is a
+    /// CPU fallback. `None` for a normal load and for older sidecars.
+    pub accel_fallback: Option<String>,
 }
 
 /// Transcription client that supports **concurrent in-flight requests** to the
@@ -621,9 +628,16 @@ impl TranscriptionClient {
 
         match response {
             SidecarResponse::ModelLoaded {
-                accel, model_dir, ..
+                accel,
+                model_dir,
+                accel_fallback,
+                ..
             } => {
-                let info = EngineInfo { accel, model_dir };
+                let info = EngineInfo {
+                    accel,
+                    model_dir,
+                    accel_fallback,
+                };
                 *self
                     .last_engine_info
                     .lock()
@@ -651,9 +665,16 @@ impl TranscriptionClient {
         let response = self.await_response(id, rx, 10).await?;
         match response {
             SidecarResponse::EngineInfo {
-                accel, model_dir, ..
+                accel,
+                model_dir,
+                accel_fallback,
+                ..
             } => {
-                let info = EngineInfo { accel, model_dir };
+                let info = EngineInfo {
+                    accel,
+                    model_dir,
+                    accel_fallback,
+                };
                 *self
                     .last_engine_info
                     .lock()

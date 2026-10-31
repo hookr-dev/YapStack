@@ -610,6 +610,9 @@ interface AppState {
     engine: EngineKindDto;
     accel: string | null;
     modelDir: string | null;
+    /// Reason the attempted accelerator failed, when `accel` is a CPU
+    /// fallback; null otherwise.
+    accelFallback: string | null;
   } | null;
 
   // Setters (called by event listeners)

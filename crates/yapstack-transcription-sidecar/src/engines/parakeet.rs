@@ -7,6 +7,7 @@ use parakeet_rs::{ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 use tracing::{debug, info, warn};
 use yapstack_common::types::TranscriptSegment;
 
+use crate::engines::ort_placement::{self, PlacementRecorder, SessionPlacement};
 use crate::engines::{
     normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
     TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
@@ -59,8 +60,16 @@ impl ParakeetBackend {
     }
 }
 
-impl TranscriptionBackend for ParakeetBackend {
-    fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
+impl ParakeetBackend {
+    /// Loads the model under an explicit accelerator choice. With a
+    /// `placement` recorder attached, returns ORT's node placement for each
+    /// session of the model that ended up loaded (encoder first).
+    fn load_model_with(
+        &mut self,
+        model_path: &Path,
+        choice: AccelChoice,
+        placement: Option<PlacementRecorder>,
+    ) -> Result<Vec<SessionPlacement>, String> {
         if !model_path.is_dir() {
             return Err(format!(
                 "parakeet model path must be a directory containing encoder-model.onnx and \
@@ -76,62 +85,73 @@ impl TranscriptionBackend for ParakeetBackend {
         );
 
         let cache_dir = self.coreml_cache_dir.as_deref();
-        let choice = AccelChoice::from_env();
-        // Auto: skip CoreML when external `.onnx.data` is present (known ORT
-        // bug `model_path must not be empty`). The skip ONLY applies when
-        // CoreML is the auto-selected EP — WebGPU runs through a different
-        // ORT codepath that doesn't try to serialize the partitioned subgraph
-        // back through the model path, so it's safe with external data.
-        // User-forced choices are honored regardless (so a hand-set
-        // `YAPSTACK_PARAKEET_ACCEL=coreml` will still try CoreML even on a
-        // fp32 bundle, fail, and hit the fallback chain below).
-        let exec_config = match choice {
-            AccelChoice::Auto if auto_skip_due_to_external_data(model_path) => None,
-            _ => build_exec_config(choice, cache_dir),
-        };
-        let accel_attempted = exec_config.is_some();
-        let attempted_label = if accel_attempted {
-            resolved_accel_label(choice)
-        } else {
-            "cpu"
-        };
+        let target = resolve_accel(choice, ModelDirTraits::inspect(model_path));
         info!(
             marker = "live_accel_choice",
             engine = "parakeet",
             requested = ?choice,
-            attempted = attempted_label,
+            attempted = target.label(),
             model_dir = %model_path.display(),
             "parakeet acceleration resolved"
         );
-        // `actual_label` records which EP actually took the model — it
-        // diverges from `attempted_label` only on the fallback path below.
-        let (model, actual_label) = match ParakeetTDT::from_pretrained(model_path, exec_config) {
-            Ok(m) => (m, attempted_label.to_string()),
-            Err(e) if accel_attempted => {
+        let attempt = ParakeetTDT::from_pretrained(
+            model_path,
+            build_exec_config(target, cache_dir, placement.as_ref()),
+        );
+        // `loaded` diverges from `target` only on the fallback path below.
+        let (mut model, loaded, accel_fallback) = match attempt {
+            Ok(m) => (m, target, None),
+            Err(e) if target != AccelTarget::Cpu => {
                 warn!(
                     marker = "live_accel_fallback",
                     engine = "parakeet",
-                    requested = attempted_label,
+                    requested = target.label(),
                     error = %e,
                     "accelerator load failed; falling back to CPU \
                      (set YAPSTACK_PARAKEET_ACCEL=cpu to suppress this attempt)"
                 );
-                let m = ParakeetTDT::from_pretrained(model_path, None)
-                    .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
-                (m, "cpu".to_string())
+                // Drop whatever the failed attempt reported so the
+                // placement below describes only the sessions that loaded.
+                if let Some(recorder) = placement.as_ref() {
+                    recorder.take();
+                }
+                let m = ParakeetTDT::from_pretrained(
+                    model_path,
+                    build_exec_config(AccelTarget::Cpu, cache_dir, placement.as_ref()),
+                )
+                .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
+                let reason = format!("{} failed to load: {e}", target.label());
+                (m, AccelTarget::Cpu, Some(reason))
             }
             Err(e) => return Err(format!("failed to load parakeet model: {e}")),
         };
+
+        let sessions = placement.map(|r| r.take()).unwrap_or_default();
+        log_placement(loaded, &sessions);
+
+        warm_up(&mut model);
         self.model = Some(model);
         self.last_engine_info = Some(EngineInfo {
-            accel: actual_label,
+            accel: loaded.label().to_string(),
             model_dir: model_path.display().to_string(),
+            accel_fallback,
         });
         info!(
             "parakeet TDT model loaded in {} ms",
             load_start.elapsed().as_millis()
         );
-        Ok(())
+        Ok(sessions)
+    }
+}
+
+impl TranscriptionBackend for ParakeetBackend {
+    fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
+        self.load_model_with(
+            model_path,
+            AccelChoice::from_env(),
+            PlacementRecorder::from_env(),
+        )
+        .map(drop)
     }
 
     fn engine_info(&self) -> Option<EngineInfo> {
@@ -321,158 +341,246 @@ impl AccelChoice {
     }
 }
 
-/// Stable string label for the accelerator that an `AccelChoice` resolves
-/// to under the current cfg. Matches what `auto_exec_config` actually
-/// builds for `AccelChoice::Auto`. Used for the `ModelLoaded.accel`
-/// telemetry payload — kept lowercase + ASCII for grep-friendliness.
-fn resolved_accel_label(choice: AccelChoice) -> &'static str {
-    match choice {
-        AccelChoice::Cpu => "cpu",
-        AccelChoice::Auto => {
-            #[cfg(all(target_os = "macos", feature = "webgpu"))]
-            {
-                "webgpu"
-            }
-            #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
-            {
-                "coreml"
-            }
-            // Gate C passed 2026-07-05: non-macOS Auto attempts WebGPU (see
-            // auto_exec_config). This is the ATTEMPTED label; load_model's
-            // fallback rewrites the actual label to "cpu" if the EP fails.
-            #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
-            {
-                "webgpu"
-            }
-            #[cfg(all(not(target_os = "macos"), not(feature = "webgpu")))]
-            {
-                "cpu"
-            }
-            #[cfg(all(target_os = "macos", not(feature = "webgpu"), not(feature = "coreml")))]
-            {
-                "cpu"
-            }
+/// Execution provider a load attempts, after `AccelChoice` is resolved
+/// against the build and the model directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccelTarget {
+    Cpu,
+    #[cfg(feature = "coreml")]
+    CoreMl,
+    #[cfg(feature = "webgpu")]
+    WebGpu,
+}
+
+impl AccelTarget {
+    /// Stable label for the `ModelLoaded.accel` telemetry payload — kept
+    /// lowercase + ASCII for grep-friendliness.
+    fn label(self) -> &'static str {
+        match self {
+            AccelTarget::Cpu => "cpu",
+            #[cfg(feature = "coreml")]
+            AccelTarget::CoreMl => "coreml",
+            #[cfg(feature = "webgpu")]
+            AccelTarget::WebGpu => "webgpu",
         }
-        #[cfg(feature = "coreml")]
-        AccelChoice::CoreMl => "coreml",
-        #[cfg(feature = "webgpu")]
-        AccelChoice::WebGpu => "webgpu",
     }
 }
 
-/// Returns true when the model dir contains an external `.onnx.data` file
-/// AND the auto-selected accelerator would be a CoreML-style EP that
-/// stumbles on the "model_path must not be empty" partitioning bug. With
-/// the new Apple Silicon default of WebGPU, this only fires when CoreML
-/// is the only EP compiled in (legacy/fallback build) — which means the
-/// fp32 bundle on those builds keeps its CPU-only behavior.
-//
-// `needless_return` is allowed here for the same reason as `auto_exec_config`:
-// the trailing arms are mutually-exclusive `#[cfg]` blocks (only one compiled
-// per target × feature), and the early `return false` in the webgpu arm reads
-// as a clean guard. Lint-only: no runtime behavior changes.
-#[allow(clippy::needless_return)]
-fn auto_skip_due_to_external_data(model_path: &Path) -> bool {
-    if !has_external_data_file(model_path) {
-        return false;
-    }
-    // If WebGPU is compiled in, Auto will pick WebGPU over CoreML on Apple
-    // Silicon — and WebGPU is safe with external data, so don't skip.
-    #[cfg(all(target_os = "macos", feature = "webgpu"))]
-    {
-        return false;
-    }
-    #[cfg(not(all(target_os = "macos", feature = "webgpu")))]
-    {
-        // Auto would pick CoreML on Apple Silicon (legacy / no-webgpu build)
-        // OR fall through to CPU on other platforms. Keep the skip on
-        // CoreML-only Apple builds; harmless no-op elsewhere.
-        true
-    }
+/// What the accelerator decision needs to know about a model directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelDirTraits {
+    /// An external `.onnx.data` initializer is present.
+    has_external_data: bool,
+    /// The encoder graph parakeet-rs will load passes [`gpu_placement_ok`].
+    gpu_placement_ok: bool,
 }
 
-fn build_exec_config(
-    choice: AccelChoice,
-    cache_dir: Option<&Path>,
-) -> Option<parakeet_rs::ExecutionConfig> {
-    info!("parakeet accelerator choice: {:?}", choice);
-    match choice {
-        AccelChoice::Cpu => {
-            _ = cache_dir;
-            None
+impl ModelDirTraits {
+    fn inspect(model_dir: &Path) -> Self {
+        Self {
+            has_external_data: has_external_data_file(model_dir),
+            gpu_placement_ok: find_encoder_file_name(model_dir)
+                .is_some_and(|name| gpu_placement_ok(&name)),
         }
-        AccelChoice::Auto => auto_exec_config(cache_dir),
-        #[cfg(feature = "coreml")]
-        AccelChoice::CoreMl => build_coreml_config(cache_dir),
-        // Explicit opt-in (YAPSTACK_PARAKEET_ACCEL=webgpu) registers the EP
-        // strictly: if WebGPU can't initialize, session creation FAILS and
-        // the error surfaces, instead of ort silently falling back to CPU
-        // while we report accel="webgpu" — that would invalidate any
-        // GPU-vs-CPU comparison made against the label (Gate C).
-        #[cfg(feature = "webgpu")]
-        AccelChoice::WebGpu => build_webgpu_config_strict(),
     }
 }
 
-/// Apple Silicon defaults to WebGPU (Dawn → Metal). parakeet-rs's source
-/// notes that CoreML EP currently runs slower than CPU on Parakeet because
-/// the ONNX graphs have dynamic input shapes (CoreML claims the nodes but
-/// runs them on CPU with overhead), and parakeet-rs hardcodes
-/// `ComputeUnits::CPUAndGPU` rather than `CPUAndNeuralEngine` — so CoreML
-/// is not the path to ANE acceleration today. WebGPU bypasses that issue
-/// at the cost of going through Metal instead of Apple's CoreML compiler.
+/// Whether the WebGPU EP places this encoder graph's heavy (MatMul/Conv
+/// family) ops on the GPU — gate G4 is >= 90%. Placement is a property of
+/// graph × ORT build × EP, not of the user's hardware, so a table measured
+/// with `YAPSTACK_ORT_PLACEMENT=1` (ORT 1.24, the `placement` ignored test
+/// below) is the honest source. Re-measure when the graph or ORT changes.
+/// Unlisted graphs are never attempted on the GPU under Auto.
+fn gpu_placement_ok(encoder_file_name: &str) -> bool {
+    match encoder_file_name {
+        // fp32 export: MatMul 289/289 and Conv 77/77 on WebGPU (100%).
+        "encoder-model.onnx" => true,
+        // ORT *dynamic* int8: the WebGPU EP has no MatMulInteger,
+        // ConvInteger or DynamicQuantizeLinear kernels, so 294 of the 366
+        // heavy nodes run on CPU (19.7% on GPU) and every layer copies
+        // tensors across the boundary — half the speed of plain CPU.
+        "encoder-model.int8.onnx" => false,
+        _ => false,
+    }
+}
+
+/// The encoder file parakeet-rs 0.3.5 picks from a model directory: the
+/// first of its fixed candidates that exists, else the first `encoder*.onnx`
+/// (`model_tdt.rs` `find_encoder`). Mirrored so the accelerator decision is
+/// about the graph that actually loads.
+fn find_encoder_file_name(model_dir: &Path) -> Option<String> {
+    const CANDIDATES: [&str; 3] = [
+        "encoder-model.onnx",
+        "encoder.onnx",
+        "encoder-model.int8.onnx",
+    ];
+    if let Some(name) = CANDIDATES.iter().find(|c| model_dir.join(c).exists()) {
+        return Some((*name).to_string());
+    }
+    std::fs::read_dir(model_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|name| name.starts_with("encoder") && name.ends_with(".onnx"))
+}
+
+/// Resolve the user's (or Auto's) choice for this model directory.
+/// Explicit choices are honored regardless of the model: a hand-set
+/// `YAPSTACK_PARAKEET_ACCEL=webgpu` still attempts WebGPU on int8, so the
+/// two can be compared.
+fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
+    match choice {
+        AccelChoice::Auto => resolve_auto(model),
+        AccelChoice::Cpu => AccelTarget::Cpu,
+        #[cfg(feature = "coreml")]
+        AccelChoice::CoreMl => AccelTarget::CoreMl,
+        #[cfg(feature = "webgpu")]
+        AccelChoice::WebGpu => AccelTarget::WebGpu,
+    }
+}
+
+/// Apple Silicon Auto attempts WebGPU (Dawn → Metal), but only for encoder
+/// graphs that pass [`gpu_placement_ok`]; anything else runs on CPU, which
+/// is both honest and faster than a GPU session doing its heavy ops on
+/// CPU. CoreML is not the Auto path: parakeet-rs hardcodes
+/// `ComputeUnits::CPUAndGPU` and the dynamic input shapes leave the heavy
+/// ops on CPU anyway. The CoreML-only fallback build keeps skipping models
+/// with external `.onnx.data` (ORT's `model_path must not be empty` bug on
+/// CoreML partitioning; WebGPU doesn't serialize the partitioned subgraph,
+/// so it is safe with external data).
 ///
 /// Non-macOS targets (Windows/Linux) attempt WebGPU under Auto since Gate C
 /// passed (2026-07-05: the Windows canary validated WebGPU correct AND
-/// clearly faster than CPU per ADR 0004's validation gate). Registration is
-/// strict — EP-init failure surfaces through `load_model`'s explicit CPU
-/// fallback (logged, honest label) rather than ort's silent one.
+/// clearly faster than CPU per ADR 0004's validation gate).
+///
+/// Every WebGPU registration is strict, so an EP-init failure surfaces
+/// through `load_model_with`'s explicit, logged CPU fallback (honest
+/// label, `accel_fallback` reason) rather than ort's silent one.
 /// `YAPSTACK_PARAKEET_ACCEL=cpu` remains the escape hatch.
 //
-// `needless_return` is allowed here because the body is a set of
-// mutually-exclusive `#[cfg]` blocks — exactly one is compiled per target ×
-// feature combo. The early `return`s let each arm read as a self-contained
-// branch; rewriting them as a single tail expression would force an awkward
-// cfg-nested if/else that clippy can't see through anyway. Lint-only: no
-// runtime behavior changes.
+// `needless_return` is allowed because the body is a set of mutually
+// exclusive `#[cfg]` blocks — exactly one is compiled per target × feature
+// combo — and the early `return`s let each read as a self-contained arm.
 #[allow(clippy::needless_return)]
-fn auto_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionConfig> {
+fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
     #[cfg(all(target_os = "macos", feature = "webgpu"))]
     {
-        _ = cache_dir;
-        return build_webgpu_config();
+        _ = model.has_external_data;
+        return if model.gpu_placement_ok {
+            AccelTarget::WebGpu
+        } else {
+            AccelTarget::Cpu
+        };
     }
     #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
     {
-        return build_coreml_config(cache_dir);
+        _ = model.gpu_placement_ok;
+        return if model.has_external_data {
+            AccelTarget::Cpu
+        } else {
+            AccelTarget::CoreMl
+        };
     }
-    // Gate C PASSED (2026-07-05): the Windows canary judged WebGPU correct
-    // AND clearly faster than CPU, so non-macOS Auto now attempts WebGPU.
-    // STRICT registration on purpose: if the EP can't initialize (no
-    // adapter, VM, RDP, stale drivers), session creation fails and
-    // `load_model`'s explicit fallback retries CPU with a logged
-    // `live_accel_fallback` marker and an honest accel="cpu" label — no
-    // silent ort-internal fallback under a webgpu label, and no
-    // hard-broken default for GPU-less machines.
+    // Gate C measured int8 + WebGPU faster than CPU on the Windows canary,
+    // so the placement gate is not applied here; a non-macOS placement
+    // measurement is what would change that.
     #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
     {
-        _ = cache_dir;
-        return build_webgpu_config_strict();
+        _ = (model.has_external_data, model.gpu_placement_ok);
+        return AccelTarget::WebGpu;
     }
-    #[cfg(all(not(target_os = "macos"), not(feature = "webgpu")))]
+    #[cfg(not(any(
+        all(target_os = "macos", any(feature = "webgpu", feature = "coreml")),
+        all(not(target_os = "macos"), feature = "webgpu")
+    )))]
     {
-        _ = cache_dir;
-        None
+        _ = (model.has_external_data, model.gpu_placement_ok);
+        AccelTarget::Cpu
     }
-    #[cfg(all(target_os = "macos", not(feature = "webgpu"), not(feature = "coreml")))]
-    {
-        _ = cache_dir;
-        None
+}
+
+/// The parakeet-rs config for a target. `None` is parakeet-rs's default
+/// (CPU EP). A placement recorder, when given, is attached to every session
+/// on top of the target's own configuration.
+fn build_exec_config(
+    target: AccelTarget,
+    cache_dir: Option<&Path>,
+    placement: Option<&PlacementRecorder>,
+) -> Option<parakeet_rs::ExecutionConfig> {
+    info!("parakeet accelerator target: {:?}", target);
+    let config = match target {
+        AccelTarget::Cpu => {
+            _ = cache_dir;
+            None
+        }
+        #[cfg(feature = "coreml")]
+        AccelTarget::CoreMl => Some(build_coreml_config(cache_dir)),
+        #[cfg(feature = "webgpu")]
+        AccelTarget::WebGpu => Some(build_webgpu_config_strict()),
+    };
+    match placement {
+        None => config,
+        Some(recorder) => Some(with_placement_recorder(
+            config.unwrap_or_default(),
+            recorder.clone(),
+        )),
+    }
+}
+
+/// Chains the recorder after any `configure` hook the config already has
+/// (parakeet-rs keeps a single hook, so setting a second would replace it).
+fn with_placement_recorder(
+    config: parakeet_rs::ExecutionConfig,
+    recorder: PlacementRecorder,
+) -> parakeet_rs::ExecutionConfig {
+    let inner = config.configure.clone();
+    config.with_custom_configure(move |builder| {
+        let builder = match inner.as_ref() {
+            Some(configure) => configure(builder)?,
+            None => builder,
+        };
+        recorder.attach(builder)
+    })
+}
+
+/// One `ort_placement` line per loaded session (encoder, then
+/// decoder_joint), for the opt-in diagnostics.
+fn log_placement(loaded: AccelTarget, sessions: &[SessionPlacement]) {
+    const SESSION_NAMES: [&str; 2] = ["encoder", "decoder_joint"];
+    let ep = ort_placement::ort_ep_name(loaded.label());
+    for (i, s) in sessions.iter().enumerate() {
+        info!(
+            marker = "ort_placement",
+            session = SESSION_NAMES.get(i).copied().unwrap_or("other"),
+            ep = loaded.label(),
+            heavy_on_ep = %s.heavy_on_label(ep),
+            cpu_nodes = s.nodes_by_ep.get("CPUExecutionProvider").copied().unwrap_or(0),
+            nodes_by_ep = ?s.nodes_by_ep,
+            heavy_by_ep = ?s.heavy_by_ep,
+            "ort node placement"
+        );
+    }
+}
+
+/// One silent second through the full pipeline right after load, so the
+/// first real chunk doesn't pay the cold-start cost (allocator arenas,
+/// WebGPU pipeline compilation): measured cold runs on WebGPU were up to
+/// ~45% slower than steady state. A failure is only logged — a broken model surfaces on the
+/// first real transcribe with its own error.
+fn warm_up(model: &mut ParakeetTDT) {
+    let start = std::time::Instant::now();
+    let silence = vec![0.0_f32; PARAKEET_SAMPLE_RATE as usize];
+    match model.transcribe_samples(silence, PARAKEET_SAMPLE_RATE, 1, Some(TimestampMode::Words)) {
+        Ok(_) => info!(
+            "parakeet warmup inference in {} ms",
+            start.elapsed().as_millis()
+        ),
+        Err(e) => warn!("parakeet warmup inference failed: {e}"),
     }
 }
 
 #[cfg(feature = "coreml")]
-fn build_coreml_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionConfig> {
+fn build_coreml_config(cache_dir: Option<&Path>) -> parakeet_rs::ExecutionConfig {
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
     let mut cfg = ExecutionConfig::default().with_execution_provider(ExecutionProvider::CoreML);
     if let Some(dir) = cache_dir {
@@ -488,51 +596,34 @@ fn build_coreml_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::Executio
     } else {
         info!("CoreML enabled, no cache dir provided — recompile cost on every spawn");
     }
-    Some(cfg)
+    cfg
 }
 
-// Gated to macOS because its only caller is auto_exec_config's macOS arm —
-// every other path (explicit opt-in, non-macOS Auto) uses the strict
-// variant below.
-#[cfg(all(feature = "webgpu", target_os = "macos"))]
-fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
-    use parakeet_rs::{ExecutionConfig, ExecutionProvider};
-    // Dawn drives the WebGPU EP: Metal on macOS, Vulkan/D3D12 on Windows/Linux.
-    // SOFT registration (parakeet-rs registers the EP without
-    // error_on_failure): if WebGPU can't initialize, ort silently falls
-    // back to CPU. Kept for the macOS Auto path where that is the shipping
-    // behavior; the accel label can overreport on that path. The explicit
-    // opt-in routes through build_webgpu_config_strict instead.
-    info!("WebGPU EP requested (Dawn → Metal on macOS, Vulkan/D3D12 elsewhere)");
-    Some(ExecutionConfig::default().with_execution_provider(ExecutionProvider::WebGPU))
-}
-
-/// Strict WebGPU registration for the explicit opt-in: the EP carries
-/// `error_on_failure`, so an unavailable adapter/driver fails session
-/// creation loudly instead of silently degrading to CPU. parakeet-rs's own
-/// WebGPU arm registers the EP soft, so we pass `Cpu` (a no-op arm) and
-/// register providers ourselves via the `configure` hook, which parakeet-rs
-/// applies after its own arm. CPU stays registered AFTER WebGPU as the
-/// per-node fallback for ops the EP doesn't implement — node placement
-/// within a working GPU session, not session-level fallback. Memory
-/// patterns are disabled per WebGPU-EP guidance for dynamic input shapes
-/// (the TDT transducer reshapes every chunk).
+/// Strict WebGPU registration (Dawn → Metal on macOS, Vulkan/D3D12
+/// elsewhere): the EP carries `error_on_failure`, so an unavailable
+/// adapter/driver fails session creation loudly instead of silently
+/// degrading to CPU under a `webgpu` label. parakeet-rs's own WebGPU arm
+/// registers the EP soft, so we pass `Cpu` (a no-op arm) and register
+/// providers ourselves via the `configure` hook, which parakeet-rs applies
+/// after its own arm. CPU stays registered AFTER WebGPU as the per-node
+/// fallback for ops the EP doesn't implement — node placement within a
+/// working GPU session, not session-level fallback. Memory patterns are
+/// disabled per WebGPU-EP guidance for dynamic input shapes (the TDT
+/// transducer reshapes every chunk).
 #[cfg(feature = "webgpu")]
-fn build_webgpu_config_strict() -> Option<parakeet_rs::ExecutionConfig> {
+fn build_webgpu_config_strict() -> parakeet_rs::ExecutionConfig {
     use parakeet_rs::{ExecutionConfig, ExecutionProvider};
     info!("WebGPU EP requested (strict: registration failure is a hard error)");
-    Some(
-        ExecutionConfig::default()
-            .with_execution_provider(ExecutionProvider::Cpu)
-            .with_custom_configure(|builder| {
-                Ok(builder
-                    .with_memory_pattern(false)?
-                    .with_execution_providers([
-                        ort::ep::WebGPU::default().build().error_on_failure(),
-                        ort::ep::CPU::default().build().error_on_failure(),
-                    ])?)
-            }),
-    )
+    ExecutionConfig::default()
+        .with_execution_provider(ExecutionProvider::Cpu)
+        .with_custom_configure(|builder| {
+            Ok(builder
+                .with_memory_pattern(false)?
+                .with_execution_providers([
+                    ort::ep::WebGPU::default().build().error_on_failure(),
+                    ort::ep::CPU::default().build().error_on_failure(),
+                ])?)
+        })
 }
 
 fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegment]) {
@@ -723,5 +814,179 @@ mod tests {
         let mut segs = vec![ts(0, 1000), ts(1000, 2000)];
         assign_speakers(&mut segs, &[]);
         assert!(segs.iter().all(|s| s.speaker_id.is_none()));
+    }
+
+    // --- accelerator resolution ---
+
+    /// A throwaway model dir holding empty files with the given names.
+    fn model_dir(tag: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "yapstack-parakeet-accel-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        dir
+    }
+
+    const INT8_FILES: [&str; 4] = [
+        "encoder-model.int8.onnx",
+        "decoder_joint-model.int8.onnx",
+        "nemo128.onnx",
+        "vocab.txt",
+    ];
+    const FP32_FILES: [&str; 4] = [
+        "encoder-model.onnx",
+        "encoder-model.onnx.data",
+        "decoder_joint-model.onnx",
+        "vocab.txt",
+    ];
+
+    #[test]
+    fn gpu_placement_table_rejects_dynamic_int8_and_unknown_graphs() {
+        assert!(gpu_placement_ok("encoder-model.onnx"));
+        assert!(!gpu_placement_ok("encoder-model.int8.onnx"));
+        assert!(!gpu_placement_ok("encoder-model.somethingelse.onnx"));
+    }
+
+    #[test]
+    fn finds_the_encoder_parakeet_rs_would_load() {
+        let int8 = model_dir("find-int8", &INT8_FILES);
+        assert_eq!(
+            find_encoder_file_name(&int8).as_deref(),
+            Some("encoder-model.int8.onnx")
+        );
+        // The fixed candidates win over the fallback scan, in order.
+        let both = model_dir(
+            "find-both",
+            &["encoder-model.int8.onnx", "encoder-model.onnx"],
+        );
+        assert_eq!(
+            find_encoder_file_name(&both).as_deref(),
+            Some("encoder-model.onnx")
+        );
+        let other = model_dir("find-other", &["encoder-model.fp16.onnx"]);
+        assert_eq!(
+            find_encoder_file_name(&other).as_deref(),
+            Some("encoder-model.fp16.onnx")
+        );
+        assert_eq!(find_encoder_file_name(&model_dir("find-none", &[])), None);
+    }
+
+    #[test]
+    fn inspects_model_dir_traits() {
+        assert_eq!(
+            ModelDirTraits::inspect(&model_dir("traits-int8", &INT8_FILES)),
+            ModelDirTraits {
+                has_external_data: false,
+                gpu_placement_ok: false,
+            }
+        );
+        assert_eq!(
+            ModelDirTraits::inspect(&model_dir("traits-fp32", &FP32_FILES)),
+            ModelDirTraits {
+                has_external_data: true,
+                gpu_placement_ok: true,
+            }
+        );
+    }
+
+    const INT8: ModelDirTraits = ModelDirTraits {
+        has_external_data: false,
+        gpu_placement_ok: false,
+    };
+    const FP32: ModelDirTraits = ModelDirTraits {
+        has_external_data: true,
+        gpu_placement_ok: true,
+    };
+
+    #[test]
+    fn explicit_cpu_is_cpu_for_every_model() {
+        for model in [INT8, FP32] {
+            assert_eq!(resolve_accel(AccelChoice::Cpu, model).label(), "cpu");
+        }
+    }
+
+    /// The shipped int8 runs its quantized ops on CPU under WebGPU, at half
+    /// plain-CPU speed — so macOS Auto resolves it to CPU and says so.
+    #[cfg(all(target_os = "macos", feature = "webgpu"))]
+    #[test]
+    fn macos_auto_resolves_int8_to_cpu_and_fp32_to_webgpu() {
+        assert_eq!(resolve_accel(AccelChoice::Auto, INT8), AccelTarget::Cpu);
+        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "cpu");
+        assert_eq!(resolve_accel(AccelChoice::Auto, FP32).label(), "webgpu");
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
+    #[test]
+    fn non_macos_auto_keeps_attempting_webgpu() {
+        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "webgpu");
+    }
+
+    #[cfg(not(feature = "webgpu"))]
+    #[test]
+    fn auto_without_webgpu_never_claims_webgpu() {
+        for model in [INT8, FP32] {
+            assert_ne!(resolve_accel(AccelChoice::Auto, model).label(), "webgpu");
+        }
+    }
+
+    /// An explicit opt-in is honored even for int8, so GPU-vs-CPU can still
+    /// be compared on purpose.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn explicit_webgpu_is_honored_for_int8() {
+        assert_eq!(resolve_accel(AccelChoice::WebGpu, INT8).label(), "webgpu");
+    }
+
+    /// WebGPU must never take parakeet-rs's soft arm (silent CPU fallback
+    /// under a webgpu label): the config passes the no-op `Cpu` arm and
+    /// registers WebGPU strictly through the configure hook.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn webgpu_config_registers_the_ep_strictly() {
+        let cfg = build_exec_config(AccelTarget::WebGpu, None, None).expect("config");
+        assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
+        assert!(cfg.configure.is_some());
+    }
+
+    #[test]
+    fn cpu_config_is_parakeet_default_unless_recording_placement() {
+        assert!(build_exec_config(AccelTarget::Cpu, None, None).is_none());
+        let recorder = PlacementRecorder::default();
+        let cfg = build_exec_config(AccelTarget::Cpu, None, Some(&recorder)).expect("config");
+        assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
+        assert!(cfg.configure.is_some());
+    }
+
+    /// Gate G4 on a real model: the EP Auto reports must hold >= 90% of the
+    /// encoder's MatMul/Conv-family nodes. Red for int8 under the old
+    /// "always WebGPU" Auto (19.7%); green for int8 → CPU and fp32 → WebGPU.
+    #[test]
+    #[ignore = "needs YAPSTACK_TEST_PARAKEET_DIR set to a downloaded Parakeet model dir"]
+    fn auto_places_heavy_ops_on_the_reported_ep() {
+        let dir =
+            std::env::var("YAPSTACK_TEST_PARAKEET_DIR").expect("set YAPSTACK_TEST_PARAKEET_DIR");
+        let mut backend = ParakeetBackend::new(None, None);
+        let sessions = backend
+            .load_model_with(
+                Path::new(&dir),
+                AccelChoice::Auto,
+                Some(PlacementRecorder::default()),
+            )
+            .expect("model loads");
+        let reported = backend.engine_info().expect("engine info").accel;
+        let ep = ort_placement::ort_ep_name(&reported);
+        let encoder = sessions.first().expect("encoder placement recorded");
+        let share = encoder.heavy_share(ep);
+        assert!(
+            share >= 0.90,
+            "reported {reported} but only {:.1}% of MatMul/Conv nodes placed there: {:?}",
+            100.0 * share,
+            encoder.heavy_by_ep
+        );
     }
 }

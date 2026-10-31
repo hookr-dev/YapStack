@@ -14,6 +14,8 @@ use yapstack_common::types::TranscriptSegment;
 pub mod whisper;
 
 #[cfg(feature = "parakeet")]
+pub mod ort_placement;
+#[cfg(feature = "parakeet")]
 pub mod parakeet;
 
 /// Per-request transcription options. Engines ignore options they don't
@@ -74,6 +76,10 @@ pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String
 pub struct EngineInfo {
     pub accel: String,
     pub model_dir: String,
+    /// Why the attempted accelerator failed to load, when the load fell
+    /// back to CPU. `None` when the attempted EP loaded, or when CPU was
+    /// the resolved choice in the first place.
+    pub accel_fallback: Option<String>,
 }
 
 /// What every transcription backend must implement. Engine-specific
