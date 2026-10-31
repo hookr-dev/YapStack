@@ -71,6 +71,7 @@ fn main() {
     // silently ignored and a stale `libcrsql_bundle_static.a` would be relinked.
     for dir in [
         vendor_core.join("rs/core/src"),
+        vendor_core.join("rs/bundle/src"),
         vendor_core.join("rs/sqlite-rs-embedded/sqlite3_capi/src"),
         vendor_core.join("rs/sqlite-rs-embedded/sqlite_nostd/src"),
     ] {

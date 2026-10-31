@@ -8,7 +8,9 @@ on:
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  # Supersede stale PR runs only; every push to main runs to completion so its
+  # result is recorded for that commit (release.yml checks it before building).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
