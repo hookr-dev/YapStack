@@ -13,7 +13,18 @@ updates:
       - rust
     commit-message:
       prefix: "chore(cargo)"
+    ignore:
+      # ONNX Runtime bindings are on release candidates whose "patch" bumps break the
+      # API (rc.12 -> rc.14 broke silero's session builder). The transcription sidecar
+      # pins ort exactly; upgrade ort and silero together, deliberately, by hand.
+      - dependency-name: "ort"
+      - dependency-name: "silero"
     groups:
+      # sha2 and hmac share the `digest` trait version, so they must move together.
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
       cargo-minor-and-patch:
         applies-to: version-updates
         update-types:
@@ -53,3 +64,7 @@ updates:
       - github-actions
     commit-message:
       prefix: "chore(actions)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

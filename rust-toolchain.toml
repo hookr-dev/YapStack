@@ -1,3 +1,7 @@
 [toolchain]
-channel = "stable"
+# Pinned so CI and local builds use the same compiler; bump deliberately in its own PR
+# (new releases routinely add clippy lints, which CI runs with -D warnings).
+# The vendored cr-sqlite bundle builds separately with its own pinned nightly
+# (vendor/cr-sqlite/core/rs/bundle_static/rust-toolchain.toml).
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]

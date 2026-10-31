@@ -6,9 +6,10 @@ How to cut and ship a YapStack release. Owned end-to-end by a maintainer with ac
 
 A release is a git tag of the form `vX.Y.Z` (or `vX.Y.Z-prerelease`) on `main`. Pushing the tag triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml), which:
 
-1. Builds the macOS Apple Silicon target with code signing + notarization.
-2. Generates `latest.json` (Tauri auto-updater manifest) referencing the signed `.app.tar.gz`.
-3. Creates a **draft** GitHub Release with the DMG, the updater bundle + minisign signature, `latest.json`, and SHA-256 checksums attached.
+1. Waits for the CI Quality Checks (Rust Format, Rust macOS, Rust Windows, Frontend) on the tagged commit and stops the release unless all of them passed. The tag must point at a commit that was pushed to `main`.
+2. Builds the macOS Apple Silicon target with code signing + notarization, and the Windows x64 NSIS installer. Both include the `sync` feature.
+3. Generates `latest.json` (Tauri auto-updater manifest) referencing the signed macOS and Windows updater bundles.
+4. Creates a **draft** GitHub Release with the DMG, the Windows installer, the updater bundles + minisign signatures, `latest.json`, and SHA-256 checksums attached.
 
 The draft is the maintainer's last review gate. Nothing ships to existing installs until the draft is published — `latest.json` only gets served from the release URL once the draft is no longer a draft.
 
@@ -35,7 +36,7 @@ When bumping the release version, edit all of:
 
 This is the path used for every release the project has shipped so far. PR title convention is `chore: prepare vX.Y.Z` (see commits `8891757`, `e302676`, `709ceee`, `5205d8a` for prior cuts).
 
-1. **Confirm `main` is green.** `git pull origin main && pnpm check` must pass locally. Don't skip — the release workflow doesn't re-run `pnpm check`.
+1. **Confirm `main` is green.** Check that CI passed on the `main` commit you will tag (the release workflow refuses to build otherwise), then `git pull origin main && pnpm check` locally. CI doesn't cover everything `pnpm check` does on your machine, so run both.
 2. **Create the prep branch.** `git checkout -b chore/prepare-vX.Y.Z`.
 3. **Bump the version files** (table above). Run `cargo build -p yapstack-desktop` once to let `Cargo.lock` regenerate.
 4. **Roll the CHANGELOG.**
@@ -89,9 +90,18 @@ Don't skip these — the auto-updater silently pushes whatever `latest.json` ref
 - **Never delete a published tag.** Even a withdrawn release keeps its tag for forensic history. Deleting tags breaks `git describe`, the changelog cross-references, and confuses anyone bisecting an issue.
 - **Never `git push --force` to `main`** as part of a release.
 
+## Canary and test builds
+
+Two manual workflows produce installers without cutting a release:
+
+- **Release → Run workflow** on a branch builds only the Windows installer (the Windows canary).
+- **Sync Test Build → Run workflow** builds macOS and/or Windows from any ref.
+
+Both run in the `canary` environment, **without** the Tauri updater signing key, and pass `--config src-tauri/tauri.no-updater.conf.json` so no updater artifacts are produced. Install them by hand; they can't be served to existing installs. A signed + notarized macOS test build (`mac_signed`) needs the `release` environment, so it only runs from refs that environment allows.
+
 ## Required secrets
 
-Configured on the `release` GitHub Actions environment. Do not commit these or echo them in build logs.
+Configured as **environment secrets on the `release` GitHub Actions environment**, not as repository secrets: repository secrets are readable by every workflow on every branch. Restrict the environment's deployment refs to `main` and `v*` tags. Do not commit these or echo them in build logs.
 
 | Secret | Purpose |
 |---|---|
@@ -103,7 +113,7 @@ Configured on the `release` GitHub Actions environment. Do not commit these or e
 | `APPLE_TEAM_ID` | Apple Developer team ID |
 | `TAURI_SIGNING_PRIVATE_KEY` | Tauri minisign **private** key (paired with the public key in `tauri.conf.json`) |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the minisign private key |
-| `APTABASE_KEY` | Analytics key embedded in the build |
+| `APTABASE_KEY` | Analytics key embedded in the build. Canary and test builds use it too, so it can stay a repository secret. |
 
 If any of these are unset or invalid, the workflow will fail at the signing or notarization step. The fix is in repo settings — not in the workflow file.
 
