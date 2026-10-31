@@ -5,6 +5,7 @@ import { Copy, Eye, EyeOff, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import type { DbSegment } from "@/lib/db";
 import { segmentsToAttributedMarkdown } from "@/lib/export";
+import { speakersFromNames } from "@/lib/speakers";
 import { trackTranscriptExported } from "@/lib/analytics";
 
 export function BulkActionsBar({
@@ -30,7 +31,10 @@ export function BulkActionsBar({
   const ids = selected.map((s) => s.id);
 
   const handleCopy = async () => {
-    const text = segmentsToAttributedMarkdown(selected);
+    const speakers = speakersFromNames(
+      useAppStore.getState().settings.speakerNames[selected[0].session_id],
+    );
+    const text = segmentsToAttributedMarkdown(selected, { speakers });
     if (text.length === 0) {
       toast.info("Nothing to copy");
       return;

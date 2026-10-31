@@ -31,6 +31,7 @@ import {
   getSession,
 } from "@/lib/db";
 import { segmentsToAttributedMarkdown, segmentsForSpeaker } from "@/lib/export";
+import { speakersFromNames } from "@/lib/speakers";
 import { exportTranscriptToFile } from "@/lib/transcript-export";
 import { trackTranscriptExported } from "@/lib/analytics";
 import { formatDuration, formatElapsed } from "@/lib/utils";
@@ -164,6 +165,7 @@ export function SessionHeader({
   const sessionFolderMap = useAppStore((s) => s.sessionFolderMap);
   const toggleSessionFolder = useAppStore((s) => s.toggleSessionFolder);
   const removeSessionFromAllFolders = useAppStore((s) => s.removeSessionFromAllFolders);
+  const speakerNames = useAppStore((s) => s.settings.speakerNames[session.id]);
 
   const sessionFolderIds = sessionFolderMap[session.id] ?? [];
   const inAnyFolder = sessionFolderIds.length > 0;
@@ -174,6 +176,7 @@ export function SessionHeader({
 
   // Hidden segments are excluded from copy/export.
   const exportable = segments.filter((s) => s.hidden === 0);
+  const speakers = speakersFromNames(speakerNames);
   const micCount = exportable.filter((s) => s.source === "Mic").length;
   const systemCount = exportable.filter((s) => s.source === "System").length;
   const hasMic = micCount > 0;
@@ -467,7 +470,7 @@ export function SessionHeader({
                   <DropdownMenuItem
                     onClick={() =>
                       copyTranscript(
-                        segmentsToAttributedMarkdown(exportable),
+                        segmentsToAttributedMarkdown(exportable, { speakers }),
                         "full",
                         "Copied transcript",
                       )
@@ -510,7 +513,7 @@ export function SessionHeader({
                   <DropdownMenuItem
                     onClick={() =>
                       exportTranscript(
-                        segmentsToAttributedMarkdown(exportable),
+                        segmentsToAttributedMarkdown(exportable, { speakers }),
                         "full",
                         `${exportBaseName}.md`,
                       )

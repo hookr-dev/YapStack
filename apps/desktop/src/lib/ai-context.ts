@@ -32,6 +32,7 @@ import type { FolderContextLayer } from "./ai-prompts";
 import type { ToolContext } from "./ai-tools";
 import type { ActionDefinition } from "./ai-actions";
 import { getFolderPath, buildFolderTree } from "./folder-tree";
+import { speakersFromNames } from "./speakers";
 
 export type ListChatContext = Exclude<ChatContext, { type: "session" }>;
 
@@ -95,7 +96,7 @@ export function createSessionSources(
       assembler: async () => {
         const segments = await getSessionSegments(sessionId);
         const state = useAppStore.getState();
-        const speakerNames = state.settings.speakerNames[sessionId];
+        const speakers = speakersFromNames(state.settings.speakerNames[sessionId]);
         // When the user has an active segment selection, scope the
         // transcript context to just those segments. Selection is global
         // in the store but is reset on session change, so any non-empty
@@ -105,7 +106,7 @@ export function createSessionSources(
           selected.size > 0
             ? segments.filter((s) => selected.has(s.id))
             : segments;
-        return assembleTranscriptContext(scoped, speakerNames);
+        return assembleTranscriptContext(scoped, speakers);
       },
     });
   }
