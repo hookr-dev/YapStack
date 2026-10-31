@@ -87,7 +87,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 ## What good agent output looks like here
 
 - Reads the **smallest** relevant slice of code to make a confident change.
-- Runs `pnpm check` (or the targeted subset) before claiming done.
+- Runs `pnpm check` (or the targeted subset) before claiming done, and reads any `cfg(windows)` code it touched, since only CI compiles it.
 - Updates `CHANGELOG.md` for user-visible changes.
 - Adds or updates tests for behaviour changes.
 - Writes a tight commit subject + a *why* in the body when non-obvious.
@@ -99,7 +99,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 - Loading the whole codebase before starting.
 - Writing comments that restate code (`// increment counter`).
 - Adding "future-proofing" abstractions for problems we don't have.
-- Skipping tests.
+- Skipping tests, or making CI pass by adding sleeps, retries, or `#[ignore]`.
 - Editing `apps/desktop/src/lib/tauri.ts` by hand.
 - Force-pushing without explicit per-action user confirmation.
 - Committing `.env`, model files, or anything else `.gitignore` would have caught.

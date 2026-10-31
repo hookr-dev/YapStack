@@ -12,7 +12,7 @@ pnpm tauri dev          # full app
 pnpm check              # gate command — must pass before opening a PR
 ```
 
-Prerequisites: Rust ≥ 1.77.2 ([rustup](https://rustup.rs)), Node.js ≥ 22, pnpm (`corepack enable && corepack prepare pnpm@latest-10 --activate`), cmake (only if building with the `whisper` feature flag).
+Prerequisites: Rust per [`rust-toolchain.toml`](rust-toolchain.toml) (installed automatically by [rustup](https://rustup.rs)), Node.js 24, pnpm (`corepack enable && corepack prepare pnpm@latest-10 --activate`), cmake (only if building with the `whisper` feature flag).
 
 ## Where to start
 
@@ -38,7 +38,7 @@ Prerequisites: Rust ≥ 1.77.2 ([rustup](https://rustup.rs)), Node.js ≥ 22, pn
 1. **Fork** the repo (once we're public).
 2. **Branch** from `main`. Naming: `feat/<short-name>`, `fix/<short-name>`, `chore/<short-name>`, `refactor/<short-name>`, `docs/<short-name>`.
 3. **Make one focused change.** One logical change per PR.
-4. **Run `pnpm check` locally** before opening the PR. CI runs the same suite on macOS only.
+4. **Run `pnpm check` locally** before opening the PR. CI additionally runs the Rust checks on Windows; see [`AGENTS.md` § Keeping CI green](AGENTS.md#keeping-ci-green).
 5. **Update [`CHANGELOG.md`](CHANGELOG.md)** under `## [Unreleased]` if your change is user-visible. See [`AGENTS.md` § Changelog discipline](AGENTS.md#changelog-discipline) for what counts.
 6. **Open the PR.** The template will prompt for summary, motivation, and a test plan.
 
@@ -125,12 +125,12 @@ Full command list: [`AGENTS.md` § Build & test commands](AGENTS.md#build--test-
 - New features that don't introduce another transcription engine, audio backend, or LLM provider abstraction.
 - Performance improvements with `live_pressure` telemetry showing the win.
 - Doc improvements that follow the established structure.
-- Platform-support fixes for macOS Apple Silicon (primary), Intel Macs (best-effort).
+- Platform-support fixes for macOS Apple Silicon and Windows x64 (supported) and Intel Macs (best-effort).
 
 **Won't**:
 - New transcription engines without an [ADR](docs/adr/) demonstrating why Whisper + Parakeet aren't enough.
 - New abstraction layers ("provider interface", "engine plugin system") for hypothetical future engines.
-- Windows or Linux platform-support PRs that break macOS. Local Windows builds are tolerated; official Windows support is a future-release concern.
+- Platform-specific changes that break another supported platform. Linux desktop support isn't a target yet.
 - Changes that touch the Tauri minisign **public key** in `tauri.conf.json` — breaks every existing install's auto-updater.
 
 ## Reporting security issues
