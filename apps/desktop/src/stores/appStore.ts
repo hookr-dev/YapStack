@@ -610,6 +610,11 @@ interface AppState {
     engine: EngineKindDto;
     accel: string | null;
     modelDir: string | null;
+    /// Reason the attempted accelerator failed, when `accel` is a CPU
+    /// fallback; null otherwise.
+    accelFallback: string | null;
+    /// The GPU EP leaves part of the model's heavy ops on the CPU.
+    accelPartial: boolean;
   } | null;
 
   // Setters (called by event listeners)
