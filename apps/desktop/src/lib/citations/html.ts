@@ -7,8 +7,9 @@ import {
   toPillHtml,
 } from "./render";
 
-// Text in these is shown literally (code) or already a reference (pills).
-const SKIP_TEXT_IN = "code, pre, [data-segment-ref]";
+// Text in these is shown literally (code), is already a reference (pills),
+// or can't hold a pill (a pill nested in a link is invalid UI).
+const SKIP_TEXT_IN = "code, pre, a, [data-segment-ref]";
 const PILL = "span[data-segment-ref]";
 
 /**
@@ -55,10 +56,11 @@ export function hasUnconvertedCitations(html: string): boolean {
 
 /**
  * Convert citation markers in stored note HTML into pills, and re-resolve
- * pending pills whose segment now exists. A marker that doesn't resolve is
- * kept as a pending pill, never removed. Text in code, `pre` and existing
- * pills is left alone, as are attribute values. Returns `html` itself when
- * nothing changed, so callers can compare to decide whether to persist.
+ * pending pills whose segment now exists. An ID-shaped marker that doesn't
+ * resolve is kept as a pending pill, never removed. Text in code, `pre`,
+ * links and existing pills is left alone, as are attribute values. Returns
+ * `html` itself when nothing changed, so callers can compare to decide
+ * whether to persist.
  */
 export function convertCitationsInHtml(
   html: string,

@@ -386,7 +386,7 @@ describe("AIChatMessage", () => {
         <AIChatMessage
           message={makeMessage({
             role: "assistant",
-            content: "See [[seg:missing-id]] here",
+            content: "See [[seg:ffffff00]] here",
           })}
           segments={[makeSegment()]}
           onCitationClick={vi.fn()}

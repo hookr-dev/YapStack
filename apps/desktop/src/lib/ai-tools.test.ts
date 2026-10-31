@@ -78,11 +78,11 @@ describe("convertCitationsToSegmentRefs", () => {
 
   it("keeps an unmatched citation as an unlabelled pending pill, never a hex label", () => {
     const result = convertCitationsToSegmentRefs(
-      "See [[seg:unknown123]] here",
+      "See [[seg:ffff0000aaaa]] here",
       [makeSegment({ id: "abc123", audio_offset_seconds: 5 })],
     );
     expect(result).toBe(
-      'See <span data-segment-ref="" data-segment-id="unknown123" data-timestamp="" data-offset="0"></span> here',
+      'See <span data-segment-ref="" data-segment-id="ffff0000aaaa" data-timestamp="" data-offset="0"></span> here',
     );
   });
 

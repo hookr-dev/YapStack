@@ -59,9 +59,23 @@ export interface SplitResult {
   invalidCount: number;
 }
 
-// A token that still carries what the model wrote: an ID, or a timestamp.
+const ID_SHAPED = /^[0-9a-f][0-9a-f-]{5,}$/i;
+
+// Worth a pending pill: clearly a citation to something, i.e. a timestamp or
+// an ID-shaped value (6+ hex characters, or a UUID).
 function isKeepable(token: CitationToken): boolean {
-  return token.kind === "time" || token.segmentId !== "";
+  return token.kind === "time" || ID_SHAPED.test(token.segmentId);
+}
+
+// Not a citation at all: a word with no digits (`[seg: intro]`). Left as
+// literal text rather than removed or kept as a pill.
+function isLiteral(token: CitationToken): boolean {
+  return (
+    token.kind === "segment" &&
+    token.segmentId !== "" &&
+    !/\d/.test(token.segmentId) &&
+    !ID_SHAPED.test(token.segmentId)
+  );
 }
 
 /**
@@ -96,19 +110,21 @@ export function splitCitations(
   for (const run of runs) {
     const seen = new Set<string>();
     const rendered: CitationPart[] = [];
-    for (const token of run.tokens) {
-      const ref = index ? resolveCitation(token, index) : null;
+    const refs = run.tokens.map((t) => (index ? resolveCitation(t, index) : null));
+    if (run.tokens.every((t, i) => !refs[i] && isLiteral(t))) continue;
+    run.tokens.forEach((token, i) => {
+      const ref = refs[i];
       if (!ref) {
         invalidCount++;
         if (keepUnresolved && isKeepable(token)) {
           rendered.push({ kind: "unresolved", token });
         }
-        continue;
+        return;
       }
-      if (seen.has(ref.segmentId)) continue;
+      if (seen.has(ref.segmentId)) return;
       seen.add(ref.segmentId);
       rendered.push({ kind: "ref", ref });
-    }
+    });
 
     let before = text.slice(cursor, run.start);
     let end = run.end;

@@ -136,7 +136,7 @@ describe("render", () => {
 
   it("rewrites resolved markers and drops the rest with their space", () => {
     const result = rewriteCitations(
-      "One [[seg:89ea3e1d]]. Two [[seg:nope]]. Three [[seg:17:05]].",
+      "One [[seg:89ea3e1d]]. Two [[seg:ffffff00]]. Three [[seg:17:05]].",
       index,
       toPlainLabel,
     );
@@ -148,7 +148,7 @@ describe("render", () => {
 
   it("strips the following space for a dropped marker at line start", () => {
     expect(
-      rewriteCitations("[[seg:nope]] Leading\n[[seg:nope]] Next", index, toPlainLabel).text,
+      rewriteCitations("[[seg:ffffff00]] Leading\n[[seg:ffffff00]] Next", index, toPlainLabel).text,
     ).toBe("Leading\nNext");
   });
 
@@ -196,6 +196,25 @@ describe("pending pills", () => {
     expect(
       splitCitations("x [[seg:]] y", index, { keepUnresolved: true }).parts,
     ).toEqual([{ kind: "text", text: "x y" }]);
+  });
+
+  it.each([
+    ["no id-shaped value", "See [seg: intro] here", "See [seg: intro] here"],
+    ["a word id", "See [[seg:overview]] here", "See [[seg:overview]] here"],
+  ])("keeps %s as literal text", (_label, html, expected) => {
+    expect(convertCitationsInHtml(`<p>${html}</p>`, index)).toBe(`<p>${expected}</p>`);
+    expect(rewriteCitations(html, index, toPlainLabel).text).toBe(expected);
+  });
+
+  it("drops a short hex fragment instead of keeping a pending pill", () => {
+    expect(convertCitationsInHtml("<p>x [[seg:48e2...]].</p>", index)).toBe(
+      "<p>x.</p>",
+    );
+  });
+
+  it("leaves citations inside link text literal", () => {
+    const html = `<p><a href="https://x.test">see [[seg:${A.id}]]</a></p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(html);
   });
 
   it("finds nothing to convert in plain notes", () => {
