@@ -19,6 +19,7 @@ const {
   clearChatContextProfileMock,
   resolveAndCreateClientMock,
   streamChatWithToolsMock,
+  executeToolMock,
 } = vi.hoisted(() => ({
   getChatMessagesMock: vi.fn(),
   insertChatMessageMock: vi.fn(),
@@ -26,6 +27,7 @@ const {
   clearChatContextProfileMock: vi.fn(),
   resolveAndCreateClientMock: vi.fn(),
   streamChatWithToolsMock: vi.fn(),
+  executeToolMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
@@ -65,6 +67,12 @@ vi.mock("@/lib/ai", async () => {
     resolveAndCreateClient: resolveAndCreateClientMock,
     streamChatWithTools: streamChatWithToolsMock,
   };
+});
+
+vi.mock("@/lib/ai-tools", async () => {
+  const actual =
+    await vi.importActual<typeof import("@/lib/ai-tools")>("@/lib/ai-tools");
+  return { ...actual, executeTool: executeToolMock };
 });
 
 import { useAppStore } from "@/stores/appStore";
@@ -162,5 +170,62 @@ describe("chat-bar sends without a usable override fall back per usage", () => {
     getChatContextProfileIdMock.mockResolvedValue("p-deleted");
     expect(await send("summarize")).toBe("p-actions-default");
     expect(clearChatContextProfileMock).toHaveBeenCalledWith("s1");
+  });
+});
+
+describe("Summarize's title, tag and folder tool rounds", () => {
+  it("every round runs on the picked Profile's client and model", async () => {
+    const pickedClient = { tag: "client-for-p-picked" };
+    resolveAndCreateClientMock.mockImplementation(
+      (cfg: AIConfig, id: string | null) => ({
+        client: id === "p-picked" ? pickedClient : { tag: `client-for-${id}` },
+        model: cfg.profiles.find((p) => p.id === id)?.model ?? "?",
+      }),
+    );
+    executeToolMock.mockResolvedValue({ name: "x", detail: "done" });
+    const rounds = [
+      [
+        { id: "t1", name: "update_title", arguments: { title: "Standup" } },
+        { id: "t2", name: "tag_session", arguments: { tags: ["team"] } },
+      ],
+      [{ id: "t3", name: "add_session_to_folder", arguments: { folder_id: "f1" } }],
+    ];
+    let call = 0;
+    streamChatWithToolsMock.mockImplementation(async function* () {
+      const calls = rounds[call++];
+      if (calls) {
+        yield { type: "tool_calls", calls };
+      } else {
+        yield { type: "token", content: "summary" };
+      }
+      yield { type: "done" };
+    });
+
+    const ctx = makeCtx();
+    (ctx as unknown as { tools: unknown }).tools = {
+      availableToolIds: ["update_title", "tag_session", "add_session_to_folder"],
+      getToolContext: vi.fn().mockResolvedValue({}),
+    };
+    const { result } = renderHook(() =>
+      useChatMessages(ctx, "", vi.fn(), [], vi.fn()),
+    );
+    await waitFor(() => expect(getChatMessagesMock).toHaveBeenCalled());
+    await act(async () => {
+      await result.current.handleSend(getAction("summarize"));
+    });
+
+    expect(resolveAndCreateClientMock).toHaveBeenCalledTimes(1);
+    expect(resolveAndCreateClientMock.mock.calls[0][1]).toBe("p-picked");
+    expect(executeToolMock.mock.calls.map((c) => c[0])).toEqual([
+      "update_title",
+      "tag_session",
+      "add_session_to_folder",
+    ]);
+    // Two tool rounds plus the final synthesis round.
+    expect(streamChatWithToolsMock).toHaveBeenCalledTimes(3);
+    for (const [client, model] of streamChatWithToolsMock.mock.calls) {
+      expect(client).toBe(pickedClient);
+      expect(model).toBe("llama3.1:8b");
+    }
   });
 });

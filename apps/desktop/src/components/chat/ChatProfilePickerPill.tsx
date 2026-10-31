@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
 import { ProfilePicker } from "@/components/ai/ProfilePicker";
@@ -21,6 +21,11 @@ import {
 export function ChatProfilePickerPill({ contextKey }: { contextKey: string }) {
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const [override, setOverride] = useState<string | null>(null);
+  // The conversation on screen right now. A save started in one conversation
+  // can finish after the user switched to another; its result must not land
+  // in the new conversation's pill (same idea as NoteEditor's sessionIdRef).
+  const contextKeyRef = useRef(contextKey);
+  contextKeyRef.current = contextKey;
 
   useEffect(() => {
     let cancelled = false;
@@ -58,13 +63,14 @@ export function ChatProfilePickerPill({ contextKey }: { contextKey: string }) {
   // Persist before updating local state: the send path reads the DB row, so
   // the pill must never show a pick the next send won't use.
   async function handleChange(next: string | null) {
+    const startedKey = contextKey;
     try {
       if (next === null) {
-        await clearChatContextProfile(contextKey);
+        await clearChatContextProfile(startedKey);
       } else {
-        await setChatContextProfileId(contextKey, next);
+        await setChatContextProfileId(startedKey, next);
       }
-      setOverride(next);
+      if (contextKeyRef.current === startedKey) setOverride(next);
     } catch (err) {
       toast.error(
         `Couldn't save the model choice: ${err instanceof Error ? err.message : String(err)}`,

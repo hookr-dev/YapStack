@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
@@ -113,6 +113,29 @@ describe("ChatProfilePickerPill", () => {
     );
     expect(trigger()).toHaveTextContent("Default");
     expect(trigger()).not.toHaveTextContent("Local llama");
+  });
+
+  it("a save that finishes after a conversation switch doesn't relabel the new conversation", async () => {
+    let finishSave!: () => void;
+    setChatContextProfileIdMock.mockImplementation(
+      () => new Promise<void>((resolve) => { finishSave = resolve; }),
+    );
+    const { rerender } = render(<ChatProfilePickerPill contextKey="s1" />);
+    await waitFor(() => expect(getChatContextProfileIdMock).toHaveBeenCalledWith("s1"));
+    await userEvent.click(trigger());
+    await userEvent.click(await screen.findByRole("button", { name: /Local llama/ }));
+    expect(setChatContextProfileIdMock).toHaveBeenCalledWith("s1", "p-picked");
+
+    // Switch to s2 (no override row) while s1's save is still pending.
+    rerender(<ChatProfilePickerPill contextKey="s2" />);
+    await waitFor(() => expect(getChatContextProfileIdMock).toHaveBeenCalledWith("s2"));
+    await act(async () => {
+      finishSave();
+    });
+
+    expect(trigger()).toHaveTextContent("Default");
+    expect(trigger()).not.toHaveTextContent("Local llama");
+    expect(setChatContextProfileIdMock).not.toHaveBeenCalledWith("s2", expect.anything());
   });
 
   it("shows a dangling override (deleted Profile) as Default", async () => {
