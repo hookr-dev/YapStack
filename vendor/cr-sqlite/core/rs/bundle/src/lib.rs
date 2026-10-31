@@ -28,7 +28,12 @@ fn panic(_info: &PanicInfo) -> ! {
     core::intrinsics::abort()
 }
 
-#[cfg(not(target_family = "wasm"))]
+// YAPSTACK VENDOR PATCH (3): not in the `static` build. That archive is linked into
+// std binaries, and this no-op would shadow std's `rust_eh_personality` (first
+// definition wins on Apple ld), so any unwinding panic in the host process aborts
+// with "failed to initiate panic". The bundle itself is built panic=abort and never
+// unwinds, so it does not need its own personality. See YAPSTACK_PATCHES.md.
+#[cfg(not(any(target_family = "wasm", feature = "static")))]
 #[lang = "eh_personality"]
 extern "C" fn eh_personality() {}
 
