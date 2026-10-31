@@ -1,0 +1,161 @@
+name: Server Integration
+
+# Runs the relay's `#[ignore]`-gated integration suites (crates/yapstack-server/tests/)
+# against a live Postgres + MinIO, mirroring deploy/docker-compose.yml. The main CI
+# runs plain `cargo test --all` with no database, so these tests only execute here.
+
+on:
+  pull_request:
+    paths:
+      - "crates/yapstack-server/**"
+      - "crates/yapstack-sync/**"
+      - "crates/yapstack-crypto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "deploy/**"
+      - ".github/workflows/server-integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/yapstack-server/**"
+      - "crates/yapstack-sync/**"
+      - "crates/yapstack-crypto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "deploy/**"
+      - ".github/workflows/server-integration.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-integration-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  server-integration:
+    name: Server integration (Postgres + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # Same major as deploy/docker-compose.yml.
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yapstack_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d yapstack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Tests connect as the superuser (the migration owner), exactly as the suites'
+      # doc comments describe. rls_nonowner_flow.rs runs migrations on this connection
+      # and then builds a serving pool with `SET ROLE yapstack_app`, which needs a
+      # superuser session.
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/yapstack_test
+      # Consumed by deploy/postgres-init/00-yapstack-roles.sh (run below).
+      POSTGRES_USER: postgres
+      POSTGRES_DB: yapstack_test
+      YAPSTACK_APP_PASSWORD: ci-app-password
+      # Object store for gc_flow.rs::gc_deletes_object_and_row_live and
+      # sync_flow.rs::audio_presign_reports_already_exists_only_when_object_present
+      # (the object-storage no-plaintext canary). Both silently SKIP when S3_ENDPOINT
+      # is unset; the "Assert object-store env" step makes that a hard failure here.
+      S3_ENDPOINT: http://127.0.0.1:9000
+      S3_BUCKET: yapstack
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_REGION: us-east-1
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Start MinIO
+        # Not a `services:` container: service containers cannot override the image
+        # command, and MinIO needs `server /data`. Same image as deploy/docker-compose.yml.
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$S3_ACCESS_KEY" \
+            -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
+            --health-cmd "mc ready local || exit 1" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            minio/minio:latest server /data
+          for _ in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' minio)"
+            if [ "$status" = "healthy" ]; then echo "minio healthy"; exit 0; fi
+            sleep 2
+          done
+          docker logs minio
+          echo "::error::MinIO did not become healthy"
+          exit 1
+
+      - name: Create bucket
+        # Mirrors the compose `minio-init` one-shot.
+        run: |
+          docker run --rm --network host --entrypoint /bin/sh minio/mc:latest -c "
+            mc alias set yap \"$S3_ENDPOINT\" \"$S3_ACCESS_KEY\" \"$S3_SECRET_KEY\" &&
+            mc mb --ignore-existing yap/\"$S3_BUCKET\""
+
+      - name: Initialize Postgres roles
+        # Runs the same first-boot init script the compose stack mounts into
+        # /docker-entrypoint-initdb.d: installs pgcrypto and creates the non-owner
+        # yapstack_app LOGIN role.
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGPASSWORD: postgres
+        run: sh deploy/postgres-init/00-yapstack-roles.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: server-integration-ubuntu-latest
+
+      - name: Assert object-store env
+        # The two MinIO-backed tests return early (pass) when S3_ENDPOINT is unset.
+        # Fail loudly instead so they can never be silently skipped in this job.
+        run: |
+          for v in DATABASE_URL S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY; do
+            if [ -z "${!v:-}" ]; then echo "::error::$v is not set"; exit 1; fi
+          done
+
+      - name: Build tests
+        run: cargo test -p yapstack-server --no-run --locked
+
+      - name: Run integration tests (including ignored)
+        # --include-ignored runs every test, ignored or not. The output is checked
+        # afterwards so that no test is reported as ignored and no test took a SKIP path.
+        run: |
+          set -o pipefail
+          cargo test -p yapstack-server --locked -- --include-ignored --nocapture 2>&1 | tee test-output.log
+
+      - name: Verify nothing was skipped
+        run: |
+          if grep -E '^SKIP:' test-output.log; then
+            echo "::error::a test took its SKIP path"
+            exit 1
+          fi
+          if grep -E '^test result:' test-output.log | grep -Ev ' 0 ignored;'; then
+            echo "::error::some tests were reported as ignored"
+            exit 1
+          fi
+          echo "Executed: $(grep -E '^test .* \.\.\. ok$' test-output.log | wc -l) tests"
+
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs minio || true
