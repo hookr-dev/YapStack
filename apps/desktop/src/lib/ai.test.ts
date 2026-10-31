@@ -16,6 +16,7 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 import {
   chatContextKey,
+  chatContextTypeFromKey,
   assembleTranscriptContext,
   assembleNoteContext,
   formatSegmentSpeaker,
@@ -93,6 +94,21 @@ describe("chatContextKey", () => {
   it('returns "pinned" for pinned context', () => {
     const ctx: ChatContext = { type: "pinned" };
     expect(chatContextKey(ctx)).toBe("pinned");
+  });
+});
+
+describe("chatContextTypeFromKey", () => {
+  it("round-trips every context type without the id", () => {
+    const contexts: ChatContext[] = [
+      { type: "session", sessionId: "3f2b8c1e-9d4a-4e7b-8a6f-1c2d3e4f5a6b" },
+      { type: "folder", folderId: "folder-1" },
+      { type: "all" },
+      { type: "pinned" },
+      { type: "dictation" },
+    ];
+    for (const ctx of contexts) {
+      expect(chatContextTypeFromKey(chatContextKey(ctx))).toBe(ctx.type);
+    }
   });
 });
 

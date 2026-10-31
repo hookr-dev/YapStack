@@ -33,7 +33,28 @@ export function isAnalyticsEnabled(): boolean {
  */
 function track(name: string, props?: Props): void {
   if (!emitEnabled) return;
-  trackEvent(name, props).catch(() => {});
+  trackEvent(name, props && scrubProps(props)).catch(() => {});
+}
+
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+// The path segment after a home-directory root is the OS account name.
+const HOME_DIR_RE = /((?:\/Users|\/home|[A-Za-z]:[\\/]Users)[\\/])[^\\/\s]+/g;
+
+/**
+ * Replaces UUIDs and home-directory account names in a string. Record ids
+ * (sessions, custom dictation slots) are UUIDs, and error messages can carry
+ * file paths; neither belongs in an analytics event.
+ */
+export function scrubIdentifiers(value: string): string {
+  return value.replace(UUID_RE, "<id>").replace(HOME_DIR_RE, "$1<user>");
+}
+
+function scrubProps(props: Props): Props {
+  const out: Props = {};
+  for (const [key, value] of Object.entries(props)) {
+    out[key] = typeof value === "string" ? scrubIdentifiers(value) : value;
+  }
+  return out;
 }
 
 // App lifecycle
@@ -94,7 +115,6 @@ export function trackTranscriptExported(props: {
 // Dictation
 export function trackDictationStarted(props: {
   slot_id: string;
-  slot_name: string;
   ai_enabled: number;
   has_prompt: number;
   output_action: string;

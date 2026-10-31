@@ -24,6 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Folder dialog reframed around AI context.** The folder description is now the prominent "Context for AI" field, and the icon grid collapses into an expandable picker. The transcript bulk-selection bar's copy is simplified to a single attributed-markdown copy.
 
 ### Fixed
+- **Usage analytics no longer include identifiers.** The chat event sent a session's id instead of just the context type, and the dictation event sent the slot's user-chosen name. Both are fixed, and every analytics value is now scrubbed of record ids (UUIDs) and home-directory account names (for example in file paths inside error messages) before it is sent.
 - **Full/Max backfill no longer drops the oldest ~15s.** A "Full buffer" rewind previously lost ~15s of the earliest audio to a capacity-proportional safety margin; it now returns the full requested window (the safety margin is a fixed sub-second guard applied only when over-requesting).
 - **Backfill no longer bounces the transcript.** Older segments arriving during live transcription no longer jump the viewport; a scrolled-up reader stays put, while the live tail still follows when you're pinned to the bottom.
 - **Session-list scroll position is remembered.** Returning from a session to the list restores your scroll position (independently per filter) instead of snapping to the top.
