@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use crate::change::{apply_change, ChangeRow, Changeset, SENTINEL_CID};
 use crate::schema::column_exists;
 use crate::SyncError;
+use yapstack_common::write_turnstile::WriteTurnstile;
 
 /// Create the local quarantine table. Prefixed `_yapstack_` and never CRRified, so
 /// it never syncs.
@@ -81,8 +82,14 @@ fn apply_or_quarantine(conn: &Connection, r: &ChangeRow) -> Result<bool, SyncErr
 /// `schema::alter_dance` and `outbox::enqueue_local`). Taking the write lock up front lets
 /// `busy_timeout` serialize this merge against the app's writer instead of failing the whole
 /// changeset under boot-time contention.
+///
+/// The merge takes the process [`WriteTurnstile`] turn around its transaction, so a catch-up
+/// running merges back to back hands the lock to any in-process writer already waiting
+/// instead of out-racing it in SQLite's busy handler. Must not be called inside an open
+/// transaction or while holding a turn.
 pub fn merge_changeset(conn: &Connection, cs: &Changeset) -> Result<(usize, usize), SyncError> {
     ensure_pending_table(conn)?;
+    let _turn = WriteTurnstile::process().acquire();
     // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut applied = 0usize;
