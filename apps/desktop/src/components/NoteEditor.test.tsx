@@ -10,10 +10,13 @@ import {
   tauriCommandsMock,
 } from "@/test/tauri-mocks";
 
-const { getNoteMock, saveNoteMock } = vi.hoisted(() => ({
-  getNoteMock: vi.fn(),
-  saveNoteMock: vi.fn(),
-}));
+const { getNoteMock, saveNoteMock, getSessionSegmentsMock } = vi.hoisted(
+  () => ({
+    getNoteMock: vi.fn(),
+    saveNoteMock: vi.fn(),
+    getSessionSegmentsMock: vi.fn(),
+  }),
+);
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
 vi.mock("@tauri-apps/api/event", () => tauriEventMock());
@@ -34,7 +37,7 @@ vi.mock("@/lib/db", async () => {
     ...actual,
     getNote: getNoteMock,
     saveNote: saveNoteMock,
-    getSessionSegments: vi.fn().mockResolvedValue([]),
+    getSessionSegments: getSessionSegmentsMock,
   };
 });
 
@@ -93,6 +96,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   getNoteMock.mockResolvedValue({ content: "<p>original</p>" });
   saveNoteMock.mockResolvedValue(undefined);
+  getSessionSegmentsMock.mockResolvedValue([]);
   useAppStore.setState({ noteEditingSessionId: null, remoteNoteUpdate: null });
 });
 
@@ -135,6 +139,148 @@ describe("NoteEditor — sync-down of an open note (A1c)", () => {
 
     await waitFor(() => expect(screen.getByText("half a thought")).toBeTruthy());
     expect(screen.queryByText("remote text")).toBeNull();
+  });
+});
+
+describe("NoteEditor — citation conversion on load", () => {
+  const SEG_ID = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+  const STORED = `<p>Hiring is costly [[seg:${SEG_ID}]].</p>`;
+
+  it("leaves citations untouched and saves nothing until segments are loaded", async () => {
+    getNoteMock.mockResolvedValue({ content: STORED });
+
+    renderEditor();
+    await waitFor(() =>
+      expect(editorDom()?.textContent).toContain("Hiring is costly"),
+    );
+    expect(getSessionSegmentsMock).toHaveBeenCalledWith("s1");
+    expect(editorDom().textContent).toContain(`[[seg:${SEG_ID}]]`);
+    expect(saveNoteMock).not.toHaveBeenCalled();
+
+    // Segments arrive (e.g. synced after the note); the next load converts.
+    cleanup();
+    getSessionSegmentsMock.mockResolvedValue([
+      {
+        id: SEG_ID,
+        session_id: "s1",
+        source: "Mic",
+        text: "t",
+        audio_offset_seconds: 127,
+        chunk_duration_seconds: 5,
+        confidence: 0.9,
+        created_at: "",
+        chunk_index: 0,
+        original_text: null,
+        edited_at: null,
+        deleted_at: null,
+        hidden: 0,
+      },
+    ]);
+    renderEditor();
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    const saved = saveNoteMock.mock.calls[0][1] as string;
+    expect(saved).toContain(`data-segment-id="${SEG_ID}"`);
+    expect(saved).not.toContain("[[seg:");
+    await waitFor(() =>
+      expect(editorDom().querySelector("[data-segment-ref]")?.textContent).toBe(
+        "2:07",
+      ),
+    );
+  });
+});
+
+describe("NoteEditor — citation whose segment hasn't synced", () => {
+  const LATE_ID = "48e2014f-ac1c-4c13-bb83-f4c2799df9dc";
+  const segRow = (id: string, audio_offset_seconds: number) => ({
+    id,
+    session_id: "s1",
+    source: "Mic",
+    text: "t",
+    audio_offset_seconds,
+    chunk_duration_seconds: 5,
+    confidence: 0.9,
+    created_at: "",
+    chunk_index: 0,
+    original_text: null,
+    edited_at: null,
+    deleted_at: null,
+    hidden: 0,
+  });
+
+  it("saves it with the full id, shows it unavailable, and resolves once the segment exists", async () => {
+    getNoteMock.mockResolvedValue({
+      content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
+    });
+    // Partial sync: some of the session's segments are here, not the cited one.
+    getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
+
+    renderEditor();
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    const saved = saveNoteMock.mock.calls[0][1] as string;
+    expect(saved).toContain(`data-segment-id="${LATE_ID}" data-timestamp=""`);
+    expect(saved).not.toContain("[[seg:");
+
+    const pill = await waitFor(() => {
+      const el = editorDom().querySelector("[data-segment-ref]");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(pill.getAttribute("aria-disabled")).toBe("true");
+    expect(pill.getAttribute("aria-label")).toBe("Source unavailable");
+    expect(pill.textContent).toBe("");
+
+    // The segment syncs in; the next load resolves the stored pending pill.
+    cleanup();
+    saveNoteMock.mockClear();
+    getNoteMock.mockResolvedValue({ content: saved });
+    getSessionSegmentsMock.mockResolvedValue([
+      segRow("other-seg", 3),
+      segRow(LATE_ID, 1025),
+    ]);
+    renderEditor();
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    expect(saveNoteMock.mock.calls[0][1]).toContain(
+      `data-segment-id="${LATE_ID}" data-timestamp="17:05"`,
+    );
+    await waitFor(() =>
+      expect(editorDom().querySelector("[data-segment-ref]")?.textContent).toBe(
+        "17:05",
+      ),
+    );
+    expect(
+      editorDom().querySelector("[data-segment-ref]")?.getAttribute("aria-disabled"),
+    ).toBeNull();
+  });
+});
+
+describe("NoteEditor — every citation shape converts on load", () => {
+  it("converts a single-bracket citation with no [[seg: in the note", async () => {
+    const id = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+    getNoteMock.mockResolvedValue({ content: `<p>Tooling [seg:${id} 2:07].</p>` });
+    getSessionSegmentsMock.mockResolvedValue([
+      {
+        id,
+        session_id: "s1",
+        source: "Mic",
+        text: "t",
+        audio_offset_seconds: 127,
+        chunk_duration_seconds: 5,
+        confidence: 0.9,
+        created_at: "",
+        chunk_index: 0,
+        original_text: null,
+        edited_at: null,
+        deleted_at: null,
+        hidden: 0,
+      },
+    ]);
+    renderEditor();
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    expect(saveNoteMock.mock.calls[0][1]).toContain(
+      `data-segment-id="${id}" data-timestamp="2:07"`,
+    );
   });
 });
 

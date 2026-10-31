@@ -1,4 +1,4 @@
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -6,12 +6,22 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Copy, Check, BookmarkPlus, Quote } from "lucide-react";
-import { memo, useState, type ReactNode } from "react";
+import { memo, useMemo, useState } from "react";
 import type { ChatMessage } from "@/lib/ai";
 import type { DbSegment } from "@/lib/db";
 import { getAction } from "@/lib/ai-actions";
 import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 import { formatTime } from "@/lib/utils";
+import {
+  splitTrailingPartial,
+  trimPartialCitation,
+} from "@/lib/citations/parse";
+import {
+  createSegmentIndex,
+  findSegment,
+  type SegmentIndex,
+} from "@/lib/citations/resolve";
+import { splitCitations, toPlainLabel } from "@/lib/citations/render";
 
 interface ToolBadge {
   tool: string;
@@ -62,77 +72,122 @@ function parseToolBadges(content: string): {
   };
 }
 
-// Stateless pattern used for `.test()` checks. `renderTextWithCitations`
-// builds its own `g`-flagged regex from `.source` for the exec-loop, so
-// keeping this one without `g` is safe and prevents the cross-call
-// `lastIndex` drift that was making citations render as raw text after
-// the first chat message in a session.
-const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/;
+// Resolved citations become mdast link nodes with this href, and the `a`
+// override below turns them into chips. Rewriting at the markdown AST means
+// code (fenced, tilde, indented, inline) is never touched: it isn't a `text`
+// node.
+const CITATION_HREF_PREFIX = "#yapstack-citation:";
 
-function renderTextWithCitations(
-  text: string,
-  segments: DbSegment[] | undefined,
-  onCitationClick: ((segmentId: string) => void) | undefined,
-): ReactNode[] {
-  const parts: ReactNode[] = [];
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
+interface MdNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: MdNode[];
+}
 
-  const regex = new RegExp(CITE_REGEX.source, "g");
-  while ((match = regex.exec(text)) !== null) {
-    // Text before the citation
-    if (match.index > lastIndex) {
-      parts.push(text.slice(lastIndex, match.index));
-    }
+const isLink = (node: MdNode) =>
+  node.type === "link" || node.type === "linkReference";
 
-    const segId = match[1];
-    const segment = segments?.find((s) => s.id === segId);
-
-    if (segment && onCitationClick) {
-      const ts = formatTime(segment.audio_offset_seconds);
-      const preview =
-        segment.text.length > 80
-          ? segment.text.slice(0, 80) + "..."
-          : segment.text;
-
-      parts.push(
-        <Tooltip key={`cite-${match.index}`}>
-          <TooltipTrigger asChild>
-            <button
-              onClick={() => onCitationClick(segId)}
-              className="inline-flex items-center gap-0.5 rounded bg-accent px-1 py-0.5 text-[10px] font-medium text-accent-foreground hover:bg-accent/80 cursor-pointer align-baseline"
-            >
-              <Quote className="h-2.5 w-2.5" />
-              {ts}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top" className="max-w-xs text-xs">
-            {preview}
-          </TooltipContent>
-        </Tooltip>,
-      );
-    } else {
-      // Segment not found — render as plain text timestamp or remove marker
-      parts.push(
-        <span
-          key={`cite-${match.index}`}
-          className="inline-flex items-center gap-0.5 rounded bg-accent/50 px-1 py-0.5 text-[10px] font-medium text-accent-foreground/60"
-        >
-          <Quote className="h-2.5 w-2.5" />
-          ref
-        </span>,
-      );
-    }
-
-    lastIndex = match.index + match[0].length;
+// The document's final leaf, or `null` when it sits inside a link (a
+// completed link is never a marker still being typed).
+function lastLeaf(node: MdNode): MdNode | null {
+  let leaf = node;
+  while (leaf.children?.length) {
+    if (isLink(leaf)) return null;
+    leaf = leaf.children[leaf.children.length - 1];
   }
+  return leaf;
+}
 
-  // Remaining text
-  if (lastIndex < text.length) {
-    parts.push(text.slice(lastIndex));
-  }
+function rewriteCitationText(node: MdNode, index: SegmentIndex | null): void {
+  // Text inside a link can't hold another link.
+  if (!node.children || isLink(node)) return;
+  const siblings = node.children;
+  node.children = siblings.flatMap((child, i): MdNode[] => {
+    if (child.type !== "text") {
+      rewriteCitationText(child, index);
+      return [child];
+    }
+    // A marker cut off by formatting (`[[seg:` then `code` or `strong`)
+    // stays literal rather than being parsed, and half-dropped, from one piece.
+    const [head, tail] =
+      i < siblings.length - 1
+        ? splitTrailingPartial(child.value ?? "")
+        : [child.value ?? "", ""];
+    const { parts } = splitCitations(head, index, { keepUnresolved: false });
+    const tailNode: MdNode[] = tail ? [{ type: "text", value: tail }] : [];
+    return parts.flatMap((part): MdNode[] => {
+      if (part.kind === "text") return [{ type: "text", value: part.text }];
+      if (part.kind !== "ref") return [];
+      return [
+        {
+          type: "link",
+          url: CITATION_HREF_PREFIX + part.ref.segmentId,
+          children: [{ type: "text", value: toPlainLabel(part.ref) }],
+        },
+      ];
+    }).concat(tailNode);
+  });
+}
 
-  return parts;
+/**
+ * Remark plugin: resolve citations in chat text nodes. Without a transcript
+ * in scope (folder or multi-session chat) markers can't resolve, so they're
+ * removed rather than printed raw; chat rows keep the original text. While
+ * streaming, a trailing marker that hasn't closed yet is held back, but only
+ * when the tail is prose, never inside code.
+ */
+function remarkCitations(index: SegmentIndex | null, isStreaming: boolean) {
+  return () => (tree: unknown) => {
+    const root = tree as MdNode;
+    if (isStreaming) {
+      const leaf = lastLeaf(root);
+      if (leaf?.type === "text" && leaf.value) {
+        const kept = trimPartialCitation(leaf.value);
+        if (kept !== leaf.value) leaf.value = kept.trimEnd();
+      }
+    }
+    rewriteCitationText(root, index);
+  };
+}
+
+function CitationChip({
+  segment,
+  onCitationClick,
+}: {
+  segment: DbSegment;
+  onCitationClick: ((segmentId: string) => void) | undefined;
+}) {
+  const ts = formatTime(segment.audio_offset_seconds);
+  const preview =
+    segment.text.length > 80 ? segment.text.slice(0, 80) + "..." : segment.text;
+  const chipClass =
+    "inline-flex items-center gap-0.5 rounded bg-accent px-1 py-0.5 text-[10px] font-medium text-accent-foreground align-baseline";
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        {onCitationClick ? (
+          <button
+            type="button"
+            onClick={() => onCitationClick(segment.id)}
+            className={`${chipClass} hover:bg-accent/80 cursor-pointer`}
+          >
+            <Quote className="h-2.5 w-2.5" />
+            {ts}
+          </button>
+        ) : (
+          <span className={chipClass}>
+            <Quote className="h-2.5 w-2.5" />
+            {ts}
+          </span>
+        )}
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs text-xs">
+        {preview}
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 export const AIChatMessage = memo(function AIChatMessage({
@@ -142,6 +197,41 @@ export const AIChatMessage = memo(function AIChatMessage({
   onCitationClick,
 }: AIChatMessageProps) {
   const [copied, setCopied] = useState(false);
+  const index = useMemo(
+    () => (segments ? createSegmentIndex(segments) : null),
+    [segments],
+  );
+  const markdownComponents = useMemo<Components>(
+    () => ({
+      a: ({ href, children, node: _node, ...props }) => {
+        if (index && href?.startsWith(CITATION_HREF_PREFIX)) {
+          const segment = findSegment(
+            index,
+            href.slice(CITATION_HREF_PREFIX.length),
+          );
+          if (segment) {
+            return (
+              <CitationChip
+                segment={segment}
+                onCitationClick={onCitationClick}
+              />
+            );
+          }
+        }
+        return (
+          <a href={href} {...props}>
+            {children}
+          </a>
+        );
+      },
+    }),
+    [index, onCitationClick],
+  );
+  const isStreaming = !!message.isStreaming;
+  const remarkPlugins = useMemo(
+    () => [remarkCitations(index, isStreaming)],
+    [index, isStreaming],
+  );
 
   const isUser = message.role === "user";
 
@@ -179,7 +269,6 @@ export const AIChatMessage = memo(function AIChatMessage({
 
   const hasLiveExecs = message.toolExecutions && message.toolExecutions.length > 0;
   const { badges, text } = parseToolBadges(message.content);
-  const hasCitations = CITE_REGEX.test(text);
 
   const toolExecsFromBadges = !hasLiveExecs && badges.length > 0
     ? badges.map((b) => ({
@@ -201,34 +290,12 @@ export const AIChatMessage = memo(function AIChatMessage({
       )}
       {(text.trim() || message.isStreaming) && (
         <div className="max-w-[95%] rounded-2xl rounded-bl-md bg-muted/80 border border-border/50 px-3 py-2 text-xs ai-chat-markdown">
-          {hasCitations && (segments || onCitationClick) ? (
-            <ReactMarkdown
-              components={{
-                p: ({ children }) => (
-                  <p>
-                    {processCitationsInChildren(
-                      children,
-                      segments,
-                      onCitationClick,
-                    )}
-                  </p>
-                ),
-                li: ({ children }) => (
-                  <li>
-                    {processCitationsInChildren(
-                      children,
-                      segments,
-                      onCitationClick,
-                    )}
-                  </li>
-                ),
-              }}
-            >
-              {text}
-            </ReactMarkdown>
-          ) : (
-            <ReactMarkdown>{text}</ReactMarkdown>
-          )}
+          <ReactMarkdown
+            components={markdownComponents}
+            remarkPlugins={remarkPlugins}
+          >
+            {text}
+          </ReactMarkdown>
           {message.isStreaming && (
             <span className="inline-block w-1.5 h-4 bg-foreground/60 animate-pulse ml-0.5 align-text-bottom" />
           )}
@@ -263,33 +330,3 @@ export const AIChatMessage = memo(function AIChatMessage({
     </div>
   );
 });
-
-function processCitationsInChildren(
-  children: ReactNode,
-  segments: DbSegment[] | undefined,
-  onCitationClick: ((segmentId: string) => void) | undefined,
-): ReactNode {
-  if (!children) return children;
-
-  if (typeof children === "string") {
-    if (CITE_REGEX.test(children)) {
-      return renderTextWithCitations(children, segments, onCitationClick);
-    }
-    return children;
-  }
-
-  if (Array.isArray(children)) {
-    return children.map((child, i) => {
-      if (typeof child === "string" && CITE_REGEX.test(child)) {
-        return (
-          <span key={i}>
-            {renderTextWithCitations(child, segments, onCitationClick)}
-          </span>
-        );
-      }
-      return child;
-    });
-  }
-
-  return children;
-}

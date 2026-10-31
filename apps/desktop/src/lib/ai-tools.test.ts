@@ -76,13 +76,24 @@ describe("convertCitationsToSegmentRefs", () => {
     expect(result).toContain('data-offset="65"');
   });
 
-  it("uses truncated ID for unmatched segment", () => {
+  it("keeps an unmatched citation as an unlabelled pending pill, never a hex label", () => {
     const result = convertCitationsToSegmentRefs(
-      "See [[seg:unknown123]]",
-      [],
+      "See [[seg:ffff0000aaaa]] here",
+      [makeSegment({ id: "abc123", audio_offset_seconds: 5 })],
     );
-    expect(result).toContain('data-segment-id="unknown123"');
-    expect(result).toContain(">unknown1</span>");
+    expect(result).toBe(
+      'See <span data-segment-ref="" data-segment-id="ffff0000aaaa" data-timestamp="" data-offset="0"></span> here',
+    );
+  });
+
+  it("resolves a pending pill once its segment exists", () => {
+    const pending = convertCitationsToSegmentRefs("See [[seg:late-seg]]", [
+      makeSegment({ id: "other", audio_offset_seconds: 5 }),
+    ]);
+    const healed = convertCitationsToSegmentRefs(pending, [
+      makeSegment({ id: "late-seg", audio_offset_seconds: 65 }),
+    ]);
+    expect(healed).toContain('data-segment-id="late-seg" data-timestamp="1:05"');
   });
 
   it("replaces multiple citations", () => {

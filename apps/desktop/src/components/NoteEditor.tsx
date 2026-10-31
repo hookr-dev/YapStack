@@ -40,6 +40,7 @@ import { useAppStore } from "@/stores/appStore";
 import { log } from "@/lib/logger";
 import { SegmentReference } from "@/lib/tiptap-segment-ref";
 import { convertCitationsToSegmentRefs } from "@/lib/ai-tools";
+import { hasUnconvertedCitations } from "@/lib/citations/html";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -590,11 +591,17 @@ export function NoteEditor({
       const note = await getNote(sessionId);
       if (cancelled) return;
       let content = note?.content ?? "";
-      // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes
-      if (content.includes("[[seg:")) {
+      // Convert citation markers (any shape the parser accepts) to
+      // <span data-segment-ref> nodes, and re-resolve pending pills whose
+      // segment wasn't here last time (a synced note can land before its
+      // transcript). Skipped while the session has no segments locally, so
+      // the stored text is left as-is.
+      if (hasUnconvertedCitations(content)) {
         const segments = await getSessionSegments(sessionId);
         if (cancelled) return;
-        content = convertCitationsToSegmentRefs(content, segments);
+        if (segments.length > 0) {
+          content = convertCitationsToSegmentRefs(content, segments);
+        }
         // Persist the converted content so future loads don't need re-conversion
         if (note && content !== note.content) {
           await saveNote(sessionId, content);

@@ -700,6 +700,13 @@ Segments are passed to the AI with IDs embedded in the timestamp: `[seg:abc123 0
 
 In saved notes (via `save_to_notes` tool), citations are converted to `<span data-segment-ref>` elements that the Tiptap `SegmentReference` extension renders as interactive pills.
 
+Both paths go through `lib/citations/` (parse → resolve → render), the one owner of citation handling:
+- `parse.ts` tolerates the shapes models actually emit (truncated, hedged or quoted IDs, `[[seg:m:ss]]`, several IDs per bracket, `[seg:ID m:ss]`, missing brackets, case/spacing variants). Unbracketed markers need `seg:`/`seg_` plus a 6+ hex ID, and `segment:` needs an ID or timestamp, so prose ("segment 3", "12:30 pm", "[3]") never matches. `trimPartialCitation` holds back an unclosed marker while a reply streams.
+- `resolve.ts` resolves against a `SegmentIndex`: an ID resolves by exact match, or by unique 6+ character prefix within a single-session index; a time-only citation resolves to the segment spanning it (single session only). An unresolved ID is never swapped for the segment at its timestamp, and IDs are never matched by edit distance.
+- `render.ts` `splitCitations` is the core; never a raw code or a hex-labelled pill:
+  - **Display (chat)** rewrites mdast `text` nodes in a remark plugin (so code of any kind is untouched) and removes unresolved markers; chat rows keep the original text. With no index (folder / multi-session chat) every marker is removed.
+  - **Persisted (notes)**: `html.ts` `convertCitationsInHtml` walks DOM text nodes (skipping `code`, `pre`, existing pills and all attributes) and keeps each unresolved marker as a *pending pill* (`toPendingPillHtml`: `span[data-segment-ref]` with the original ID and timestamp and an empty `data-timestamp`), rendered as a muted "Source unavailable" node. Pending pills re-resolve on note load once the segment exists. Persisting never destroys a citation.
+
 ### Tool Badge Persistence
 
 When tools execute, badge lines are prepended to the assistant message content for DB persistence:
