@@ -590,11 +590,18 @@ export function NoteEditor({
       const note = await getNote(sessionId);
       if (cancelled) return;
       let content = note?.content ?? "";
-      // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes
+      // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes.
+      // Conversion removes citations it can't resolve and the result is
+      // persisted, so it must not run before this session's segments exist
+      // locally (a synced note can land before its transcript): with no
+      // segments every citation would be deleted for good. Leave the text
+      // as-is and convert on a later load.
       if (content.includes("[[seg:")) {
         const segments = await getSessionSegments(sessionId);
         if (cancelled) return;
-        content = convertCitationsToSegmentRefs(content, segments);
+        if (segments.length > 0) {
+          content = convertCitationsToSegmentRefs(content, segments);
+        }
         // Persist the converted content so future loads don't need re-conversion
         if (note && content !== note.content) {
           await saveNote(sessionId, content);

@@ -463,6 +463,21 @@ describe("AIChatMessage", () => {
       expect(bubble?.textContent).toBe("Across sessions this held.");
     });
 
+    it.each([
+      ["inline code", "Write `[[seg:seg-1]]` to cite.", "[[seg:seg-1]]"],
+      ["fenced code", "```\n[[seg:seg-1]]\n```", "[[seg:seg-1]]"],
+    ])("keeps citations literal inside %s", (_label, content, literal) => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content })}
+          segments={[makeSegment()]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(container.querySelector("code")?.textContent?.trim()).toBe(literal);
+      expect(screen.queryByRole("button", { name: "1:05" })).not.toBeInTheDocument();
+    });
+
     it("keeps ordinary markdown links as links", () => {
       renderWithTooltip(
         <AIChatMessage

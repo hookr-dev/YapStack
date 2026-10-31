@@ -13,7 +13,11 @@ import { getAction } from "@/lib/ai-actions";
 import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 import { formatTime } from "@/lib/utils";
 import { trimPartialCitation } from "@/lib/citations/parse";
-import { createSegmentIndex, findSegment } from "@/lib/citations/resolve";
+import {
+  createSegmentIndex,
+  findSegment,
+  type SegmentIndex,
+} from "@/lib/citations/resolve";
 import { rewriteCitations, toPlainLabel } from "@/lib/citations/render";
 import type { TranscriptRef } from "@/lib/citations/types";
 
@@ -73,6 +77,20 @@ const CITATION_HREF_PREFIX = "#yapstack-citation:";
 
 function toCitationLink(ref: TranscriptRef): string {
   return `[${toPlainLabel(ref)}](${CITATION_HREF_PREFIX}${ref.segmentId})`;
+}
+
+// Fenced blocks (closed, or still open mid-stream) and inline code spans.
+// Captured so `split` keeps them at odd indices.
+const CODE_REGEX = /(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g;
+
+/** Rewrite citations outside code; code stays literal. */
+function rewriteChatCitations(text: string, index: SegmentIndex | null): string {
+  return text
+    .split(CODE_REGEX)
+    .map((part, i) =>
+      i % 2 === 1 ? part : rewriteCitations(part, index, toCitationLink).text,
+    )
+    .join("");
 }
 
 function CitationChip({
@@ -191,11 +209,10 @@ export const AIChatMessage = memo(function AIChatMessage({
   // Without a transcript in scope (folder or multi-session chat) markers can't
   // resolve, so they're stripped rather than printed raw. While streaming, a
   // marker that hasn't closed yet is held back until it can be resolved.
-  const displayText = rewriteCitations(
+  const displayText = rewriteChatCitations(
     message.isStreaming ? trimPartialCitation(text) : text,
     index,
-    toCitationLink,
-  ).text;
+  );
 
   const toolExecsFromBadges = !hasLiveExecs && badges.length > 0
     ? badges.map((b) => ({
