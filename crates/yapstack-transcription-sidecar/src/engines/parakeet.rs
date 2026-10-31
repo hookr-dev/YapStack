@@ -85,7 +85,8 @@ impl ParakeetBackend {
         );
 
         let cache_dir = self.coreml_cache_dir.as_deref();
-        let target = resolve_accel(choice, ModelDirTraits::inspect(model_path));
+        let traits = ModelDirTraits::inspect(model_path);
+        let target = resolve_accel(choice, traits);
         info!(
             marker = "live_accel_choice",
             engine = "parakeet",
@@ -135,6 +136,7 @@ impl ParakeetBackend {
             accel: loaded.label().to_string(),
             model_dir: model_path.display().to_string(),
             accel_fallback,
+            accel_partial: heavy_ops_partial(loaded, traits.gpu_placement),
         });
         info!(
             "parakeet TDT model loaded in {} ms",
@@ -371,36 +373,62 @@ impl AccelTarget {
 struct ModelDirTraits {
     /// An external `.onnx.data` initializer is present.
     has_external_data: bool,
-    /// The encoder graph parakeet-rs will load passes [`gpu_placement_ok`].
-    gpu_placement_ok: bool,
+    /// [`gpu_placement`] of the encoder graph parakeet-rs will load.
+    gpu_placement: GpuPlacement,
 }
 
 impl ModelDirTraits {
     fn inspect(model_dir: &Path) -> Self {
         Self {
             has_external_data: has_external_data_file(model_dir),
-            gpu_placement_ok: find_encoder_file_name(model_dir)
-                .is_some_and(|name| gpu_placement_ok(&name)),
+            gpu_placement: find_encoder_file_name(model_dir)
+                .map_or(GpuPlacement::Unmeasured, |name| gpu_placement(&name)),
         }
     }
 }
 
-/// Whether the WebGPU EP places this encoder graph's heavy (MatMul/Conv
-/// family) ops on the GPU — gate G4 is >= 90%. Placement is a property of
-/// graph × ORT build × EP, not of the user's hardware, so a table measured
-/// with `YAPSTACK_ORT_PLACEMENT=1` (ORT 1.24, the `placement` ignored test
-/// below) is the honest source. Re-measure when the graph or ORT changes.
-/// Unlisted graphs are never attempted on the GPU under Auto.
-fn gpu_placement_ok(encoder_file_name: &str) -> bool {
+/// How much of an encoder graph's heavy (MatMul/Conv family) work the
+/// WebGPU EP takes. Gate G4 counts >= 90% as `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuPlacement {
+    Full,
+    /// Some heavy ops have no WebGPU kernel and run on the CPU EP.
+    Partial,
+    /// Not in the table; Auto never attempts the GPU for it.
+    Unmeasured,
+}
+
+/// Placement is a property of graph × ORT build × EP — kernel coverage does
+/// not depend on the OS or the user's GPU — so a measured table is the
+/// honest source. Measured with `YAPSTACK_ORT_PLACEMENT=1` / the
+/// `auto_places_heavy_ops_on_the_reported_ep` ignored test on ORT 1.24
+/// (ort rc.12), Apple M5 Pro, 2026-10-31. Re-measure when a graph or ORT
+/// changes. Whether a `Partial` graph is still *worth* the GPU is a speed
+/// question, answered per platform in [`resolve_auto`].
+fn gpu_placement(encoder_file_name: &str) -> GpuPlacement {
     match encoder_file_name {
-        // fp32 export: MatMul 289/289 and Conv 77/77 on WebGPU (100%).
-        "encoder-model.onnx" => true,
-        // ORT *dynamic* int8: the WebGPU EP has no MatMulInteger,
-        // ConvInteger or DynamicQuantizeLinear kernels, so 294 of the 366
-        // heavy nodes run on CPU (19.7% on GPU) and every layer copies
-        // tensors across the boundary — half the speed of plain CPU.
-        "encoder-model.int8.onnx" => false,
-        _ => false,
+        // fp32 export: MatMul 289/289 and Conv 77/77 on WebGPU (366/366).
+        "encoder-model.onnx" => GpuPlacement::Full,
+        // ORT *dynamic* int8: no WebGPU kernels for MatMulInteger,
+        // ConvInteger or DynamicQuantizeLinear, so only the 72 fp32 MatMuls
+        // of 366 heavy nodes run on WebGPU (19.7%).
+        "encoder-model.int8.onnx" => GpuPlacement::Partial,
+        _ => GpuPlacement::Unmeasured,
+    }
+}
+
+/// Whether the loaded EP is a GPU EP that, per the static placement table,
+/// leaves part of the graph's heavy ops on the CPU EP.
+fn heavy_ops_partial(loaded: AccelTarget, placement: GpuPlacement) -> bool {
+    match loaded {
+        AccelTarget::Cpu => {
+            _ = placement;
+            false
+        }
+        #[cfg(feature = "coreml")]
+        AccelTarget::CoreMl => false,
+        #[cfg(feature = "webgpu")]
+        AccelTarget::WebGpu => placement == GpuPlacement::Partial,
     }
 }
 
@@ -440,18 +468,22 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 }
 
 /// Auto attempts WebGPU (Dawn → Metal on macOS, Vulkan/D3D12 on
-/// Windows/Linux), but only for encoder graphs that pass
-/// [`gpu_placement_ok`]; anything else runs on CPU, which is both honest
-/// and faster than a GPU session doing its heavy ops on CPU. CoreML is not the Auto path: parakeet-rs hardcodes
+/// Windows/Linux) for `Full` graphs everywhere. For `Partial` graphs the
+/// answer is a measured speed comparison, per platform:
+/// - macOS: CPU. int8 on WebGPU ran at 16.9× realtime vs 32.9× on plain
+///   CPU (M5 Pro, 2026-10-31; docs/plans/research/q4-delivery/asr.md §2.2),
+///   because every layer copies tensors across the EP boundary.
+/// - Windows/Linux: WebGPU. Gate C (ADR 0004 "Gate C passed",
+///   docs/plans/windows-support.md item 13) measured int8 on WebGPU as
+///   correct and clearly faster than CPU on real Windows hardware, so the
+///   partial placement still wins there. The label says it is partial.
+///
+/// `Unmeasured` graphs run on CPU. CoreML is not the Auto path: parakeet-rs hardcodes
 /// `ComputeUnits::CPUAndGPU` and the dynamic input shapes leave the heavy
 /// ops on CPU anyway. The CoreML-only fallback build keeps skipping models
 /// with external `.onnx.data` (ORT's `model_path must not be empty` bug on
 /// CoreML partitioning; WebGPU doesn't serialize the partitioned subgraph,
 /// so it is safe with external data).
-///
-/// Non-macOS targets (Windows/Linux) attempt WebGPU under Auto since Gate C
-/// passed (2026-07-05, ADR 0004); the placement gate narrows that to the
-/// graphs whose heavy ops WebGPU can actually run.
 ///
 /// Every WebGPU registration is strict, so an EP-init failure surfaces
 /// through `load_model_with`'s explicit, logged CPU fallback (honest
@@ -463,20 +495,19 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 // combo — and the early `return`s let each read as a self-contained arm.
 #[allow(clippy::needless_return)]
 fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
-    // Whether the EP has kernels for a graph's ops does not depend on the
-    // OS, so the placement gate applies on every platform.
     #[cfg(feature = "webgpu")]
     {
         _ = model.has_external_data;
-        return if model.gpu_placement_ok {
-            AccelTarget::WebGpu
-        } else {
-            AccelTarget::Cpu
+        let partial_wins = !cfg!(target_os = "macos");
+        return match model.gpu_placement {
+            GpuPlacement::Full => AccelTarget::WebGpu,
+            GpuPlacement::Partial if partial_wins => AccelTarget::WebGpu,
+            GpuPlacement::Partial | GpuPlacement::Unmeasured => AccelTarget::Cpu,
         };
     }
     #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
     {
-        _ = model.gpu_placement_ok;
+        _ = model.gpu_placement;
         return if model.has_external_data {
             AccelTarget::Cpu
         } else {
@@ -485,7 +516,7 @@ fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
     }
     #[cfg(not(any(feature = "webgpu", all(target_os = "macos", feature = "coreml"))))]
     {
-        _ = (model.has_external_data, model.gpu_placement_ok);
+        _ = (model.has_external_data, model.gpu_placement);
         AccelTarget::Cpu
     }
 }
@@ -837,10 +868,16 @@ mod tests {
     ];
 
     #[test]
-    fn gpu_placement_table_rejects_dynamic_int8_and_unknown_graphs() {
-        assert!(gpu_placement_ok("encoder-model.onnx"));
-        assert!(!gpu_placement_ok("encoder-model.int8.onnx"));
-        assert!(!gpu_placement_ok("encoder-model.somethingelse.onnx"));
+    fn gpu_placement_table_marks_dynamic_int8_partial() {
+        assert_eq!(gpu_placement("encoder-model.onnx"), GpuPlacement::Full);
+        assert_eq!(
+            gpu_placement("encoder-model.int8.onnx"),
+            GpuPlacement::Partial
+        );
+        assert_eq!(
+            gpu_placement("encoder-model.somethingelse.onnx"),
+            GpuPlacement::Unmeasured
+        );
     }
 
     #[test]
@@ -873,25 +910,25 @@ mod tests {
             ModelDirTraits::inspect(&model_dir("traits-int8", &INT8_FILES)),
             ModelDirTraits {
                 has_external_data: false,
-                gpu_placement_ok: false,
+                gpu_placement: GpuPlacement::Partial,
             }
         );
         assert_eq!(
             ModelDirTraits::inspect(&model_dir("traits-fp32", &FP32_FILES)),
             ModelDirTraits {
                 has_external_data: true,
-                gpu_placement_ok: true,
+                gpu_placement: GpuPlacement::Full,
             }
         );
     }
 
     const INT8: ModelDirTraits = ModelDirTraits {
         has_external_data: false,
-        gpu_placement_ok: false,
+        gpu_placement: GpuPlacement::Partial,
     };
     const FP32: ModelDirTraits = ModelDirTraits {
         has_external_data: true,
-        gpu_placement_ok: true,
+        gpu_placement: GpuPlacement::Full,
     };
 
     #[test]
@@ -901,23 +938,55 @@ mod tests {
         }
     }
 
-    /// The shipped int8 runs its quantized ops on CPU under WebGPU, at half
-    /// plain-CPU speed — so macOS Auto resolves it to CPU and says so.
-    #[cfg(all(target_os = "macos", feature = "webgpu"))]
-    #[test]
-    fn macos_auto_resolves_int8_to_cpu_and_fp32_to_webgpu() {
-        assert_eq!(resolve_accel(AccelChoice::Auto, INT8), AccelTarget::Cpu);
-        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "cpu");
-        assert_eq!(resolve_accel(AccelChoice::Auto, FP32).label(), "webgpu");
+    /// Resolved target plus the `accel_partial` flag a load would report.
+    #[cfg(feature = "webgpu")]
+    fn auto(model: ModelDirTraits) -> (&'static str, bool) {
+        let target = resolve_accel(AccelChoice::Auto, model);
+        (
+            target.label(),
+            heavy_ops_partial(target, model.gpu_placement),
+        )
     }
 
-    /// The Windows/Linux case: the same Auto arm applies on every OS, so
-    /// int8 resolves to CPU there too while fp32 still attempts WebGPU.
+    /// macOS measured int8 on WebGPU at half plain-CPU speed, so Auto runs
+    /// it on CPU; fp32 keeps the GPU with a full label.
+    #[cfg(all(target_os = "macos", feature = "webgpu"))]
+    #[test]
+    fn macos_auto_resolves_int8_to_cpu_and_fp32_to_full_webgpu() {
+        assert_eq!(auto(INT8), ("cpu", false));
+        assert_eq!(auto(FP32), ("webgpu", false));
+    }
+
+    /// Windows/Linux: Gate C measured int8 on WebGPU faster than CPU, so
+    /// Auto keeps WebGPU — and labels it partial.
+    #[cfg(all(not(target_os = "macos"), feature = "webgpu"))]
+    #[test]
+    fn non_macos_auto_keeps_int8_on_partial_webgpu_and_fp32_on_full() {
+        assert_eq!(auto(INT8), ("webgpu", true));
+        assert_eq!(auto(FP32), ("webgpu", false));
+    }
+
     #[cfg(feature = "webgpu")]
     #[test]
-    fn auto_applies_the_placement_gate_on_every_platform() {
-        assert_eq!(resolve_accel(AccelChoice::Auto, INT8).label(), "cpu");
-        assert_eq!(resolve_accel(AccelChoice::Auto, FP32).label(), "webgpu");
+    fn auto_never_attempts_the_gpu_for_unmeasured_graphs() {
+        let unknown = ModelDirTraits {
+            has_external_data: false,
+            gpu_placement: GpuPlacement::Unmeasured,
+        };
+        assert_eq!(auto(unknown), ("cpu", false));
+    }
+
+    /// An explicit WebGPU opt-in on int8 is reported as partial on every OS.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn explicit_webgpu_on_int8_is_labelled_partial() {
+        let target = resolve_accel(AccelChoice::WebGpu, INT8);
+        assert!(heavy_ops_partial(target, INT8.gpu_placement));
+    }
+
+    #[test]
+    fn cpu_is_never_partial() {
+        assert!(!heavy_ops_partial(AccelTarget::Cpu, GpuPlacement::Partial));
     }
 
     #[cfg(not(feature = "webgpu"))]
@@ -957,8 +1026,9 @@ mod tests {
     }
 
     /// Gate G4 on a real model: the EP Auto reports must hold >= 90% of the
-    /// encoder's MatMul/Conv-family nodes. Red for int8 under the old
-    /// "always WebGPU" Auto (19.7%); green for int8 → CPU and fp32 → WebGPU.
+    /// encoder's MatMul/Conv-family nodes, unless the load reports
+    /// `accel_partial` — then the static table must agree that it doesn't.
+    /// Red for int8 under the old macOS Auto (`webgpu`, 19.7%, not flagged).
     #[test]
     #[ignore = "needs YAPSTACK_TEST_PARAKEET_DIR set to a downloaded Parakeet model dir"]
     fn auto_places_heavy_ops_on_the_reported_ep() {
@@ -972,13 +1042,16 @@ mod tests {
                 Some(PlacementRecorder::default()),
             )
             .expect("model loads");
-        let reported = backend.engine_info().expect("engine info").accel;
+        let info = backend.engine_info().expect("engine info");
+        let reported = info.accel;
         let ep = ort_placement::ort_ep_name(&reported);
         let encoder = sessions.first().expect("encoder placement recorded");
         let share = encoder.heavy_share(ep);
-        assert!(
-            share >= 0.90,
-            "reported {reported} but only {:.1}% of MatMul/Conv nodes placed there: {:?}",
+        assert_eq!(
+            share < 0.90,
+            info.accel_partial,
+            "reported {reported} (partial={}) with {:.1}% of MatMul/Conv nodes placed there: {:?}",
+            info.accel_partial,
             100.0 * share,
             encoder.heavy_by_ep
         );

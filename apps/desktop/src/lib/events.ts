@@ -77,6 +77,9 @@ export type TranscriptionEngineLoadedEvent = {
   /** Why the attempted accelerator failed to load, when `accel` is a CPU
    *  fallback. Optional: older hosts don't send it. */
   accel_fallback?: string | null;
+  /** `accel` is a GPU EP that leaves part of the model's heavy ops on the
+   *  CPU. Optional: older hosts don't send it. */
+  accel_partial?: boolean;
 };
 
 /**

@@ -62,6 +62,7 @@ impl TranscriptionBackend for WhisperBackend {
             accel,
             model_dir: model_path.display().to_string(),
             accel_fallback: None,
+            accel_partial: false,
         });
         Ok(())
     }

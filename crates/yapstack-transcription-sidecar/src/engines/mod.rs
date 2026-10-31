@@ -80,6 +80,9 @@ pub struct EngineInfo {
     /// back to CPU. `None` when the attempted EP loaded, or when CPU was
     /// the resolved choice in the first place.
     pub accel_fallback: Option<String>,
+    /// `accel` is a GPU EP that, per the sidecar's static placement table,
+    /// leaves part of the model's heavy ops on the CPU EP.
+    pub accel_partial: bool,
 }
 
 /// What every transcription backend must implement. Engine-specific

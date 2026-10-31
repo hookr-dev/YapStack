@@ -62,6 +62,7 @@ export function useLiveTranscriptionEvents() {
             accel: payload.accel,
             modelDir: payload.model_dir,
             accelFallback: payload.accel_fallback ?? null,
+            accelPartial: payload.accel_partial ?? false,
           },
         });
       }),

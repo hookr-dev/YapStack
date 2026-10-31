@@ -75,11 +75,13 @@ fn log_sidecar_response(response: &SidecarResponse) {
             accel,
             model_dir,
             accel_fallback,
+            accel_partial,
         } => debug!(
             id = id,
             accel = accel.as_deref(),
             model_dir = model_dir.as_deref(),
             accel_fallback = accel_fallback.as_deref(),
+            accel_partial = accel_partial,
             "sidecar response: model_loaded"
         ),
         SidecarResponse::EngineInfo {
@@ -87,11 +89,13 @@ fn log_sidecar_response(response: &SidecarResponse) {
             accel,
             model_dir,
             accel_fallback,
+            accel_partial,
         } => debug!(
             id = id,
             accel = accel.as_deref(),
             model_dir = model_dir.as_deref(),
             accel_fallback = accel_fallback.as_deref(),
+            accel_partial = accel_partial,
             "sidecar response: engine_info"
         ),
         SidecarResponse::Error { id, message } => debug!(
@@ -186,6 +190,9 @@ pub struct EngineInfo {
     /// Why the attempted accelerator failed to load, when `accel` is a
     /// CPU fallback. `None` for a normal load and for older sidecars.
     pub accel_fallback: Option<String>,
+    /// `accel` is a GPU EP that leaves part of the model's heavy ops on the
+    /// CPU. False for older sidecars.
+    pub accel_partial: bool,
 }
 
 /// Transcription client that supports **concurrent in-flight requests** to the
@@ -631,12 +638,14 @@ impl TranscriptionClient {
                 accel,
                 model_dir,
                 accel_fallback,
+                accel_partial,
                 ..
             } => {
                 let info = EngineInfo {
                     accel,
                     model_dir,
                     accel_fallback,
+                    accel_partial,
                 };
                 *self
                     .last_engine_info
@@ -668,12 +677,14 @@ impl TranscriptionClient {
                 accel,
                 model_dir,
                 accel_fallback,
+                accel_partial,
                 ..
             } => {
                 let info = EngineInfo {
                     accel,
                     model_dir,
                     accel_fallback,
+                    accel_partial,
                 };
                 *self
                     .last_engine_info

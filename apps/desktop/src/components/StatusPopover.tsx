@@ -311,7 +311,7 @@ export function StatusPopover() {
               loadedEngineInfo.accelFallback
                 ? ` [fallback: ${loadedEngineInfo.accelFallback}]`
                 : ""
-            }${
+            }${loadedEngineInfo.accelPartial ? " [partial]" : ""}${
               loadedEngineInfo.modelDir
                 ? ` (${loadedEngineInfo.modelDir
                     .split(/[/\\]/)
@@ -431,6 +431,7 @@ export function StatusPopover() {
                     {accelDisplayLabel(
                       loadedEngineInfo.accel,
                       loadedEngineInfo.accelFallback,
+                      loadedEngineInfo.accelPartial,
                     )}
                   </span>
                   {loadedEngineInfo.modelDir && (

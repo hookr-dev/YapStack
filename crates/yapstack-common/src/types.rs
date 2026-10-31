@@ -99,6 +99,11 @@ pub enum SidecarResponse {
         /// ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         accel_fallback: Option<String>,
+        /// `accel` is a GPU EP that leaves part of the model's heavy ops on
+        /// the CPU (from the sidecar's static placement table). Additive:
+        /// absent means false, and it is only sent when true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accel_partial: bool,
     },
     /// Response to `QueryEngineInfo` — same shape as `ModelLoaded` but
     /// fired in response to an explicit query, not a load. `accel`/
@@ -113,6 +118,9 @@ pub enum SidecarResponse {
         /// See `ModelLoaded::accel_fallback`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         accel_fallback: Option<String>,
+        /// See `ModelLoaded::accel_partial`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accel_partial: bool,
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
@@ -314,8 +322,13 @@ mod tests {
         // Older sidecar: no accel_fallback key → None.
         let json = r#"{"type":"model_loaded","id":1,"accel":"cpu","model_dir":"/m"}"#;
         match serde_json::from_str::<SidecarResponse>(json).unwrap() {
-            SidecarResponse::ModelLoaded { accel_fallback, .. } => {
-                assert_eq!(accel_fallback, None)
+            SidecarResponse::ModelLoaded {
+                accel_fallback,
+                accel_partial,
+                ..
+            } => {
+                assert_eq!(accel_fallback, None);
+                assert!(!accel_partial);
             }
             _ => panic!("wrong variant"),
         }
@@ -333,10 +346,11 @@ mod tests {
             accel: Some("webgpu".into()),
             model_dir: None,
             accel_fallback: None,
+            accel_partial: false,
         };
-        assert!(!serde_json::to_string(&normal)
-            .unwrap()
-            .contains("accel_fallback"));
+        let wire = serde_json::to_string(&normal).unwrap();
+        assert!(!wire.contains("accel_fallback"));
+        assert!(!wire.contains("accel_partial"));
 
         // A fallback round-trips its reason.
         let fallback = SidecarResponse::EngineInfo {
@@ -344,6 +358,7 @@ mod tests {
             accel: Some("cpu".into()),
             model_dir: None,
             accel_fallback: Some("webgpu failed to load: no adapter".into()),
+            accel_partial: false,
         };
         let json = serde_json::to_string(&fallback).unwrap();
         match serde_json::from_str::<SidecarResponse>(&json).unwrap() {
@@ -351,6 +366,20 @@ mod tests {
                 accel_fallback.as_deref(),
                 Some("webgpu failed to load: no adapter")
             ),
+            _ => panic!("wrong variant"),
+        }
+
+        // A partial GPU load round-trips its flag.
+        let partial = SidecarResponse::ModelLoaded {
+            id: 5,
+            accel: Some("webgpu".into()),
+            model_dir: None,
+            accel_fallback: None,
+            accel_partial: true,
+        };
+        let json = serde_json::to_string(&partial).unwrap();
+        match serde_json::from_str::<SidecarResponse>(&json).unwrap() {
+            SidecarResponse::ModelLoaded { accel_partial, .. } => assert!(accel_partial),
             _ => panic!("wrong variant"),
         }
     }
