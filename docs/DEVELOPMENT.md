@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- Rust stable (see `rust-toolchain.toml`)
-- Node.js >= 22
+- Rust, pinned in `rust-toolchain.toml` (rustup installs the pinned version automatically). The `sync` feature also needs `nightly-2023-10-05` for the vendored cr-sqlite bundle: `rustup toolchain install nightly-2023-10-05`.
+- Node.js 24 (CI uses 24; the frontend tests need `node:sqlite`)
 - pnpm
 - cmake (only needed for `--features whisper`)
 

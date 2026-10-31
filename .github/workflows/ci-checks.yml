@@ -13,6 +13,7 @@ jobs:
   rust-fmt:
     name: Rust Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -27,6 +28,7 @@ jobs:
   rust:
     name: Rust (macos-latest)
     runs-on: macos-latest
+    timeout-minutes: 60
     # whisper-rs-sys bundles whisper.cpp; on Apple Silicon (macos-latest)
     # ggml-cpu's ARM quants.c uses `vmmlaq_s32`, which requires the i8mm
     # target feature. The bundled cmake build doesn't auto-enable it on
@@ -93,6 +95,7 @@ jobs:
   rust-windows:
     name: Rust (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -155,6 +158,7 @@ jobs:
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
