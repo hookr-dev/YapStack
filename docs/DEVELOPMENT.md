@@ -281,6 +281,28 @@ Run them locally with:
 cargo test -p yapstack-audio -- --ignored
 ```
 
+### Running the server integration tests locally
+
+The relay's integration suites in `crates/yapstack-server/tests/` are `#[ignore]`d because they need a live Postgres and S3-compatible object store. CI runs them in `.github/workflows/server-integration.yml`; to run them locally:
+
+```bash
+# Postgres 16 (same major as deploy/docker-compose.yml), connected to as the superuser
+docker run -d --name yap-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=yapstack_test postgres:16
+
+# Same first-boot setup the compose stack runs (pgcrypto + the yapstack_app role)
+PGHOST=127.0.0.1 PGPASSWORD=postgres POSTGRES_USER=postgres POSTGRES_DB=yapstack_test \
+  YAPSTACK_APP_PASSWORD=dev sh deploy/postgres-init/00-yapstack-roles.sh
+
+# MinIO (or any S3-compatible store) on :9000 with a `yapstack` bucket, then:
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/yapstack_test \
+S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=yapstack \
+S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin \
+  cargo test -p yapstack-server -- --include-ignored
+```
+
+Without `S3_ENDPOINT`, the two object-store tests (`gc_deletes_object_and_row_live`, `audio_presign_reports_already_exists_only_when_object_present`) print `SKIP:` and pass without running; CI treats that as a failure. MinIO no longer publishes container images or binaries, so CI builds the last upstream release from source (`go install github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z`).
+
 ## Models Directory
 
 Whisper models are stored in the app's data directory under `models/`:
