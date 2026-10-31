@@ -40,7 +40,11 @@
 #     "Run anyway"); currentUser install; Credential Manager works.
 #   * macOS: UNSIGNED / ad-hoc unless mac_signed=true (Gatekeeper: right-click ->
 #     Open the first time). mac_signed=true replicates release.yml sign+notarize
-#     and requires the Apple secrets in the `release` environment.
+#     and uses the `release` environment for the Apple secrets, so it is only
+#     allowed from refs that environment permits.
+#   * Neither platform gets the Tauri updater signing key: these artifacts are
+#     installed by hand, so they are built without updater artifacts
+#     (tauri.no-updater.conf.json) and run in the `canary` environment.
 
 name: Sync Test Build
 
@@ -56,7 +60,7 @@ on:
         type: boolean
         default: true
       mac_signed:
-        description: "Sign + notarize the macOS build (needs Apple secrets in the release env)"
+        description: "Sign + notarize the macOS build (uses the release environment's Apple secrets)"
         type: boolean
         default: false
   # No push trigger. It used to be scoped to `feat/sync-relay-skeleton` purely so the
@@ -65,6 +69,10 @@ on:
 
 # Minimal top-level permissions — jobs elevate as needed
 permissions: {}
+
+concurrency:
+  group: sync-test-build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -84,11 +92,10 @@ jobs:
     # any ref is buildable. Untick `mac` to skip this job.
     if: ${{ inputs.mac }}
     runs-on: macos-latest
-    # `release` env carries the Apple + Tauri updater-signing secrets. tauri.conf.json
-    # sets createUpdaterArtifacts, so TAURI_SIGNING_PRIVATE_KEY is required even for an
-    # unsigned (mac_signed=false) build. The canary Windows dispatch precedent shows the
-    # release env does not block branch dispatch runs.
-    environment: release
+    timeout-minutes: 120
+    # Only a signed build needs the `release` environment (Apple secrets). Every build
+    # here disables updater artifacts, so the Tauri updater signing key is never needed.
+    environment: ${{ inputs.mac_signed && 'release' || 'canary' }}
     permissions:
       contents: read
     env:
@@ -123,7 +130,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
@@ -185,9 +192,7 @@ jobs:
         # vars are set, so tauri does not attempt to notarize.
         env:
           APPLE_SIGNING_IDENTITY: "-"
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
+        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync --config src-tauri/tauri.no-updater.conf.json
 
       - name: Build Tauri app (--features sync, signed + notarized)
         if: ${{ inputs.mac_signed }}
@@ -196,9 +201,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
+        run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync --config src-tauri/tauri.no-updater.conf.json
 
       - name: Upload macOS sync artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -213,8 +216,9 @@ jobs:
     name: Build Windows (sync)
     if: ${{ inputs.windows }}
     runs-on: windows-latest
-    # Same rationale as the macOS job: createUpdaterArtifacts needs the Tauri signing key.
-    environment: release
+    timeout-minutes: 120
+    # No secrets beyond analytics are needed: the build disables updater artifacts.
+    environment: canary
     permissions:
       contents: read
     env:
@@ -244,7 +248,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
@@ -293,10 +297,8 @@ jobs:
         # strict. Both definitions are equivalent no-ops under panic="abort" (the repo's
         # release profile), so allowing the first-wins duplicate is safe for this build.
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           RUSTFLAGS: "-Clink-arg=/FORCE:MULTIPLE"
-        run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync
+        run: pnpm --filter @yapstack/desktop tauri build --target x86_64-pc-windows-msvc --bundles nsis -f sync --config src-tauri/tauri.no-updater.conf.json
 
       - name: Upload Windows sync artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
