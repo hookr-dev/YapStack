@@ -48,12 +48,14 @@ function pills(html: string) {
   ].map(([, id, ts, off]) => ({ id, ts, off }));
 }
 
-/** Contract: a citation either becomes a working pill (known segment id,
- *  m:ss label) or disappears. It never leaves a raw `seg:` code on screen
- *  and never produces a pill labelled with a hex fragment that seeks to 0. */
+/** Contract: a citation becomes a working pill (known segment id, m:ss
+ *  label) or an unlabelled pending pill (shown as an unavailable source, kept
+ *  so it can resolve later). It never leaves a raw `seg:` code on screen and
+ *  never produces a pill labelled with a hex fragment that seeks to 0. */
 function expectNoDeadOrRawCitations(html: string) {
   expect(visibleText(html)).not.toMatch(/seg[:_]/i);
   for (const p of pills(html)) {
+    if (p.ts === "") continue;
     expect(SEGMENTS.map((s) => s.id)).toContain(p.id);
     expect(p.ts).toMatch(/^\d+:\d{2}(:\d{2})?$/);
   }
@@ -81,5 +83,22 @@ describe("citation post-processing on real model output", () => {
   ])("%s", (_label, modelOutput) => {
     const html = convertCitationsToSegmentRefs(`<p>${modelOutput}</p>`, SEGMENTS);
     expectNoDeadOrRawCitations(html);
+  });
+});
+
+describe("unresolved citations in notes are kept, not destroyed", () => {
+  it("keeps the full id of a mis-copied UUID on a pending pill", () => {
+    const miscopied = "89ea3e1d-6adb-45f5-b0e5-7ca605644c6f";
+    const html = convertCitationsToSegmentRefs(
+      `<p>x [[seg:${miscopied}]].</p>`,
+      SEGMENTS,
+    );
+    expect(pills(html)).toEqual([{ id: miscopied, ts: "", off: "0" }]);
+    expect(visibleText(html)).toBe("x .");
+  });
+
+  it("keeps a timestamp-only citation so it can resolve later", () => {
+    const html = convertCitationsToSegmentRefs("<p>x [[seg:9:59]].</p>", SEGMENTS);
+    expect(pills(html)).toEqual([{ id: "", ts: "", off: "599" }]);
   });
 });

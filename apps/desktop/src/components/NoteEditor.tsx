@@ -40,6 +40,7 @@ import { useAppStore } from "@/stores/appStore";
 import { log } from "@/lib/logger";
 import { SegmentReference } from "@/lib/tiptap-segment-ref";
 import { convertCitationsToSegmentRefs } from "@/lib/ai-tools";
+import { hasPendingPills } from "@/lib/citations/render";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -590,13 +591,11 @@ export function NoteEditor({
       const note = await getNote(sessionId);
       if (cancelled) return;
       let content = note?.content ?? "";
-      // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes.
-      // Conversion removes citations it can't resolve and the result is
-      // persisted, so it must not run before this session's segments exist
-      // locally (a synced note can land before its transcript): with no
-      // segments every citation would be deleted for good. Leave the text
-      // as-is and convert on a later load.
-      if (content.includes("[[seg:")) {
+      // Convert [[seg:ID]] text citations to <span data-segment-ref> nodes,
+      // and re-resolve pending pills whose segment wasn't here last time (a
+      // synced note can land before its transcript). Skipped while the session
+      // has no segments locally, so the stored text is left as-is.
+      if (content.includes("[[seg:") || hasPendingPills(content)) {
         const segments = await getSessionSegments(sessionId);
         if (cancelled) return;
         if (segments.length > 0) {

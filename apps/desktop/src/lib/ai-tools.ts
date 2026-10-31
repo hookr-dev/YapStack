@@ -31,7 +31,12 @@ import {
 } from "./ai";
 import { formatTime, stripHtml } from "./utils";
 import { createSegmentIndex } from "./citations/resolve";
-import { rewriteCitations, toPillHtml } from "./citations/render";
+import {
+  resolvePendingPills,
+  rewriteCitations,
+  toPendingPillHtml,
+  toPillHtml,
+} from "./citations/render";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
 
@@ -206,14 +211,20 @@ export interface ToolDefinition {
 /**
  * Replace citation markers in model-authored HTML with the
  * `<span data-segment-ref>` nodes the Tiptap SegmentReference extension
- * renders as pills. Markers that don't resolve to one of `segments` are
- * removed (see `lib/citations`).
+ * renders as pills. The result is persisted, so a marker that doesn't resolve
+ * to one of `segments` is kept as an unlabelled pending pill (shown as an
+ * unavailable source) rather than removed, and pending pills already in
+ * `html` are re-resolved (see `lib/citations`).
  */
 export function convertCitationsToSegmentRefs(
   html: string,
   segments: DbSegment[],
 ): string {
-  return rewriteCitations(html, createSegmentIndex(segments), toPillHtml).text;
+  const index = createSegmentIndex(segments);
+  return resolvePendingPills(
+    rewriteCitations(html, index, toPillHtml, toPendingPillHtml).text,
+    index,
+  );
 }
 
 // --- Registry ---

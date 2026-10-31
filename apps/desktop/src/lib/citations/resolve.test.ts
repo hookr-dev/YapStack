@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { createSegmentIndex, resolveCitation } from "./resolve";
-import { rewriteCitations, toPillHtml, toPlainLabel } from "./render";
+import {
+  hasPendingPills,
+  resolvePendingPills,
+  rewriteCitations,
+  toPendingPillHtml,
+  toPillHtml,
+  toPlainLabel,
+} from "./render";
 import type { DbSegment } from "@/lib/db";
 
 function seg(
@@ -149,5 +156,26 @@ describe("render", () => {
     expect(
       rewriteCitations(`Fact [[seg:${A.id}]].`, null, toPlainLabel),
     ).toEqual({ text: "Fact.", invalidCount: 1 });
+  });
+});
+
+describe("pending pills", () => {
+  it("re-resolves a pending pill and leaves labelled pills untouched", () => {
+    const pending = toPendingPillHtml({ kind: "segment", segmentId: A.id })!;
+    const dead = `<span data-segment-ref="" data-segment-id="deadbeef" data-timestamp="deadbeef" data-offset="0">deadbeef</span>`;
+    const html = `<p>${pending} ${dead}</p>`;
+    expect(hasPendingPills(html)).toBe(true);
+    expect(resolvePendingPills(html, index)).toBe(
+      `<p>${toPillHtml(refA)} ${dead}</p>`,
+    );
+  });
+
+  it("leaves a pending pill as-is while its segment is still missing", () => {
+    const pending = toPendingPillHtml({ kind: "segment", segmentId: "late" })!;
+    expect(resolvePendingPills(pending, index)).toBe(pending);
+  });
+
+  it("keeps nothing for an empty id", () => {
+    expect(toPendingPillHtml({ kind: "segment", segmentId: "" })).toBeNull();
   });
 });

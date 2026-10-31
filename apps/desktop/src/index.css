@@ -318,6 +318,10 @@
   .tiptap-editor span[data-segment-ref]:hover {
     opacity: 0.8;
   }
+  .tiptap-editor span[data-segment-ref][aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .tiptap-editor p.is-editor-empty:first-child::before {
     color: var(--muted-foreground);
     opacity: 0.5;

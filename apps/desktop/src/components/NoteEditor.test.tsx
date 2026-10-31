@@ -190,6 +190,71 @@ describe("NoteEditor — citation conversion on load", () => {
   });
 });
 
+describe("NoteEditor — citation whose segment hasn't synced", () => {
+  const LATE_ID = "48e2014f-ac1c-4c13-bb83-f4c2799df9dc";
+  const segRow = (id: string, audio_offset_seconds: number) => ({
+    id,
+    session_id: "s1",
+    source: "Mic",
+    text: "t",
+    audio_offset_seconds,
+    chunk_duration_seconds: 5,
+    confidence: 0.9,
+    created_at: "",
+    chunk_index: 0,
+    original_text: null,
+    edited_at: null,
+    deleted_at: null,
+    hidden: 0,
+  });
+
+  it("saves it with the full id, shows it unavailable, and resolves once the segment exists", async () => {
+    getNoteMock.mockResolvedValue({
+      content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
+    });
+    // Partial sync: some of the session's segments are here, not the cited one.
+    getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
+
+    renderEditor();
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    const saved = saveNoteMock.mock.calls[0][1] as string;
+    expect(saved).toContain(`data-segment-id="${LATE_ID}" data-timestamp=""`);
+    expect(saved).not.toContain("[[seg:");
+
+    const pill = await waitFor(() => {
+      const el = editorDom().querySelector("[data-segment-ref]");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(pill.getAttribute("aria-disabled")).toBe("true");
+    expect(pill.getAttribute("aria-label")).toBe("Source unavailable");
+    expect(pill.textContent).toBe("");
+
+    // The segment syncs in; the next load resolves the stored pending pill.
+    cleanup();
+    saveNoteMock.mockClear();
+    getNoteMock.mockResolvedValue({ content: saved });
+    getSessionSegmentsMock.mockResolvedValue([
+      segRow("other-seg", 3),
+      segRow(LATE_ID, 1025),
+    ]);
+    renderEditor();
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    expect(saveNoteMock.mock.calls[0][1]).toContain(
+      `data-segment-id="${LATE_ID}" data-timestamp="17:05"`,
+    );
+    await waitFor(() =>
+      expect(editorDom().querySelector("[data-segment-ref]")?.textContent).toBe(
+        "17:05",
+      ),
+    );
+    expect(
+      editorDom().querySelector("[data-segment-ref]")?.getAttribute("aria-disabled"),
+    ).toBeNull();
+  });
+});
+
 describe("NoteEditor — save guards (A1a/A1d)", () => {
   it("writes nothing on blur when the content is unchanged", async () => {
     renderEditor();
