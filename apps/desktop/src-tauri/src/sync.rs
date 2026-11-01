@@ -4054,10 +4054,13 @@ fn spawn_drain(
                 // — never per idle cycle, counts only, no row content or secrets.
                 if report.applied > 0 || report.quarantined > 0 || report.replayed > 0 {
                     tracing::info!(
-                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed)",
+                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed; \
+                         {} waiting for an app update, {} failed to apply)",
                         report.applied,
                         report.quarantined,
-                        report.replayed
+                        report.replayed,
+                        report.replay_waiting,
+                        report.replay_failed
                     );
                 }
 

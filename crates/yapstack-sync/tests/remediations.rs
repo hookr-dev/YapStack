@@ -249,7 +249,7 @@ fn r7_quarantine_replay_across_schema_gap() {
 
     // B runs the SAME wrapped migration, then replays the quarantine.
     schema::crsql_alter(b.conn(), "doc", "ALTER TABLE doc ADD COLUMN b TEXT").unwrap();
-    let replayed = replay_pending(b.conn()).unwrap();
+    let replayed = replay_pending(b.conn()).unwrap().replayed;
     assert_eq!(
         replayed, quarantined,
         "every quarantined change must replay"
@@ -563,5 +563,41 @@ fn merge_waits_out_a_concurrent_writer_instead_of_failing() {
     assert_eq!(count(dst.conn(), "SELECT count(*) FROM app_t"), 1);
 
     // The replay path takes the same lock discipline; with an empty queue it is a clean no-op.
-    assert_eq!(replay_pending(dst.conn()).unwrap(), 0);
+    assert_eq!(replay_pending(dst.conn()).unwrap().replayed, 0);
+}
+
+/// FP1 (ADR 0006 §4): a DB missing some `SYNC_TABLES` members (a table added after cutover
+/// that this device hasn't created yet) still migrates, and the cascade and uniqueness passes
+/// skip the relationships that name a missing table instead of failing the drain. The rest
+/// still run: deleting a session still tombstones its segments.
+#[test]
+fn absent_tables_are_tolerated_by_migrate_cascade_and_uniqueness() {
+    let db = CrsqlDb::open_in_memory().unwrap();
+    support::create_original_schema(db.conn());
+    support::populate(db.conn());
+    db.conn()
+        .execute_batch(
+            "DROP TABLE shares; DROP TABLE session_audio_parts; DROP TABLE session_tags;",
+        )
+        .unwrap();
+    schema::crr_migrate(db.conn()).expect("missing sync tables are skipped");
+    assert!(!schema::is_crr(db.conn(), "shares").unwrap());
+    assert!(schema::is_crr(db.conn(), "sessions").unwrap());
+
+    let conn = db.conn();
+    let sid: String = conn
+        .query_row("SELECT session_id FROM segments LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    conn.execute("DELETE FROM sessions WHERE id=?1", [&sid])
+        .unwrap();
+    let stats = cascade_gc(conn).expect("cascade skips relationships with a missing table");
+    assert!(stats.deleted > 0);
+    assert_eq!(
+        count(
+            conn,
+            &format!("SELECT count(*) FROM segments WHERE session_id='{sid}'")
+        ),
+        0
+    );
+    enforce_uniqueness(conn).expect("uniqueness skips passes with a missing table");
 }

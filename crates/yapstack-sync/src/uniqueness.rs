@@ -14,6 +14,7 @@
 
 use rusqlite::Connection;
 
+use crate::schema::all_crr;
 use crate::SyncError;
 
 /// Counts from one uniqueness pass.
@@ -34,10 +35,25 @@ pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncErro
     // `SQLITE_BUSY_SNAPSHOT` — which the busy handler does NOT retry, so it fails outright
     // regardless of `busy_timeout` (same rationale as `quarantine::merge_changeset`).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Each pass runs only when the tables it reads are CRRs here (they read the clock tables),
+    // so a DB without one of them is tolerated (ADR 0006 §4).
+    let ready = |tables: &[&str]| all_crr(&tx, tables);
     let stats = UniquenessStats {
-        notes_removed: dedup_notes(&tx)?,
-        tags_merged: dedup_tags(&tx)?,
-        audio_parts_removed: dedup_audio_parts(&tx)?,
+        notes_removed: if ready(&["notes"])? {
+            dedup_notes(&tx)?
+        } else {
+            0
+        },
+        tags_merged: if ready(&["tags", "session_tags"])? {
+            dedup_tags(&tx)?
+        } else {
+            0
+        },
+        audio_parts_removed: if ready(&["session_audio_parts"])? {
+            dedup_audio_parts(&tx)?
+        } else {
+            0
+        },
     };
     tx.commit()?;
     Ok(stats)

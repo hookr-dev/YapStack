@@ -160,7 +160,7 @@ app-layer passes reinstate what was stripped after each converged merge:
 | `_yapstack_sync_meta` | `client_id` (unused in production; the keychain identity wins), `pull_watermark`, `push_watermark`, `client_seq`, `seq_reconciled`, `bound_tenant_id` |
 | `_yapstack_sync_prep` | `schema_version` marker that the live DB has been CRR-prepared |
 | `_yapstack_outbox` | encrypted, chunked local changesets awaiting ack |
-| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for unknown columns, clock intact) |
+| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for tables that aren't a CRR here yet, or for unknown columns; clock intact) |
 | `_yapstack_crypto_quarantine` | undecryptable pulled changesets (ciphertext, durable, retryable) |
 | `_yapstack_audio_upload_queue` | audio upload state machine per part |
 
@@ -415,9 +415,21 @@ including its own echoes (idempotent; this is how a restored database re-acquire
 own history), one transaction per changeset with cooperative yields and a real pause
 every 32 merges so UI writers can take the lock. A changeset that fails to decrypt or
 decode is stored in the crypto quarantine and the watermark **advances past it**
-(§11.3 as amended: durable, surfaced, retryable, never wedging). Unknown-column rows go
-to the schema quarantine and replay after the column lands. The watermark is written
-once per page.
+(§11.3 as amended: durable, surfaced, retryable, never wedging). A row goes to the
+schema quarantine when its table isn't a CRR locally (absent, or present but not yet
+converted), **sentinel rows included**, or when its column is unknown; readiness is
+checked once per table per changeset. Any other failure to apply a row still fails the
+changeset and rides back as `pull_error`. The watermark is written once per page.
+
+Replay runs at the end of every drain cycle. It walks the stash in arrival (`id`) order,
+one row per write transaction, each under the process `WriteTurnstile` taken before
+`BEGIN IMMEDIATE`. A row that is still not ready waits; a ready row that fails rolls back
+alone, stays stashed and is retried next cycle, and every later stashed row for the same
+`(table, pk)` is skipped for that pass, so a column row never lands over a failed delete
+sentinel. The cycle reports `replay_waiting` (rows waiting for an app update) and
+`replay_failed` (failed plus held behind a failure); today they reach the drain log only,
+not lane status. `crr_migrate`, `cascade_gc` and `enforce_uniqueness` skip a sync table
+this device doesn't have, or hasn't converted, yet (ADR 0006 §4).
 
 ### 6.5 Maintenance
 
@@ -690,6 +702,7 @@ onboarding completes.
 | I12 | Two devices converge through the relay; random programs converge | `runtime::two_devices_converge_through_relay`, `convergence_proptest` |
 | I13 | Independent UUID libraries merge as a lossless union; shared ancestry is lossy by design | `merge_semantics::*` |
 | I14 | Unknown-column changes quarantine and replay after migration | `remediations::r7_quarantine_replay_across_schema_gap` |
+| I-NT1 | A row for a table that isn't a CRR locally never fails a changeset: it waits in the schema quarantine, the watermark advances, and it replays once the table is a CRR; one failing stashed row never blocks the others | `outbox::tests::wedge_regression_new_table_sentinel`, `quarantine::tests::*`, `remediations::absent_tables_are_tolerated_by_migrate_cascade_and_uniqueness` |
 | I15 | Dedup and cascade never destroy a partially merged or not-yet-merged row | `data_integrity_prove::*` |
 | I16 | A restored DB re-acquires its own history (own echoes merge) | `outbox` restore tests |
 | I17 | Stale CRR triggers are detected and healed without touching sync state | `trigger_arity::*` |
