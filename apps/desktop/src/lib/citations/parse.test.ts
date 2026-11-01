@@ -169,10 +169,8 @@ describe("splitAtCrossingMarkers", () => {
         Array.from({ length: n }, (_, i) => (i % 2 ? `${A.slice(6)}]] ` : "[[seg:89ea3e")),
     ],
   ])("scales linearly with %s markers", (_label, make) => {
-    const small = timeMs(make(2_500));
-    const large = timeMs(make(10_000));
-    expect(large).toBeLessThan(250);
-    // Quadratic work would take ~16x as long for 4x the input.
-    expect(large / Math.max(small, 1)).toBeLessThan(8);
+    // Linear work takes tens of ms here; the earlier quadratic version took
+    // about 2 s, so the bound has wide margin both ways under CI load.
+    expect(timeMs(make(20_000))).toBeLessThan(500);
   });
 });
