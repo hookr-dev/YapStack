@@ -108,12 +108,18 @@ export interface TextSpan {
 
 /**
  * Split each of `pieces`, consecutive text in one line of inline content
- * (text nodes across formatting, code and links), into spans, marking as
- * literal every part of a marker that spans a boundary between pieces, plus
- * any trailing unclosed marker that a following piece continues. A marker
- * split by formatting (`[[seg:` then `</strong>ID]]`) can't be parsed from
- * one piece without dropping or misreading half of it, so the whole of it
- * stays literal; markers wholly inside one piece are left to the caller.
+ * (text nodes across formatting, code and links; a line ends at a block edge
+ * or hard break), into spans, marking as literal any marker that can't be
+ * trusted from its piece alone:
+ *  - a marker that spans a boundary between pieces (`[[seg:` then
+ *    `</strong>ID]]`): parsed from one piece, half of it would be dropped or
+ *    misread, so the whole of it stays literal;
+ *  - a marker the piece reads differently from the line as a whole, such as
+ *    an unclosed marker the next piece continues;
+ *  - a marker left unterminated at the line end (`[[seg:89ea3e1d`), which
+ *    may be cut off and must never be resolved by its prefix.
+ * Markers both readings agree on are left to the caller. Linear in the
+ * length of the line.
  */
 export function splitAtCrossingMarkers(pieces: readonly string[]): TextSpan[][] {
   const starts: number[] = [];
@@ -122,42 +128,57 @@ export function splitAtCrossingMarkers(pieces: readonly string[]): TextSpan[][] 
     starts.push(pos);
     pos += piece.length;
   }
-  const literal: Array<[number, number]> = [];
-  const crosses = (start: number, end: number) =>
-    starts.some((b, i) => i > 0 && start < b && b < end);
-  for (const run of parseCitations(pieces.join(""))) {
-    for (const m of run.markers) {
-      if (crosses(m.start, m.end)) literal.push([m.start, m.end]);
+  const lineEnd = pos;
+  const joined = pieces.join("");
+  // Literal ranges per piece, in the piece's own offsets.
+  const literal: Array<Array<[number, number]>> = pieces.map(() => []);
+  const agreed = new Set<string>();
+
+  // Markers come back in order, so one pointer walks the piece boundaries.
+  let p = 0;
+  for (const run of parseCitations(joined)) {
+    for (const { start, end } of run.markers) {
+      while (p < pieces.length - 1 && starts[p + 1] <= start) p++;
+      const crosses = p < pieces.length - 1 && starts[p + 1] < end;
+      const unterminated = end === lineEnd && !/[\])]$/.test(joined.slice(start, end));
+      if (!crosses && !unterminated) {
+        agreed.add(`${start}:${end}`);
+        continue;
+      }
+      for (let q = p; q < pieces.length && starts[q] < end; q++) {
+        const from = Math.max(start, starts[q]) - starts[q];
+        const to = Math.min(end, starts[q] + pieces[q].length) - starts[q];
+        if (to > from) literal[q].push([from, to]);
+      }
     }
   }
-  pieces.forEach((piece, i) => {
-    if (i === pieces.length - 1) return;
-    const head = trimPartialCitation(piece);
-    if (head.length < piece.length) {
-      literal.push([starts[i] + head.length, starts[i] + piece.length]);
-    }
-  });
-  literal.sort((a, b) => a[0] - b[0]);
 
   return pieces.map((piece, i) => {
-    const from = starts[i];
+    const ranges = literal[i];
+    for (const run of parseCitations(piece)) {
+      for (const { start, end } of run.markers) {
+        if (!agreed.has(`${starts[i] + start}:${starts[i] + end}`)) {
+          ranges.push([start, end]);
+        }
+      }
+    }
+    ranges.sort((a, b) => a[0] - b[0]);
     const spans: TextSpan[] = [];
-    const push = (start: number, end: number, isLiteral: boolean) => {
-      if (end <= start) return;
-      const text = piece.slice(start - from, end - from);
+    const push = (from: number, to: number, isLiteral: boolean) => {
+      if (to <= from) return;
+      const text = piece.slice(from, to);
       const last = spans[spans.length - 1];
       if (last?.literal === isLiteral) last.text += text;
       else spans.push({ text, literal: isLiteral });
     };
-    let cursor = from;
-    const to = from + piece.length;
-    for (const [start, end] of literal) {
-      if (end <= cursor || start >= to) continue;
-      push(cursor, Math.max(cursor, start), false);
-      push(Math.max(cursor, start), Math.min(end, to), true);
-      cursor = Math.max(cursor, Math.min(end, to));
+    let cursor = 0;
+    for (const [from, to] of ranges) {
+      if (to <= cursor) continue;
+      push(cursor, from, false);
+      push(Math.max(cursor, from), to, true);
+      cursor = to;
     }
-    push(cursor, to, false);
+    push(cursor, piece.length, false);
     return spans;
   });
 }

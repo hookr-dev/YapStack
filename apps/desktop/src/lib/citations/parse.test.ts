@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { parseCitations, parseTimestamp, trimPartialCitation } from "./parse";
+import {
+  parseCitations,
+  parseTimestamp,
+  splitAtCrossingMarkers,
+  trimPartialCitation,
+} from "./parse";
 import type { CitationToken } from "./types";
 
 const A = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
@@ -125,5 +130,49 @@ describe("trimPartialCitation", () => {
     "Starts a [note",
   ])("leaves %j alone", (text) => {
     expect(trimPartialCitation(text)).toBe(text);
+  });
+});
+
+describe("splitAtCrossingMarkers", () => {
+  it("leaves a complete bare marker at a piece end convertible", () => {
+    expect(splitAtCrossingMarkers([`seg:${A}`, " text"])).toEqual([
+      [{ text: `seg:${A}`, literal: false }],
+      [{ text: " text", literal: false }],
+    ]);
+  });
+
+  it("keeps a marker left unterminated at the line end literal", () => {
+    expect(splitAtCrossingMarkers(["x [[seg:89ea3e1d"])).toEqual([
+      [
+        { text: "x ", literal: false },
+        { text: "[[seg:89ea3e1d", literal: true },
+      ],
+    ]);
+  });
+
+  // Best of three runs, so a slow moment on CI can't fail it.
+  function timeMs(pieces: string[]): number {
+    let best = Infinity;
+    for (let r = 0; r < 3; r++) {
+      const t0 = performance.now();
+      splitAtCrossingMarkers(pieces);
+      best = Math.min(best, performance.now() - t0);
+    }
+    return best;
+  }
+
+  it.each([
+    ["whole", (n: number) => Array.from({ length: n }, () => `[[seg:${A}]] `)],
+    [
+      "split",
+      (n: number) =>
+        Array.from({ length: n }, (_, i) => (i % 2 ? `${A.slice(6)}]] ` : "[[seg:89ea3e")),
+    ],
+  ])("scales linearly with %s markers", (_label, make) => {
+    const small = timeMs(make(2_500));
+    const large = timeMs(make(10_000));
+    expect(large).toBeLessThan(250);
+    // Quadratic work would take ~16x as long for 4x the input.
+    expect(large / Math.max(small, 1)).toBeLessThan(8);
   });
 });

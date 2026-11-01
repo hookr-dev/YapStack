@@ -11,7 +11,7 @@ import {
 // or can't hold a pill (a pill nested in a link is invalid UI).
 const SKIP_TEXT_IN = "code, pre, a, [data-segment-ref]";
 const PILL = "span[data-segment-ref]";
-// Elements text flows through within one line, so a marker can continue
+// Elements text flows through within one line (a `<br>` ends it), so a marker can continue
 // across their edges (`<strong>[[seg:</strong>ID]]`).
 const INLINE =
   "a, abbr, b, bdi, bdo, cite, code, data, del, dfn, em, font, i, img, ins, kbd, mark, q, s, samp, small, span, strike, strong, sub, sup, time, u, var, wbr";
@@ -46,23 +46,20 @@ function citationTextNodes(doc: Document): Array<[Text, TextSpan[]]> {
       (node as Element).matches("br, img, wbr");
     if (!isLeaf) continue;
     const block = blockOf(node);
-    if (block !== lineBlock && line.length > 0) {
+    const isBreak = node.nodeName === "BR";
+    if ((isBreak || block !== lineBlock) && line.length > 0) {
       lines.push(line);
       line = [];
     }
     lineBlock = block;
-    line.push(node);
+    if (!isBreak) line.push(node);
   }
   if (line.length > 0) lines.push(line);
 
   const out: Array<[Text, TextSpan[]]> = [];
   for (const nodes of lines) {
     const pieces = nodes.map((n) =>
-      n.nodeType === Node.TEXT_NODE
-        ? (n as Text).data
-        : n.nodeName === "BR"
-          ? "\n"
-          : "",
+      n.nodeType === Node.TEXT_NODE ? (n as Text).data : "",
     );
     splitAtCrossingMarkers(pieces).forEach((spans, i) => {
       const node = nodes[i];

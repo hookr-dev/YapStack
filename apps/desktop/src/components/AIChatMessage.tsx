@@ -100,7 +100,8 @@ function lastLeaf(node: MdNode): MdNode | null {
   return leaf;
 }
 
-// Phrasing nodes text flows through within one line, and inline leaves.
+// Phrasing nodes text flows through within one line (a hard break ends
+// it), and inline leaves.
 const INLINE_PARENTS = new Set([
   "emphasis",
   "strong",
@@ -112,7 +113,6 @@ const INLINE_LEAVES = new Set([
   "text",
   "inlineCode",
   "html",
-  "break",
   "image",
   "imageReference",
   "footnoteReference",
@@ -122,11 +122,16 @@ const INLINE_LEAVES = new Set([
 // and links, so a marker split by formatting is found whole and kept literal.
 function textSpans(root: MdNode): Map<MdNode, TextSpan[]> {
   const lines: MdNode[][] = [];
-  const visit = (parent: MdNode, line: MdNode[]) => {
+  // Returns the line still open after `parent`, as a hard break inside
+  // formatting starts a new one.
+  const visit = (parent: MdNode, line: MdNode[]): MdNode[] => {
     let current = line;
     for (const child of parent.children ?? []) {
       if (INLINE_PARENTS.has(child.type)) {
-        visit(child, current);
+        current = visit(child, current);
+      } else if (child.type === "break") {
+        current = [];
+        lines.push(current);
       } else if (INLINE_LEAVES.has(child.type)) {
         current.push(child);
       } else {
@@ -137,6 +142,7 @@ function textSpans(root: MdNode): Map<MdNode, TextSpan[]> {
         lines.push(current);
       }
     }
+    return current;
   };
   const top: MdNode[] = [];
   lines.push(top);
@@ -145,7 +151,7 @@ function textSpans(root: MdNode): Map<MdNode, TextSpan[]> {
   const spans = new Map<MdNode, TextSpan[]>();
   for (const nodes of lines) {
     const pieces = nodes.map((n) =>
-      n.type === "break" ? "\n" : (n.value ?? ""),
+      n.value ?? "",
     );
     splitAtCrossingMarkers(pieces).forEach((s, i) => {
       if (nodes[i].type === "text") spans.set(nodes[i], s);

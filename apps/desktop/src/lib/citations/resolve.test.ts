@@ -246,6 +246,23 @@ describe("pending pills", () => {
     expect(convertCitationsInHtml(html, index)).toBe(html);
   });
 
+  it("converts a complete bare marker that ends a formatting element", () => {
+    expect(
+      convertCitationsInHtml(`<p><strong>seg:${A.id}</strong> text</p>`, index),
+    ).toBe(`<p><strong>${toPillHtml(refA)}</strong> text</p>`);
+  });
+
+  it("never prefix-resolves a marker cut off at a paragraph end", () => {
+    const html = `<p>[[seg:89ea3e1d</p><p>-0000-4000-8000-000000000000]]</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(html);
+  });
+
+  it("treats a line break as a hard break, leaving no orphaned bracket", () => {
+    expect(convertCitationsInHtml(`<p>[<br>[seg:${A.id}]]</p>`, index)).toBe(
+      `<p>[<br>${toPillHtml(refA)}</p>`,
+    );
+  });
+
   it("still converts whole markers on either side of formatting", () => {
     const html = `<p><strong>[[seg:${A.id}]]</strong>, [[seg:${B.id}]]</p>`;
     expect(convertCitationsInHtml(html, index)).toBe(

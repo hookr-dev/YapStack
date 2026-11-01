@@ -521,6 +521,44 @@ describe("AIChatMessage", () => {
       );
     });
 
+    it("converts a complete bare marker that ends bold text", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content: `**seg:${UUID}** text` })}
+          segments={[makeSegment({ id: UUID })]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "1:05" })).toBeInTheDocument();
+    });
+
+    it("never prefix-resolves a marker cut off at a paragraph end", () => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({
+            role: "assistant",
+            content: "[[seg:89ea3e1d\n\n-0000-4000-8000-000000000000]]",
+          })}
+          segments={[makeSegment({ id: UUID })]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: "1:05" })).not.toBeInTheDocument();
+      expect(container.querySelector("p")?.textContent).toBe("[[seg:89ea3e1d");
+    });
+
+    it("treats a hard line break as a break, leaving no orphaned bracket", () => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content: `x [\\\n[seg:${UUID}]] y` })}
+          segments={[makeSegment({ id: UUID })]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(container.querySelector("br")).not.toBeNull();
+      expect(container.querySelector(".ai-chat-markdown")?.textContent).toBe("x [\n1:05 y");
+    });
+
     it("keeps ordinary markdown links as links", () => {
       renderWithTooltip(
         <AIChatMessage
