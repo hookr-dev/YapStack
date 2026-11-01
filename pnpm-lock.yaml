@@ -149,8 +149,8 @@ importers:
         specifier: ^1.63.0
         version: 1.63.0(@types/react@19.3.0)(react@19.3.1)
       marked:
-        specifier: ^17.0.1
-        version: 17.0.1
+        specifier: ^18.1.2
+        version: 18.1.2
       openai:
         specifier: ^6.36.0
         version: 6.36.0(ws@8.19.0)
@@ -2486,6 +2486,11 @@ packages:
 
   marked@17.0.1:
     resolution: {integrity: sha512-boeBdiS0ghpWcSwoNm/jJBwdpFaMnZWRzjA6SkUMYb40SVaN1x7mmfGKp0jvexGcx+7y2La5zRZsYFZI6Qpypg==}
+    engines: {node: '>= 20'}
+    hasBin: true
+
+  marked@18.1.2:
+    resolution: {integrity: sha512-DfOnvLAQ6WYeWxWO1u4RyFOeqyHup6dks5PPqnoFiooU7ipRvidO/2j8plhAHIiZg574E9ZlzSjUiPMLAzFkgg==}
     engines: {node: '>= 20'}
     hasBin: true
 
@@ -5353,6 +5358,8 @@ snapshots:
       '@jridgewell/sourcemap-codec': 1.5.5
 
   marked@17.0.1: {}
+
+  marked@18.1.2: {}
 
   mdast-util-from-markdown@2.0.2(supports-color@7.2.0):
     dependencies:
