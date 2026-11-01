@@ -6,7 +6,7 @@
 //! library policy, not a spec requirement. Keeping one implementation means the
 //! KAT vectors (§13) exercise exactly the bytes production uses.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

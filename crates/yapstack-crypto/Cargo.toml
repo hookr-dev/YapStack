@@ -10,7 +10,7 @@ description = "RustCrypto implementation of the YapStack CRYPTO_SPEC (World B). 
 [dependencies]
 argon2 = "0.5"
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = { workspace = true }
 ed25519-dalek = "2"
 subtle = "2"
