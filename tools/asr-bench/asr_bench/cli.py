@@ -23,7 +23,7 @@ CACHE = TOOL_DIR / ".cache"
 STAGED_SIDECAR = CACHE / "bin" / (build_mod.SIDECAR + (".exe" if sys.platform == "win32" else ""))
 
 CSV_FIELDS = [
-    "model", "accel_requested", "accel_loaded", "accel_fallback", "accel_partial", "corpus",
+    "status", "model", "accel_requested", "accel_loaded", "accel_fallback", "accel_partial", "corpus",
     "clips", "audio_s", "warmup_runs", "scored_runs", "rtfx_steady", "rtfx_min", "rtfx_max",
     "rtfx_cold", "load_s", "cpu_user_s", "cpu_sys_s", "peak_rss_mb", "wer", "cer",
     "scored_utts", "unscored_utts", "errors", "placement_encoder", "placement_decoder_joint",
@@ -98,6 +98,8 @@ def run_row(args, sidecar: Path, model: str, model_dir: Path, accel: str, corpor
         e = metrics.error_rates(pairs, args.normalizer)
         expected = args.expect.get(f"{model}:{accel}")
         row = {
+            # A row with any failed utterance times and scores only a subset; never report it as a clean result.
+            "status": "incomplete" if errors else "ok",
             "model": model,
             "accel_requested": accel,
             "accel_loaded": stats.accel or "",
@@ -172,7 +174,7 @@ MD_COLUMNS = [
     ("Corpus", "corpus"), ("Clips", "clips"), ("Runs", "scored_runs"), ("Steady RTFx", "rtfx_steady"),
     ("Min–max", None), ("Cold RTFx", "rtfx_cold"), ("Load s", "load_s"), ("CPU user s", "cpu_user_s"),
     ("Peak RSS MB", "peak_rss_mb"), ("WER %", "wer"), ("CER %", "cer"),
-    ("Encoder placement", "placement_encoder"), ("vs expected", None),
+    ("Errors", "errors"), ("Encoder placement", "placement_encoder"), ("vs expected", None), ("Status", None),
 ]
 
 
@@ -194,6 +196,8 @@ def markdown(rows, args, sidecar: Path) -> str:
         for header, key in MD_COLUMNS:
             if header == "Min–max":
                 cells.append(f"{row['rtfx_min']}–{row['rtfx_max']}" if row["rtfx_min"] != "" else "")
+            elif header == "Status":
+                cells.append(f"incomplete ({row['errors']} errors)" if row["status"] != "ok" else "ok")
             elif header == "vs expected":
                 cells.append(f"{row['rtfx_vs_expected']} of {row['expected_rtfx']}" if row["expected_rtfx"] else "")
             else:
@@ -250,15 +254,22 @@ def cmd_run(args) -> int:
         w = csv.DictWriter(fh, fieldnames=list(utterances[0]) if utterances else ["model"])
         w.writeheader()
         w.writerows(utterances)
+    (out / "results.json").write_text(json.dumps(rows, indent=2) + "\n")
     md = markdown(rows, args, sidecar)
     (out / "results.md").write_text(md)
     print("\n" + md)
-    print(f"wrote {out}/results.csv, results.md, utterances.csv, logs/")
+    print(f"wrote {out}/results.csv, results.json, results.md, utterances.csv, logs/")
 
     misses = [r for r in rows if r["rtfx_vs_expected"] and abs(float(r["rtfx_vs_expected"].rstrip("%")) / 100) > args.tolerance]
     for r in misses:
         print(f"OUTSIDE ±{args.tolerance:.0%}: {r['model']}:{r['accel_requested']} {r['rtfx_steady']} vs {r['expected_rtfx']}", file=sys.stderr)
-    return 1 if misses else 0
+    failed = [r for r in rows if r["status"] != "ok"]
+    for r in failed:
+        print(f"INCOMPLETE: {r['model']}:{r['accel_requested']} on {r['corpus']}: {r['errors']} failed transcriptions", file=sys.stderr)
+    unmeasured = [k for k in args.expect if not any(f"{r['model']}:{r['accel_requested']}" == k and r["rtfx_vs_expected"] for r in rows)]
+    for k in unmeasured:
+        print(f"NO MEASUREMENT: --expect {k} has no steady RTFx to check", file=sys.stderr)
+    return 1 if misses or failed or unmeasured else 0
 
 
 def cmd_build(args) -> int:

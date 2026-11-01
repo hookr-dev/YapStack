@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,9 +93,10 @@ class EndToEnd(unittest.TestCase):
                 "--only", "m:webgpu", "--corpus", f"dir:{corpus}", "--repeat", "2",
                 "--expect", "m:webgpu=8", "--out", str(out),
             ])
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 1)  # a failed utterance fails the run
             with open(out / "results.csv") as fh:
                 [row] = list(csv.DictReader(fh))
+            self.assertEqual(row["status"], "incomplete")
             self.assertEqual(row["accel_loaded"], "webgpu")
             self.assertEqual(row["scored_runs"], "2")  # the failing clip is not timed
             self.assertEqual(row["errors"], "2")
@@ -111,6 +113,52 @@ class EndToEnd(unittest.TestCase):
             write_wav(root / "a.wav", 2.0)
             code = cli.main(["run", "--sidecar", str(FAKE), "--model", f"m={root}", "--corpus", str(root),
                              "--expect", "m:cpu=20", "--out", str(root / "out")])
+            self.assertEqual(code, 1)
+
+    def test_all_failed_corpus_fails_even_with_expectation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            write_wav(corpus / "fail1.wav", 1.0)
+            write_wav(corpus / "fail2.wav", 1.0)
+            out = root / "out"
+            code = cli.main(["run", "--sidecar", str(FAKE), "--model", f"m={root}", "--corpus", f"dir:{corpus}",
+                             "--expect", "m:cpu=20", "--warmup", "0", "--out", str(out)])
+            self.assertEqual(code, 1)
+            [row] = json.loads((out / "results.json").read_text())
+            self.assertEqual(row["status"], "incomplete")
+            self.assertEqual(row["errors"], 2)
+            self.assertEqual(row["scored_runs"], 0)
+            self.assertIn("incomplete (2 errors)", (out / "results.md").read_text())
+
+    def test_partially_failed_corpus_is_marked_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            write_wav(corpus / "a.wav", 2.0)
+            (corpus / "a.txt").write_text("hello world")
+            write_wav(corpus / "fail.wav", 1.0)
+            (corpus / "fail.txt").write_text("this one never transcribes")
+            out = root / "out"
+            code = cli.main(["run", "--sidecar", str(FAKE), "--model", f"m={root}", "--corpus", f"dir:{corpus}",
+                             "--out", str(out)])
+            self.assertEqual(code, 1)
+            [row] = json.loads((out / "results.json").read_text())
+            self.assertEqual(row["status"], "incomplete")
+            self.assertEqual(row["errors"], 1)
+            self.assertEqual(row["unscored_utts"], 1)
+            md = (out / "results.md").read_text()
+            self.assertIn("| Errors |", md)
+            self.assertIn("incomplete (1 errors)", md)
+
+    def test_expect_row_with_no_measurement_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_wav(root / "a.wav", 2.0)
+            code = cli.main(["run", "--sidecar", str(FAKE), "--model", f"m={root}", "--corpus", str(root),
+                             "--expect", "m:webgpu=8", "--out", str(root / "out")])
             self.assertEqual(code, 1)
 
     def test_placement_pass_reads_the_session_logger(self):

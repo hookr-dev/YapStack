@@ -10,7 +10,7 @@ For every model × execution-provider row it reports:
 - **Node placement**: a separate load-only pass with `YAPSTACK_ORT_PLACEMENT=1`, which reports the heavy (MatMul/Conv-family) ops on the EP per ORT session. This is feature-detected. A sidecar built before that variable existed shows `n/a`.
 - **WER and CER**: corpus-level (total edits over total reference words), after the pinned Whisper / Open ASR Leaderboard normaliser (`--normalizer english`, the default, or `basic` for non-English references).
 
-It writes `results.csv`, `results.md`, `utterances.csv` (per run: reference, hypothesis, timing) and the raw sidecar stderr under `results/<timestamp>/`. That folder is gitignored. Nothing it downloads, builds or writes is committed.
+It writes `results.csv`, `results.json`, `results.md`, `utterances.csv` (per run: reference, hypothesis, timing) and the raw sidecar stderr under `results/<timestamp>/`. That folder is gitignored. Nothing it downloads, builds or writes is committed.
 
 macOS and Linux only. Windows rows come from the canary builds instead.
 
@@ -96,7 +96,7 @@ uv run asr-bench run \
 
 ### Self-check
 
-The 2026-10-31 probe (`docs/plans/research/q4-delivery/asr.md` §2.2) used a 16.2 s TTS clip, one cold plus five steady transcribes per process. `--expect` makes the run exit non-zero if a row's steady RTFx falls outside `--tolerance` (default ±10%):
+The 2026-10-31 probe (`docs/plans/research/q4-delivery/asr.md` §2.2) used a 16.2 s TTS clip, one cold plus five steady transcribes per process. `--expect` makes the run exit non-zero if a row's steady RTFx falls outside `--tolerance` (default ±10%) or has no measurement. Any failed transcription marks its row `incomplete` (error count in every report) and also exits non-zero:
 
 ```bash
 uv run asr-bench run --model int8=… --model fp16=… --model int4=… --accel cpu,webgpu \
