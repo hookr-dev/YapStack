@@ -32,6 +32,7 @@ import {
 import { formatTime, stripHtml } from "./utils";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
+import { speakersFromNames } from "./speakers";
 
 // --- Core types ---
 
@@ -1058,18 +1059,13 @@ registerTool({
       if (!inScope(hit.sessionId)) return;
       if (bySessionId.has(hit.sessionId)) return;
       // Prepend the speaker label so the model can tell who said this
-      // before deciding whether to expand the session. The label uses the
-      // same convention as `formatSegmentSpeaker`: Mic -> "You", System
-      // with diarisation -> speaker name, System without -> "Other".
-      // Per-session speaker overrides (`speakerNames`) are applied so a
-      // renamed "Speaker 1 -> Alice" mapping shows through here too.
-      const speakerNames =
-        useAppStore.getState().settings.speakerNames[hit.sessionId];
-      let label: string;
-      if (hit.source === "Mic") label = "You";
-      else if (hit.speakerId != null)
-        label = speakerNames?.[hit.speakerId] ?? `Speaker ${hit.speakerId + 1}`;
-      else label = "Other";
+      // before deciding whether to expand the session.
+      const label = formatSegmentSpeaker(
+        { source: hit.source ?? "System", speaker_id: hit.speakerId },
+        speakersFromNames(
+          useAppStore.getState().settings.speakerNames[hit.sessionId],
+        ),
+      );
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
         title: hit.sessionTitle,
@@ -1259,12 +1255,13 @@ registerTool({
           // that session. Pulled fresh per session because IDs are
           // session-local (the same speaker_id in two sessions is two
           // different people).
-          const speakerNames =
-            useAppStore.getState().settings.speakerNames[sid];
+          const speakers = speakersFromNames(
+            useAppStore.getState().settings.speakerNames[sid],
+          );
           lines.push("**Transcript:**");
           for (const seg of live.slice(0, 200)) {
             const ts = formatTime(Math.max(0, seg.audio_offset_seconds));
-            const label = formatSegmentSpeaker(seg, speakerNames);
+            const label = formatSegmentSpeaker(seg, speakers);
             lines.push(`[seg:${seg.id} ${ts}] (${label}) ${seg.text}`);
             provenance.push({
               type: "segment",

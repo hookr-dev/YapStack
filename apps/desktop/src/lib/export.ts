@@ -1,11 +1,18 @@
 import type { DbSegment } from "@/lib/db";
+import {
+  resolveSpeakerLabel,
+  speakerKeyOf,
+  type SessionSpeakers,
+  type SpeakerKey,
+} from "@/lib/speakers";
 
-/** Mic = the user ("Me"), System = the other party ("Them"). */
 type SpeakerSource = DbSegment["source"];
 
 /** A run of consecutive same-speaker segments, merged into one turn. */
 interface Turn {
   source: SpeakerSource;
+  speakerKey: SpeakerKey;
+  label: string;
   /** Offset of the first segment in the merged turn. */
   offsetSeconds: number;
   text: string;
@@ -29,40 +36,46 @@ export function formatTimestamp(seconds: number): string {
  * Time-sorts segments, drops empties, then merges consecutive same-speaker
  * segments into turns. The merged turn keeps the FIRST segment's offset.
  */
-function segmentsToTurns(segments: DbSegment[]): Turn[] {
+function segmentsToTurns(segments: DbSegment[], speakers?: SessionSpeakers): Turn[] {
   const ordered = [...segments]
     .sort((a, b) => a.audio_offset_seconds - b.audio_offset_seconds)
-    .map((s) => ({ source: s.source, offsetSeconds: s.audio_offset_seconds, text: s.text.trim() }))
+    .map((s) => ({
+      source: s.source,
+      speakerKey: speakerKeyOf(s),
+      label: resolveSpeakerLabel(s, speakers, "human"),
+      offsetSeconds: s.audio_offset_seconds,
+      text: s.text.trim(),
+    }))
     .filter((s) => s.text.length > 0);
 
   const turns: Turn[] = [];
   for (const seg of ordered) {
     const last = turns[turns.length - 1];
-    if (last && last.source === seg.source) {
+    if (last && last.speakerKey === seg.speakerKey) {
       last.text = `${last.text} ${seg.text}`;
     } else {
-      turns.push({ source: seg.source, offsetSeconds: seg.offsetSeconds, text: seg.text });
+      turns.push({ ...seg });
     }
   }
   return turns;
 }
 
-function speakerLabel(source: SpeakerSource): string {
-  return source === "Mic" ? "Me" : "Them";
-}
-
 /**
  * Renders segments as attributed markdown: one merged turn per paragraph,
- * prefixed with `**Me:**` / `**Them:**` and, with `includeTimestamps`, a
- * `[mm:ss]` tag from the turn's first offset.
+ * prefixed with the speaker's label (`**Me:**`, `**Them:**`, `**Speaker 2:**`,
+ * a renamed speaker's name) and, with `includeTimestamps`, a `[mm:ss]` tag
+ * from the turn's first offset.
  */
 export function segmentsToAttributedMarkdown(
   segments: DbSegment[],
-  { includeTimestamps = false }: { includeTimestamps?: boolean } = {},
+  {
+    includeTimestamps = false,
+    speakers,
+  }: { includeTimestamps?: boolean; speakers?: SessionSpeakers } = {},
 ): string {
-  return segmentsToTurns(segments)
+  return segmentsToTurns(segments, speakers)
     .map((turn) => {
-      const label = `**${speakerLabel(turn.source)}:**`;
+      const label = `**${turn.label}:**`;
       const stamp = includeTimestamps ? ` [${formatTimestamp(turn.offsetSeconds)}]` : "";
       return `${label}${stamp} ${turn.text}`;
     })

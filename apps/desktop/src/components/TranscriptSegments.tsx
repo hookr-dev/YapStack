@@ -4,6 +4,13 @@ import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
 import { Pencil } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import {
+  resolveSpeakerLabel,
+  speakerKeyOf,
+  speakersFromNames,
+  type SessionSpeakers,
+  type SpeakerKey,
+} from "@/lib/speakers";
 
 const SPEAKER_COLORS = [
   "bg-teal-500/10 text-teal-700 dark:text-teal-300 border-teal-500/30",
@@ -16,25 +23,24 @@ function speakerColor(speakerId: number): string {
   return SPEAKER_COLORS[speakerId % SPEAKER_COLORS.length];
 }
 
-function defaultSpeakerLabel(speakerId: number): string {
-  return `Speaker ${speakerId + 1}`;
-}
-
 interface SpeakerHeaderProps {
   sessionId: string;
+  segment: DbSegment;
   speakerId: number;
-  customName: string | undefined;
+  speakers: SessionSpeakers;
 }
 
-function SpeakerHeader({ sessionId, speakerId, customName }: SpeakerHeaderProps) {
+function SpeakerHeader({ sessionId, segment, speakerId, speakers }: SpeakerHeaderProps) {
   const setSpeakerName = useAppStore((s) => s.setSpeakerName);
+  const speakerKey = speakerKeyOf(segment);
+  const customName = speakers[speakerKey]?.display_name ?? undefined;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(customName ?? "");
 
-  const display = customName ?? defaultSpeakerLabel(speakerId);
+  const display = resolveSpeakerLabel(segment, speakers, "human");
 
   const commit = () => {
-    setSpeakerName(sessionId, speakerId, draft);
+    setSpeakerName(sessionId, speakerKey, draft);
     setEditing(false);
   };
 
@@ -53,7 +59,7 @@ function SpeakerHeader({ sessionId, speakerId, customName }: SpeakerHeaderProps)
               setEditing(false);
             }
           }}
-          placeholder={defaultSpeakerLabel(speakerId)}
+          placeholder={resolveSpeakerLabel(segment, undefined, "human")}
           className="h-6 max-w-[140px] px-2 text-[11px]"
         />
       </div>
@@ -89,7 +95,7 @@ interface TranscriptSegmentsProps {
 }
 
 type Group = {
-  source: "Mic" | "System";
+  speakerKey: SpeakerKey;
   speakerId: number | null;
   items: DbSegment[];
 };
@@ -108,6 +114,7 @@ function TranscriptSegmentsInner({
   const speakerNames = useAppStore(
     (s) => s.settings.speakerNames[sessionId],
   );
+  const speakers = useMemo(() => speakersFromNames(speakerNames), [speakerNames]);
 
   // Source-vs-source visual differentiation lives in `EditableSegment`
   // (chat-bubble alignment / styling), so we don't add per-group "You" /
@@ -126,17 +133,16 @@ function TranscriptSegmentsInner({
     if (!speakerSeen) {
       return { groups: [] as Group[], hasSpeakerIds: false };
     }
-    // New group on either source change or speaker change so two adjacent
-    // same-id segments from different sources don't visually merge under
-    // one SpeakerHeader.
+    // Speaker keys are channel-qualified, so two adjacent same-id segments
+    // from different sources don't visually merge under one SpeakerHeader.
     const out: Group[] = [];
     for (const seg of segments) {
-      const speakerId = seg.speaker_id ?? null;
+      const speakerKey = speakerKeyOf(seg);
       const tail = out[out.length - 1];
-      if (tail && tail.source === seg.source && tail.speakerId === speakerId) {
+      if (tail && tail.speakerKey === speakerKey) {
         tail.items.push(seg);
       } else {
-        out.push({ source: seg.source, speakerId, items: [seg] });
+        out.push({ speakerKey, speakerId: seg.speaker_id ?? null, items: [seg] });
       }
     }
     return { groups: out, hasSpeakerIds: true };
@@ -169,8 +175,9 @@ function TranscriptSegmentsInner({
           {group.speakerId != null && (
             <SpeakerHeader
               sessionId={sessionId}
+              segment={group.items[0]}
               speakerId={group.speakerId}
-              customName={speakerNames?.[group.speakerId]}
+              speakers={speakers}
             />
           )}
           {group.items.map((segment) => {
