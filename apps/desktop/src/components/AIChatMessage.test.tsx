@@ -532,6 +532,17 @@ describe("AIChatMessage", () => {
       expect(screen.getByRole("button", { name: "1:05" })).toBeInTheDocument();
     });
 
+    it("converts a complete bare marker that ends the reply", () => {
+      renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content: `Point seg:${UUID}` })}
+          segments={[makeSegment({ id: UUID })]}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "1:05" })).toBeInTheDocument();
+    });
+
     it("never prefix-resolves a marker cut off at a paragraph end", () => {
       const { container } = renderWithTooltip(
         <AIChatMessage

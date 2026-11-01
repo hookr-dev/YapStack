@@ -106,6 +106,22 @@ export interface TextSpan {
   literal: boolean;
 }
 
+const OPENS = /^[[(]/;
+const CLOSES = /[\])]$/;
+const FULL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether marker text found at the end of a line may have been cut off: a
+ * bracketed marker missing its closer, or a bare ID shorter than a full
+ * UUID (`seg:89ea3e1d` could be the start of one that continues in the next
+ * block). A bare full UUID is complete.
+ */
+function isUnterminated(marker: string): boolean {
+  if (CLOSES.test(marker)) return false;
+  if (OPENS.test(marker)) return true;
+  return !FULL_UUID.test(marker.replace(/^seg[:_]/i, ""));
+}
+
 /**
  * Split each of `pieces`, consecutive text in one line of inline content
  * (text nodes across formatting, code and links; a line ends at a block edge
@@ -116,8 +132,9 @@ export interface TextSpan {
  *    misread, so the whole of it stays literal;
  *  - a marker the piece reads differently from the line as a whole, such as
  *    an unclosed marker the next piece continues;
- *  - a marker left unterminated at the line end (`[[seg:89ea3e1d`), which
- *    may be cut off and must never be resolved by its prefix.
+ *  - a marker left unterminated at the line end (`[[seg:89ea3e1d`, or a
+ *    bare `seg:89ea3e1d`), which may be cut off and must never be resolved
+ *    by its prefix. A bare full UUID at the line end is complete.
  * Markers both readings agree on are left to the caller. Linear in the
  * length of the line.
  */
@@ -140,7 +157,7 @@ export function splitAtCrossingMarkers(pieces: readonly string[]): TextSpan[][] 
     for (const { start, end } of run.markers) {
       while (p < pieces.length - 1 && starts[p + 1] <= start) p++;
       const crosses = p < pieces.length - 1 && starts[p + 1] < end;
-      const unterminated = end === lineEnd && !/[\])]$/.test(joined.slice(start, end));
+      const unterminated = end === lineEnd && isUnterminated(joined.slice(start, end));
       if (!crosses && !unterminated) {
         agreed.add(`${start}:${end}`);
         continue;

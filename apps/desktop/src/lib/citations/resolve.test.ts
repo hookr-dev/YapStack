@@ -252,6 +252,28 @@ describe("pending pills", () => {
     ).toBe(`<p><strong>${toPillHtml(refA)}</strong> text</p>`);
   });
 
+  it.each([
+    ["a paragraph", (m: string) => `<p>See ${m}</p>`],
+    ["a list item", (m: string) => `<ul><li><p>Point ${m}</p></li></ul>`],
+    ["bold that ends a paragraph", (m: string) => `<p><strong>${m}</strong></p>`],
+    ["a line before a break", (m: string) => `<p>See ${m}<br>next</p>`],
+  ])("converts a complete bare marker at the end of %s", (_label, wrap) => {
+    expect(convertCitationsInHtml(wrap(`seg:${A.id}`), index)).toBe(
+      wrap(toPillHtml(refA)),
+    );
+  });
+
+  it("converts a complete underscore bare marker at a paragraph end", () => {
+    expect(convertCitationsInHtml(`<p>Point seg_${A.id}</p>`, index)).toBe(
+      `<p>Point ${toPillHtml(refA)}</p>`,
+    );
+  });
+
+  it("never prefix-resolves a bare id cut off at a paragraph end", () => {
+    const html = `<p>seg:89ea3e1d</p><p>-0000-4000-8000-000000000000</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(html);
+  });
+
   it("never prefix-resolves a marker cut off at a paragraph end", () => {
     const html = `<p>[[seg:89ea3e1d</p><p>-0000-4000-8000-000000000000]]</p>`;
     expect(convertCitationsInHtml(html, index)).toBe(html);
