@@ -100,14 +100,64 @@ export function trimPartialCitation(text: string): string {
   return m ? text.slice(0, m.index) : text;
 }
 
+/** A piece of text and whether it must be shown as-is, never parsed. */
+export interface TextSpan {
+  text: string;
+  literal: boolean;
+}
+
 /**
- * Split `text` into the part before a trailing unclosed marker and the
- * marker itself (`["x ", "[[seg:"]`); the tail is `""` when `text` doesn't
- * end mid-marker. For text that continues in a following node (`[[seg:` then
- * a code or bold node), the tail must be kept literal: the marker can't be
- * parsed from one piece without dropping half of it.
+ * Split each of `pieces`, consecutive text in one line of inline content
+ * (text nodes across formatting, code and links), into spans, marking as
+ * literal every part of a marker that spans a boundary between pieces, plus
+ * any trailing unclosed marker that a following piece continues. A marker
+ * split by formatting (`[[seg:` then `</strong>ID]]`) can't be parsed from
+ * one piece without dropping or misreading half of it, so the whole of it
+ * stays literal; markers wholly inside one piece are left to the caller.
  */
-export function splitTrailingPartial(text: string): [string, string] {
-  const head = trimPartialCitation(text);
-  return [head, text.slice(head.length)];
+export function splitAtCrossingMarkers(pieces: readonly string[]): TextSpan[][] {
+  const starts: number[] = [];
+  let pos = 0;
+  for (const piece of pieces) {
+    starts.push(pos);
+    pos += piece.length;
+  }
+  const literal: Array<[number, number]> = [];
+  const crosses = (start: number, end: number) =>
+    starts.some((b, i) => i > 0 && start < b && b < end);
+  for (const run of parseCitations(pieces.join(""))) {
+    for (const m of run.markers) {
+      if (crosses(m.start, m.end)) literal.push([m.start, m.end]);
+    }
+  }
+  pieces.forEach((piece, i) => {
+    if (i === pieces.length - 1) return;
+    const head = trimPartialCitation(piece);
+    if (head.length < piece.length) {
+      literal.push([starts[i] + head.length, starts[i] + piece.length]);
+    }
+  });
+  literal.sort((a, b) => a[0] - b[0]);
+
+  return pieces.map((piece, i) => {
+    const from = starts[i];
+    const spans: TextSpan[] = [];
+    const push = (start: number, end: number, isLiteral: boolean) => {
+      if (end <= start) return;
+      const text = piece.slice(start - from, end - from);
+      const last = spans[spans.length - 1];
+      if (last?.literal === isLiteral) last.text += text;
+      else spans.push({ text, literal: isLiteral });
+    };
+    let cursor = from;
+    const to = from + piece.length;
+    for (const [start, end] of literal) {
+      if (end <= cursor || start >= to) continue;
+      push(cursor, Math.max(cursor, start), false);
+      push(Math.max(cursor, start), Math.min(end, to), true);
+      cursor = Math.max(cursor, Math.min(end, to));
+    }
+    push(cursor, to, false);
+    return spans;
+  });
 }

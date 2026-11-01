@@ -1,4 +1,4 @@
-import { parseCitations, splitTrailingPartial } from "./parse";
+import { parseCitations, splitAtCrossingMarkers, type TextSpan } from "./parse";
 import { resolveCitation, type SegmentIndex } from "./resolve";
 import {
   pendingPillToken,
@@ -11,22 +11,69 @@ import {
 // or can't hold a pill (a pill nested in a link is invalid UI).
 const SKIP_TEXT_IN = "code, pre, a, [data-segment-ref]";
 const PILL = "span[data-segment-ref]";
+// Elements text flows through within one line, so a marker can continue
+// across their edges (`<strong>[[seg:</strong>ID]]`).
+const INLINE =
+  "a, abbr, b, bdi, bdo, cite, code, data, del, dfn, em, font, i, img, ins, kbd, mark, q, s, samp, small, span, strike, strong, sub, sup, time, u, var, wbr";
+
+function blockOf(node: Node): Element | null {
+  let el = node.parentElement;
+  while (el?.matches(INLINE)) el = el.parentElement;
+  return el;
+}
 
 /**
  * Citation work in stored note HTML, found by walking the DOM rather than
  * matching the raw string: only visible text nodes outside code and pills
- * are read, never attribute values. Same `TreeWalker(SHOW_TEXT)` approach as
- * `replaceTextInHtml` in `lib/ai-tools.ts`.
+ * are read, never attribute values. Same `TreeWalker` approach as
+ * `replaceTextInHtml` in `lib/ai-tools.ts`. Text is read a line at a time
+ * across inline elements, so a marker split by formatting is found whole and
+ * kept literal (`splitAtCrossingMarkers`). Returns each text node holding a
+ * marker with its spans.
  */
-function citationTextNodes(doc: Document): Text[] {
-  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
-  const nodes: Text[] = [];
+function citationTextNodes(doc: Document): Array<[Text, TextSpan[]]> {
+  const lines: Node[][] = [];
+  let line: Node[] = [];
+  let lineBlock: Element | null = null;
+  const walker = doc.createTreeWalker(
+    doc.body,
+    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+  );
   while (walker.nextNode()) {
-    const node = walker.currentNode as Text;
-    if (node.parentElement?.closest(SKIP_TEXT_IN)) continue;
-    if (parseCitations(node.data).length > 0) nodes.push(node);
+    const node = walker.currentNode;
+    const isLeaf =
+      node.nodeType === Node.TEXT_NODE ||
+      (node as Element).matches("br, img, wbr");
+    if (!isLeaf) continue;
+    const block = blockOf(node);
+    if (block !== lineBlock && line.length > 0) {
+      lines.push(line);
+      line = [];
+    }
+    lineBlock = block;
+    line.push(node);
   }
-  return nodes;
+  if (line.length > 0) lines.push(line);
+
+  const out: Array<[Text, TextSpan[]]> = [];
+  for (const nodes of lines) {
+    const pieces = nodes.map((n) =>
+      n.nodeType === Node.TEXT_NODE
+        ? (n as Text).data
+        : n.nodeName === "BR"
+          ? "\n"
+          : "",
+    );
+    splitAtCrossingMarkers(pieces).forEach((spans, i) => {
+      const node = nodes[i];
+      if (node.nodeType !== Node.TEXT_NODE) return;
+      if (node.parentElement?.closest(SKIP_TEXT_IN)) return;
+      if (spans.some((s) => !s.literal && parseCitations(s.text).length > 0)) {
+        out.push([node as Text, spans]);
+      }
+    });
+  }
+  return out;
 }
 
 function pendingPills(doc: Document): Element[] {
@@ -80,31 +127,34 @@ export function convertCitationsInHtml(
     changed = true;
   }
 
-  for (const node of citationTextNodes(doc)) {
-    // A marker cut off by a following element (`[[seg:<code>…`) stays literal.
-    const [head, tail] = node.nextSibling
-      ? splitTrailingPartial(node.data)
-      : [node.data, ""];
-    const { parts } = splitCitations(head, index, { keepUnresolved: true });
-    if (parts.length === 1 && parts[0].kind === "text" && parts[0].text === head) {
-      continue;
-    }
+  for (const [node, spans] of citationTextNodes(doc)) {
     const frag = doc.createDocumentFragment();
-    for (const part of parts) {
-      if (part.kind === "text") {
-        frag.append(doc.createTextNode(part.text));
-      } else {
-        frag.append(
-          fragmentFromHtml(
-            doc,
-            part.kind === "ref"
-              ? toPillHtml(part.ref)
-              : toPendingPillHtml(part.token),
-          ),
-        );
+    let nodeChanged = false;
+    for (const span of spans) {
+      if (span.literal) {
+        frag.append(doc.createTextNode(span.text));
+        continue;
+      }
+      const { parts } = splitCitations(span.text, index, { keepUnresolved: true });
+      if (parts.length !== 1 || parts[0].kind !== "text" || parts[0].text !== span.text) {
+        nodeChanged = true;
+      }
+      for (const part of parts) {
+        if (part.kind === "text") {
+          frag.append(doc.createTextNode(part.text));
+        } else {
+          frag.append(
+            fragmentFromHtml(
+              doc,
+              part.kind === "ref"
+                ? toPillHtml(part.ref)
+                : toPendingPillHtml(part.token),
+            ),
+          );
+        }
       }
     }
-    if (tail) frag.append(doc.createTextNode(tail));
+    if (!nodeChanged) continue;
     node.replaceWith(frag);
     changed = true;
   }

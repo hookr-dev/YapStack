@@ -495,6 +495,32 @@ describe("AIChatMessage", () => {
       expect(bubble?.textContent).toBe("x [[seg:seg-1]] y");
     });
 
+    const UUID = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+    it.each([
+      ["a closing **", `x **[[seg:89ea3e**${UUID.slice(6)}]] y`, [UUID]],
+      ["a closing *", `x *[[seg:89ea3e*${UUID.slice(6)}]] y`, [UUID]],
+      ["nested formatting", `x ***[[seg:89ea3e***${UUID.slice(6)}]] y`, [UUID]],
+      [
+        "a prefix that matches another segment",
+        "x **[[seg:89ea3e1d**-0000-4000-8000-000000000000]] y",
+        [UUID],
+      ],
+      ["a link", `x [[[seg:89ea3e](https://x.test)${UUID.slice(6)}]] y`, [UUID]],
+    ])("leaves a marker split across %s whole", (_label, content, ids) => {
+      const { container } = renderWithTooltip(
+        <AIChatMessage
+          message={makeMessage({ role: "assistant", content })}
+          segments={ids.map((id) => makeSegment({ id }))}
+          onCitationClick={vi.fn()}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: "1:05" })).not.toBeInTheDocument();
+      const bubble = container.querySelector(".ai-chat-markdown");
+      expect(bubble?.textContent).toBe(
+        content.replace(/\*+/g, "").replace(/\[\[\[seg:89ea3e\]\(https:\/\/x\.test\)/, "[[seg:89ea3e"),
+      );
+    });
+
     it("keeps ordinary markdown links as links", () => {
       renderWithTooltip(
         <AIChatMessage

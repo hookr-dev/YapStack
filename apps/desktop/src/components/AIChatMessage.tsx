@@ -13,8 +13,9 @@ import { getAction } from "@/lib/ai-actions";
 import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 import { formatTime } from "@/lib/utils";
 import {
-  splitTrailingPartial,
+  splitAtCrossingMarkers,
   trimPartialCitation,
+  type TextSpan,
 } from "@/lib/citations/parse";
 import {
   createSegmentIndex,
@@ -99,34 +100,88 @@ function lastLeaf(node: MdNode): MdNode | null {
   return leaf;
 }
 
-function rewriteCitationText(node: MdNode, index: SegmentIndex | null): void {
+// Phrasing nodes text flows through within one line, and inline leaves.
+const INLINE_PARENTS = new Set([
+  "emphasis",
+  "strong",
+  "delete",
+  "link",
+  "linkReference",
+]);
+const INLINE_LEAVES = new Set([
+  "text",
+  "inlineCode",
+  "html",
+  "break",
+  "image",
+  "imageReference",
+  "footnoteReference",
+]);
+
+// Spans for each text node, read a line at a time across formatting, code
+// and links, so a marker split by formatting is found whole and kept literal.
+function textSpans(root: MdNode): Map<MdNode, TextSpan[]> {
+  const lines: MdNode[][] = [];
+  const visit = (parent: MdNode, line: MdNode[]) => {
+    let current = line;
+    for (const child of parent.children ?? []) {
+      if (INLINE_PARENTS.has(child.type)) {
+        visit(child, current);
+      } else if (INLINE_LEAVES.has(child.type)) {
+        current.push(child);
+      } else {
+        const inner: MdNode[] = [];
+        lines.push(inner);
+        visit(child, inner);
+        current = [];
+        lines.push(current);
+      }
+    }
+  };
+  const top: MdNode[] = [];
+  lines.push(top);
+  visit(root, top);
+
+  const spans = new Map<MdNode, TextSpan[]>();
+  for (const nodes of lines) {
+    const pieces = nodes.map((n) =>
+      n.type === "break" ? "\n" : (n.value ?? ""),
+    );
+    splitAtCrossingMarkers(pieces).forEach((s, i) => {
+      if (nodes[i].type === "text") spans.set(nodes[i], s);
+    });
+  }
+  return spans;
+}
+
+function rewriteCitationText(
+  node: MdNode,
+  index: SegmentIndex | null,
+  spans: Map<MdNode, TextSpan[]>,
+): void {
   // Text inside a link can't hold another link.
   if (!node.children || isLink(node)) return;
-  const siblings = node.children;
-  node.children = siblings.flatMap((child, i): MdNode[] => {
+  node.children = node.children.flatMap((child): MdNode[] => {
     if (child.type !== "text") {
-      rewriteCitationText(child, index);
+      rewriteCitationText(child, index, spans);
       return [child];
     }
-    // A marker cut off by formatting (`[[seg:` then `code` or `strong`)
-    // stays literal rather than being parsed, and half-dropped, from one piece.
-    const [head, tail] =
-      i < siblings.length - 1
-        ? splitTrailingPartial(child.value ?? "")
-        : [child.value ?? "", ""];
-    const { parts } = splitCitations(head, index, { keepUnresolved: false });
-    const tailNode: MdNode[] = tail ? [{ type: "text", value: tail }] : [];
-    return parts.flatMap((part): MdNode[] => {
-      if (part.kind === "text") return [{ type: "text", value: part.text }];
-      if (part.kind !== "ref") return [];
-      return [
-        {
-          type: "link",
-          url: CITATION_HREF_PREFIX + part.ref.segmentId,
-          children: [{ type: "text", value: toPlainLabel(part.ref) }],
-        },
-      ];
-    }).concat(tailNode);
+    const own = spans.get(child) ?? [{ text: child.value ?? "", literal: false }];
+    return own.flatMap((span): MdNode[] => {
+      if (span.literal) return [{ type: "text", value: span.text }];
+      const { parts } = splitCitations(span.text, index, { keepUnresolved: false });
+      return parts.flatMap((part): MdNode[] => {
+        if (part.kind === "text") return [{ type: "text", value: part.text }];
+        if (part.kind !== "ref") return [];
+        return [
+          {
+            type: "link",
+            url: CITATION_HREF_PREFIX + part.ref.segmentId,
+            children: [{ type: "text", value: toPlainLabel(part.ref) }],
+          },
+        ];
+      });
+    });
   });
 }
 
@@ -147,7 +202,7 @@ function remarkCitations(index: SegmentIndex | null, isStreaming: boolean) {
         if (kept !== leaf.value) leaf.value = kept.trimEnd();
       }
     }
-    rewriteCitationText(root, index);
+    rewriteCitationText(root, index, textSpans(root));
   };
 }
 

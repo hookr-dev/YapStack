@@ -230,6 +230,33 @@ describe("pending pills", () => {
     expect(convertCitationsInHtml(html, index)).toBe(html);
   });
 
+  // An id whose prefix uniquely matches B, but which is not B.
+  const OTHER = "48e2014f-0000-4000-8000-000000000000";
+
+  it.each([
+    ["a closing </strong>", `x <strong>[[seg:</strong>${A.id}]] y`],
+    ["a closing </em>", `x <em>[[seg:</em>${A.id}]] y`],
+    ["nested formatting", `x <strong><em>[[seg:89ea3e</em></strong>1d-6adb-45f5-b0e5-7ca605644c60]] y`],
+    ["a prefix that matches another segment", `x <strong>[[seg:48e2014f</strong>${OTHER.slice(8)}]] y`],
+    ["an opening bracket", `x <strong>[[</strong>seg:${A.id}]] y`],
+    ["a link", `x <a href="https://x.test">[[seg:</a>${A.id}]] y`],
+    ["a link holding the id", `x [[seg:<a href="https://x.test">${A.id}</a>]] y`],
+  ])("keeps a marker split across %s whole and literal", (_label, body) => {
+    const html = `<p>${body}</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(html);
+  });
+
+  it("still converts whole markers on either side of formatting", () => {
+    const html = `<p><strong>[[seg:${A.id}]]</strong>, [[seg:${B.id}]]</p>`;
+    expect(convertCitationsInHtml(html, index)).toBe(
+      `<p><strong>${toPillHtml(refA)}</strong>, ${toPillHtml({
+        sessionId: "s1",
+        segmentId: B.id,
+        offsetSeconds: 1025,
+      })}</p>`,
+    );
+  });
+
   it("drops a short hex fragment instead of keeping a pending pill", () => {
     expect(convertCitationsInHtml("<p>x [[seg:48e2...]].</p>", index)).toBe(
       "<p>x.</p>",
