@@ -130,7 +130,7 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(row["status"], "incomplete")
             self.assertEqual(row["errors"], 2)
             self.assertEqual(row["scored_runs"], 0)
-            self.assertIn("incomplete (2 errors)", (out / "results.md").read_text())
+            self.assertIn("incomplete (2 errors, 0 warm-up errors)", (out / "results.md").read_text())
 
     def test_partially_failed_corpus_is_marked_incomplete(self):
         with tempfile.TemporaryDirectory() as d:
@@ -151,7 +151,24 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(row["unscored_utts"], 1)
             md = (out / "results.md").read_text()
             self.assertIn("| Errors |", md)
-            self.assertIn("incomplete (1 errors)", md)
+            self.assertIn("incomplete (1 errors, 0 warm-up errors)", md)
+
+    def test_failed_warmup_marks_the_row_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            write_wav(corpus / "flaky.wav", 2.0)  # the fake fails only the first transcribe (the warm-up)
+            out = root / "out"
+            code = cli.main(["run", "--sidecar", str(FAKE), "--model", f"m={root}", "--corpus", f"dir:{corpus}",
+                             "--out", str(out)])
+            self.assertEqual(code, 1)
+            [row] = json.loads((out / "results.json").read_text())
+            self.assertEqual((row["status"], row["errors"], row["warmup_errors"]), ("incomplete", 0, 1))
+            self.assertEqual(row["scored_runs"], 1)
+            md = (out / "results.md").read_text()
+            self.assertIn("| Warm-up errors |", md)
+            self.assertIn("incomplete (0 errors, 1 warm-up errors)", md)
 
     def test_expect_row_with_no_measurement_fails(self):
         with tempfile.TemporaryDirectory() as d:

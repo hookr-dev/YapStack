@@ -96,7 +96,7 @@ uv run asr-bench run \
 
 ### Self-check
 
-The 2026-10-31 probe (`docs/plans/research/q4-delivery/asr.md` §2.2) used a 16.2 s TTS clip, one cold plus five steady transcribes per process. `--expect` makes the run exit non-zero if a row's steady RTFx falls outside `--tolerance` (default ±10%) or has no measurement. Any failed transcription marks its row `incomplete` (error count in every report) and also exits non-zero:
+The 2026-10-31 probe (`docs/plans/research/q4-delivery/asr.md` §2.2) used a 16.2 s TTS clip, one cold plus five steady transcribes per process. `--expect` makes the run exit non-zero if a row's steady RTFx falls outside `--tolerance` (default ±10%) or has no measurement. Any failed transcription, warm-up included, marks its row `incomplete` (error count in every report) and also exits non-zero:
 
 ```bash
 uv run asr-bench run --model int8=… --model fp16=… --model int4=… --accel cpu,webgpu \

@@ -26,7 +26,7 @@ CSV_FIELDS = [
     "status", "model", "accel_requested", "accel_loaded", "accel_fallback", "accel_partial", "corpus",
     "clips", "audio_s", "warmup_runs", "scored_runs", "rtfx_steady", "rtfx_min", "rtfx_max",
     "rtfx_cold", "load_s", "cpu_user_s", "cpu_sys_s", "peak_rss_mb", "wer", "cer",
-    "scored_utts", "unscored_utts", "errors", "placement_encoder", "placement_decoder_joint",
+    "scored_utts", "unscored_utts", "errors", "warmup_errors", "placement_encoder", "placement_decoder_joint",
     "expected_rtfx", "rtfx_vs_expected", "model_dir",
 ]
 
@@ -62,9 +62,12 @@ def run_row(args, sidecar: Path, model: str, model_dir: Path, accel: str, corpor
     sc = Sidecar(sidecar, model_dir, accel, logs / f"{tag}.stderr")
     info = sc.stats.engine_info
     first = corpora[0].clips[0]
-    cold = []
+    cold, warmup_errors = [], 0
     for _ in range(args.warmup):
         t = sc.transcribe(first.path)
+        if t.error:
+            warmup_errors += 1
+            continue
         cold.append(first.seconds / t.infer_s if t.infer_s else None)
 
     per_corpus = []
@@ -99,7 +102,7 @@ def run_row(args, sidecar: Path, model: str, model_dir: Path, accel: str, corpor
         expected = args.expect.get(f"{model}:{accel}")
         row = {
             # A row with any failed utterance times and scores only a subset; never report it as a clean result.
-            "status": "incomplete" if errors else "ok",
+            "status": "incomplete" if errors or warmup_errors else "ok",
             "model": model,
             "accel_requested": accel,
             "accel_loaded": stats.accel or "",
@@ -123,6 +126,7 @@ def run_row(args, sidecar: Path, model: str, model_dir: Path, accel: str, corpor
             "scored_utts": e.scored,
             "unscored_utts": len(corpus.clips) - e.scored,
             "errors": errors,
+            "warmup_errors": warmup_errors,
             "placement_encoder": placement_cell(sessions, placement_ok, "encoder"),
             "placement_decoder_joint": placement_cell(sessions, placement_ok, "decoder_joint"),
             "expected_rtfx": expected or "",
@@ -174,7 +178,7 @@ MD_COLUMNS = [
     ("Corpus", "corpus"), ("Clips", "clips"), ("Runs", "scored_runs"), ("Steady RTFx", "rtfx_steady"),
     ("Min–max", None), ("Cold RTFx", "rtfx_cold"), ("Load s", "load_s"), ("CPU user s", "cpu_user_s"),
     ("Peak RSS MB", "peak_rss_mb"), ("WER %", "wer"), ("CER %", "cer"),
-    ("Errors", "errors"), ("Encoder placement", "placement_encoder"), ("vs expected", None), ("Status", None),
+    ("Errors", "errors"), ("Warm-up errors", "warmup_errors"), ("Encoder placement", "placement_encoder"), ("vs expected", None), ("Status", None),
 ]
 
 
@@ -197,7 +201,7 @@ def markdown(rows, args, sidecar: Path) -> str:
             if header == "Min–max":
                 cells.append(f"{row['rtfx_min']}–{row['rtfx_max']}" if row["rtfx_min"] != "" else "")
             elif header == "Status":
-                cells.append(f"incomplete ({row['errors']} errors)" if row["status"] != "ok" else "ok")
+                cells.append(f"incomplete ({row['errors']} errors, {row['warmup_errors']} warm-up errors)" if row["status"] != "ok" else "ok")
             elif header == "vs expected":
                 cells.append(f"{row['rtfx_vs_expected']} of {row['expected_rtfx']}" if row["expected_rtfx"] else "")
             else:
@@ -265,7 +269,7 @@ def cmd_run(args) -> int:
         print(f"OUTSIDE ±{args.tolerance:.0%}: {r['model']}:{r['accel_requested']} {r['rtfx_steady']} vs {r['expected_rtfx']}", file=sys.stderr)
     failed = [r for r in rows if r["status"] != "ok"]
     for r in failed:
-        print(f"INCOMPLETE: {r['model']}:{r['accel_requested']} on {r['corpus']}: {r['errors']} failed transcriptions", file=sys.stderr)
+        print(f"INCOMPLETE: {r['model']}:{r['accel_requested']} on {r['corpus']}: {r['errors']} failed transcriptions, {r['warmup_errors']} failed warm-ups", file=sys.stderr)
     unmeasured = [k for k in args.expect if not any(f"{r['model']}:{r['accel_requested']}" == k and r["rtfx_vs_expected"] for r in rows)]
     for k in unmeasured:
         print(f"NO MEASUREMENT: --expect {k} has no steady RTFx to check", file=sys.stderr)
