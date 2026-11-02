@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+use yapstack_common::sync::{SyncCapabilityBlocked, SyncCapabilityLevels, SyncCapabilityRefusal};
 use yapstack_entitlements::wire::QuotaExceeded;
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,18 @@ pub enum AppError {
     /// gate reads.
     #[error("service unavailable: {0}")]
     Unavailable(String),
+    /// The caller's sync capability is below the workspace floor (ADR 0006 §5.7): HTTP 426
+    /// `update_required`, carrying the current levels.
+    #[error("update required")]
+    UpdateRequired(SyncCapabilityLevels),
+    /// A push batch declares a capability level above the floor the relay holds right now
+    /// (ADR 0006 §5.4): HTTP 409 `sync_capability_floor`, carrying the current levels.
+    #[error("sync capability floor")]
+    CapabilityFloor(SyncCapabilityLevels),
+    /// A floor raise was refused because in-window devices report a lower level: HTTP 409
+    /// `sync_capability_blocked` with the blocking devices.
+    #[error("sync capability raise blocked")]
+    CapabilityBlocked(Box<SyncCapabilityBlocked>),
     #[error("database error")]
     Db(#[from] sqlx::Error),
     #[error("internal error")]
@@ -41,6 +54,34 @@ impl IntoResponse for AppError {
         // The quota error has a bespoke, published body shape — emit it directly.
         if let AppError::Quota(q) = &self {
             return (StatusCode::TOO_MANY_REQUESTS, Json(q.as_ref())).into_response();
+        }
+        match &self {
+            AppError::UpdateRequired(l) => {
+                return (
+                    StatusCode::UPGRADE_REQUIRED,
+                    Json(capability_refusal(
+                        "update_required",
+                        "Update YapStack to keep syncing",
+                        *l,
+                    )),
+                )
+                    .into_response();
+            }
+            AppError::CapabilityFloor(l) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(capability_refusal(
+                        "sync_capability_floor",
+                        "batch needs a higher workspace sync capability",
+                        *l,
+                    )),
+                )
+                    .into_response();
+            }
+            AppError::CapabilityBlocked(b) => {
+                return (StatusCode::CONFLICT, Json(b.as_ref())).into_response();
+            }
+            _ => {}
         }
         let (status, code, message) = match &self {
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
@@ -60,7 +101,10 @@ impl IntoResponse for AppError {
                 "too many requests".into(),
             ),
             AppError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable", m.clone()),
-            AppError::Quota(_) => unreachable!("handled above"),
+            AppError::Quota(_)
+            | AppError::UpdateRequired(_)
+            | AppError::CapabilityFloor(_)
+            | AppError::CapabilityBlocked(_) => unreachable!("handled above"),
             AppError::Db(e) => {
                 tracing::error!(error = %e, "database error");
                 (
@@ -79,5 +123,14 @@ impl IntoResponse for AppError {
             }
         };
         (status, Json(json!({ "code": code, "message": message }))).into_response()
+    }
+}
+
+fn capability_refusal(code: &str, message: &str, l: SyncCapabilityLevels) -> SyncCapabilityRefusal {
+    SyncCapabilityRefusal {
+        code: code.into(),
+        message: message.into(),
+        required_sync_capability: l.required_sync_capability,
+        requested_sync_capability: l.requested_sync_capability,
     }
 }

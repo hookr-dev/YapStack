@@ -15,6 +15,7 @@ import {
 import type { DbSegment } from "@/lib/db";
 import { countWords } from "@/lib/utils";
 import { log } from "@/lib/logger";
+import { speakersFromNames } from "@/lib/speakers";
 
 /** Output-format guidance appended to every Insight's system prompt by the
  *  engine. Keeps users' freeform insight prompts focused on *what* to extract
@@ -190,7 +191,10 @@ export function useInsightEngine() {
       const newSegments = allSegments.filter(
         (s) => !processedIdsRef.current.has(s.id) && isVisibleSegment(s),
       );
-      const transcript = assembleTranscriptContext(newSegments);
+      const speakers = state.activeSessionId
+        ? speakersFromNames(state.settings.speakerNames[state.activeSessionId])
+        : undefined;
+      const transcript = assembleTranscriptContext(newSegments, speakers);
       if (!transcript) {
         // Backstop (the scheduler already required visible new content).
         log.debug(

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Changeset relay (SYNC_SPEC §6.3–§6.4, §9.1): push, pull, completeness/anti-entropy, and the
 //! SSE wakeup stream. The relay stores opaque ciphertext and a dense, per-tenant,
-//! COMMIT-ORDERED `changeset_seq`; it never decrypts.
+//! COMMIT-ORDERED `changeset_seq`; it never decrypts. `capability` is the per-tenant sync
+//! capability floor that gates pull, push and the snapshot routes (ADR 0006 §5).
 
+pub mod capability;
 pub mod completeness;
 pub mod pull;
 pub mod push;

@@ -327,6 +327,75 @@ describe("SyncTab — on", () => {
     );
   });
 
+  it("a held push names the blocking devices and offers Remove for roster members", async () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({
+        roster: [SELF, PEER],
+        lastError: "HTTP 403 Forbidden from the relay on pull",
+        capabilityNotice: {
+          kind: "waiting-for-devices",
+          blockers: [
+            { label: PEER.label, platform: "windows", lastSeen: new Date().toISOString(), fingerprint: PEER.fingerprint },
+            { label: "old install", platform: null, lastSeen: new Date().toISOString(), fingerprint: null },
+          ],
+        },
+      }),
+    });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async () => makeStatus({ roster: [SELF] }));
+    render(<SyncTab />);
+    const alert = screen.getByText("Waiting for other devices to update").closest("[role=alert]") as HTMLElement;
+    expect(within(alert).getByText("Work Laptop")).toBeInTheDocument();
+    expect(within(alert).getByText("old install")).toBeInTheDocument();
+    // An unrelated error from the other direction is still shown next to the notice.
+    expect(screen.getByText("Connection problem")).toBeInTheDocument();
+    expect(screen.getByText("HTTP 403 Forbidden from the relay on pull")).toBeInTheDocument();
+    // Only the roster member gets Remove, and it is the same password-confirmed removal.
+    const removes = within(alert).getAllByRole("button", { name: /^Remove / });
+    expect(removes).toHaveLength(1);
+    await userEvent.click(removes[0]);
+    const dialog = screen.getByRole("alertdialog");
+    await userEvent.type(within(dialog).getByLabelText("Your password"), "hunter22");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Remove device" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("sync_remove_device", {
+        fingerprint: PEER.fingerprint,
+        password: "hunter22",
+      }),
+    );
+  });
+
+  it("the relay's version advisory shows in lane status", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({
+        versionAdvisory: {
+          minClientVersion: "1.0.0-alpha.13",
+          raw: "This app is version 1.0.0-alpha.12; the relay requires at least 1.0.0-alpha.13. Update YapStack to keep syncing.",
+        },
+      }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText(/the relay requires at least 1\.0\.0-alpha\.13/)).toBeInTheDocument();
+  });
+
+  it("update required and the another-device nudge each get their own notice", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ capabilityNotice: { kind: "update-required" } }),
+    });
+    const { unmount } = render(<SyncTab />);
+    expect(screen.getByText("Update YapStack to keep syncing")).toBeInTheDocument();
+    unmount();
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ capabilityNotice: { kind: "another-device-needs-update" } }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Another device needs you to update YapStack")).toBeInTheDocument();
+  });
+
   it("a removed device is told so, offered Sign out, and cannot remove others", async () => {
     setup({ email: "user@example.com", status: makeStatus({ roster: [PEER], removed: true }) });
     render(<SyncTab />);

@@ -133,11 +133,27 @@ describe("formatSegmentSpeaker", () => {
     };
   }
 
-  it("returns 'You' for Mic source regardless of speaker_id", () => {
+  it("returns 'You' for an undiarized Mic segment", () => {
     expect(formatSegmentSpeaker(seg({ source: "Mic" }))).toBe("You");
+  });
+
+  // A diarized mic means several people in the room share the user's
+  // microphone, so a mic cluster is not assumed to be the user.
+  it("returns 'Speaker N' for a diarized Mic segment, not 'You'", () => {
     expect(formatSegmentSpeaker(seg({ source: "Mic", speaker_id: 0 }))).toBe(
-      "You",
+      "Speaker 1",
     );
+    expect(formatSegmentSpeaker(seg({ source: "Mic", speaker_id: 1 }))).toBe(
+      "Speaker 2",
+    );
+  });
+
+  it("returns 'You' for a Mic cluster marked as the user", () => {
+    expect(
+      formatSegmentSpeaker(seg({ source: "Mic", speaker_id: 1 }), {
+        "mic:c1": { is_self_override: true },
+      }),
+    ).toBe("You");
   });
 
   it("returns 'Other' for System source without speaker_id", () => {
@@ -153,10 +169,10 @@ describe("formatSegmentSpeaker", () => {
     ).toBe("Speaker 3");
   });
 
-  it("uses speakerNames overrides when provided", () => {
+  it("uses speaker display names when provided", () => {
     expect(
       formatSegmentSpeaker(seg({ source: "System", speaker_id: 0 }), {
-        0: "Alice",
+        "system:c0": { display_name: "Alice" },
       }),
     ).toBe("Alice");
   });

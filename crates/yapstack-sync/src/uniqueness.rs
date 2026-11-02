@@ -14,6 +14,7 @@
 
 use rusqlite::Connection;
 
+use crate::schema::all_crr;
 use crate::SyncError;
 
 /// Counts from one uniqueness pass.
@@ -22,6 +23,9 @@ pub struct UniquenessStats {
     pub notes_removed: usize,
     pub tags_merged: usize,
     pub audio_parts_removed: usize,
+    /// Passes skipped because a table they read isn't a CRR here yet. Non-zero means the
+    /// pass must run again once that table is converted.
+    pub skipped: usize,
 }
 
 /// Enforce all three dropped uniqueness constraints. One transaction.
@@ -34,10 +38,25 @@ pub fn enforce_uniqueness(conn: &Connection) -> Result<UniquenessStats, SyncErro
     // `SQLITE_BUSY_SNAPSHOT` — which the busy handler does NOT retry, so it fails outright
     // regardless of `busy_timeout` (same rationale as `quarantine::merge_changeset`).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Each pass runs only when the tables it reads are CRRs here (they read the clock tables),
+    // so a DB without one of them is tolerated (ADR 0006 §4).
+    let mut skipped = 0usize;
+    let mut run = |tables: &[&str], pass: fn(&Connection) -> Result<usize, SyncError>| {
+        if all_crr(&tx, tables)? {
+            pass(&tx)
+        } else {
+            skipped += 1;
+            Ok::<usize, SyncError>(0)
+        }
+    };
+    let notes_removed = run(&["notes"], dedup_notes)?;
+    let tags_merged = run(&["tags", "session_tags"], dedup_tags)?;
+    let audio_parts_removed = run(&["session_audio_parts"], dedup_audio_parts)?;
     let stats = UniquenessStats {
-        notes_removed: dedup_notes(&tx)?,
-        tags_merged: dedup_tags(&tx)?,
-        audio_parts_removed: dedup_audio_parts(&tx)?,
+        notes_removed,
+        tags_merged,
+        audio_parts_removed,
+        skipped,
     };
     tx.commit()?;
     Ok(stats)

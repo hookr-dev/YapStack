@@ -220,6 +220,8 @@ async fn main() {
                         id,
                         accel: info.as_ref().map(|i| i.accel.clone()),
                         model_dir: info.as_ref().map(|i| i.model_dir.clone()),
+                        accel_partial: info.as_ref().is_some_and(|i| i.accel_partial),
+                        accel_fallback: info.and_then(|i| i.accel_fallback),
                     };
                     if let Err(e) = send_response(&response).await {
                         error!("failed to send engine_info response: {}", e);
@@ -232,6 +234,8 @@ async fn main() {
                         id,
                         accel: None,
                         model_dir: None,
+                        accel_fallback: None,
+                        accel_partial: false,
                     };
                     let _ = send_response(&response).await;
                 }
@@ -250,6 +254,8 @@ async fn main() {
                                     id,
                                     accel: info.as_ref().map(|i| i.accel.clone()),
                                     model_dir: info.as_ref().map(|i| i.model_dir.clone()),
+                                    accel_partial: info.as_ref().is_some_and(|i| i.accel_partial),
+                                    accel_fallback: info.and_then(|i| i.accel_fallback),
                                 };
                                 if let Err(e) = send_response(&response).await {
                                     error!("failed to send response: {}", e);

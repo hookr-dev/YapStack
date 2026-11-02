@@ -786,6 +786,12 @@ pub struct SyncStatusDto {
     audio_upload_outstanding: u64, audio_backfill_outstanding: u64, audio_upload_failed: u64,
     audio_uploaded_total: u64, audio_backfill_complete: bool,
     removed: bool,                     // this device was removed from the account by another device (SYNC_SPEC §5.7)
+    capability_notice: Option<SyncCapabilityNoticeDto>, // ADR 0006 §5 lane-status notice
+    version_advisory: Option<VersionAdvisory>,          // refreshed on the first drain cycle, on reconnect, else every 15 min (ADR 0006 §5.9)
+}
+pub enum SyncCapabilityNoticeDto {     // tagged on `kind`, kebab-case
+    UpdateRequired, AnotherDeviceNeedsUpdate,
+    WaitingForDevices { blockers: Vec<CapabilityBlockerDto { label?, platform?, last_seen, fingerprint? }> },
 }
 pub struct SignupResultDto { recovery_code: String, device_fingerprint: String }
 pub struct LoginBeginResultDto { salt_mismatch: bool }
@@ -816,12 +822,17 @@ pub struct ChangePasswordRequest { current_auth_key: Option<String>, auth_key, w
 pub struct RosterUploadRequest { device_list: Value, signature, counter, vault_key_epoch, active_devices: Vec<Uuid>, revoked_devices: Vec<Uuid>, current_auth_key: Option<String> }   // revoked_devices non-empty ⇒ current_auth_key required (§15.D)
 pub struct RosterUploadResponse { counter, vault_key_epoch }
 pub struct RosterFetchResponse  { device_list, signature, counter, vault_key_epoch }  // GET /devices/roster
-pub struct DeviceInfo { client_id, ed25519_pub, label, platform, status: "pending" | "active" | "revoked", added_at }   // GET /devices
+pub struct DeviceInfo { client_id, ed25519_pub, label, platform, status: "pending" | "active" | "revoked", added_at, sync_capability, capability_seen_at: Option<String> }   // GET /devices
 // POST /sync/push, GET /sync/pull, GET /sync/completeness, POST /audio/presign
 pub struct PushChange { client_id, client_seq, ciphertext, schema_version, engine_version }
 pub struct PushRequest { changes: Vec<PushChange> }               // ≤ 1000 changes, ≤ 5 MiB raw
 pub struct PushResponse { acks: Vec<PushAck { client_id, client_seq, changeset_seq, deduplicated }>, max_changeset_seq }
-pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more }
+pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more, required_sync_capability, requested_sync_capability }
+// Sync capability gate (ADR 0006 §5): request headers X-YapStack-Sync-Capability (pull, snapshot, raise), X-YapStack-Batch-Capability (push) and X-YapStack-Snapshot-Capability (snapshot presign content level); absent = 0
+pub struct RaiseSyncCapabilityRequest { required_sync_capability }          // PUT /sync/capability → SyncCapabilityLevels
+pub struct SyncCapabilityLevels { required_sync_capability, requested_sync_capability }
+pub struct SyncCapabilityRefusal { code: "update_required" (426) | "sync_capability_floor" (409), message, required_sync_capability, requested_sync_capability }
+pub struct SyncCapabilityBlocked { code: "sync_capability_blocked", message, required_sync_capability, requested_sync_capability, blockers: Vec<CapabilityBlocker { client_id, label, platform, sync_capability, capability_seen_at }> }   // 409 from PUT /sync/capability
 pub struct CompletenessResponse { max_changeset_seq, count, contiguous, per_client: Vec<ClientTail { client_id, max_client_seq }> }
 pub struct PresignResponse { already_exists, upload_url: Option<String>, object_key, content_length }
 ```
@@ -1109,7 +1120,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `executeTool` | `(name, args, ctx) → Promise<ExecutedTool \| null>` | Executes a tool by name. Returns `null` if the tool is a no-op (e.g., title unchanged). |
 | `captureUndoSnapshot` | `<T>(loader: () => Promise<T>) → Promise<T>` | Helper that loads pre-mutation state for the executor's `undoData`, used by mutating tools so undo restores the prior value. |
 | `undoToolCalls` | `(executed, ctx) → Promise<void>` | Reverses tool executions in LIFO order |
-| `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces `[[seg:ID]]` text citations with `<span data-segment-ref>` HTML nodes for Tiptap rendering |
+| `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces citation markers with `<span data-segment-ref>` HTML nodes for Tiptap rendering; markers that don't resolve to `segments` become unlabelled pending pills, and existing pending pills are re-resolved (delegates to `lib/citations/`) |
 
 **Registered Tools**
 | Tool Name | Parameters | DB Operations | Effects |
