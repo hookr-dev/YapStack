@@ -1199,7 +1199,12 @@ export type SyncCapabilityNoticeDto =
  * This device's push is held behind a change that needs a higher floor, and the relay
  * named the devices that must update (or be removed) first.
  */
-{ kind: "waiting-for-devices"; blockers: CapabilityBlockerDto[] }
+{ kind: "waiting-for-devices"; blockers: CapabilityBlockerDto[] } |
+/**
+ * This device's push is held because the relay predates the capability gate (it has no
+ * floor-raise route). Changes from other devices still arrive.
+ */
+{ kind: "relay-needs-update" }
 export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null;
 /**
  * T024 push progress. Unacked outbox entries still to push (0 == up to date).
