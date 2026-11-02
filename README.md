@@ -130,7 +130,7 @@ AI cleanup is optional. Without it, you still get fast, accurate on-device dicta
 
 ### Capture and transcribe
 - **Mic and system audio**, recorded separately, so your words and the other participants are labeled apart.
-- **On-device speech-to-text:** NVIDIA Parakeet TDT v3 (fast and accurate for English plus 24 European languages) or OpenAI Whisper (99 languages).
+- **On-device speech-to-text:** NVIDIA Parakeet TDT v3 (fast and accurate for English plus 24 European languages, auto-detected).
 - **[Rewind](#forgot-to-hit-record-rewind-and-keep-it)** a recording from up to 10 minutes in the past.
 - **Speaker diarization (optional)** with renameable speakers, using Sortformer with Parakeet.
 - **Full audio playback** at 0.5×–2×; click any timestamp to jump straight to that moment.
@@ -154,9 +154,9 @@ AI cleanup is optional. Without it, you still get fast, accurate on-device dicta
 
 | Platform | Status | Notes |
 |---|---|---|
-| macOS (Apple Silicon) | ✅ Supported | Primary target. Metal Whisper; Parakeet on WebGPU with the int8 model. |
+| macOS (Apple Silicon) | ✅ Supported | Primary target. Parakeet on WebGPU with the int8 model. |
 | macOS (Intel) | ⚠️ Best-effort | Builds and runs; reduced performance, limited testing. |
-| Windows (x64) | ✅ Supported | Installers ship with each release. Parakeet uses WebGPU and falls back to CPU (force CPU with `YAPSTACK_PARAKEET_ACCEL=cpu`); Whisper runs on CPU. See [ADR 0004](docs/adr/0004-cross-platform-rollout-windows-first.md). |
+| Windows (x64) | ✅ Supported | Installers ship with each release. Parakeet uses WebGPU and falls back to CPU (force CPU with `YAPSTACK_PARAKEET_ACCEL=cpu`). See [ADR 0004](docs/adr/0004-cross-platform-rollout-windows-first.md). |
 | Linux | ❌ Not yet | No current build target. |
 
 ## What leaves your machine
@@ -221,7 +221,7 @@ Yes. Global shortcuts let you dictate into any app on your computer, with option
 <details>
 <summary><strong>How does it compare to Superwhisper, Wispr Flow, or MacWhisper?</strong></summary>
 
-YapStack is a free, open-source option for voice dictation. Speech-to-text runs on your device with Parakeet or Whisper, it works on both macOS and Windows, and the same app also records and transcribes your meetings. AI cleanup is optional and can use a local model.
+YapStack is a free, open-source option for voice dictation. Speech-to-text runs on your device with Parakeet, it works on both macOS and Windows, and the same app also records and transcribes your meetings. AI cleanup is optional and can use a local model.
 </details>
 
 <details>
@@ -233,7 +233,7 @@ It covers similar ground (meeting transcripts, AI summaries, and action items) w
 <details>
 <summary><strong>Which languages are supported?</strong></summary>
 
-Parakeet TDT v3 (the default) supports English and 24 other European languages. Whisper supports 99 languages. You can switch engines in Settings → Transcription.
+Parakeet TDT v3 supports English and 24 other European languages, and detects which one is spoken automatically. Other languages are not supported yet.
 </details>
 
 <details>

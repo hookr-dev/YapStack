@@ -46,8 +46,6 @@ import type {
   CaptureStatusDto,
   BufferStatusDto,
   AudioDeviceInfoDto,
-  ModelInfoDto,
-  ModelSizeDto,
   CaptureSourceDto,
   MixConfigDto,
   LiveTranscriptionConfig,
@@ -58,6 +56,7 @@ import type {
   EngineDescriptorDto,
   ParakeetModelInfoDto,
   SortformerModelInfoDto,
+  LegacyModelFileDto,
 } from "@/lib/tauri";
 import {
   createSession as dbCreateSession,
@@ -117,7 +116,6 @@ import {
   type LiveInsightResult,
   type LiveInsightStatus,
 } from "@/lib/insights";
-import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
 import { normalizeSpeakerNames, type SpeakerKey } from "@/lib/speakers";
 import {
@@ -142,14 +140,12 @@ import {
   trackFolderCreated,
   trackSessionPinned,
   trackSessionUnpinned,
-  trackModelDownloaded,
-  trackModelDeleted,
-  trackModelSwitched,
   trackEngineError,
   trackSettingChanged,
   trackSessionMovedToFolder,
   setAnalyticsEnabled,
 } from "@/lib/analytics";
+import { formatBytes } from "@/lib/utils";
 
 export type ThemeMode = "light" | "dark" | "system";
 
@@ -186,7 +182,7 @@ Rules:
 
 4. Fix grammar, tense, and sentence boundaries, but do not upgrade the register. Keep the speaker's natural voice; do not make casual speech sound formal.
 
-5. Preserve technical content exactly. Code, file paths, library names, CLI commands, acronyms, product names, numbers, and identifiers must survive intact. Correct obvious Whisper misrenderings of technical terms from context (e.g., "react jay s" → "React.js", "get hub" → "GitHub", "pie torch" → "PyTorch", "cursor I D" → "Cursor IDE"). When unsure, keep the speaker's word.
+5. Preserve technical content exactly. Code, file paths, library names, CLI commands, acronyms, product names, numbers, and identifiers must survive intact. Correct obvious speech-recognition misrenderings of technical terms from context (e.g., "react jay s" → "React.js", "get hub" → "GitHub", "pie torch" → "PyTorch", "cursor I D" → "Cursor IDE"). When unsure, keep the speaker's word.
 
 6. Organize for an LLM reader. Lead with the core ask or topic. Group related points. Use short paragraphs or a short list if the dictation naturally contains enumerated items — otherwise prose. Do not add headings, preambles, or meta-commentary.
 
@@ -331,7 +327,10 @@ export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
   selectedEngine: EngineKindDto;
-  selectedModelSize: ModelSizeDto;
+  /// Set by the v32 migration when it moved a Whisper user to Parakeet
+  /// (ADR 0005). autoSetup shows a one-time toast explaining the Parakeet
+  /// download, then clears it once the engine is ready.
+  whisperRemovedNotice: boolean;
   selectedParakeetVariant: ParakeetVariantDto;
   diarizationEnabled: boolean;
   /// `{ [sessionId]: { [speakerKey]: "Alice" } }`, keyed by `SpeakerKey`
@@ -342,10 +341,6 @@ export interface Settings {
   language: string;
   mixConfig: MixConfigDto;
   bufferMaxSeconds: number;
-  silenceDurationMs: number;
-  maxChunkSeconds: number;
-  promptContextChars: number;
-  promptDecaySilenceSeconds: number;
   theme: ThemeMode;
   sidebarCollapsed: boolean;
   /** AI Connection + Profile config (replaces the pre-refactor single-provider shape). */
@@ -594,7 +589,9 @@ interface AppState {
 
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
-  models: ModelInfoDto[];
+  /// Model files left behind by earlier releases (today: Whisper GGML
+  /// weights). Settings offers to remove them; nothing deletes them silently.
+  legacyModelFiles: LegacyModelFileDto[];
   // Engine catalogue + Parakeet/Sortformer model state (loaded on autoSetup).
   // engineCatalogue is the static capability descriptor from the Rust side.
   // parakeetModels/sortformerStatus are the per-variant download status.
@@ -671,21 +668,15 @@ interface AppState {
    * direct IPC fetch.
    */
   applyDeviceList: (devices: AudioDeviceInfoDto[]) => void;
-  refreshModels: () => Promise<void>;
+  refreshLegacyModelFiles: () => Promise<void>;
+  deleteLegacyModelFiles: () => Promise<void>;
   updateSettings: (partial: Partial<Settings>) => void;
   clearAllSessions: () => Promise<void>;
-  downloadModel: (size: ModelSizeDto) => Promise<void>;
-  deleteModel: (size: ModelSizeDto) => Promise<void>;
-  switchModel: (size: ModelSizeDto) => Promise<void>;
 
   // Engine + Parakeet/Sortformer actions
   loadEngineCatalogue: () => Promise<void>;
   refreshParakeetModels: () => Promise<void>;
   refreshSortformerStatus: () => Promise<void>;
-  /// Switch the active transcription engine. Shuts down the current sidecar
-  /// client and re-inits with the new engine. The frontend persists the
-  /// selection via `updateSettings`; autoSetup picks it up on next start.
-  switchEngine: (engine: EngineKindDto) => Promise<void>;
   downloadParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
   deleteParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
   /// Toggle speaker diarization. When flipped on for the first time and
@@ -911,25 +902,33 @@ async function deleteSessionAudio(
   }
 }
 
+/// Moves a persisted Whisper user onto Parakeet and drops the Whisper-only
+/// settings (ADR 0005). Idempotent: `merge` runs it on every rehydrate.
+export function coerceWhisperSettings(settings: Record<string, unknown>): void {
+  if (settings.selectedEngine === "Whisper") {
+    settings.selectedEngine = "Parakeet";
+    settings.whisperRemovedNotice = true;
+  }
+  delete settings.selectedModelSize;
+  delete settings.silenceDurationMs;
+  delete settings.maxChunkSeconds;
+  delete settings.promptContextChars;
+  delete settings.promptDecaySilenceSeconds;
+}
+
 const defaultSettings: Settings = {
   captureSource: "Mixed",
   selectedMicDeviceId: null,
-  // Parakeet is the recommended default for fresh installs. Upgrade users
-  // keep whatever engine they had — the v22 migration fallback below still
-  // initializes pre-v22 users to "Whisper" so we don't silently swap
-  // engines under anyone who chose Whisper explicitly.
+  // Parakeet is the only engine (ADR 0005). Persisted "Whisper" values are
+  // coerced in both `migrate` (v32) and `merge`.
   selectedEngine: "Parakeet",
-  selectedModelSize: "Small",
+  whisperRemovedNotice: false,
   selectedParakeetVariant: "TdtV3",
   diarizationEnabled: false,
   speakerNames: {},
   language: "en",
   mixConfig: { mic_gain: 1.0, system_gain: 1.0, normalize: false },
   bufferMaxSeconds: 300,
-  silenceDurationMs: 800,
-  maxChunkSeconds: 30,
-  promptContextChars: 350,
-  promptDecaySilenceSeconds: 5,
   theme: "system",
   sidebarCollapsed: false,
   aiConfig: DEFAULT_AI_CONFIG,
@@ -1112,6 +1111,7 @@ function groupBySession<T extends { session_id: string }>(
 let navRequestSeq = 0;
 
 function createAppStore() {
+  let autoSetupInFlight: Promise<void> | null = null;
   return create<AppState>()(
     persist(
       (set, get) => ({
@@ -1183,7 +1183,7 @@ function createAppStore() {
       syncStatus: null,
       relayConn: { kind: "idle" },
       devices: [],
-      models: [],
+      legacyModelFiles: [],
       engineCatalogue: [],
       parakeetModels: [],
       sortformerStatus: null,
@@ -1704,29 +1704,17 @@ function createAppStore() {
             get().syncStatus?.deviceFingerprint ?? null,
           );
 
-          const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
-          const vocabHints = buildVocabularyHints(freshFolders, freshTags);
-
           const config: LiveTranscriptionConfig = {
-            silence_duration_ms: settings.silenceDurationMs,
-            max_chunk_seconds: settings.maxChunkSeconds,
             backfill_seconds: backfillSeconds ?? 0,
             source: settings.captureSource,
             mix_config:
               settings.captureSource === "Mixed" ? settings.mixConfig : null,
             language: settings.language,
-            prompt_context_chars: settings.promptContextChars,
-            prompt_decay_silence_seconds:
-              settings.promptDecaySilenceSeconds > 0
-                ? settings.promptDecaySilenceSeconds
-                : null,
             session_id: sessionId,
             audio_save_location: settings.audioSaveLocation,
             audio_export_format: settings.audioExportFormat,
             mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-            diarization:
-              settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
-            vocabulary_hints: vocabHints,
+            diarization: settings.diarizationEnabled,
             source_kind: "session",
           };
 
@@ -1853,9 +1841,7 @@ function createAppStore() {
           return;
         }
 
-        const [freshFolders, freshTags, existingSegments, existingParts] = await Promise.all([
-          listFolders(),
-          listTags(),
+        const [existingSegments, existingParts] = await Promise.all([
           getSessionSegments(sessionId),
           listSessionAudioParts(sessionId),
         ]);
@@ -1870,28 +1856,18 @@ function createAppStore() {
           0,
         );
         const nextPartIndex = existingParts.length;
-        const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
-          silence_duration_ms: settings.silenceDurationMs,
-          max_chunk_seconds: settings.maxChunkSeconds,
           backfill_seconds: 0,
           source: settings.captureSource,
           mix_config: settings.captureSource === "Mixed" ? settings.mixConfig : null,
           language: settings.language,
-          prompt_context_chars: settings.promptContextChars,
-          prompt_decay_silence_seconds:
-            settings.promptDecaySilenceSeconds > 0
-              ? settings.promptDecaySilenceSeconds
-              : null,
           session_id: sessionId,
           audio_save_location: settings.audioSaveLocation,
           audio_export_format: settings.audioExportFormat,
           mp3_bitrate:
             settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-          diarization:
-            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
-          vocabulary_hints: vocabHints,
+          diarization: settings.diarizationEnabled,
           resume: {
             part_index: nextPartIndex,
             offset_base_seconds: offsetBaseSeconds,
@@ -2249,70 +2225,83 @@ function createAppStore() {
         );
       },
 
-      refreshModels: async () => {
-        try {
-          const result = await commands.getAvailableModels();
-          if (result.status === "ok") {
-            set({ models: result.data });
-          }
-        } catch (e) {
-          console.error("Failed to refresh models:", e);
+      refreshLegacyModelFiles: async () => {
+        const result = await commands.listLegacyModelFiles();
+        if (result.status === "ok") {
+          set({ legacyModelFiles: result.data });
+        } else {
+          console.error(
+            "Failed to list legacy model files:",
+            commandErrorMessage(result.error),
+          );
         }
       },
 
-      autoSetup: async () => {
-        // HMR-preserved Zustand store already holds "ready" when the backend
-        // is warm — skip the whole setup path. On fresh app start enginePhase
-        // is "idle", so this falls through to full init. Backend commands are
-        // idempotent (startCapture treats AlreadyRunning as Ok,
-        // init_transcription_client short-circuits on is_some()), so any
-        // duplicate calls are harmless.
-        if (get().enginePhase === "ready") return;
+      deleteLegacyModelFiles: async () => {
+        const names = get().legacyModelFiles.map((f) => f.name);
+        if (names.length === 0) return;
+        const result = await commands.deleteLegacyModelFiles(names);
+        await get().refreshLegacyModelFiles();
+        if (result.status === "error") {
+          throw new Error(commandErrorMessage(result.error));
+        }
+      },
 
-        // The webview boots concurrently with the Rust setup hook, so a fast
-        // frontend can invoke commands whose managed state doesn't exist yet
-        // ("state not managed" — observed on the Windows canary). Wait for
-        // the backend's ready flag before the first engine command; the flag
-        // itself is builder-managed, so this poll can never race.
-        await waitForBackendReady();
+      autoSetup: () => {
+        // One run at a time: Retry, a remount and the first launch can all
+        // call this while a run is still awaiting its download, and a second
+        // run would start a second download of the same model.
+        if (autoSetupInFlight) return autoSetupInFlight;
+        autoSetupInFlight = (async () => {
+          // HMR-preserved Zustand store already holds "ready" when the backend
+          // is warm — skip the whole setup path. On fresh app start enginePhase
+          // is "idle", so this falls through to full init. Backend commands are
+          // idempotent (startCapture treats AlreadyRunning as Ok,
+          // init_transcription_client short-circuits on is_some()), so any
+          // duplicate calls are harmless.
+          if (get().enginePhase === "ready") return;
 
-        const { settings } = get();
+          // The webview boots concurrently with the Rust setup hook, so a fast
+          // frontend can invoke commands whose managed state doesn't exist yet
+          // ("state not managed" — observed on the Windows canary). Wait for
+          // the backend's ready flag before the first engine command; the flag
+          // itself is builder-managed, so this poll can never race.
+          await waitForBackendReady();
 
-        // Request Screen Recording TCC up front — on macOS 14.2+ this gates
-        // the Core Audio tap cpal uses for system audio loopback. Fire the
-        // prompt before startCapture so users see it during onboarding instead
-        // of later, silently failing.
-        commands.requestScreenCapturePermission().catch(() => {});
+          const { settings } = get();
 
-        // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
-        commands
-          .startCapture(
-            settings.selectedMicDeviceId,
-            settings.captureSource,
-            settings.bufferMaxSeconds,
-          )
-          .then((result) => {
-            if (result.status === "error") {
-              commands.getCaptureStatus().then((r) => {
-                if (r.status === "ok") get().setCaptureStatus(r.data);
-              });
-            }
-          })
-          .catch(() => {});
+          // Request Screen Recording TCC up front — on macOS 14.2+ this gates
+          // the Core Audio tap cpal uses for system audio loopback. Fire the
+          // prompt before startCapture so users see it during onboarding instead
+          // of later, silently failing.
+          commands.requestScreenCapturePermission().catch(() => {});
 
-        // Track 2 — Engine setup
-        try {
-          // Load devices + catalogue in parallel (non-blocking)
-          get()
-            .refreshDevices()
-            .catch((e) => console.error("Failed to refresh devices:", e));
-          get()
-            .loadEngineCatalogue()
-            .catch((e) => console.error("Failed to load catalogue:", e));
+          // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
+          commands
+            .startCapture(
+              settings.selectedMicDeviceId,
+              settings.captureSource,
+              settings.bufferMaxSeconds,
+            )
+            .then((result) => {
+              if (result.status === "error") {
+                commands.getCaptureStatus().then((r) => {
+                  if (r.status === "ok") get().setCaptureStatus(r.data);
+                });
+              }
+            })
+            .catch(() => {});
 
-          if (settings.selectedEngine === "Parakeet") {
-            // Parakeet path
-            //
+          // Track 2 — Engine setup
+          try {
+            // Load devices + catalogue in parallel (non-blocking)
+            get()
+              .refreshDevices()
+              .catch((e) => console.error("Failed to refresh devices:", e));
+            get()
+              .loadEngineCatalogue()
+              .catch((e) => console.error("Failed to load catalogue:", e));
+
             // Variant resolution is driven by the backend's
             // `recommended_for_host()` (cfg-driven, deterministic per
             // machine). For the post-update upgrade case — Apple Silicon
@@ -2361,7 +2350,20 @@ function createAppStore() {
               // already has another variant downloaded (the upgrade
               // case), surface a one-time toast so they know why a
               // fresh download is happening right after the app update.
-              if (legacyFallback) {
+              if (settings.whisperRemovedNotice) {
+                const size = get().parakeetModels.find(
+                  (m) => m.variant === recommended,
+                )?.approximate_size_bytes;
+                toast.info(
+                  size
+                    ? `Whisper has been removed. YapStack now uses Parakeet; downloading it once (${formatBytes(size)})…`
+                    : "Whisper has been removed. YapStack now uses Parakeet; downloading it once…",
+                  {
+                    id: "parakeet-variant-upgrade",
+                    duration: 10000,
+                  },
+                );
+              } else if (legacyFallback) {
                 toast.info(
                   "Upgrading Parakeet to the optimized model for your Mac. Downloading…",
                   {
@@ -2432,7 +2434,6 @@ function createAppStore() {
             set({ enginePhase: "initializing" });
             const initResult = await commands.initTranscriptionClient(
               "Parakeet",
-              null,
               variant,
               settings.diarizationEnabled,
             );
@@ -2442,128 +2443,21 @@ function createAppStore() {
               return;
             }
             set({ enginePhase: "ready", engineError: null });
-            return;
-          }
-
-          // Whisper path (default).
-          const modelsResult = await commands.getAvailableModels();
-          if (modelsResult.status === "ok") {
-            set({ models: modelsResult.data });
-          }
-
-          const models = get().models;
-          const selectedModel = models.find(
-            (m) => m.size === settings.selectedModelSize,
-          );
-
-          if (!selectedModel?.downloaded) {
-            set({ enginePhase: "downloading", modelDownloadProgress: 0 });
-            const downloadResult = await commands.downloadModel(
-              settings.selectedModelSize,
-            );
-            if (downloadResult.status === "error") {
-              trackEngineError({ error: commandErrorMessage(downloadResult.error), phase: "downloading" });
-              set({
-                enginePhase: "error",
-                engineError: commandErrorMessage(downloadResult.error),
-                modelDownloadProgress: null,
-              });
-              return;
+            if (settings.whisperRemovedNotice) {
+              get().updateSettings({ whisperRemovedNotice: false });
             }
-            set({ modelDownloadProgress: null });
-            await get().refreshModels();
+          } catch (e) {
+            // console.error routes through the frontend log bridge, so the
+            // failure lands in the unified log file — engine setup errors on
+            // a user's machine must be diagnosable from logs alone.
+            console.error("engine autoSetup failed:", e);
+            set({ enginePhase: "error", engineError: String(e) });
           }
-
-          set({ enginePhase: "initializing" });
-          const initResult = await commands.initTranscriptionClient(
-            "Whisper",
-            settings.selectedModelSize,
-            null,
-            false,
-          );
-          if (initResult.status === "error") {
-            trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
-            set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
-            return;
-          }
-
-          set({ enginePhase: "ready", engineError: null });
-        } catch (e) {
-          // console.error routes through the frontend log bridge, so the
-          // failure lands in the unified log file — engine setup errors on
-          // a user's machine must be diagnosable from logs alone.
-          console.error("engine autoSetup failed:", e);
-          set({ enginePhase: "error", engineError: String(e) });
-        }
+        })().finally(() => {
+          autoSetupInFlight = null;
+        });
+        return autoSetupInFlight;
       },
-
-      downloadModel: async (size: ModelSizeDto) => {
-        set({ modelDownloadProgress: 0 });
-        try {
-          const result = await commands.downloadModel(size);
-          if (result.status === "error") {
-            throw new Error(commandErrorMessage(result.error));
-          }
-          trackModelDownloaded({ model_size: size });
-          await get().refreshModels();
-        } finally {
-          set({ modelDownloadProgress: null });
-        }
-      },
-
-      deleteModel: async (size: ModelSizeDto) => {
-        const result = await commands.deleteModel(size);
-        if (result.status === "error") {
-          throw new Error(commandErrorMessage(result.error));
-        }
-        trackModelDeleted({ model_size: size });
-        await get().refreshModels();
-      },
-
-      switchModel: async (size: ModelSizeDto) => {
-        const { models, settings: { selectedModelSize: fromSize } } = get();
-        const model = models.find((m) => m.size === size);
-
-        try {
-          // Download if needed
-          if (!model?.downloaded) {
-            set({ enginePhase: "downloading", modelDownloadProgress: 0 });
-            const downloadResult = await commands.downloadModel(size);
-            if (downloadResult.status === "error") {
-              throw new Error(commandErrorMessage(downloadResult.error));
-            }
-            set({ modelDownloadProgress: null });
-            await get().refreshModels();
-          }
-
-          // Shutdown current engine
-          set({ enginePhase: "initializing" });
-          set({ loadedEngineInfo: null });
-          await commands.shutdownTranscriptionClient();
-
-          // Init with new model
-          const initResult = await commands.initTranscriptionClient(
-            "Whisper",
-            size,
-            null,
-            false,
-          );
-          if (initResult.status === "error") {
-            throw new Error(commandErrorMessage(initResult.error));
-          }
-
-          trackModelSwitched({ model_size: size, from_size: fromSize });
-          set({
-            enginePhase: "ready",
-            engineError: null,
-          });
-          get().updateSettings({ selectedModelSize: size });
-        } catch (e) {
-          set({ enginePhase: "error", engineError: String(e) });
-        }
-      },
-
-      // ---------- Engine + Parakeet/Sortformer actions ----------
 
       loadEngineCatalogue: async () => {
         try {
@@ -2589,110 +2483,6 @@ function createAppStore() {
           if (r.status === "ok") set({ sortformerStatus: r.data });
         } catch (e) {
           console.error("Failed to refresh sortformer status:", e);
-        }
-      },
-
-      switchEngine: async (engine: EngineKindDto) => {
-        const settings = get().settings;
-        if (settings.selectedEngine === engine) return;
-        const previousEngine = settings.selectedEngine;
-
-        // Flip the UI to the target engine up front so any download shows
-        // progress in the same model row the user would see after the switch
-        // completes — no top-of-screen banner, no cross-engine flicker.
-        get().updateSettings({ selectedEngine: engine });
-
-        try {
-          if (engine === "Parakeet") {
-            await get().refreshParakeetModels();
-            // Prefer a variant already on disk (host-recommended first),
-            // else download the host-recommended one. Using the persisted
-            // selection alone downloaded fp32 TdtV3 (2.5 GB, unusably slow
-            // on CPU) on hosts whose recommendation is int8.
-            const recommendedRes =
-              await commands.getRecommendedParakeetVariant();
-            const recommended =
-              recommendedRes.status === "ok" ? recommendedRes.data : null;
-            const downloadedVariants = get().parakeetModels.filter(
-              (m) => m.downloaded,
-            );
-            const variant =
-              downloadedVariants.find((m) => m.variant === recommended)
-                ?.variant ??
-              downloadedVariants[0]?.variant ??
-              recommended ??
-              settings.selectedParakeetVariant;
-            if (variant !== settings.selectedParakeetVariant) {
-              get().updateSettings({ selectedParakeetVariant: variant });
-            }
-            const ready = get().parakeetModels.find(
-              (m) => m.variant === variant && m.downloaded,
-            );
-            if (!ready) {
-              set({ modelDownloadProgress: 0 });
-              const dl = await commands.downloadParakeetModel(variant);
-              if (dl.status === "error") {
-                set({ modelDownloadProgress: null });
-                throw new Error(commandErrorMessage(dl.error));
-              }
-              set({ modelDownloadProgress: null });
-              await get().refreshParakeetModels();
-            }
-            if (settings.diarizationEnabled) {
-              await get().refreshSortformerStatus();
-              if (!get().sortformerStatus?.downloaded) {
-                set({ modelDownloadProgress: 0 });
-                const dl = await commands.downloadSortformerModel("V2_1");
-                if (dl.status === "error") {
-                  console.error(
-                    "sortformer download failed; continuing without diarization:",
-                    commandErrorMessage(dl.error),
-                  );
-                }
-                set({ modelDownloadProgress: null });
-                await get().refreshSortformerStatus();
-              }
-            }
-          } else if (engine === "Whisper") {
-            await get().refreshModels();
-            const ready = get().models.find(
-              (m) => m.size === settings.selectedModelSize && m.downloaded,
-            );
-            if (!ready) {
-              set({ modelDownloadProgress: 0 });
-              const dl = await commands.downloadModel(
-                settings.selectedModelSize,
-              );
-              if (dl.status === "error") {
-                set({ modelDownloadProgress: null });
-                throw new Error(commandErrorMessage(dl.error));
-              }
-              set({ modelDownloadProgress: null });
-              await get().refreshModels();
-            }
-          }
-
-          set({ enginePhase: "initializing" });
-          set({ loadedEngineInfo: null });
-          await commands.shutdownTranscriptionClient();
-
-          const initResult = await commands.initTranscriptionClient(
-            engine,
-            engine === "Whisper" ? settings.selectedModelSize : null,
-            // Re-read: the Parakeet branch above may have re-resolved the
-            // variant to the host recommendation and persisted it.
-            engine === "Parakeet" ? get().settings.selectedParakeetVariant : null,
-            engine === "Parakeet" ? settings.diarizationEnabled : false,
-          );
-          if (initResult.status === "error") {
-            throw new Error(commandErrorMessage(initResult.error));
-          }
-
-          set({ enginePhase: "ready", engineError: null });
-        } catch (e) {
-          get().updateSettings({ selectedEngine: previousEngine });
-          set({ enginePhase: "error", engineError: String(e) });
-          throw e;
         }
       },
 
@@ -2775,7 +2565,6 @@ function createAppStore() {
           await commands.shutdownTranscriptionClient();
           const r = await commands.initTranscriptionClient(
             "Parakeet",
-            null,
             settings.selectedParakeetVariant,
             false,
           );
@@ -2801,9 +2590,8 @@ function createAppStore() {
         }
 
         const trackedKeys = [
-          "captureSource", "theme", "language", "silenceDurationMs",
-          "maxChunkSeconds", "promptContextChars",
-          "promptDecaySilenceSeconds", "bufferMaxSeconds", "showRecordingIndicator",
+          "captureSource", "theme", "language", "bufferMaxSeconds",
+          "showRecordingIndicator",
         ] as const;
         for (const key of trackedKeys) {
           if (key in partial) {
@@ -3511,7 +3299,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 31,
+      version: 32,
       partialize: (state) => ({
         settings: state.settings,
         // Non-secret sync handles only (server URL, enabled flag, cursor,
@@ -3543,6 +3331,11 @@ function createAppStore() {
             1 - persistedSettings.dictationDuckTarget;
         }
         delete persistedSettings.dictationDuckTarget;
+
+        // Whisper was removed (ADR 0005). Also coerced by the v32 migration;
+        // repeated here so a persist-version skew can never rehydrate an
+        // engine the backend no longer accepts.
+        coerceWhisperSettings(persistedSettings);
 
         return {
           ...current,
@@ -3581,26 +3374,26 @@ function createAppStore() {
         if (version < 2 && state.settings) {
           const old = state.settings as Record<string, unknown>;
           if (old.silenceDurationMs === undefined) {
-            old.silenceDurationMs = defaultSettings.silenceDurationMs;
+            old.silenceDurationMs = 800;
           }
           if (old.maxChunkSeconds === undefined) {
-            old.maxChunkSeconds = defaultSettings.maxChunkSeconds;
+            old.maxChunkSeconds = 30;
           }
         }
         if (version < 3 && state.settings) {
           // v2 shipped with aggressive defaults that hurt quality — reset to proven values
           const old = state.settings as Record<string, unknown>;
           if (old.silenceDurationMs === 500) {
-            old.silenceDurationMs = defaultSettings.silenceDurationMs;
+            old.silenceDurationMs = 800;
           }
           if (old.maxChunkSeconds === 15) {
-            old.maxChunkSeconds = defaultSettings.maxChunkSeconds;
+            old.maxChunkSeconds = 30;
           }
         }
         if (version < 4 && state.settings) {
           const old = state.settings as Record<string, unknown>;
           if (old.promptContextChars === undefined) {
-            old.promptContextChars = defaultSettings.promptContextChars;
+            old.promptContextChars = 350;
           }
         }
         if (version < 5 && state.settings) {
@@ -3675,7 +3468,7 @@ function createAppStore() {
         if (version < 15 && state.settings) {
           const old = state.settings as Record<string, unknown>;
           if (old.promptDecaySilenceSeconds === undefined) {
-            old.promptDecaySilenceSeconds = defaultSettings.promptDecaySilenceSeconds;
+            old.promptDecaySilenceSeconds = 5;
           }
         }
         if (version < 16 && state.settings) {
@@ -3881,6 +3674,9 @@ function createAppStore() {
           // legacy `ai` field stays as the re-migration safety net. Without
           // this, DBs that ran that build keep re-persisting the duplicate.
           delete (state.settings as Record<string, unknown>)._legacyAi;
+        }
+        if (version < 32 && state.settings) {
+          coerceWhisperSettings(state.settings);
         }
         return state as unknown as { settings: Settings };
       },

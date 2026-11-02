@@ -10,7 +10,7 @@ Design, testing, and coding posture for YapStack. Short and opinionated. When yo
 
 **Lock-free audio path.** The capture hot path (mic / system) writes into an SPSC ring buffer with `Release`/`Acquire` orderings on a monotonic `write_pos`. Never introduce a mutex on this path. Consumers read via `snapshot_since(pos)` — if you need coordination, add a position counter, not a lock.
 
-**Per-engine tuning.** VAD thresholds, chunk sizes, and hallucination filters are **per-engine** on the backend. When you tune Parakeet, do not touch Whisper's proven values, and vice versa. Whisper keeps the aggressive always-reject hallucination list; Parakeet uses the softened variant. This asymmetry is intentional — Parakeet has fewer hallucinations but a softer filter still catches the real ones without dropping good output.
+**Per-engine tuning.** VAD thresholds, chunk sizes, and hallucination filters are **per-engine** on the backend (`profile_for(EngineKind)` in the live loop). Parakeet is the only engine today (ADR 0005); if another engine is added, it gets its own profile rather than retuning Parakeet's values. The hallucination filter keeps only canned outros in the always-reject tier and drops short fillers only at low confidence, so a real end-of-turn "thank you" survives.
 
 **Frontend state has one cache: the DB.** Zustand owns UI state (view, filters, selection, settings). SQLite owns persisted entities (sessions, segments, notes, folders, chat, dictation). There is no query cache — no React Query, no SWR. If you're reading the same data in two components, lift into the store or into a single parent. Adding a second caching layer in the frontend is a refactor, not a feature.
 
@@ -52,7 +52,7 @@ Design, testing, and coding posture for YapStack. Short and opinionated. When yo
 
 **No error handling for cases that can't happen.** Validate at system boundaries: user input, external APIs, sidecar IPC, DB schema. Trust internal code and framework guarantees. Adding `try/catch` around internal calls obscures real bugs.
 
-**Feature-gated code for missing feature flags is an error, not a fallback.** If the sidecar is built without the `parakeet` feature and the user selects Parakeet, return a clear error per request (`engines/mod.rs` dispatcher does this today). Don't silently fall back to Whisper — that hides the misconfiguration.
+**Feature-gated code for missing feature flags is an error, not a fallback.** If the sidecar is built without the `parakeet` feature, every request returns a clear `no transcription engine compiled in` error (the `main.rs` dispatcher does this today), and an unknown `--engine` value exits at startup. Don't silently fall back to another engine — that hides the misconfiguration.
 
 **Comments explain WHY, not WHAT.** Code says what. Comments explain hidden constraints, workarounds for specific bugs, surprising invariants. Do not write `// used by X` — that belongs in the commit message or PR description and rots as the codebase evolves.
 

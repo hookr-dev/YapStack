@@ -14,7 +14,6 @@ export function useAutoSetup() {
       const { settings } = useAppStore.getState();
       trackAppLaunched({
         capture_source: settings.captureSource,
-        model_size: settings.selectedModelSize,
         dictation_enabled: settings.dictation.enabled ? 1 : 0,
         dictation_slot_count: settings.dictation.slots.length,
         theme: settings.theme,

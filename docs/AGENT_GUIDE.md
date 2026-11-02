@@ -17,7 +17,7 @@ Skip everything else until a task forces it.
 |---|---|
 | Audio capture, ring buffer | `crates/yapstack-audio/` |
 | Sidecar IPC types | `crates/yapstack-common/src/types.rs` |
-| Transcription engines | `crates/yapstack-transcription-sidecar/src/engines/` (`whisper.rs`, `parakeet.rs`) |
+| Transcription engines | `crates/yapstack-transcription-sidecar/src/engines/` (`parakeet.rs`) |
 | Tauri command layer | `apps/desktop/src-tauri/src/commands/` |
 | Live transcription loop | `apps/desktop/src-tauri/src/commands/live_transcription.rs` |
 | DB migrations | `apps/desktop/src-tauri/src/db.rs` |
@@ -71,7 +71,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 
 ### Editing transcription pipeline behaviour
 
-1. Read the live transcription section of [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) end-to-end before touching `commands/live_transcription.rs`. There's tight coupling between cursors, VAD state machines, prompt context, and stream health monitoring.
+1. Read the live transcription section of [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) end-to-end before touching `commands/live_transcription.rs`. There's tight coupling between cursors, VAD state machines, and stream health monitoring.
 2. The `live_pressure` and `live_engine_loaded` log markers are how you observe runtime behaviour. Add new markers via `tracing::info!(marker = "...", ...)`.
 3. Backfill must continue to work concurrently with live; don't break the `origin: "backfill"` flow.
 4. Test on a real recording session before declaring done. UI tests don't catch pipeline regressions.

@@ -85,7 +85,7 @@ export const DEFAULT_INSIGHTS_SETTINGS: InsightsSettings = {
 // (ASHA) ≈ 2 words/sec, mapping `thresholdWords` to a target talk-time, and
 // (b) the within-speaker pause hierarchy — clause boundaries ~0.5-1 s, sentence
 // ~1-1.5 s, discourse/turn ~2 s. Crucially, our transcription sidecar emits a
-// segment ONLY on a Silero-VAD silence (≥500 ms Parakeet / ≥800 ms Whisper) or
+// segment ONLY on a Silero-VAD silence (≥500 ms) or
 // a max-length cut, so a segment's arrival already marks a real pause; the
 // `settle` here is *additional* trailing quiet on top of that chunker silence
 // (which is why settles are short — an earlier 3-4 s settle matched a rare
