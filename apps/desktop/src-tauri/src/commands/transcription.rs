@@ -9,29 +9,12 @@ use tracing::{error, info};
 use yapstack_common::engines::engine_catalogue;
 use yapstack_common::types::EngineKind;
 use yapstack_transcription::{
-    ModelManager, ModelSize, ParakeetVariant, SortformerVariant, TranscriptionClient,
+    LegacyModelFile, ModelManager, ParakeetVariant, SortformerVariant, TranscriptionClient,
 };
 
 use super::error::CommandError;
 
 // --- DTOs ---
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub enum ModelSizeDto {
-    Tiny,
-    Base,
-    Small,
-    Medium,
-}
-
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct ModelInfoDto {
-    pub size: ModelSizeDto,
-    pub downloaded: bool,
-    pub path: Option<String>,
-    pub display_name: String,
-    pub approximate_size_bytes: u64,
-}
 
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct TranscriptSegmentDto {
@@ -39,15 +22,15 @@ pub struct TranscriptSegmentDto {
     pub end_ms: u64,
     pub text: String,
     pub confidence: f32,
-    /// Populated when the active engine is Parakeet *and* diarization
-    /// was requested for the originating transcribe call. `None` for Whisper.
+    /// Populated when diarization was requested for the originating
+    /// transcribe call.
     pub speaker_id: Option<u8>,
 }
 
-/// Which transcription engine the frontend has selected.
+/// Which transcription engine the frontend has selected. Parakeet is the
+/// only engine (ADR 0005).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum EngineKindDto {
-    Whisper,
     Parakeet,
 }
 
@@ -66,14 +49,21 @@ pub enum SortformerVariantDto {
     V2_1,
 }
 
-/// Engine capabilities + supported languages for the cascading UI in Settings.
+/// Engine capabilities + supported languages for Settings.
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct EngineDescriptorDto {
     pub kind: EngineKindDto,
     pub display_name: String,
     pub languages: Vec<String>,
     pub supports_diarization: bool,
-    pub supports_initial_prompt: bool,
+}
+
+/// A model file left behind by an earlier release (today: Whisper GGML
+/// weights and the GGML Silero VAD file) that no current model uses.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct LegacyModelFileDto {
+    pub name: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -115,32 +105,9 @@ pub struct SortformerModelInfoDto {
 
 // --- From impls ---
 
-impl From<ModelSizeDto> for ModelSize {
-    fn from(s: ModelSizeDto) -> Self {
-        match s {
-            ModelSizeDto::Tiny => ModelSize::Tiny,
-            ModelSizeDto::Base => ModelSize::Base,
-            ModelSizeDto::Small => ModelSize::Small,
-            ModelSizeDto::Medium => ModelSize::Medium,
-        }
-    }
-}
-
-impl From<ModelSize> for ModelSizeDto {
-    fn from(s: ModelSize) -> Self {
-        match s {
-            ModelSize::Tiny => ModelSizeDto::Tiny,
-            ModelSize::Base => ModelSizeDto::Base,
-            ModelSize::Small => ModelSizeDto::Small,
-            ModelSize::Medium => ModelSizeDto::Medium,
-        }
-    }
-}
-
 impl From<EngineKindDto> for EngineKind {
     fn from(k: EngineKindDto) -> Self {
         match k {
-            EngineKindDto::Whisper => EngineKind::Whisper,
             EngineKindDto::Parakeet => EngineKind::Parakeet,
         }
     }
@@ -149,7 +116,6 @@ impl From<EngineKindDto> for EngineKind {
 impl From<EngineKind> for EngineKindDto {
     fn from(k: EngineKind) -> Self {
         match k {
-            EngineKind::Whisper => EngineKindDto::Whisper,
             EngineKind::Parakeet => EngineKindDto::Parakeet,
         }
     }
@@ -181,14 +147,11 @@ impl From<SortformerVariantDto> for SortformerVariant {
     }
 }
 
-impl From<yapstack_transcription::ModelInfo> for ModelInfoDto {
-    fn from(m: yapstack_transcription::ModelInfo) -> Self {
+impl From<LegacyModelFile> for LegacyModelFileDto {
+    fn from(f: LegacyModelFile) -> Self {
         Self {
-            size: m.size.into(),
-            downloaded: m.downloaded,
-            path: m.path.map(|p| p.to_string_lossy().into_owned()),
-            display_name: m.display_name,
-            approximate_size_bytes: m.approximate_size_bytes,
+            name: f.name,
+            bytes: f.bytes,
         }
     }
 }
@@ -204,7 +167,6 @@ pub type ModelManagerState = Arc<Mutex<ModelManager>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub kind: EngineKind,
-    pub whisper_model: Option<ModelSize>,
     pub parakeet_variant: Option<ParakeetVariant>,
     pub diarization: bool,
 }
@@ -476,71 +438,41 @@ pub type DictationOwnsMicState = Arc<DictationOwnsMic>;
 
 // --- Commands ---
 
+/// Lists model files left behind by earlier releases, with their sizes, so
+/// Settings can offer to remove them. Nothing is deleted without the user.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_available_models(
+pub async fn list_legacy_model_files(
     state: tauri::State<'_, ModelManagerState>,
-) -> Result<Vec<ModelInfoDto>, CommandError> {
+) -> Result<Vec<LegacyModelFileDto>, CommandError> {
     let manager = state.lock().await;
     Ok(manager
-        .list_all()
+        .list_legacy_model_files()
         .into_iter()
-        .map(ModelInfoDto::from)
+        .map(LegacyModelFileDto::from)
         .collect())
 }
 
+/// Deletes the named legacy model files. Names that aren't legacy model
+/// files are refused.
 #[tauri::command]
 #[specta::specta]
-pub async fn download_model(
+pub async fn delete_legacy_model_files(
     state: tauri::State<'_, ModelManagerState>,
-    window: tauri::Window,
-    size: ModelSizeDto,
-) -> Result<String, CommandError> {
-    info!(size = ?size, "downloading model");
-    // Clone the manager so we can release the lock before the long download.
-    // ModelManager is cheap to clone (just a PathBuf).
+    names: Vec<String>,
+) -> Result<(), CommandError> {
+    info!(?names, "deleting legacy model files");
     let manager = {
         let guard = state.lock().await;
         guard.clone()
     };
-    let model_size: ModelSize = size.into();
-
-    let path = manager
-        .download(model_size, move |progress| {
-            let _ = window.emit(
-                "model-download-progress",
-                serde_json::json!({
-                    "percent": progress,
-                    "size": format!("{:?}", model_size),
-                }),
-            );
-        })
+    manager
+        .delete_legacy_model_files(&names)
         .await
         .map_err(|e| {
-            error!("model download failed: {}", e);
+            error!("legacy model file deletion failed: {}", e);
             CommandError::from(e)
-        })?;
-
-    info!(path = %path.display(), "model downloaded");
-    Ok(path.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn delete_model(
-    state: tauri::State<'_, ModelManagerState>,
-    size: ModelSizeDto,
-) -> Result<(), CommandError> {
-    info!(size = ?size, "deleting model");
-    // Clone the manager so we can release the lock before async filesystem I/O.
-    let manager = {
-        let guard = state.lock().await;
-        guard.clone()
-    };
-    manager.delete(size.into()).await.map_err(|e| {
-        error!("model deletion failed: {}", e);
-        CommandError::from(e)
-    })
+        })
 }
 
 #[tauri::command]
@@ -603,8 +535,7 @@ pub async fn get_transcription_status(
 
 // ---------- Engine catalogue + Parakeet/Sortformer commands ----------
 
-/// Returns the static engine catalogue (Whisper + Parakeet capability + language lists).
-/// The frontend uses this to drive the cascading engine → model → language UI.
+/// Returns the static engine catalogue (capabilities + language lists).
 #[tauri::command]
 #[specta::specta]
 pub async fn get_engine_catalogue() -> Result<Vec<EngineDescriptorDto>, CommandError> {
@@ -615,7 +546,6 @@ pub async fn get_engine_catalogue() -> Result<Vec<EngineDescriptorDto>, CommandE
             display_name: d.display_name.to_string(),
             languages: d.languages.iter().map(|s| (*s).to_string()).collect(),
             supports_diarization: d.supports_diarization,
-            supports_initial_prompt: d.supports_initial_prompt,
         })
         .collect())
 }
@@ -768,9 +698,8 @@ pub async fn delete_sortformer_model(
         .map_err(CommandError::from)
 }
 
-/// Spawn the sidecar with the requested engine. Whisper requires
-/// `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
-/// enable Sortformer diarization.
+/// Spawn the sidecar with the requested engine. Parakeet requires
+/// `parakeet_variant` and may optionally enable Sortformer diarization.
 ///
 /// Re-init semantics:
 /// - If the engine is uninitialized, build the client + scheduler.
@@ -788,13 +717,11 @@ pub async fn init_transcription_client(
     model_manager_state: tauri::State<'_, ModelManagerState>,
     scheduler_state: tauri::State<'_, TranscriptionSchedulerState>,
     engine: EngineKindDto,
-    whisper_model: Option<ModelSizeDto>,
     parakeet_variant: Option<ParakeetVariantDto>,
     enable_diarization: bool,
 ) -> Result<(), CommandError> {
     info!(
         engine = ?engine,
-        whisper_model = ?whisper_model,
         parakeet_variant = ?parakeet_variant,
         enable_diarization,
         "initializing transcription client"
@@ -802,7 +729,6 @@ pub async fn init_transcription_client(
 
     let requested = EngineConfig {
         kind: engine.into(),
-        whisper_model: whisper_model.clone().map(Into::into),
         parakeet_variant: parakeet_variant.map(Into::into),
         diarization: enable_diarization,
     };
@@ -822,7 +748,7 @@ pub async fn init_transcription_client(
         }
     }
 
-    // Clone the model manager so ensure_vad_model / ensure_sortformer awaits
+    // Clone the model manager so the ensure_sortformer await
     // don't hold the outer ModelManagerState lock — those can take seconds
     // on a cold fetch and would otherwise serialize every other consumer.
     // ModelManager is cheap to clone (PathBuf-backed).
@@ -832,25 +758,7 @@ pub async fn init_transcription_client(
     };
     let sidecar_path = find_sidecar_path()?;
 
-    let (model_path, vad_model_path, sortformer_model_path, coreml_cache_dir) = match engine {
-        EngineKindDto::Whisper => {
-            let size: ModelSize = whisper_model
-                .ok_or(CommandError::NotFound {
-                    message: "whisper_model required when engine=Whisper".into(),
-                })?
-                .into();
-            let mp = manager.model_path(size).ok_or(CommandError::NotFound {
-                message: format!("whisper model {:?} not downloaded", size),
-            })?;
-            let vad = match manager.ensure_vad_model().await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    error!("ensure_vad_model failed: {}, proceeding without VAD", e);
-                    None
-                }
-            };
-            (mp, vad, None, None)
-        }
+    let (model_path, sortformer_model_path, coreml_cache_dir) = match engine {
         EngineKindDto::Parakeet => {
             let variant: ParakeetVariant = parakeet_variant
                 .ok_or(CommandError::NotFound {
@@ -873,7 +781,7 @@ pub async fn init_transcription_client(
                 .app_data_dir()
                 .ok()
                 .map(|d| d.join("cache").join("coreml"));
-            (mp, None, sortformer, cache_dir)
+            (mp, sortformer, cache_dir)
         }
     };
 
@@ -882,7 +790,6 @@ pub async fn init_transcription_client(
         &sidecar_path,
         engine_kind,
         &model_path,
-        vad_model_path.as_deref(),
         sortformer_model_path.as_deref(),
         coreml_cache_dir.as_deref(),
     )
@@ -1043,37 +950,6 @@ fn current_target_triple() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_model_size_dto_roundtrip() {
-        let sizes = [
-            (ModelSizeDto::Tiny, ModelSize::Tiny),
-            (ModelSizeDto::Base, ModelSize::Base),
-            (ModelSizeDto::Small, ModelSize::Small),
-            (ModelSizeDto::Medium, ModelSize::Medium),
-        ];
-        for (dto, expected) in sizes {
-            let domain: ModelSize = dto.into();
-            assert!(
-                matches!(domain, ref e if std::mem::discriminant(&domain) == std::mem::discriminant(&expected))
-            );
-        }
-    }
-
-    #[test]
-    fn test_model_size_domain_to_dto_roundtrip() {
-        let sizes = [
-            ModelSize::Tiny,
-            ModelSize::Base,
-            ModelSize::Small,
-            ModelSize::Medium,
-        ];
-        for size in sizes {
-            let dto: ModelSizeDto = size.into();
-            let back: ModelSize = dto.into();
-            assert_eq!(std::mem::discriminant(&size), std::mem::discriminant(&back));
-        }
-    }
 
     #[test]
     fn test_current_target_triple_not_empty() {

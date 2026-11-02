@@ -105,9 +105,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
-      - name: Install cmake
-        run: brew install cmake
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
@@ -239,12 +236,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
-      - name: Check cmake
-        # windows-latest ships cmake in the runner image; the sidecar's
-        # whisper-rs / parakeet-rs cmake builds use it. Echo the version so
-        # runner-image updates that break the build are diagnosable.
-        run: cmake --version
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
@@ -289,7 +280,7 @@ jobs:
 
       - name: Build sidecars
         # Pass the Windows target explicitly so the build script's Windows
-        # branch runs (features: whisper,parakeet) and emits the
+        # branch runs (features: parakeet,webgpu) and emits the
         # target-triple-suffixed exe that Tauri's externalBin requires:
         # binaries/yapstack-transcription-sidecar-x86_64-pc-windows-msvc.exe
         shell: bash

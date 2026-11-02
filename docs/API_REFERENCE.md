@@ -50,15 +50,16 @@ pub struct TranscriptSegment {
     pub end_ms: u64,
     pub text: String,
     pub confidence: f32,
-    /// Set by the diarization post-pass (Parakeet + Sortformer). `None` for
-    /// Whisper segments and for any pre-diarization Parakeet segment.
+    /// Set by the diarization post-pass (Parakeet + Sortformer). `None` when
+    /// diarization was not requested or did not run.
     /// Serialised with `skip_serializing_if = "Option::is_none"`.
     pub speaker_id: Option<u8>,
 }
 
-/// Which transcription engine the sidecar should instantiate.
-pub enum EngineKind { Whisper, Parakeet }
-impl EngineKind { pub fn as_str(&self) -> &'static str; }  // "whisper" | "parakeet"
+/// Which transcription engine the sidecar should instantiate. Parakeet is the
+/// only engine (ADR 0005); the enum stays as the extension point.
+pub enum EngineKind { Parakeet }
+impl EngineKind { pub fn as_str(&self) -> &'static str; }  // "parakeet"
 
 // Sidecar IPC protocol (tagged JSON unions)
 pub enum SidecarRequest {
@@ -66,9 +67,7 @@ pub enum SidecarRequest {
         id: u64,
         audio_path: PathBuf,
         language: Option<String>,
-        initial_prompt: Option<String>,   // Whisper only; Parakeet TDT decoder ignores
-        single_segment: Option<bool>,
-        diarization: bool,                // Parakeet only when sidecar has --sortformer-model
+        diarization: bool,                // honored when the sidecar has --sortformer-model
     },
     LoadModel { id: u64, model_path: PathBuf },
     Shutdown,
@@ -92,8 +91,7 @@ pub struct EngineDescriptor {
     pub display_name: &'static str,
     /// BCP-47 / ISO-639-1 codes. First entry is the engine's primary language.
     pub languages: &'static [&'static str],
-    pub supports_diarization: bool,    // Parakeet only
-    pub supports_initial_prompt: bool, // Whisper only
+    pub supports_diarization: bool,
 }
 
 impl EngineDescriptor {
@@ -104,7 +102,7 @@ pub fn engine_catalogue() -> &'static [EngineDescriptor];
 pub fn descriptor(kind: EngineKind) -> &'static EngineDescriptor;
 ```
 
-Whisper exposes 99 ISO-639 codes; Parakeet TDT v3 exposes 25 European codes.
+The catalogue has one entry: Parakeet TDT v3, with 25 European codes.
 
 ---
 
@@ -377,21 +375,19 @@ pub enum AudioError {
 ### Re-exports (`lib.rs`)
 
 ```rust
-pub use client::{TranscriptionClient, TranscriptionResult};
+pub use client::{EngineInfo, TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
-pub use model::{ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant};
+pub use model::{LegacyModelFile, ModelManager, ParakeetVariant, SortformerVariant};
 ```
 
 ### ModelManager (`model.rs`)
 
-Manages **three** model families: Whisper (single ggml file), Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory), and Sortformer (single ONNX file for diarization). All from HuggingFace with streaming SHA-256 verification.
+Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. There is no hash verification yet; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. It also lists and deletes legacy files earlier releases left in `models/` (Whisper GGML weights and the GGML Silero VAD file); it never deletes them on its own.
 
 ```rust
-pub enum ModelSize { Tiny, Base, Small, Medium }  // Whisper, Serialize + Deserialize
-pub enum ParakeetVariant { TdtV3 }                // multilingual, 25 European languages
+pub enum ParakeetVariant { TdtV3, TdtV3Int8 }     // multilingual, 25 European languages
 pub enum SortformerVariant { V2_1 }               // up to 4 speakers
 
-impl ModelSize { /* filename, approximate_size_bytes, download_url, display_name, all */ }
 impl ParakeetVariant {
     pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3"
     pub fn files(&self) -> &'static [(&'static str, &'static str, u64)];       // (name, url, size) per file
@@ -401,7 +397,8 @@ impl ParakeetVariant {
 }
 impl SortformerVariant { /* filename, download_url, approximate_size_bytes, display_name */ }
 
-pub struct ModelInfo { /* size, downloaded, path, display_name, approximate_size_bytes */ }
+/// A legacy model file present in models/.
+pub struct LegacyModelFile { pub name: String, pub bytes: u64 }
 
 pub struct ModelManager { /* models_dir: PathBuf */ }
 
@@ -409,20 +406,9 @@ impl ModelManager {
     pub fn new(app_data_dir: PathBuf) -> Self;        // stored in app_data_dir/models/
     pub fn models_dir(&self) -> &Path;
 
-    // ---- Whisper ----
-    pub fn is_available(&self, size: ModelSize) -> bool;
-    pub fn model_path(&self, size: ModelSize) -> Option<PathBuf>;
-    pub fn expected_model_path(&self, size: ModelSize) -> PathBuf;
-    pub async fn download(&self, size: ModelSize, on_progress: impl Fn(f32) + Send) -> Result<PathBuf>;
-    pub async fn verify_checksum(&self, size: ModelSize, expected_sha256: &str) -> Result<bool>;
-    pub async fn delete(&self, size: ModelSize) -> Result<()>;
-    pub fn list_downloaded(&self) -> Vec<ModelSize>;
-    pub fn list_all(&self) -> Vec<ModelInfo>;
-
-    // ---- Whisper VAD (Silero ~885KB, auto-downloaded) ----
-    pub fn vad_model_path(&self) -> Option<PathBuf>;
-    pub async fn download_vad_model(&self, on_progress: impl Fn(f32) + Send) -> Result<PathBuf>;
-    pub async fn ensure_vad_model(&self) -> Result<PathBuf>;
+    // ---- Legacy files (ggml-{tiny,base,small,medium}.bin, ggml-silero-v6.2.0.bin) ----
+    pub fn list_legacy_model_files(&self) -> Vec<LegacyModelFile>;             // present files, in catalogue order
+    pub async fn delete_legacy_model_files(&self, names: &[String]) -> Result<()>; // refuses names outside the legacy list; missing files skipped
 
     // ---- Parakeet (multi-file ONNX bundle in models_dir/parakeet-<variant>/) ----
     pub fn parakeet_model_dir(&self, variant: ParakeetVariant) -> PathBuf;
@@ -439,9 +425,9 @@ impl ModelManager {
 }
 ```
 
-### TranscriptionClient (`client.rs`, was `whisper.rs`)
+### TranscriptionClient (`client.rs`)
 
-Engine-agnostic JSON-line IPC client for the sidecar. Spawns the sidecar with `--engine whisper|parakeet` and forwards engine-specific flags (`--vad-model` for Whisper, `--sortformer-model` and `--coreml-cache-dir` for Parakeet).
+Engine-agnostic JSON-line IPC client for the sidecar. Spawns the sidecar with `--engine parakeet` and forwards the optional `--sortformer-model` and `--coreml-cache-dir` flags.
 
 ```rust
 pub struct TranscriptionResult {
@@ -457,15 +443,14 @@ impl TranscriptionClient {
         sidecar_path: &Path,
         engine: EngineKind,
         model_path: &Path,
-        vad_model_path: Option<&Path>,           // Whisper only
-        sortformer_model_path: Option<&Path>,    // Parakeet only — enables per-call diarization
+        sortformer_model_path: Option<&Path>,    // enables per-call diarization
         coreml_cache_dir: Option<&Path>,         // Parakeet+CoreML only — persistent compile cache
     ) -> Result<Self>;
 
     pub fn engine(&self) -> EngineKind;          // read-only after construction
 
-    pub async fn transcribe(&mut self, audio_path: &Path, language: Option<&str>, initial_prompt: Option<&str>) -> Result<TranscriptionResult>;
-    pub async fn transcribe_with(&mut self, audio_path: &Path, language: Option<&str>, initial_prompt: Option<&str>, diarization: bool) -> Result<TranscriptionResult>;
+    pub async fn transcribe(&self, audio_path: &Path, language: Option<&str>) -> Result<TranscriptionResult>;  // diarization off
+    pub async fn transcribe_with(&self, audio_path: &Path, language: Option<&str>, diarization: bool) -> Result<TranscriptionResult>;
     pub async fn load_model(&mut self, model_path: &Path) -> Result<()>;
     pub async fn shutdown(&mut self) -> Result<()>;
     pub fn is_running(&self) -> bool;
@@ -500,11 +485,10 @@ Binary. No public API. Communicates via JSON-line IPC.
 **CLI**:
 ```
 yapstack-transcription-sidecar
-    [--engine whisper|parakeet]                # default: whisper (preserves prior CLI behavior)
-    [--model /path/to/model[/dir]]              # ggml file for Whisper, model dir for Parakeet
-    [--vad-model /path/to/silero.bin]           # Whisper only
-    [--sortformer-model /path/to/sortformer.onnx]  # Parakeet only — enables per-call diarization
-    [--coreml-cache-dir /path/to/cache/]        # Parakeet only — persistent CoreML compile cache
+    [--engine parakeet]                         # default: parakeet; any other value exits with code 2
+    [--model /path/to/model/dir]                # Parakeet model dir
+    [--sortformer-model /path/to/sortformer.onnx]  # enables per-call diarization
+    [--coreml-cache-dir /path/to/cache/]        # persistent CoreML compile cache
 ```
 
 **Env vars**:
@@ -512,58 +496,30 @@ yapstack-transcription-sidecar
 - `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
 **Feature flags**:
-- `whisper` — Whisper transcription via whisper-rs (requires cmake)
-- `metal` — Metal acceleration for whisper-rs
 - `parakeet` — Parakeet TDT via parakeet-rs + ORT (also enables Sortformer diarization)
 - `coreml` — Adds the ORT-CoreML execution provider for Parakeet (Apple targets)
 - `webgpu` — Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS)
-- Default features = `["whisper", "parakeet"]`
+- Default features = `["parakeet"]`
 
-If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--no-default-features --features whisper` build), every IPC request returns `engine 'X' not compiled in this build`.
+A `--no-default-features` build has no engine compiled in; every IPC request returns `no transcription engine compiled in`.
 
-**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. Concrete impls in `engines/whisper.rs` (whisper-rs + flash attention + Silero VAD) and `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + CoreML/WebGPU/CPU EP via env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
+**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + CoreML/WebGPU/CPU EP via env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
 
-**Whisper parameters**:
-```rust
-greedy(best_of=1)           // deterministic at temp 0 — all candidates identical
-no_context(true)            // prevents cross-chunk context leakage
-logprob_thold(-1.0)         // relaxed to avoid dropping valid speech
-max_tokens(100/200)         // 100 for single-segment, 200 for multi-segment
-suppress_blank(true)
-suppress_nst(true)
-temperature(0.0)
-temperature_inc(0.2)        // fallback for noisy segments (retries at 0.2, 0.4…)
-no_speech_thold(0.45)
-entropy_thold(2.0)
-single_segment(adaptive)    // true if audio <10s, false otherwise
-```
-
-**Silero VAD** (when `--vad-model` provided):
-```rust
-threshold: 0.5              // speech probability threshold
-min_speech_duration: 250    // ms — minimum speech to consider
-min_silence_duration: 100   // ms — minimum silence to split
-speech_pad: 30              // ms — padding around speech segments
-```
-VAD runs as whisper.cpp preprocessing — non-speech audio is skipped before decoding, reducing hallucinations on silent/ambient segments.
-
-**Audio preprocessing** (behind `whisper` feature):
-- `to_mono(samples, channels)` — delegates to `yapstack_common::audio::deinterleave_to_mono()`
-- `resample(samples, from_rate, to_rate)` — sinc interpolation resampling via rubato (Cubic, BlackmanHarris2, sinc_len 256, f_cutoff 0.98) to Whisper's expected 16kHz
+**Audio preprocessing**: `engines::read_wav_as_mono_16k()` loads the WAV, downmixes via `yapstack_common::audio::deinterleave_to_mono()`, and resamples to 16 kHz via `yapstack_common::audio::resample()`.
 
 **Hallucination filtering** (`should_include_segment(text, confidence) -> bool`):
 ```rust
 // Filters out (in order):
-// 1. Empty text or special tokens ([BLANK_AUDIO], [MUSIC], etc.)
-// 2. Low confidence: confidence < 0.4
-// 3. Excessive word repetition: 3+ consecutive identical words
+// 1. Empty text, text with no alphanumerics, or bracketed tokens ([BLANK_AUDIO], [MUSIC], etc.)
+// 2. Excessive repetition (6+ consecutive identical words or a repeated phrase),
+//    only when confidence < 0.7
 //    - Direct check, then punctuation-normalized check via normalize_for_repetition()
-//    - "Yeah.Yeah.Yeah." → "Yeah . Yeah . Yeah ." → detected as repetition
-// 4. Known hallucination patterns at marginal confidence (< 0.6):
-//    47 patterns including "thank you", "thanks for watching", "bye", "yeah",
-//    "um", "so", "uh", "okay", "oh", "right", "hmm", "well", "you know",
-//    "subscribe", "the end", etc.
-// All filter hits logged at info! level for debugging.
+// 3. Low confidence: confidence < 0.4
+// 4. yapstack_common::hallucination::is_always_reject(text): canned outros
+//    ("thanks for watching", "please subscribe", ...) at any confidence
+// 5. yapstack_common::hallucination::is_marginal_reject(text) at confidence < 0.6:
+//    short fillers ("yeah", "um", "thank you", "bye", ...)
+// Repetition hits logged at info! level for debugging.
 ```
 
 ---
@@ -589,7 +545,7 @@ pub enum CommandError {
 Five managed states. The Tauri-facing names (rather than full type definitions) appear here; field shapes live with the Rust types and rotate freely without a doc change.
 
 - `AudioManagerState` — audio capture lifecycle, ring buffers, capture-source tracking.
-- `ModelManagerState` — Whisper / Parakeet / Sortformer model download + path resolution.
+- `ModelManagerState` — Parakeet / Sortformer model download + path resolution, and legacy model file cleanup.
 - `TranscriptionSchedulerState` — single source of truth for engine initialization. Wraps an `Option<InitializedEngine>` carrying the active `EngineConfig` and the long-lived `Arc<TranscriptionScheduler>`. The scheduler owns the sole `Arc<TranscriptionClient>` for the engine's lifetime; both runtimes clone it from here.
 - `LiveTranscriptionState` — two named slots (`session`, `dictation`), each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. See ARCHITECTURE.md § "Live Transcription" and the rustdoc on `RuntimeSlot` / `LiveTranscriptionSlots`.
 - `DictationOwnsMicState` — mic-ownership window list (open + closed `[start, end)` intervals). See GLOSSARY.md "Mic-ownership window" and the rustdoc on `DictationOwnsMic` for the contract.
@@ -621,13 +577,12 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 ### Transcription Commands (`commands/transcription.rs`)
 | Command | Args | Returns |
 |---------|------|---------|
-| `get_available_models` | — | `Vec<ModelInfoDto>` (Whisper) |
-| `download_model` | `size` | `String` (path) |
-| `delete_model` | `size` | `()` |
-| `init_transcription_client` | `engine, whisper_model?, parakeet_variant?, enable_diarization` | `()` |
+| `list_legacy_model_files` | — | `Vec<LegacyModelFileDto { name, bytes }>` (legacy files present in `models/`) |
+| `delete_legacy_model_files` | `names: Vec<String>` | `()` (`Transcription` error, nothing deleted, if any name is outside the legacy list) |
+| `init_transcription_client` | `engine, parakeet_variant?, enable_diarization` | `()` |
 | `shutdown_transcription_client` | — | `()` |
 | `get_transcription_status` | — | `TranscriptionStatusDto { initialized: bool }` |
-| `get_engine_catalogue` | — | `Vec<EngineDescriptorDto>` (engine kinds × supported languages × capability flags) |
+| `get_engine_catalogue` | — | `Vec<EngineDescriptorDto { kind, display_name, languages, supports_diarization }>` (one entry: Parakeet) |
 | `get_parakeet_models` | — | `Vec<ParakeetModelInfoDto>` |
 | `download_parakeet_model` | `variant: ParakeetVariantDto` | `String` (dir path) |
 | `delete_parakeet_model` | `variant: ParakeetVariantDto` | `()` |
@@ -639,12 +594,14 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 
 Re-init semantics are precise:
 - If the engine is uninitialized: build client + scheduler, OK.
-- If already initialized with a *matching* `EngineConfig` (engine kind + Whisper model + Parakeet variant + diarization): return OK (idempotent — covers HMR remounts).
+- If already initialized with a *matching* `EngineConfig` (engine kind + Parakeet variant + diarization): return OK (idempotent — covers HMR remounts).
 - If already initialized with a *different* config: return `InvalidInput` with "engine already initialized; call shutdown_transcription_client first". Engine swap is an explicit two-step operation; there is no implicit drain.
 
 `shutdown_transcription_client` refuses with `InvalidInput` if any runtime slot is non-`Idle`; otherwise calls `scheduler.shutdown_client()` to drain the worker, take the client, and call `client.shutdown().await`.
 
-All `download_*` commands emit `"model-download-progress"` events to the window with `{ percent: f32, ... }` (additional fields for Parakeet/Sortformer: `kind: "parakeet" | "sortformer"`, `variant`).
+`list_legacy_model_files` / `delete_legacy_model_files` cover the files earlier releases left in `models/`: `ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin` (Whisper weights) and `ggml-silero-v6.2.0.bin` (GGML Silero VAD). Nothing deletes them without a user action; `delete_legacy_model_files` refuses any name outside that fixed list, so it cannot remove a current model.
+
+All `download_*` commands emit `"model-download-progress"` events to the window with `{ percent: f32, kind: "parakeet" | "sortformer", variant }`.
 
 ### Live Transcription Commands (`commands/live_transcription.rs`)
 | Command | Args | Returns |
@@ -661,7 +618,7 @@ Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape:
 - `source_kind: "session" | "dictation"` — *routing identity*. Frontend listeners filter on this to decide which UI surface owns the event. The session segment store skips `dictation` events; the dictation hook accepts only `dictation` events with a matching synthetic `session_id`.
 - `origin: "live" | "backfill" | "final_flush"` — *priority class* set by the scheduler at emit time. Tells the frontend which queue lane the chunk came from. **Never route on `origin`**: a dictation runtime's stop-time chunks are legitimately `final_flush`. See PRINCIPLES.md § "Routing identity is not priority class".
 
-Other contract points on `LiveSegmentEvent`: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners can route without stale-state guards. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+Other contract points on `LiveSegmentEvent`: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners can route without stale-state guards. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
 
 `stop_live_transcription` snapshots `AudioManager::buffer_positions()` plus a short tail grace into a `StopRequest` for the targeted slot. After that point, the targeted live loop skips normal VAD polling, idle cursor advancement, stream-health restarts, and unbounded WAV flushing. Final live chunks and the session WAV tail are read only up to that bounded stop position; later samples are ignored for the stopped runtime. The other slot's runtime (e.g. a session running while a dictation stops) is unaffected.
 
@@ -679,11 +636,11 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 
 **`LiveTranscriptionConfig`** field-level shape is the source-of-truth on the Rust struct. Notable fields the frontend touches:
 - `source_kind: LiveSourceKind` (default `Session`) — routing identity; the dictation hook passes `Dictation` explicitly. Drives every downstream filter.
-- `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable).
+- `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`. Chunking is not configurable: the Parakeet profile is fixed (500 ms silence, 10 s max chunk, 100 ms poll, 250 ms pre-roll).
 - `session_id?` enables streaming session audio recording into a new part.
 - `persist_audio_part?: bool` (default `true`; `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id).
 - `audio_save_location?`, `audio_export_format?: "wav" | "mp3"` (default `"mp3"`), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64).
-- `diarization?`, `vocabulary_hints?` (Whisper-only).
+- `diarization?`.
 - `resume?: ResumeConfig` (prior cumulative duration → `session_offset_base_seconds`, next `part_index`).
 
 For `source_kind: Dictation`, the boundary validator additionally requires `source == MicOnly`, `backfill_seconds == 0`, `persist_audio_part == false` (rejected with `InvalidInput` otherwise — failing fast beats letting an inconsistent dictation runtime emit segments into session storage paths).

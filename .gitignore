@@ -22,7 +22,7 @@ binaries/
 # Test fixtures
 tests/fixtures/*.wav
 
-# Whisper models
+# Downloaded models
 models/
 *.bin
 

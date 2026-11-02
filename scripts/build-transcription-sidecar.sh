@@ -71,28 +71,27 @@ else
     PROFILE_DIR="debug"
 fi
 
-echo "Building yapstack-transcription-sidecar with whisper + parakeet features ($PROFILE_LABEL)..."
+echo "Building yapstack-transcription-sidecar with parakeet features ($PROFILE_LABEL)..."
 echo "Targets: ${TARGETS[*]}"
 echo ""
 
 for target in "${TARGETS[@]}"; do
     echo "=== Building for $target ==="
 
-    # Both engines ship in dev + release builds. Apple targets get Metal
-    # for whisper-rs and CoreML for parakeet-rs (CPU fallback is automatic
-    # via parakeet-rs's `error_on_failure()` chain).
-    FEATURES="whisper,parakeet"
+    # Apple targets get CoreML + WebGPU for parakeet-rs (CPU fallback is
+    # automatic via parakeet-rs's `error_on_failure()` chain).
+    FEATURES="parakeet"
     if [[ "$target" == *"apple"* ]]; then
-        FEATURES="whisper,parakeet,metal,coreml,webgpu"
+        FEATURES="parakeet,coreml,webgpu"
     elif [[ "$target" == *"windows"* ]]; then
         # Parakeet WebGPU (Dawn -> D3D12/Vulkan). The feature adds a
         # load-time webgpu_dawn.dll import (ort-sys links Dawn dynamically);
         # the DLL-staging block below MUST ship every dist DLL next to the
-        # sidecar .exe or it fails before main(). Whisper stays CPU.
+        # sidecar .exe or it fails before main().
         # Gate C passed (2026-07-05): `Auto` attempts WebGPU here, with an
         # explicit CPU fallback on EP-init failure. YAPSTACK_PARAKEET_ACCEL=cpu
         # is the escape hatch.
-        FEATURES="whisper,parakeet,webgpu"
+        FEATURES="parakeet,webgpu"
     fi
 
     # shellcheck disable=SC2086
@@ -127,8 +126,7 @@ for target in "${TARGETS[@]}"; do
     # Apple targets pull in libwebgpu_dawn.dylib via parakeet-rs/webgpu → ort/webgpu.
     # The sidecar's only LC_RPATH is /usr/lib/swift, so without help dyld
     # cannot resolve @rpath/libwebgpu_dawn.dylib at process launch and the
-    # sidecar fails *before* main() — taking both Whisper and Parakeet down
-    # with it. We add two rpaths and copy the dylib into binaries/ so the
+    # sidecar fails *before* main(). We add two rpaths and copy the dylib into binaries/ so the
     # same artifact works in two layouts:
     #   - bundled:   sidecar at Contents/MacOS/, dylib at Contents/Frameworks/
     #                resolved via @executable_path/../Frameworks

@@ -2,85 +2,33 @@ use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::TranscriptionError;
 
 type Result<T> = std::result::Result<T, TranscriptionError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ModelSize {
-    Tiny,
-    Base,
-    Small,
-    Medium,
+// ----------- Legacy model files -----------
+
+/// Files earlier releases downloaded into `models/` that no current model
+/// uses: the Whisper GGML weights and the GGML Silero VAD file (both retired
+/// by ADR 0005). They are never deleted silently; the user removes them from
+/// Transcription settings.
+const LEGACY_MODEL_FILES: &[&str] = &[
+    "ggml-tiny.bin",
+    "ggml-base.bin",
+    "ggml-small.bin",
+    "ggml-medium.bin",
+    "ggml-silero-v6.2.0.bin",
+];
+
+/// A legacy model file present on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LegacyModelFile {
+    pub name: String,
+    pub bytes: u64,
 }
-
-impl ModelSize {
-    /// Returns the ggml model filename.
-    pub fn filename(&self) -> &'static str {
-        match self {
-            ModelSize::Tiny => "ggml-tiny.bin",
-            ModelSize::Base => "ggml-base.bin",
-            ModelSize::Small => "ggml-small.bin",
-            ModelSize::Medium => "ggml-medium.bin",
-        }
-    }
-
-    /// Returns the approximate size in bytes.
-    pub fn approximate_size_bytes(&self) -> u64 {
-        match self {
-            ModelSize::Tiny => 75_000_000,
-            ModelSize::Base => 142_000_000,
-            ModelSize::Small => 466_000_000,
-            ModelSize::Medium => 1_500_000_000,
-        }
-    }
-
-    /// Returns the Hugging Face download URL.
-    pub fn download_url(&self) -> String {
-        format!(
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-            self.filename()
-        )
-    }
-
-    /// Returns a human-readable display name.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            ModelSize::Tiny => "Tiny (~75 MB)",
-            ModelSize::Base => "Base (~142 MB)",
-            ModelSize::Small => "Small (~466 MB)",
-            ModelSize::Medium => "Medium (~1.5 GB)",
-        }
-    }
-
-    /// All available model sizes.
-    pub fn all() -> &'static [ModelSize] {
-        &[
-            ModelSize::Tiny,
-            ModelSize::Base,
-            ModelSize::Small,
-            ModelSize::Medium,
-        ]
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelInfo {
-    pub size: ModelSize,
-    pub downloaded: bool,
-    pub path: Option<PathBuf>,
-    pub display_name: String,
-    pub approximate_size_bytes: u64,
-}
-
-const VAD_MODEL_FILENAME: &str = "ggml-silero-v6.2.0.bin";
-const VAD_MODEL_URL: &str =
-    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin";
-const VAD_MODEL_SIZE_BYTES: u64 = 885_000;
 
 // ----------- Parakeet TDT v3 -----------
 
@@ -305,15 +253,54 @@ async fn download_file(
     Ok(())
 }
 
+/// Destinations with a download in flight. Shared by every clone of a
+/// `ModelManager`, because each Tauri command works on its own clone.
+type InFlight = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
+
+/// Held for the duration of one download; releases its destination on drop.
+struct DownloadClaim {
+    in_flight: InFlight,
+    dest: PathBuf,
+}
+
+impl Drop for DownloadClaim {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .expect("in-flight mutex poisoned")
+            .remove(&self.dest);
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelManager {
     models_dir: PathBuf,
+    in_flight: InFlight,
 }
 
 impl ModelManager {
     pub fn new(app_data_dir: PathBuf) -> Self {
         let models_dir = app_data_dir.join("models");
-        Self { models_dir }
+        Self {
+            models_dir,
+            in_flight: InFlight::default(),
+        }
+    }
+
+    /// Claim `dest` for one download. A second download of the same
+    /// destination is refused while the first runs: both would write the
+    /// same `.download` temp file.
+    fn claim_download(&self, dest: &Path) -> Result<DownloadClaim> {
+        let mut set = self.in_flight.lock().expect("in-flight mutex poisoned");
+        if !set.insert(dest.to_path_buf()) {
+            return Err(TranscriptionError::DownloadInProgress(
+                dest.display().to_string(),
+            ));
+        }
+        Ok(DownloadClaim {
+            in_flight: self.in_flight.clone(),
+            dest: dest.to_path_buf(),
+        })
     }
 
     /// Returns the directory where models are stored.
@@ -321,149 +308,44 @@ impl ModelManager {
         &self.models_dir
     }
 
-    /// Check if a model is downloaded.
-    pub fn is_available(&self, size: ModelSize) -> bool {
-        self.model_path(size).is_some()
-    }
+    // ---------- Legacy files ----------
 
-    /// Get path to model file if it exists.
-    pub fn model_path(&self, size: ModelSize) -> Option<PathBuf> {
-        let path = self.models_dir.join(size.filename());
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    /// Get path where a model would be stored (whether or not it exists).
-    pub fn expected_model_path(&self, size: ModelSize) -> PathBuf {
-        self.models_dir.join(size.filename())
-    }
-
-    /// Download model with progress callback.
-    ///
-    /// The callback receives a progress value from 0.0 to 1.0.
-    pub async fn download(
-        &self,
-        size: ModelSize,
-        on_progress: impl Fn(f32) + Send,
-    ) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.models_dir).await?;
-
-        let url = size.download_url();
-        let dest = self.models_dir.join(size.filename());
-
-        info!("downloading model {} from {}", size.filename(), url);
-        download_file(&url, &dest, size.approximate_size_bytes(), &on_progress).await?;
-        info!("model {} downloaded successfully", size.filename());
-
-        Ok(dest)
-    }
-
-    /// Verify model file checksum using streaming reads to avoid loading
-    /// the entire file (potentially 1.5 GB+) into memory.
-    pub async fn verify_checksum(&self, size: ModelSize, expected_sha256: &str) -> Result<bool> {
-        use tokio::io::AsyncReadExt;
-
-        let path = self
-            .model_path(size)
-            .ok_or_else(|| TranscriptionError::ModelNotFound(size.filename().to_string()))?;
-
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = tokio::io::BufReader::new(file);
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 64 * 1024]; // 64 KB chunks
-
-        loop {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-
-        let result: String = hasher
-            .finalize()
+    /// Legacy model files present in `models/`, in catalogue order.
+    pub fn list_legacy_model_files(&self) -> Vec<LegacyModelFile> {
+        LEGACY_MODEL_FILES
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-
-        if result != expected_sha256 {
-            warn!(
-                "checksum mismatch for {}: expected {}, got {} — deleting corrupted file",
-                size.filename(),
-                expected_sha256,
-                result
-            );
-            let _ = tokio::fs::remove_file(&path).await;
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
-    /// Delete a downloaded model.
-    pub async fn delete(&self, size: ModelSize) -> Result<()> {
-        if let Some(path) = self.model_path(size) {
-            tokio::fs::remove_file(&path).await?;
-            info!("deleted model {}", size.filename());
-        }
-        Ok(())
-    }
-
-    /// List all downloaded models.
-    pub fn list_downloaded(&self) -> Vec<ModelSize> {
-        ModelSize::all()
-            .iter()
-            .copied()
-            .filter(|s| self.is_available(*s))
-            .collect()
-    }
-
-    /// Get info for all models (downloaded or not).
-    pub fn list_all(&self) -> Vec<ModelInfo> {
-        ModelSize::all()
-            .iter()
-            .map(|&size| ModelInfo {
-                size,
-                downloaded: self.is_available(size),
-                path: self.model_path(size),
-                display_name: size.display_name().to_string(),
-                approximate_size_bytes: size.approximate_size_bytes(),
+            .filter_map(|name| {
+                // symlink_metadata: a symlink is removed, not its target, so
+                // its own size is what deleting it frees.
+                let meta = std::fs::symlink_metadata(self.models_dir.join(name)).ok()?;
+                (!meta.is_dir()).then(|| LegacyModelFile {
+                    name: (*name).to_string(),
+                    bytes: meta.len(),
+                })
             })
             .collect()
     }
 
-    /// Get path to VAD model file if it exists.
-    pub fn vad_model_path(&self) -> Option<PathBuf> {
-        let path = self.models_dir.join(VAD_MODEL_FILENAME);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+    /// Delete the named legacy model files. Names outside the legacy list are
+    /// refused, so a caller can never delete a current model through this
+    /// path. Files already gone are skipped.
+    pub async fn delete_legacy_model_files(&self, names: &[String]) -> Result<()> {
+        if let Some(bad) = names
+            .iter()
+            .find(|n| !LEGACY_MODEL_FILES.contains(&n.as_str()))
+        {
+            return Err(TranscriptionError::ModelNotFound(format!(
+                "not a legacy model file: {bad}"
+            )));
         }
-    }
-
-    /// Download the Silero VAD model with progress callback.
-    pub async fn download_vad_model(&self, on_progress: impl Fn(f32) + Send) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.models_dir).await?;
-
-        let dest = self.models_dir.join(VAD_MODEL_FILENAME);
-
-        info!("downloading VAD model from {}", VAD_MODEL_URL);
-        download_file(VAD_MODEL_URL, &dest, VAD_MODEL_SIZE_BYTES, &on_progress).await?;
-        info!("VAD model downloaded successfully");
-
-        Ok(dest)
-    }
-
-    /// Ensure the VAD model is available, downloading if missing.
-    pub async fn ensure_vad_model(&self) -> Result<PathBuf> {
-        if let Some(path) = self.vad_model_path() {
-            return Ok(path);
+        for name in names {
+            match tokio::fs::remove_file(self.models_dir.join(name)).await {
+                Ok(()) => info!("deleted legacy model file {name}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-        self.download_vad_model(|_| {}).await
+        Ok(())
     }
 
     // ---------- Parakeet ----------
@@ -492,6 +374,7 @@ impl ModelManager {
         on_progress: impl Fn(f32) + Send + Sync,
     ) -> Result<PathBuf> {
         let dir = self.parakeet_model_dir(variant);
+        let _claim = self.claim_download(&dir)?;
         tokio::fs::create_dir_all(&dir).await?;
 
         let files = variant.files();
@@ -557,8 +440,9 @@ impl ModelManager {
         variant: SortformerVariant,
         on_progress: impl Fn(f32) + Send,
     ) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.models_dir).await?;
         let dest = self.models_dir.join(variant.filename());
+        let _claim = self.claim_download(&dest)?;
+        tokio::fs::create_dir_all(&self.models_dir).await?;
         let url = variant.download_url();
         info!(
             "downloading sortformer model {} from {}",
@@ -592,26 +476,6 @@ impl ModelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_model_size_filenames() {
-        assert_eq!(ModelSize::Tiny.filename(), "ggml-tiny.bin");
-        assert_eq!(ModelSize::Base.filename(), "ggml-base.bin");
-        assert_eq!(ModelSize::Small.filename(), "ggml-small.bin");
-        assert_eq!(ModelSize::Medium.filename(), "ggml-medium.bin");
-    }
-
-    #[test]
-    fn test_model_size_urls() {
-        let url = ModelSize::Tiny.download_url();
-        assert!(url.contains("huggingface.co"));
-        assert!(url.contains("ggml-tiny.bin"));
-    }
-
-    #[test]
-    fn test_model_size_all() {
-        assert_eq!(ModelSize::all().len(), 4);
-    }
 
     #[test]
     fn parakeet_variant_dir_names_distinct() {
@@ -679,95 +543,150 @@ mod tests {
         assert_eq!(ParakeetVariant::recommended_for_host(), expected);
     }
 
-    #[test]
-    fn test_model_manager_not_available() {
+    #[tokio::test]
+    async fn concurrent_parakeet_download_of_same_variant_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(!manager.is_available(ModelSize::Tiny));
-        assert!(manager.model_path(ModelSize::Tiny).is_none());
-    }
+        // A clone stands in for the second Tauri command call.
+        let other = manager.clone();
+        let _first = manager
+            .claim_download(&manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8))
+            .unwrap();
 
-    #[test]
-    fn test_model_manager_list_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.list_downloaded().is_empty());
-    }
-
-    #[test]
-    fn test_model_manager_list_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        let all = manager.list_all();
-        assert_eq!(all.len(), 4);
-        assert!(all.iter().all(|m| !m.downloaded));
-    }
-
-    #[test]
-    fn test_model_manager_detects_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("ggml-tiny.bin"), b"fake model data").unwrap();
-
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.is_available(ModelSize::Tiny));
-        assert!(!manager.is_available(ModelSize::Base));
-        assert_eq!(manager.list_downloaded(), vec![ModelSize::Tiny]);
-    }
-
-    #[test]
-    fn test_vad_model_not_available() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.vad_model_path().is_none());
-    }
-
-    #[test]
-    fn test_vad_model_detects_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"fake vad model").unwrap();
-
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.vad_model_path().is_some());
+        let second = other
+            .download_parakeet(ParakeetVariant::TdtV3Int8, |_| {})
+            .await;
+        assert!(
+            matches!(second, Err(TranscriptionError::DownloadInProgress(_))),
+            "{second:?}"
+        );
     }
 
     #[tokio::test]
-    async fn test_verify_checksum_deletes_on_mismatch() {
+    async fn concurrent_sortformer_download_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-
-        // Write fake model data
-        let model_path = models_dir.join(ModelSize::Tiny.filename());
-        std::fs::write(&model_path, b"fake model data that will fail checksum").unwrap();
-        assert!(model_path.exists());
-
         let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.is_available(ModelSize::Tiny));
+        let dest = manager
+            .models_dir()
+            .join(SortformerVariant::V2_1.filename());
+        let _first = manager.claim_download(&dest).unwrap();
 
-        // Verify against a wrong hash — should return Ok(false) and delete the file
-        let result = manager
-            .verify_checksum(
-                ModelSize::Tiny,
-                "0000000000000000000000000000000000000000000000000000000000000000",
-            )
-            .await
-            .unwrap();
-        assert!(!result);
-        assert!(!model_path.exists(), "corrupted file should be deleted");
-        assert!(!manager.is_available(ModelSize::Tiny));
+        let second = manager
+            .clone()
+            .download_sortformer(SortformerVariant::V2_1, |_| {})
+            .await;
+        assert!(matches!(
+            second,
+            Err(TranscriptionError::DownloadInProgress(_))
+        ));
     }
 
     #[test]
-    fn test_model_size_serde_roundtrip() {
-        for size in ModelSize::all() {
-            let json = serde_json::to_string(size).unwrap();
-            let deserialized: ModelSize = serde_json::from_str(&json).unwrap();
-            assert_eq!(deserialized, *size);
-        }
+    fn download_claim_is_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let dest = manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8);
+        drop(manager.claim_download(&dest).unwrap());
+        assert!(manager.claim_download(&dest).is_ok());
+        // Other variants are independent.
+        let _a = manager.claim_download(&dest).unwrap();
+        assert!(manager
+            .claim_download(&manager.parakeet_model_dir(ParakeetVariant::TdtV3))
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_model_files_report_symlink_size_not_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let target = dir.path().join("big.bin");
+        std::fs::write(&target, vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&target, models_dir.join("ggml-small.bin")).unwrap();
+
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let files = manager.list_legacy_model_files();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].bytes < 4096, "{files:?}");
+    }
+
+    #[test]
+    fn legacy_model_files_empty_when_none_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        assert!(manager.list_legacy_model_files().is_empty());
+    }
+
+    #[test]
+    fn legacy_model_files_lists_only_known_files_with_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("ggml-small.bin"), b"12345").unwrap();
+        std::fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"12").unwrap();
+        std::fs::write(models_dir.join("notes.txt"), b"keep me").unwrap();
+        std::fs::write(
+            models_dir.join(SortformerVariant::V2_1.filename()),
+            b"current",
+        )
+        .unwrap();
+
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        assert_eq!(
+            manager.list_legacy_model_files(),
+            vec![
+                LegacyModelFile {
+                    name: "ggml-small.bin".into(),
+                    bytes: 5
+                },
+                LegacyModelFile {
+                    name: "ggml-silero-v6.2.0.bin".into(),
+                    bytes: 2
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_legacy_model_files_removes_listed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("ggml-small.bin"), b"x").unwrap();
+        std::fs::write(models_dir.join("ggml-medium.bin"), b"x").unwrap();
+
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        manager
+            .delete_legacy_model_files(&["ggml-small.bin".into(), "ggml-tiny.bin".into()])
+            .await
+            .unwrap();
+        assert!(!models_dir.join("ggml-small.bin").exists());
+        assert!(models_dir.join("ggml-medium.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_legacy_model_files_refuses_other_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let current = models_dir.join(SortformerVariant::V2_1.filename());
+        std::fs::write(&current, b"current").unwrap();
+        std::fs::write(models_dir.join("ggml-small.bin"), b"x").unwrap();
+
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let names = vec![
+            "ggml-small.bin".to_string(),
+            SortformerVariant::V2_1.filename().to_string(),
+        ];
+        assert!(manager.delete_legacy_model_files(&names).await.is_err());
+        assert!(current.exists());
+        assert!(
+            models_dir.join("ggml-small.bin").exists(),
+            "a refused batch deletes nothing"
+        );
+        let traversal = vec!["../outside.bin".to_string()];
+        assert!(manager.delete_legacy_model_files(&traversal).await.is_err());
     }
 
     #[test]

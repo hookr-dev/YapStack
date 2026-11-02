@@ -177,8 +177,6 @@ impl TranscriptionBackend for ParakeetBackend {
         );
 
         _ = opts.language;
-        _ = opts.initial_prompt;
-        _ = opts.single_segment;
 
         let start = std::time::Instant::now();
         let (transcribe_input, diarize_input) = if opts.diarization {
@@ -216,19 +214,14 @@ impl TranscriptionBackend for ParakeetBackend {
             // `should_include_segment` contract still works, and accept the
             // consequence: the confidence-gated branches (marginal-reject at
             // < 0.6, repetition filter at < 0.7) never fire for Parakeet
-            // output. Parakeet's narrower always-reject list was designed as
-            // the sole filter precisely because Parakeet doesn't hallucinate
-            // the YouTube artifacts Whisper does. If a future parakeet-rs
+            // output, so the narrow always-reject list is the only filter
+            // that applies. If a future parakeet-rs
             // release exposes token probabilities we should route a derived
             // confidence here so the lower tiers start firing.
             let confidence = 1.0_f32;
             let normalized = normalize_spacing(seg.text.trim());
             let sanitized = sanitize_text(&normalized);
-            if !should_include_segment(
-                &sanitized,
-                confidence,
-                yapstack_common::types::EngineKind::Parakeet,
-            ) {
+            if !should_include_segment(&sanitized, confidence) {
                 info!(len = sanitized.chars().count(), "parakeet segment filtered");
                 continue;
             }

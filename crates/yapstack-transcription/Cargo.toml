@@ -5,9 +5,6 @@ edition = "2021"
 license.workspace = true
 repository.workspace = true
 
-[features]
-whisper = ["dep:whisper-rs"]
-
 [dependencies]
 yapstack-common = { path = "../yapstack-common" }
 thiserror = { workspace = true }
@@ -16,9 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-sha2 = { workspace = true }
 futures-util = { workspace = true }
-whisper-rs = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

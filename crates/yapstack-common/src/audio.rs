@@ -18,7 +18,7 @@ pub enum ResampleError {
 ///
 /// Returns `Ok(Cow::Borrowed)` when `from_rate == to_rate` (zero-copy).
 /// Uses high-quality `SincFixedIn` resampler with `BlackmanHarris2` window
-/// to avoid aliasing when downsampling (e.g. 48kHz → 16kHz for Whisper).
+/// to avoid aliasing when downsampling (e.g. 48kHz → 16kHz for Parakeet).
 ///
 /// This is the single canonical resampler — both `yapstack-transcription-sidecar` and
 /// `yapstack-audio::mixer` call through here.

@@ -14,6 +14,9 @@ pub enum TranscriptionError {
     #[error("model download failed: {0}")]
     DownloadFailed(String),
 
+    #[error("already downloading: {0}")]
+    DownloadInProgress(String),
+
     #[error("sidecar process error: {0}")]
     SidecarError(String),
 
