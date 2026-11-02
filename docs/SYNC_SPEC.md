@@ -588,34 +588,36 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /auth/refresh` | refresh JWT | rotation + reuse detection |
 | `PUT /auth/password` | access JWT of an **active** device; per-(tenant, IP) 120/min; current `auth_key` or a recovery sign-in within 15 min | replaces verifier + password wrap, keeps `salt_enc` (A9) |
 | `POST /auth/recover` | none; per-IP | recovery verifier check; device identity honoured only with a valid proof (A10); enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409; none for a revoked row); recovery wrap + roster; tokens bound to the device |
-| `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
+| `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at, sync_capability, capability_seen_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
 | `PUT /devices/roster` | access JWT with `client_id` whose row is **active** (plus the current `auth_key` when `revoked_devices` is non-empty), or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; revokes `revoked_devices` (active callers only, never self); consumes the grant |
-| `POST /sync/push` | access JWT of an active device; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
-| `GET /sync/pull?since&limit` | access JWT | dense pages, never gated |
+| `POST /sync/push` | access JWT of an active device; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered; 409 `sync_capability_floor` when `X-YapStack-Batch-Capability` is above the floor (taken `FOR SHARE` before `tenant_seq`) |
+| `GET /sync/pull?since&limit` | access JWT | dense pages, never gated by entitlements; records `X-YapStack-Sync-Capability` (absent = 0) on the caller's device row; 426 `update_required` below the floor; every page carries `required_sync_capability` and `requested_sync_capability` |
+| `PUT /sync/capability` | access JWT of an active device | raise the floor to `required_sync_capability` under the floor row `FOR UPDATE`: 200 with the levels when every non-revoked device seen in 30 days reports at least that level, else 409 `sync_capability_blocked` listing them (and `requested` rises) |
 | `GET /sync/completeness` | access JWT | `max`, `count`, `contiguous`, per-client tails |
 | `GET /sync/stream` | access JWT | SSE `wakeup` events carrying only the seq |
 | `POST /audio/presign?sha256&size&part_id&session_id` | access JWT | dedup + refcount + existence-checked presigned PUT |
 | `GET /audio/part/{part_id}` | access JWT | 302 to a presigned GET, never gated |
-| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller) |
+| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller); same capability read gate as pull; presign refuses content (`X-YapStack-Snapshot-Capability`) above the floor |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
 Every device-authored write is gated on the caller's device row: push, audio presign,
 snapshot presign and `PUT /auth/password` through `devices::require_active_caller`
 (active only), and `PUT /devices/roster` through its own gate in `put_roster` (active,
 or pending with a fresh recovery grant — A7; removal additionally re-authenticates).
-Pull, audio GET, the roster GET, completeness and the SSE stream are never gated. An
+Pull, audio GET, the roster GET, completeness and the SSE stream are never gated by
+device status. Pull and the snapshot routes are gated by sync capability instead (§9.3). An
 access token outlives a revocation by at most its 15-minute TTL (reads only; writes are
 refused immediately).
 
-### 9.2 Schema (migrations 0001–0013)
+### 9.2 Schema (migrations 0001–0014)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
 `devices` (pubkey, label, platform, `status` pending|active|revoked, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `login_nonces` (A10, non-RLS), `audio_blobs` (+ `released_at`),
-`audio_objects` keyed by part, `snapshots`, `admin_nonces`.
+`audio_objects` keyed by part, `snapshots`, `admin_nonces`, `tenant_sync_capability`.
 
 Migrations 0010–0013 are the feature slices' additions, all additive: `0010`
 `devices.recovery_grant_at` (A7), `0011` `devices.recovered_at` (A9 waiver), `0012`
@@ -628,6 +630,38 @@ migration. The one-shot `migrate` service runs them as the database owner; the
 takes effect when that owner bypasses RLS (a superuser or a `BYPASSRLS` role — the
 compose default; see the managed-Postgres caveat in `self-hosting.md`). Operator steps
 are in [`self-hosting.md`](self-hosting.md#upgrading).
+
+`0014` (ADR 0006 §5) adds `devices.sync_capability` (`int`, default 0) and
+`devices.capability_seen_at` (`timestamptz`, NULL until the first pull on this relay), and
+creates the RLS'd per-tenant floor row `tenant_sync_capability (workspace_id,
+required_sync_capability, requested_sync_capability)`.
+
+### 9.3 Sync capability gate
+
+ADR 0006 §5 is authoritative. In short: every pull reports the client's capability level
+(`X-YapStack-Sync-Capability`; no header = 0). The relay records it on the caller's device
+row, throttled: the `UPDATE` writes only when the level changed, the stamp is over an hour
+old, or there is no stamp yet. The workspace floor lives in `tenant_sync_capability`,
+bootstrapped `INSERT … ON CONFLICT DO NOTHING` like `tenant_seq`. Lock order is always that
+row first, then `tenant_seq`:
+
+- pull, `GET /snapshot` and `POST /snapshot/presign` lock it `FOR SHARE`, record the
+  header, check the level and read in one transaction. Below the floor they answer 426
+  `update_required` ("Update YapStack to keep syncing"), and the stamp still commits;
+- push locks it `FOR SHARE` and refuses a batch whose `X-YapStack-Batch-Capability` is
+  above the floor the relay holds right then (409 `sync_capability_floor`). A client's
+  cached floor never authorizes a push, so a restored relay at floor 0 refuses again;
+- `POST /snapshot/presign` also declares the snapshot's content level
+  (`X-YapStack-Snapshot-Capability`, absent = 0). Each transaction that records or
+  re-points a snapshot row takes the floor row `FOR SHARE` and refuses content above the
+  floor (409 `sync_capability_floor`). Readers must be at or above the floor, which only
+  rises, so every reader of a recorded snapshot can apply it;
+- `PUT /sync/capability` locks it `FOR UPDATE`, then the caller's own device row
+  `FOR SHARE` (a caller revoked meanwhile is refused with 403), records the caller's
+  header, then re-reads `devices`. Both levels only rise (`GREATEST`). A refused raise records
+  `requested`, which every pull returns so a straggler can be nudged.
+
+Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).
 
 ### 9.3 Isolation
 
@@ -713,8 +747,9 @@ onboarding completes.
   changeset AAD; the relay's plaintext copies are untrusted hints. Because the AAD
   binds the **local** versions, any version skew between peers quarantines wholesale
   until the lagging device updates and retries — this is the v1 posture (§14 D9).
-- Relay `min_client_version` is advisory ("update this app"); there is no per-tenant
-  floor and no device staleness lifecycle (§14 D5).
+- Relay `min_client_version` is advisory ("update this app"). The per-tenant floor is
+  the sync capability gate (§9.3, ADR 0006 §5), keyed to the level each device reports,
+  not to its version. There is still no device staleness lifecycle (§14 D5).
 - Relay `protocol_version` is **2** since A10 (the login challenge). The client checks
   only that the field is present (the not-a-relay sentinel); the version itself is
   informational. Compatibility is enforced by behaviour: a client older than A10 signs in
@@ -809,7 +844,7 @@ points to §15. Nothing in this table is still open.
 | D2 | Decision report §4.2: two Argon2 passes with `salt_auth` and `salt_enc` | One pass + HKDF split (CRYPTO_SPEC §2.3) | CRYPTO_SPEC is authoritative; the report was a draft |
 | D3 | Decision report §7a: SSE events carry `(changeset_seq, ciphertext)` | Wakeup events carry the seq only; pull is the truth | Spec wins (the blind hint is the safer design) |
 | D4 | Decision report §9: `Content-MD5`, multipart > 100 MB, lazy re-hash, `GET /audio/{session_id}` | STREAM envelope, part-id addressing, pinned-length presigned PUT, AEAD tags as verification, no multipart | CRYPTO_SPEC §1.5 + this §7 are authoritative |
-| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns; no floor | Not implemented, documented (§11). Additive-only stays the safety lever; the columns stay (**§15.I**) |
+| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns. The per-tenant floor exists as the sync capability gate (§9.3, migration 0014) | Version handshake and staleness lifecycle not implemented, documented (§11). Additive-only stays the safety lever; the columns stay (**§15.I**) |
 | D6 | Decision report §8, CRYPTO_SPEC §8–§9: private-link shares and a JS share-viewer | `shares` table on both sides only; no routes, no UI, no JS stack | Not built; deferred. CRYPTO_SPEC §8/§9/§13.6 stay as the future contract |
 | D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` existed with no caller | **Done (78e0bf3):** `sync-policy.ts`, its test and the AI-wrap helpers deleted; the classification lives in §4.5 |
 | D8 | Decision report Phase 3: default server URL is the hosted relay | `DEFAULT_SYNC_SERVER_URL = ""`; the hosted hostname does not resolve | Self-host only until a hosted relay exists (**§15.G**) |

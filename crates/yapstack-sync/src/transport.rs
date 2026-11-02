@@ -609,6 +609,7 @@ impl SyncTransport for MockRelay {
             changes,
             next_seq: next,
             has_more,
+            ..PullResponse::default()
         })
     }
 

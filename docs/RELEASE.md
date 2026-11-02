@@ -32,6 +32,12 @@ When bumping the release version, edit all of:
 
 `apps/desktop/package.json` carries an unrelated `"version"` field that does **not** track release versions. Do not touch it as part of a release cut.
 
+## Relay before release
+
+Some releases need the relay to understand something first. Deploy the relay (and run its migrations) **before** publishing such a release, including on self-hosted relays.
+
+- The sync capability gate (relay migration `0014`, ADR 0006 §5) must be deployed before the release whose client sends `X-YapStack-Sync-Capability`. A relay without it ignores the header, so nothing breaks, but no device's level is recorded and no floor can be raised.
+
 ## Cutting a release
 
 This is the path used for every release the project has shipped so far. PR title convention is `chore: prepare vX.Y.Z` (see commits `8891757`, `e302676`, `709ceee`, `5205d8a` for prior cuts).

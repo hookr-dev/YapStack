@@ -859,12 +859,17 @@ pub struct ChangePasswordRequest { current_auth_key: Option<String>, auth_key, w
 pub struct RosterUploadRequest { device_list: Value, signature, counter, vault_key_epoch, active_devices: Vec<Uuid>, revoked_devices: Vec<Uuid>, current_auth_key: Option<String> }   // revoked_devices non-empty ⇒ current_auth_key required (§15.D)
 pub struct RosterUploadResponse { counter, vault_key_epoch }
 pub struct RosterFetchResponse  { device_list, signature, counter, vault_key_epoch }  // GET /devices/roster
-pub struct DeviceInfo { client_id, ed25519_pub, label, platform, status: "pending" | "active" | "revoked", added_at }   // GET /devices
+pub struct DeviceInfo { client_id, ed25519_pub, label, platform, status: "pending" | "active" | "revoked", added_at, sync_capability, capability_seen_at: Option<String> }   // GET /devices
 // POST /sync/push, GET /sync/pull, GET /sync/completeness, POST /audio/presign
 pub struct PushChange { client_id, client_seq, ciphertext, schema_version, engine_version }
 pub struct PushRequest { changes: Vec<PushChange> }               // ≤ 1000 changes, ≤ 5 MiB raw
 pub struct PushResponse { acks: Vec<PushAck { client_id, client_seq, changeset_seq, deduplicated }>, max_changeset_seq }
-pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more }
+pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more, required_sync_capability, requested_sync_capability }
+// Sync capability gate (ADR 0006 §5): request headers X-YapStack-Sync-Capability (pull, snapshot, raise), X-YapStack-Batch-Capability (push) and X-YapStack-Snapshot-Capability (snapshot presign content level); absent = 0
+pub struct RaiseSyncCapabilityRequest { required_sync_capability }          // PUT /sync/capability → SyncCapabilityLevels
+pub struct SyncCapabilityLevels { required_sync_capability, requested_sync_capability }
+pub struct SyncCapabilityRefusal { code: "update_required" (426) | "sync_capability_floor" (409), message, required_sync_capability, requested_sync_capability }
+pub struct SyncCapabilityBlocked { code: "sync_capability_blocked", message, required_sync_capability, requested_sync_capability, blockers: Vec<CapabilityBlocker { client_id, label, platform, sync_capability, capability_seen_at }> }   // 409 from PUT /sync/capability
 pub struct CompletenessResponse { max_changeset_seq, count, contiguous, per_client: Vec<ClientTail { client_id, max_client_seq }> }
 pub struct PresignResponse { already_exists, upload_url: Option<String>, object_key, content_length }
 ```
