@@ -1,0 +1,11 @@
+# Everything the bench downloads, builds or writes stays local.
+.cache/
+results/
+corpus/
+.venv/
+__pycache__/
+# Never commit audio from this tool.
+*.wav
+*.flac
+*.mp3
+*.m4a

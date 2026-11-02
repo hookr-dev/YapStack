@@ -119,6 +119,7 @@ import {
 } from "@/lib/insights";
 import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
+import { normalizeSpeakerNames, type SpeakerKey } from "@/lib/speakers";
 import {
   DEFAULT_SYNC_SERVER_URL,
   enqueueAudioForSession,
@@ -333,11 +334,11 @@ export interface Settings {
   selectedModelSize: ModelSizeDto;
   selectedParakeetVariant: ParakeetVariantDto;
   diarizationEnabled: boolean;
-  /// `{ [sessionId]: { [speakerId]: "Alice" } }`. Client-side persisted.
-  /// Populated when Parakeet + Sortformer diarization tags segments; applies
-  /// to the `SpeakerHeader` component. When diarization is off, segments
-  /// fall back to source-based labels ("You" / "Other") via `SourceHeader`.
-  speakerNames: Record<string, Record<number, string>>;
+  /// `{ [sessionId]: { [speakerKey]: "Alice" } }`, keyed by `SpeakerKey`
+  /// (`lib/speakers.ts`, e.g. `"mic:c0"`). Older builds keyed by the bare
+  /// speaker id; `normalizeSpeakerNames` reads both. Labels resolve through
+  /// `resolveSpeakerLabel`.
+  speakerNames: Record<string, Record<string, string>>;
   language: string;
   mixConfig: MixConfigDto;
   bufferMaxSeconds: number;
@@ -610,6 +611,11 @@ interface AppState {
     engine: EngineKindDto;
     accel: string | null;
     modelDir: string | null;
+    /// Reason the attempted accelerator failed, when `accel` is a CPU
+    /// fallback; null otherwise.
+    accelFallback: string | null;
+    /// The GPU EP leaves part of the model's heavy ops on the CPU.
+    accelPartial: boolean;
   } | null;
 
   // Setters (called by event listeners)
@@ -688,7 +694,7 @@ interface AppState {
   setDiarizationEnabled: (enabled: boolean) => Promise<void>;
   /// Rename a speaker for a single session. Pass an empty/whitespace `name`
   /// to clear the override and fall back to the default `Speaker N` label.
-  setSpeakerName: (sessionId: string, speakerId: number, name: string) => void;
+  setSpeakerName: (sessionId: string, speakerKey: SpeakerKey, name: string) => void;
 
   // Folder actions
   createFolder: (name: string, parentId?: string | null, icon?: string | null, color?: string | null, description?: string | null) => Promise<void>;
@@ -2703,17 +2709,19 @@ function createAppStore() {
         }
       },
 
-      setSpeakerName: (sessionId: string, speakerId: number, name: string) => {
+      setSpeakerName: (sessionId: string, speakerKey: SpeakerKey, name: string) => {
         const trimmed = name.trim();
-        const current = get().settings.speakerNames[sessionId]?.[speakerId];
+        const current = normalizeSpeakerNames(
+          get().settings.speakerNames[sessionId],
+        )[speakerKey];
         if ((current ?? "") === trimmed) return;
         set((state) => {
           const next = { ...state.settings.speakerNames };
-          const sessionMap = { ...(next[sessionId] ?? {}) };
+          const sessionMap = normalizeSpeakerNames(next[sessionId]);
           if (trimmed === "") {
-            delete sessionMap[speakerId];
+            delete sessionMap[speakerKey];
           } else {
-            sessionMap[speakerId] = trimmed;
+            sessionMap[speakerKey] = trimmed;
           }
           if (Object.keys(sessionMap).length === 0) {
             delete next[sessionId];
