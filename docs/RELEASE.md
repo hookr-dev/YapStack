@@ -70,6 +70,10 @@ This is the path used for every release the project has shipped so far. PR title
     - Download the DMG, install it on a clean macOS Apple Silicon machine, and exercise the golden path (start a session, dictation, system audio capture, verify auto-update points at the new version).
 11. **Publish the draft.** From the GitHub Releases UI, uncheck "Set as a pre-release" only if this is a stable (non-alpha/beta/rc) release; otherwise leave it as a pre-release. Click **Publish release**. Existing installs running the auto-updater will pick up `latest.json` on their next check.
 
+## Releases that add a synced table
+
+A peer that receives rows for a synced table it doesn't have yet must hold them in its schema quarantine, not stop syncing (ADR 0006 §4, SYNC_SPEC §6.4). Builds before that tolerance existed stall their pull on such a row. So **no release may introduce a new synced table (a `SYNC_TABLES` entry) unless the previous release already contained the table-readiness quarantine.** Adding one also needs the peer capability gate in ADR 0006 §5.
+
 ## Verification before publish
 
 Don't skip these — the auto-updater silently pushes whatever `latest.json` references to every install.
