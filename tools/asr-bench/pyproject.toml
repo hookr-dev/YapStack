@@ -1,0 +1,25 @@
+[project]
+name = "asr-bench"
+version = "0.1.0"
+description = "Benchmark the release-built YapStack transcription sidecar: RTFx, peak RSS, ORT node placement, WER/CER."
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+dependencies = [
+    "jiwer==4.0.0",
+    "soundfile==0.13.1",
+    "whisper-normalizer==0.1.12",
+]
+
+[project.scripts]
+asr-bench = "asr_bench.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["asr_bench"]
+
+[tool.uv]
+# Resolve against packages that have been public for a while.
+exclude-newer = "2026-10-01T00:00:00Z"
