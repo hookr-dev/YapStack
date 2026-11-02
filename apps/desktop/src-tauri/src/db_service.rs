@@ -632,10 +632,20 @@ fn master_sql(conn: &Connection, ty: &str, name: &str) -> rusqlite::Result<Optio
         })
 }
 
-/// `(name, declared type)` of each column of `table`, sorted by name.
+/// `(name, shape)` of each column of `table`, sorted by name. The shape is the
+/// declared type, the column's place in the primary key (`pk0` = not in it), and
+/// `not null` for a non-key column declared NOT NULL — the parts a CRR cutover
+/// keeps (`derive_rebuild_body`, yapstack-sync schema.rs). Left out because cutover
+/// changes them: NOT NULL on a key column (cutover always adds it) and the default
+/// value (cutover gives a NOT NULL column without one a synthetic default, and
+/// re-spells the rest).
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<(String, String)>> {
     let mut cols: Vec<(String, String)> = conn
-        .prepare("SELECT name, upper(type) FROM pragma_table_info(?1)")?
+        .prepare(
+            "SELECT name, upper(type) || ' pk' || pk || \
+                    CASE WHEN pk = 0 AND \"notnull\" THEN ' not null' ELSE '' END \
+             FROM pragma_table_info(?1)",
+        )?
         .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     cols.sort();
@@ -644,8 +654,9 @@ fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<(String
 
 /// True when every declared object in `conn` has the definition it has in
 /// `reference` (the fresh-install schema, see [`reference_schema`]):
-///   * a table has the same columns (names and declared types), and a column the
-///     same declared type. Table SQL itself isn't compared: cutover rewrites it.
+///   * a table has the same columns, and a column the same shape (type, primary
+///     key place, non-key NOT NULL; see [`table_columns`]). Table SQL itself isn't
+///     compared: cutover rewrites it.
 ///   * an index, trigger or virtual table has the same normalized `CREATE`
 ///     statement ([`normalized_sql`]). Cutover replays non-UNIQUE indexes and app
 ///     triggers verbatim, so a CRR DB still matches.
@@ -2393,6 +2404,33 @@ mod tests {
             (
                 11,
                 "DROP INDEX idx_tags_name; CREATE INDEX idx_tags_name ON tags(color);",
+            ),
+            // Same columns and indexes, other primary key or NOT NULL.
+            (
+                11,
+                "DROP TABLE session_tags; \
+                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
+                   source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
+                   created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
+                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
+            ),
+            (
+                11,
+                "DROP TABLE session_tags; \
+                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
+                   source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
+                   created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                   PRIMARY KEY (tag_id, session_id)); \
+                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
+                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
+            ),
+            (
+                11,
+                "DROP TABLE tags; \
+                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT COLLATE NOCASE, color TEXT, \
+                   created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
             ),
         ];
         let mut wrongly_recorded = Vec::new();

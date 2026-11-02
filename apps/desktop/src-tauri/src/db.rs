@@ -26,9 +26,10 @@ pub struct Migration {
 /// object in a fresh-install reference schema (`db_service::schema_effects_present`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaObject {
-    /// An ordinary table: same column names and types. Declare its columns too.
+    /// An ordinary table: same columns, each in the same shape (type, primary-key
+    /// place, non-key NOT NULL). Declare its columns too.
     Table(&'static str),
-    /// A column `(table, column)`: same declared type.
+    /// A column `(table, column)`: same shape as in the reference.
     Column(&'static str, &'static str),
     /// Same normalized `CREATE INDEX` statement.
     Index(&'static str),
