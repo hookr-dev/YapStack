@@ -1669,7 +1669,7 @@ pub struct SyncStatusDto {
     /// ADR 0006 §5: a sync capability notice for lane status, or `None`.
     capability_notice: Option<SyncCapabilityNoticeDto>,
     /// ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
-    /// every drain cycle (last-seen value kept while the relay is unreachable). Advisory.
+    /// at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
     version_advisory: Option<VersionAdvisory>,
 }
 
@@ -3421,6 +3421,103 @@ fn refreshed_min_client_version(
     fetched.unwrap_or(last_seen)
 }
 
+/// Apply one advisory fetch result: keep, replace or clear the last-seen minimum, and
+/// persist the change (a clear included) so a restart sees the same value.
+fn apply_min_client_version(
+    conn: &rusqlite::Connection,
+    workspace: Uuid,
+    last_seen: &mut Option<String>,
+    fetched: Result<Option<String>, String>,
+) {
+    let refreshed = refreshed_min_client_version(fetched, last_seen.clone());
+    if refreshed == *last_seen {
+        return;
+    }
+    let persisted = match refreshed.as_deref() {
+        Some(min) => yapstack_sync::state::set_relay_min_client_version(conn, workspace, min),
+        None => yapstack_sync::state::clear_relay_min_client_version(conn, workspace),
+    };
+    if let Err(e) = persisted {
+        tracing::warn!("sync drain: could not persist the relay's minimum version: {e}");
+    }
+    *last_seen = refreshed;
+}
+
+/// How often the drain re-reads the relay's `min_client_version` when nothing changes.
+const ADVISORY_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// When the drain should re-read the relay's `min_client_version`: on the first cycle,
+/// whenever the relay's reachability flips (lost, or reconnected), and otherwise at most
+/// every [`ADVISORY_REFRESH_INTERVAL`]. SSE wakes and local-write kicks run extra cycles;
+/// none of them refetch.
+#[derive(Debug, Default)]
+struct AdvisoryThrottle {
+    last_fetch: Option<Instant>,
+    last_reachable: Option<bool>,
+}
+
+impl AdvisoryThrottle {
+    fn should_fetch(&mut self, now: Instant, reachable: bool) -> bool {
+        let transition = self.last_reachable.is_some_and(|r| r != reachable);
+        self.last_reachable = Some(reachable);
+        let due = self
+            .last_fetch
+            .is_none_or(|t| now.duration_since(t) >= ADVISORY_REFRESH_INTERVAL);
+        if due || transition {
+            self.last_fetch = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The drain's non-blocking advisory refresh. A fetch is spawned on the drain's own
+/// runtime and only makes progress while the drain is already awaiting (a drain cycle or
+/// its idle wait), so a slow relay never delays the cycle, the first-cycle latch or the
+/// stop check. One fetch at a time, on the transport's shared client.
+struct AdvisoryRefresher {
+    client: reqwest::Client,
+    server_url: String,
+    throttle: AdvisoryThrottle,
+    in_flight: Option<tokio::task::JoinHandle<Result<Option<String>, String>>>,
+}
+
+impl AdvisoryRefresher {
+    fn new(client: reqwest::Client, server_url: String) -> Self {
+        Self {
+            client,
+            server_url,
+            throttle: AdvisoryThrottle::default(),
+            in_flight: None,
+        }
+    }
+
+    /// Hand over a finished fetch, if any, and start the next one when it's due. Never
+    /// waits on the network.
+    fn tick(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        now: Instant,
+        reachable: bool,
+    ) -> Option<Result<Option<String>, String>> {
+        let mut done = None;
+        if self.in_flight.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.in_flight.take() {
+                // Already finished, so this returns at once.
+                done = Some(rt.block_on(h).unwrap_or_else(|e| Err(e.to_string())));
+            }
+        }
+        if self.in_flight.is_none() && self.throttle.should_fetch(now, reachable) {
+            self.in_flight = Some(rt.spawn(fetch_min_client_version(
+                self.client.clone(),
+                self.server_url.clone(),
+            )));
+        }
+        done
+    }
+}
+
 fn advisory_for(app_version: &str, min_client_version: Option<&str>) -> Option<VersionAdvisory> {
     min_client_version.and_then(|min| compute_version_advisory(app_version, min))
 }
@@ -3931,6 +4028,7 @@ fn spawn_drain(
             let stale = access_token_stale(&bearer, 60);
             let info_url = server_url.clone();
             let transport = HttpTransport::new(server_url, bearer);
+            let mut advisory = AdvisoryRefresher::new(transport.http_client(), info_url);
             // ADR 0006 §5: start from what earlier runs persisted for this workspace, so the
             // nudge and the version advisory show even before the relay answers.
             CAPABILITY_NOTICE.set_if_changed(seeded_capability_notice(
@@ -4230,18 +4328,19 @@ fn spawn_drain(
                         tracing::warn!("sync drain: could not persist the relay floor: {e}");
                     }
                 }
-                // ADR 0006 §5.9: refresh the version advisory every cycle; keep the last-seen
-                // minimum while the relay is unreachable.
-                let fetched = rt.block_on(fetch_min_client_version(&info_url));
-                let refreshed =
-                    refreshed_min_client_version(fetched, last_min_client_version.clone());
-                if refreshed != last_min_client_version {
-                    if let Some(min) = refreshed.as_deref() {
-                        let _ = yapstack_sync::state::set_relay_min_client_version(
-                            conn, tenant_id, min,
-                        );
-                    }
-                    last_min_client_version = refreshed;
+                // ADR 0006 §5.9: refresh the version advisory on the first cycle, on a
+                // reachability flip, and otherwise every 15 min, without ever waiting on it;
+                // keep the last-seen minimum while the relay is unreachable.
+                let reachable = !report
+                    .first_transport_error()
+                    .is_some_and(yapstack_sync::SyncError::is_network);
+                if let Some(fetched) = advisory.tick(&rt, Instant::now(), reachable) {
+                    apply_min_client_version(
+                        conn,
+                        tenant_id,
+                        &mut last_min_client_version,
+                        fetched,
+                    );
                 }
                 VERSION_ADVISORY.set_if_changed(advisory_for(
                     env!("CARGO_PKG_VERSION"),
@@ -5579,14 +5678,14 @@ async fn probe_relay(
 
 /// The relay's published `min_client_version` (`GET /sync/info`), for the per-cycle
 /// advisory refresh. `Ok(None)` when the relay publishes none; `Err` when it can't be read.
-async fn fetch_min_client_version(server_url: &str) -> Result<Option<String>, String> {
-    let endpoint = format!("{}/sync/info", normalize_relay_url(server_url));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+async fn fetch_min_client_version(
+    client: reqwest::Client,
+    server_url: String,
+) -> Result<Option<String>, String> {
+    let endpoint = format!("{}/sync/info", normalize_relay_url(&server_url));
     let resp = client
         .get(&endpoint)
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -7302,6 +7401,103 @@ mod tests {
             ..Default::default()
         };
         assert!(reportable_error(&r).is_none());
+    }
+
+    #[test]
+    fn advisory_refresh_is_throttled_across_a_burst_of_wakes() {
+        let t0 = Instant::now();
+        let mut throttle = AdvisoryThrottle::default();
+        assert!(throttle.should_fetch(t0, true), "the first cycle fetches");
+        // A burst of SSE wakes and local-write kicks: no further fetch.
+        for i in 1..200u64 {
+            assert!(
+                !throttle.should_fetch(t0 + Duration::from_millis(i * 50), true),
+                "wake {i} must not refetch"
+            );
+        }
+        // Losing and regaining the relay is a transition: refetch once on each.
+        assert!(throttle.should_fetch(t0 + Duration::from_secs(20), false));
+        assert!(!throttle.should_fetch(t0 + Duration::from_secs(25), false));
+        assert!(
+            throttle.should_fetch(t0 + Duration::from_secs(30), true),
+            "reconnect"
+        );
+        assert!(!throttle.should_fetch(t0 + Duration::from_secs(35), true));
+        // Otherwise at most every ADVISORY_REFRESH_INTERVAL.
+        assert!(!throttle.should_fetch(t0 + ADVISORY_REFRESH_INTERVAL, true));
+        assert!(throttle.should_fetch(
+            t0 + Duration::from_secs(30) + ADVISORY_REFRESH_INTERVAL,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_slow_relay_never_blocks_the_drain_cycle() {
+        // A relay that accepts the connection and never answers. Starting the refresh must
+        // return at once (the fetch runs on the drain runtime only while the drain is already
+        // waiting), so the first-cycle latch and the stop check are never delayed by it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let conn = listener.accept();
+            std::thread::sleep(Duration::from_millis(500));
+            drop(conn);
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut refresher =
+            AdvisoryRefresher::new(reqwest::Client::new(), format!("http://{addr}"));
+        let t = Instant::now();
+        assert!(
+            refresher.tick(&rt, Instant::now(), true).is_none(),
+            "nothing finished yet"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "starting the refresh must not wait on the relay ({:?})",
+            t.elapsed()
+        );
+        // Still in flight: the next cycle neither waits nor starts a second fetch.
+        let t = Instant::now();
+        assert!(refresher.tick(&rt, Instant::now(), true).is_none());
+        assert!(t.elapsed() < Duration::from_millis(100));
+        // Once the drain's idle wait drives the runtime, the fetch resolves (here as an error,
+        // the relay hung up) and the next tick hands it over.
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(800)).await });
+        assert!(matches!(
+            refresher.tick(&rt, Instant::now(), true),
+            Some(Err(_))
+        ));
+        hold.join().unwrap();
+    }
+
+    #[test]
+    fn a_cleared_advisory_minimum_stays_cleared_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ys-adv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.db");
+        let ws = Uuid::from_u128(5);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut last = None;
+            apply_min_client_version(&conn, ws, &mut last, Ok(Some("1.0.0-alpha.12".into())));
+            assert_eq!(last.as_deref(), Some("1.0.0-alpha.12"));
+            // The relay stops publishing a minimum: cleared in memory AND on disk.
+            apply_min_client_version(&conn, ws, &mut last, Ok(None));
+            assert_eq!(last, None);
+            // A failed fetch changes nothing.
+            apply_min_client_version(&conn, ws, &mut last, Err("down".into()));
+            assert_eq!(last, None);
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            yapstack_sync::state::relay_min_client_version(&conn, ws).unwrap(),
+            None,
+            "the clear survives a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

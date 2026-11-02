@@ -250,6 +250,20 @@ pub fn relay_min_client_version(
     get_meta(conn, &relay_min_client_version_key(workspace))
 }
 
+/// Forget the relay's `min_client_version` for `workspace` (the relay stopped publishing
+/// one), so a restart doesn't resurrect a stale advisory.
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn clear_relay_min_client_version(conn: &Connection, workspace: Uuid) -> Result<(), SyncError> {
+    ensure_meta_table(conn)?;
+    conn.execute(
+        "DELETE FROM _yapstack_sync_meta WHERE key=?1",
+        [relay_min_client_version_key(workspace)],
+    )?;
+    Ok(())
+}
+
 /// Persist the relay's `min_client_version` for `workspace`.
 ///
 /// # Errors
@@ -310,5 +324,7 @@ mod tests {
             relay_min_client_version(&conn, Uuid::from_u128(2)).unwrap(),
             None
         );
+        clear_relay_min_client_version(&conn, a).unwrap();
+        assert_eq!(relay_min_client_version(&conn, a).unwrap(), None);
     }
 }

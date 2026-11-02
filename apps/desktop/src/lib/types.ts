@@ -1296,7 +1296,7 @@ removed: boolean;
 capabilityNotice: SyncCapabilityNoticeDto | null;
 /**
  * ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
- * every drain cycle (last-seen value kept while the relay is unreachable). Advisory.
+ * at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
  */
 versionAdvisory: VersionAdvisory | null }
 export type TranscriptionStatusDto = { initialized: boolean }

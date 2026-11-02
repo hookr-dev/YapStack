@@ -314,6 +314,12 @@ impl HttpTransport {
             .clone()
     }
 
+    /// The transport's HTTP client (a cheap handle onto one shared connection pool), so a
+    /// lane's side requests reuse it instead of building a client per call.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
     /// Replace the access token after a successful refresh (Bug A). Interior
     /// mutability so the shared `&HttpTransport` the drain holds can be updated
     /// between cycles. Never logs the token.

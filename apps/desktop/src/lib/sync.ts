@@ -174,8 +174,8 @@ export interface SyncStatus {
   /** ADR 0006 §5: a sync capability notice for lane status. Optional so older status
    *  snapshots read as none. */
   capabilityNotice?: SyncCapabilityNotice | null;
-  /** ADR 0006 §5.9: this app is older than the relay's minimum, refreshed every drain
-   *  cycle (last-seen kept while the relay is unreachable). Advisory only. */
+  /** ADR 0006 §5.9: this app is older than the relay's minimum, rechecked at drain
+   *  start, on reconnect and every 15 min (last-seen kept while unreachable). Advisory. */
   versionAdvisory?: RelayVersionAdvisory | null;
 }
 

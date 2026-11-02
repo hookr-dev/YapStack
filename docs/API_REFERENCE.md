@@ -830,7 +830,7 @@ pub struct SyncStatusDto {
     audio_uploaded_total: u64, audio_backfill_complete: bool,
     removed: bool,                     // this device was removed from the account by another device (SYNC_SPEC §5.7)
     capability_notice: Option<SyncCapabilityNoticeDto>, // ADR 0006 §5 lane-status notice
-    version_advisory: Option<VersionAdvisory>,          // refreshed every drain cycle (ADR 0006 §5.9)
+    version_advisory: Option<VersionAdvisory>,          // refreshed on the first drain cycle, on reconnect, else every 15 min (ADR 0006 §5.9)
 }
 pub enum SyncCapabilityNoticeDto {     // tagged on `kind`, kebab-case
     UpdateRequired, AnotherDeviceNeedsUpdate,

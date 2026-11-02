@@ -654,9 +654,13 @@ relay checks against the floor it holds right then.
 
 `min_client_version` is compared by semver precedence (`1.0.0-alpha.11 <
 1.0.0-alpha.12 < 1.0.0`). The relay's default is the prerelease floor `1.0.0-alpha.0`,
-so alpha builds aren't nagged. The drain refreshes it from `GET /sync/info` every cycle,
-persists the last-seen value per workspace (`relay_min_client_version:<workspace>`, kept
-while the relay is unreachable) and shows the advisory in lane status (ADR 0006 §5.9).
+so alpha builds aren't nagged. The drain refreshes it from `GET /sync/info` on its first
+cycle, whenever the relay's reachability flips, and otherwise every 15 minutes, on the
+transport's client and without ever waiting on it: the fetch runs on the drain runtime only
+while the drain is already awaiting, so a slow relay can't delay a cycle, the first-cycle
+latch or the stop check. The last-seen value is persisted per workspace
+(`relay_min_client_version:<workspace>`, kept while the relay is unreachable, removed when
+the relay stops publishing one) and the advisory shows in lane status (ADR 0006 §5.9).
 
 ### 9.3 Isolation
 
