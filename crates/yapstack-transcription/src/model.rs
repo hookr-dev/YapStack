@@ -253,15 +253,54 @@ async fn download_file(
     Ok(())
 }
 
+/// Destinations with a download in flight. Shared by every clone of a
+/// `ModelManager`, because each Tauri command works on its own clone.
+type InFlight = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
+
+/// Held for the duration of one download; releases its destination on drop.
+struct DownloadClaim {
+    in_flight: InFlight,
+    dest: PathBuf,
+}
+
+impl Drop for DownloadClaim {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .expect("in-flight mutex poisoned")
+            .remove(&self.dest);
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelManager {
     models_dir: PathBuf,
+    in_flight: InFlight,
 }
 
 impl ModelManager {
     pub fn new(app_data_dir: PathBuf) -> Self {
         let models_dir = app_data_dir.join("models");
-        Self { models_dir }
+        Self {
+            models_dir,
+            in_flight: InFlight::default(),
+        }
+    }
+
+    /// Claim `dest` for one download. A second download of the same
+    /// destination is refused while the first runs: both would write the
+    /// same `.download` temp file.
+    fn claim_download(&self, dest: &Path) -> Result<DownloadClaim> {
+        let mut set = self.in_flight.lock().expect("in-flight mutex poisoned");
+        if !set.insert(dest.to_path_buf()) {
+            return Err(TranscriptionError::DownloadInProgress(
+                dest.display().to_string(),
+            ));
+        }
+        Ok(DownloadClaim {
+            in_flight: self.in_flight.clone(),
+            dest: dest.to_path_buf(),
+        })
     }
 
     /// Returns the directory where models are stored.
@@ -276,8 +315,10 @@ impl ModelManager {
         LEGACY_MODEL_FILES
             .iter()
             .filter_map(|name| {
-                let meta = std::fs::metadata(self.models_dir.join(name)).ok()?;
-                meta.is_file().then(|| LegacyModelFile {
+                // symlink_metadata: a symlink is removed, not its target, so
+                // its own size is what deleting it frees.
+                let meta = std::fs::symlink_metadata(self.models_dir.join(name)).ok()?;
+                (!meta.is_dir()).then(|| LegacyModelFile {
                     name: (*name).to_string(),
                     bytes: meta.len(),
                 })
@@ -333,6 +374,7 @@ impl ModelManager {
         on_progress: impl Fn(f32) + Send + Sync,
     ) -> Result<PathBuf> {
         let dir = self.parakeet_model_dir(variant);
+        let _claim = self.claim_download(&dir)?;
         tokio::fs::create_dir_all(&dir).await?;
 
         let files = variant.files();
@@ -398,8 +440,9 @@ impl ModelManager {
         variant: SortformerVariant,
         on_progress: impl Fn(f32) + Send,
     ) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.models_dir).await?;
         let dest = self.models_dir.join(variant.filename());
+        let _claim = self.claim_download(&dest)?;
+        tokio::fs::create_dir_all(&self.models_dir).await?;
         let url = variant.download_url();
         info!(
             "downloading sortformer model {} from {}",
@@ -498,6 +541,74 @@ mod tests {
             ParakeetVariant::TdtV3Int8
         };
         assert_eq!(ParakeetVariant::recommended_for_host(), expected);
+    }
+
+    #[tokio::test]
+    async fn concurrent_parakeet_download_of_same_variant_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        // A clone stands in for the second Tauri command call.
+        let other = manager.clone();
+        let _first = manager
+            .claim_download(&manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8))
+            .unwrap();
+
+        let second = other
+            .download_parakeet(ParakeetVariant::TdtV3Int8, |_| {})
+            .await;
+        assert!(
+            matches!(second, Err(TranscriptionError::DownloadInProgress(_))),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sortformer_download_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let dest = manager
+            .models_dir()
+            .join(SortformerVariant::V2_1.filename());
+        let _first = manager.claim_download(&dest).unwrap();
+
+        let second = manager
+            .clone()
+            .download_sortformer(SortformerVariant::V2_1, |_| {})
+            .await;
+        assert!(matches!(
+            second,
+            Err(TranscriptionError::DownloadInProgress(_))
+        ));
+    }
+
+    #[test]
+    fn download_claim_is_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let dest = manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8);
+        drop(manager.claim_download(&dest).unwrap());
+        assert!(manager.claim_download(&dest).is_ok());
+        // Other variants are independent.
+        let _a = manager.claim_download(&dest).unwrap();
+        assert!(manager
+            .claim_download(&manager.parakeet_model_dir(ParakeetVariant::TdtV3))
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_model_files_report_symlink_size_not_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let target = dir.path().join("big.bin");
+        std::fs::write(&target, vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&target, models_dir.join("ggml-small.bin")).unwrap();
+
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let files = manager.list_legacy_model_files();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].bytes < 4096, "{files:?}");
     }
 
     #[test]

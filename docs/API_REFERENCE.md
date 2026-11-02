@@ -382,7 +382,7 @@ pub use model::{LegacyModelFile, ModelManager, ParakeetVariant, SortformerVarian
 
 ### ModelManager (`model.rs`)
 
-Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both from HuggingFace with streaming SHA-256 verification. It also lists and deletes legacy files earlier releases left in `models/` (Whisper GGML weights and the GGML Silero VAD file); it never deletes them on its own.
+Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. There is no hash verification yet; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. It also lists and deletes legacy files earlier releases left in `models/` (Whisper GGML weights and the GGML Silero VAD file); it never deletes them on its own.
 
 ```rust
 pub enum ParakeetVariant { TdtV3, TdtV3Int8 }     // multilingual, 25 European languages
