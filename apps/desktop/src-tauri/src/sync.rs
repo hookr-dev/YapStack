@@ -3097,7 +3097,6 @@ fn spawn_sse_subscriber(
                             &server_url,
                             &current_bearer,
                             |seq| {
-                                request_raise_backoff_reset();
                                 if should_wake(seq, pull_watermark_pub().load(Ordering::Acquire)) {
                                     drain_wake().notify_one();
                                 }
@@ -3115,6 +3114,9 @@ fn spawn_sse_subscriber(
                     Some(r) => r,
                     None => break, // shutdown requested mid-stream
                 };
+                // The stream ended: what answers at this address next may be a different
+                // relay (rolled back or upgraded), so the drain proves the gate again (O2).
+                note_relay_stream_dropped();
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -3396,29 +3398,60 @@ enum CapabilityNotice {
     None,
     UpdateRequired,
     AnotherDeviceNeedsUpdate,
-    WaitingFor(Vec<yapstack_common::sync::CapabilityBlocker>),
+    /// A raise to `level` was refused because of `blockers`.
+    WaitingFor {
+        level: i32,
+        blockers: Vec<yapstack_common::sync::CapabilityBlocker>,
+    },
     RelayNeedsUpdate,
 }
 
 static CAPABILITY_NOTICE: PubCell<CapabilityNotice> = PubCell::new();
 
-/// O3: set by the events that may have unblocked a refused floor raise (an SSE wake, a device
-/// removed from the account). The drain takes it before its next cycle and clears the raise
-/// backoff, so that cycle asks the relay again.
+/// O3: set by the events that may have unblocked a refused floor raise (the roster shows every
+/// blocker updated or gone, a device removed here). The drain takes it before its next cycle
+/// and clears the raise backoff, so that cycle asks the relay again.
 static RAISE_BACKOFF_RESET: AtomicBool = AtomicBool::new(false);
+
+/// O2: set when the relay's event stream ends. The relay at this address may have been
+/// replaced (rolled back, or upgraded), so the drain forgets what it proved about the gate.
+static RELAY_STREAM_DROPPED: AtomicBool = AtomicBool::new(false);
 
 fn request_raise_backoff_reset() {
     RAISE_BACKOFF_RESET.store(true, Ordering::Release);
 }
 
-/// Clear the drain connection's raise backoff if a reset was requested since the last call.
-fn take_raise_backoff_reset(conn: &rusqlite::Connection) {
-    if !RAISE_BACKOFF_RESET.swap(false, Ordering::AcqRel) {
-        return;
+fn note_relay_stream_dropped() {
+    RELAY_STREAM_DROPPED.store(true, Ordering::Release);
+}
+
+/// Apply the capability resets requested since the last call to the drain's connection.
+fn take_capability_resets(conn: &rusqlite::Connection) {
+    if RAISE_BACKOFF_RESET.swap(false, Ordering::AcqRel) {
+        if let Err(e) = yapstack_sync::state::clear_raise_backoff(conn) {
+            tracing::warn!("sync drain: could not clear the floor-raise backoff: {e}");
+        }
     }
-    if let Err(e) = yapstack_sync::state::clear_raise_backoff(conn) {
-        tracing::warn!("sync drain: could not clear the floor-raise backoff: {e}");
+    if RELAY_STREAM_DROPPED.swap(false, Ordering::AcqRel) {
+        if let Err(e) = yapstack_sync::state::forget_capability_gate(conn) {
+            tracing::warn!("sync drain: could not forget the relay's gate proof: {e}");
+        }
     }
+}
+
+/// True when the device index shows that every device a refused raise named has since
+/// reached the level, been revoked, or left the account, so the raise is worth asking again.
+fn roster_clears_capability_blockers(notice: &CapabilityNotice, devices: &[DeviceInfo]) -> bool {
+    let CapabilityNotice::WaitingFor { level, blockers } = notice else {
+        return false;
+    };
+    !blockers.is_empty()
+        && blockers.iter().all(|b| {
+            devices
+                .iter()
+                .find(|d| d.client_id == b.client_id)
+                .is_none_or(|d| d.status == "revoked" || d.sync_capability >= *level)
+        })
 }
 
 /// The drain's latest version advisory (ADR 0006 §5.9), published for lane status.
@@ -3582,8 +3615,11 @@ fn capability_notice(
         return CapabilityNotice::UpdateRequired;
     }
     match &report.push_error {
-        Some(SyncError::CapabilityBlocked { blockers, .. }) => {
-            return CapabilityNotice::WaitingFor(blockers.clone());
+        Some(SyncError::CapabilityBlocked { level, blockers }) => {
+            return CapabilityNotice::WaitingFor {
+                level: *level,
+                blockers: blockers.clone(),
+            };
         }
         Some(SyncError::CapabilityGateMissing { .. }) => {
             return CapabilityNotice::RelayNeedsUpdate;
@@ -4209,7 +4245,7 @@ fn spawn_drain(
                     });
                 }
 
-                take_raise_backoff_reset(conn);
+                take_capability_resets(conn);
 
                 // A cycle now ALWAYS attempts BOTH push and pull (F1); a per-direction
                 // transport error rides on the report rather than aborting the cycle. Only a
@@ -5355,6 +5391,12 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         std::collections::HashMap::new();
     match http_get_devices(session).await {
         Ok(devs) => {
+            // O3: once every device a refused raise named has updated or left, ask again now
+            // rather than at the end of the backoff.
+            if roster_clears_capability_blockers(&CAPABILITY_NOTICE.get(), &devs.devices) {
+                request_raise_backoff_reset();
+                drain_wake().notify_one();
+            }
             for d in devs.devices {
                 // A REVOKED row (§15.D) is not a device tile: removed peers vanish from
                 // the list; a removed SELF is surfaced as a distinct flag instead.
@@ -5468,7 +5510,7 @@ fn capability_notice_dto(
             Some(SyncCapabilityNoticeDto::AnotherDeviceNeedsUpdate)
         }
         CapabilityNotice::RelayNeedsUpdate => Some(SyncCapabilityNoticeDto::RelayNeedsUpdate),
-        CapabilityNotice::WaitingFor(blockers) => {
+        CapabilityNotice::WaitingFor { blockers, .. } => {
             Some(SyncCapabilityNoticeDto::WaitingForDevices {
                 blockers: blockers
                     .into_iter()
@@ -7653,7 +7695,10 @@ mod tests {
         };
         assert_eq!(
             capability_notice(&r, CapabilityNotice::None, 1),
-            CapabilityNotice::WaitingFor(vec![blocker])
+            CapabilityNotice::WaitingFor {
+                level: 2,
+                blockers: vec![blocker]
+            }
         );
 
         // Below `requested`: the nudge. It survives a cycle whose pull returned nothing,
@@ -7674,30 +7719,86 @@ mod tests {
     }
 
     #[test]
-    fn a_requested_reset_clears_the_raise_backoff_once() {
+    fn requested_capability_resets_are_applied_once() {
+        use yapstack_sync::state::{self, RaiseRefusal, RefusedRaise};
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let now = 1_000_000;
-        yapstack_sync::state::record_refused_raise(&conn, 1, &[], now).unwrap();
-        take_raise_backoff_reset(&conn);
+        let blocked = RefusedRaise {
+            level: 1,
+            refusal: RaiseRefusal::Blocked(vec![]),
+        };
+        let gate_missing = RefusedRaise {
+            level: 1,
+            refusal: RaiseRefusal::GateMissing,
+        };
+        let held = |conn: &rusqlite::Connection| state::raise_backoff(conn, now + 1).unwrap();
+
+        state::record_refused_raise(&conn, &blocked, now).unwrap();
+        take_capability_resets(&conn);
         assert!(
-            yapstack_sync::state::raise_backoff(&conn, now + 1)
-                .unwrap()
-                .is_some(),
-            "no reset requested: the backoff stands"
+            held(&conn).is_some(),
+            "nothing requested: the backoff stands"
         );
         request_raise_backoff_reset();
-        take_raise_backoff_reset(&conn);
-        assert!(yapstack_sync::state::raise_backoff(&conn, now + 1)
-            .unwrap()
-            .is_none());
-        yapstack_sync::state::record_refused_raise(&conn, 1, &[], now).unwrap();
-        take_raise_backoff_reset(&conn);
+        take_capability_resets(&conn);
+        assert!(held(&conn).is_none());
+        state::record_refused_raise(&conn, &blocked, now).unwrap();
+        take_capability_resets(&conn);
+        assert!(held(&conn).is_some(), "a reset is taken once");
+
+        // A dropped event stream (the relay may have been replaced) forgets the gate proof and
+        // a cached "no gate" answer, but not a blocker refusal.
+        state::mark_capability_gate_proven(&conn).unwrap();
+        note_relay_stream_dropped();
+        take_capability_resets(&conn);
+        assert!(!state::capability_gate_proven(&conn).unwrap());
+        assert!(held(&conn).is_some(), "a blocker refusal outlives a drop");
+        state::clear_raise_backoff(&conn).unwrap();
+        state::record_refused_raise(&conn, &gate_missing, now).unwrap();
+        note_relay_stream_dropped();
+        take_capability_resets(&conn);
+        assert!(held(&conn).is_none());
+    }
+
+    #[test]
+    fn the_roster_clears_a_hold_once_every_blocker_updated_or_left() {
+        use yapstack_common::auth::DeviceInfo;
+        let blocker = |n: u128| yapstack_common::sync::CapabilityBlocker {
+            client_id: Uuid::from_u128(n),
+            label: "old".into(),
+            platform: "windows".into(),
+            sync_capability: 0,
+            capability_seen_at: "2026-10-30T00:00:00+00:00".into(),
+        };
+        let device = |n: u128, status: &str, level: i32| DeviceInfo {
+            client_id: Uuid::from_u128(n),
+            ed25519_pub: String::new(),
+            label: String::new(),
+            platform: String::new(),
+            status: status.into(),
+            added_at: String::new(),
+            sync_capability: level,
+            capability_seen_at: None,
+        };
+        let notice = CapabilityNotice::WaitingFor {
+            level: 1,
+            blockers: vec![blocker(1), blocker(2), blocker(3)],
+        };
+        let still_blocked = [
+            device(1, "active", 1),
+            device(2, "revoked", 0),
+            device(3, "active", 0),
+        ];
+        assert!(!roster_clears_capability_blockers(&notice, &still_blocked));
+        let cleared = [device(1, "active", 1), device(2, "revoked", 0)];
         assert!(
-            yapstack_sync::state::raise_backoff(&conn, now + 1)
-                .unwrap()
-                .is_some(),
-            "a reset is taken once"
+            roster_clears_capability_blockers(&notice, &cleared),
+            "updated, revoked or gone"
         );
+        assert!(!roster_clears_capability_blockers(
+            &CapabilityNotice::RelayNeedsUpdate,
+            &cleared
+        ));
     }
 
     #[test]
