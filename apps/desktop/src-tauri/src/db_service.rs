@@ -552,21 +552,22 @@ pub fn run_migrations_list(
         }
         match apply_migration(conn, m) {
             Ok(()) => newly_applied.push(m.version),
-            Err(e) if record_if_schema_present(conn, m) => {
-                tracing::info!(
-                    "migration v{} ({}) could not apply ({e}), but every object it creates \
-                     is already present; recorded it as applied",
-                    m.version,
-                    m.description
-                );
-            }
             Err(e) => {
-                tracing::error!(
-                    "migration v{} ({}) failed; skipping (runtime schema patches will \
-                     backfill if applicable): {e}",
-                    m.version,
-                    m.description
-                );
+                if record_if_schema_present(conn, m) {
+                    tracing::info!(
+                        "migration v{} ({}) could not apply ({e}), but every object it \
+                         creates is already present; recorded it as applied",
+                        m.version,
+                        m.description
+                    );
+                } else {
+                    tracing::error!(
+                        "migration v{} ({}) failed; skipping (runtime schema patches will \
+                         backfill if applicable): {e}",
+                        m.version,
+                        m.description
+                    );
+                }
             }
         }
     }
@@ -584,18 +585,37 @@ fn record_if_schema_present(conn: &Connection, m: &crate::db::Migration) -> bool
         && record_migration(conn, m, 0).is_ok()
 }
 
-/// True when every object exists. On a CRR-prepared DB a table that sync covers
-/// must also be a CRR (have its clock table), whether the object is the table or a
-/// column of it: a plain table there is invisible to sync.
+/// True when every declared object is present in its declared shape: each table
+/// and each declared column of it, each index and trigger by name, and each
+/// virtual table by its whole normalized `CREATE` statement (an FTS table's
+/// options decide what it stores). Constraints such as `UNIQUE` aren't checked:
+/// cutover strips every non-PK UNIQUE from a synced table, so a correct CRR DB
+/// wouldn't have it.
+///
+/// On a CRR-prepared DB, a synced table (or the table of a declared column) must
+/// also be a CRR whose crsql triggers match its current columns: a plain table
+/// there doesn't sync, and a column added by a bare ALTER leaves the update trigger
+/// on the old column list until the boot heal rebuilds it, after which a later
+/// boot records the migration. A build without sync can't check the triggers, so
+/// it never records on a CRR DB.
 fn schema_effects_present(
     conn: &Connection,
     effects: &[crate::db::SchemaObject],
 ) -> rusqlite::Result<bool> {
     use crate::db::SchemaObject;
-    let named = |ty: &str, name: &str| -> rusqlite::Result<bool> {
-        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2")?
-            .exists([ty, name])
+    // Plain sqlite_master probes rather than yapstack_sync::schema's `table_exists` /
+    // `is_crr` / `column_exists`: those exist only with the `sync` feature and
+    // return SyncError, and this runs in every build.
+    let master_sql = |ty: &str, name: &str| -> rusqlite::Result<Option<Option<String>>> {
+        conn.prepare("SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2")?
+            .query_row([ty, name], |r| r.get::<_, Option<String>>(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
     };
+    let named = |ty: &str, name: &str| Ok::<_, rusqlite::Error>(master_sql(ty, name)?.is_some());
     let crr_prepared = named("table", "sessions__crsql_clock")?;
     for effect in effects {
         let (present, table) = match *effect {
@@ -607,18 +627,48 @@ fn schema_effects_present(
             ),
             SchemaObject::Index(i) => (named("index", i)?, None),
             SchemaObject::Trigger(t) => (named("trigger", t)?, None),
+            SchemaObject::VirtualTable(t, create) => (
+                master_sql("table", t)?
+                    .flatten()
+                    .is_some_and(|sql| normalized_sql(&sql) == normalized_sql(create)),
+                Some(t),
+            ),
         };
         if !present {
             return Ok(false);
         }
-        if let Some(t) = table {
-            if crr_prepared && names_sync_table(t) && !named("table", &format!("{t}__crsql_clock"))?
-            {
-                return Ok(false);
-            }
+        let Some(t) = table.filter(|t| crr_prepared && names_sync_table(t)) else {
+            continue;
+        };
+        #[cfg(feature = "sync")]
+        if !named("table", &format!("{t}__crsql_clock"))?
+            || yapstack_sync::schema::crr_triggers_are_stale(conn, t).unwrap_or(true)
+        {
+            return Ok(false);
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = t;
+            return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// A `CREATE` statement in a comparable form: lower-cased, `IF NOT EXISTS` and a
+/// trailing `;` dropped, whitespace collapsed and removed around punctuation. Two
+/// statements that differ only in spelling compare equal; any change to a name,
+/// column or option does not.
+fn normalized_sql(sql: &str) -> String {
+    let lower = sql.trim().trim_end_matches(';').to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let mut out = words.join(" ").replacen(" if not exists", "", 1);
+    for p in ["(", ")", ",", "="] {
+        out = out
+            .replace(&format!(" {p}"), p)
+            .replace(&format!("{p} "), p);
+    }
+    out
 }
 
 /// Insert the sqlx-compatible bookkeeping row for an applied migration. Empty
@@ -2150,6 +2200,39 @@ mod tests {
         assert!(run_migrations(&conn).unwrap().is_empty());
     }
 
+    /// FTS tables made by db.ts `ensureRuntimeSchema` (its `IF NOT EXISTS`
+    /// one-line spelling) match v12's declared shape.
+    #[test]
+    fn fts_tables_from_the_runtime_patch_satisfy_v12() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        forget_versions(&conn, &[12]);
+        let tok = "tokenize = 'porter unicode61 remove_diacritics 2'";
+        for (name, cols) in [
+            (
+                "segments_fts",
+                "segment_id UNINDEXED, session_id UNINDEXED, text",
+            ),
+            (
+                "notes_fts",
+                "note_id UNINDEXED, session_id UNINDEXED, content",
+            ),
+            ("sessions_fts", "session_id UNINDEXED, title"),
+            (
+                "dictations_fts",
+                "dictation_id UNINDEXED, output_text, input_text",
+            ),
+        ] {
+            conn.execute_batch(&format!(
+                "DROP TABLE {name}; \
+                 CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5({cols}, {tok});"
+            ))
+            .unwrap();
+        }
+        run_migrations(&conn).unwrap();
+        assert!(recorded_versions(&conn).contains(&12));
+    }
+
     /// A migration that fails while any object it creates is missing stays
     /// unrecorded, so a DB really missing that schema keeps the loud error.
     #[test]
@@ -2179,32 +2262,148 @@ mod tests {
         assert!(!recorded_versions(&conn).contains(&940));
     }
 
-    /// Each declared object is one its migration creates: all present after the
-    /// full chain on a fresh DB, and not all present just before the migration runs,
-    /// so the presence check tells the two states apart.
+    /// A failed migration whose objects exist by name but not in the shape it
+    /// creates stays unrecorded: one missing column, index or trigger, or an FTS
+    /// table built with other options, each keeps the migration pending.
     #[test]
-    fn declared_schema_effects_match_what_each_migration_creates() {
-        let fresh = Connection::open_in_memory().unwrap();
-        run_migrations(&fresh).unwrap();
+    fn failed_migration_with_wrong_shape_schema_stays_unrecorded() {
+        let cases: &[(i64, &str)] = &[
+            (11, "ALTER TABLE tags DROP COLUMN color;"),
+            (11, "ALTER TABLE session_tags DROP COLUMN confidence;"),
+            (11, "DROP INDEX idx_session_tags_tag;"),
+            (
+                12,
+                "DROP TABLE segments_fts; \
+                 CREATE VIRTUAL TABLE segments_fts USING fts5(segment_id UNINDEXED, \
+                   session_id UNINDEXED, text, content='', \
+                   tokenize = 'porter unicode61 remove_diacritics 2');",
+            ),
+            (
+                12,
+                "DROP TABLE notes_fts; \
+                 CREATE VIRTUAL TABLE notes_fts USING fts5(note_id UNINDEXED, \
+                   session_id UNINDEXED, content);",
+            ),
+            (12, "DROP TRIGGER notes_au;"),
+            (14, "ALTER TABLE chat_messages DROP COLUMN status;"),
+            (14, "DROP INDEX idx_chat_messages_send;"),
+        ];
+        let mut wrongly_recorded = Vec::new();
+        for (v, damage) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            run_migrations(&conn).unwrap();
+            forget_versions(&conn, &[*v]);
+            conn.execute_batch(damage).unwrap();
+            run_migrations(&conn).unwrap();
+            if recorded_versions(&conn).contains(v) {
+                wrongly_recorded.push(format!("v{v} after `{damage}`"));
+            }
+        }
+        assert!(wrongly_recorded.is_empty(), "{wrongly_recorded:#?}");
+    }
+
+    /// Every object in a sqlite_master/table_info snapshot, rendered the way
+    /// [`render_effect`] renders a declaration. FTS shadow tables (and the
+    /// bookkeeping table) are left out: they're the virtual table's internals.
+    fn schema_snapshot(conn: &Connection) -> std::collections::BTreeSet<String> {
+        let rows: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE name NOT LIKE 'sqlite_%' AND name <> '_sqlx_migrations'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        let is_virtual = |sql: &Option<String>| {
+            sql.as_deref()
+                .is_some_and(|s| s.starts_with("CREATE VIRTUAL"))
+        };
+        let virtuals: Vec<&str> = rows
+            .iter()
+            .filter(|(_, _, sql)| is_virtual(sql))
+            .map(|(_, n, _)| n.as_str())
+            .collect();
+        let mut out = std::collections::BTreeSet::new();
+        for (ty, name, sql) in &rows {
+            if virtuals.iter().any(|v| name.starts_with(&format!("{v}_"))) {
+                continue;
+            }
+            match ty.as_str() {
+                "table" if is_virtual(sql) => {
+                    out.insert(format!(
+                        "virtual:{name}:{}",
+                        normalized_sql(sql.as_deref().unwrap())
+                    ));
+                }
+                "table" => {
+                    out.insert(format!("table:{name}"));
+                    for c in table_columns_for_test(conn, name) {
+                        out.insert(format!("column:{name}.{c}"));
+                    }
+                }
+                "index" if sql.is_some() => {
+                    out.insert(format!("index:{name}"));
+                }
+                "trigger" => {
+                    out.insert(format!("trigger:{name}"));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn table_columns_for_test(conn: &Connection, t: &str) -> Vec<String> {
+        conn.prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap()
+            .query_map([t], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    fn render_effect(e: &crate::db::SchemaObject) -> String {
+        use crate::db::SchemaObject;
+        match *e {
+            SchemaObject::Table(t) => format!("table:{t}"),
+            SchemaObject::Column(t, c) => format!("column:{t}.{c}"),
+            SchemaObject::Index(i) => format!("index:{i}"),
+            SchemaObject::Trigger(t) => format!("trigger:{t}"),
+            SchemaObject::VirtualTable(t, sql) => format!("virtual:{t}:{}", normalized_sql(sql)),
+        }
+    }
+
+    /// The declared effects are exactly what the migration creates, found
+    /// independently of the declaration: snapshot the schema before and after
+    /// applying it to a DB at the previous version, and the difference must equal
+    /// the declared set (nothing missing, nothing extra, nothing removed).
+    #[test]
+    fn declared_schema_effects_equal_what_each_migration_creates() {
+        let mut checked = 0;
         for m in crate::db::migrations() {
             if m.schema_effects.is_empty() {
                 continue;
             }
-            assert!(
-                schema_effects_present(&fresh, m.schema_effects).unwrap(),
-                "v{}: declared objects exist on a fresh DB",
-                m.version
+            let conn = Connection::open_in_memory().unwrap();
+            run_migrations_list(&conn, &migrations_below(m.version)).unwrap();
+            let before = schema_snapshot(&conn);
+            let v = m.version;
+            let declared: std::collections::BTreeSet<String> =
+                m.schema_effects.iter().map(render_effect).collect();
+            assert_eq!(run_migrations_list(&conn, &[m]).unwrap(), vec![v]);
+            let after = schema_snapshot(&conn);
+            let created: std::collections::BTreeSet<String> =
+                after.difference(&before).cloned().collect();
+            assert!(before.is_subset(&after), "v{v} removed objects");
+            assert_eq!(
+                created, declared,
+                "v{v}: declared effects vs what it creates"
             );
-            let before = Connection::open_in_memory().unwrap();
-            run_migrations_list(&before, &migrations_below(m.version)).unwrap();
-            for effect in m.schema_effects {
-                assert!(
-                    !schema_effects_present(&before, std::slice::from_ref(effect)).unwrap(),
-                    "v{}: {effect:?} exists before the migration runs",
-                    m.version
-                );
-            }
+            checked += 1;
         }
+        assert!(checked >= 4, "v11–v14 declare effects");
     }
 
     /// The owner's dev DB: CRR-prepared, `_sqlx_migrations` holds 1–10 and 15–18,
@@ -2268,5 +2467,43 @@ mod tests {
         .unwrap();
         run_migrations(conn).unwrap();
         assert!(!recorded_versions(conn).contains(&11), "tags is not a CRR");
+    }
+
+    /// A build that predates the db.ts CRR gate bare-ALTERed the chat_messages
+    /// columns onto the CRR table: the columns and the clock table exist, but the
+    /// crsql update trigger still has the old column list. v13/v14 stay unrecorded
+    /// until the boot heal rebuilds the triggers, then the next run records them.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn crr_db_with_stale_triggers_records_only_after_the_heal() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        run_migrations_list(conn, &migrations_below(13)).unwrap();
+        yapstack_sync::schema::crr_migrate(conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT; \
+             ALTER TABLE chat_messages ADD COLUMN send_id TEXT; \
+             ALTER TABLE chat_messages ADD COLUMN sequence INTEGER; \
+             ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT; \
+             ALTER TABLE chat_messages ADD COLUMN observation TEXT; \
+             ALTER TABLE chat_messages ADD COLUMN status TEXT; \
+             CREATE INDEX idx_chat_messages_send ON chat_messages(context_key, send_id, sequence);",
+        )
+        .unwrap();
+        assert!(yapstack_sync::schema::crr_triggers_are_stale(conn, "chat_messages").unwrap());
+
+        run_migrations(conn).unwrap();
+        let recorded = recorded_versions(conn);
+        assert!(!recorded.contains(&13), "stale triggers: {recorded:?}");
+        assert!(!recorded.contains(&14), "stale triggers: {recorded:?}");
+
+        yapstack_sync::schema::heal_stale_crr_triggers(conn).unwrap();
+        run_migrations(conn).unwrap();
+        let recorded = recorded_versions(conn);
+        assert!(
+            recorded.contains(&13) && recorded.contains(&14),
+            "{recorded:?}"
+        );
     }
 }

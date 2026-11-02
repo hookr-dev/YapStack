@@ -10,25 +10,31 @@ pub struct Migration {
     pub description: &'static str,
     pub sql: &'static str,
     pub kind: MigrationKind,
-    /// Every schema object this migration creates, or empty. When the migration
-    /// can't be applied and all of them are already present (on a CRR DB, a synced
-    /// table must also be a CRR), the runner records it as applied instead of
-    /// failing it on every boot. Declare them only for a migration whose schema can
-    /// land out of band (a runtime schema patch, cutover) and whose data changes
-    /// that path also makes; an empty list never records a failed migration.
+    /// Every schema object this migration creates, or empty: each table with each
+    /// of its columns, each index, trigger and virtual table. A test checks the
+    /// list equals what the migration really creates. When the migration can't be
+    /// applied and all of them are already present (on a CRR DB, a synced table must
+    /// also be a CRR with current triggers), the runner records it as applied
+    /// instead of failing it on every boot. Declare them only for a migration whose
+    /// schema can land out of band (a runtime schema patch, cutover) and whose data
+    /// changes that path also makes; an empty list never records a failed migration.
     pub schema_effects: &'static [SchemaObject],
 }
 
-/// A schema object a [`Migration`] creates, probed by name in `sqlite_master`
-/// (or `pragma_table_info` for a column).
+/// A schema object a [`Migration`] creates, probed in `sqlite_master` (or
+/// `pragma_table_info` for a column).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaObject {
-    /// A table, virtual tables included.
+    /// An ordinary table, by name. Declare its columns separately.
     Table(&'static str),
     /// A column: `(table, column)`.
     Column(&'static str, &'static str),
     Index(&'static str),
     Trigger(&'static str),
+    /// A virtual table: `(name, its CREATE statement)`, matched on the whole
+    /// statement (columns and options) up to spelling, since an FTS table's
+    /// options decide what it stores.
+    VirtualTable(&'static str, &'static str),
 }
 
 /// How [`crate::db_service::run_migrations`] treats a migration on a cr-sqlite
@@ -870,8 +876,17 @@ pub fn migrations() -> Vec<Migration> {
             // while v11 is unrecorded; on a CRR DB the guard refuses v11 outright.
             schema_effects: &[
                 SchemaObject::Table("tags"),
+                SchemaObject::Column("tags", "id"),
+                SchemaObject::Column("tags", "name"),
+                SchemaObject::Column("tags", "color"),
+                SchemaObject::Column("tags", "created_at"),
                 SchemaObject::Index("idx_tags_name"),
                 SchemaObject::Table("session_tags"),
+                SchemaObject::Column("session_tags", "session_id"),
+                SchemaObject::Column("session_tags", "tag_id"),
+                SchemaObject::Column("session_tags", "source"),
+                SchemaObject::Column("session_tags", "confidence"),
+                SchemaObject::Column("session_tags", "created_at"),
                 SchemaObject::Index("idx_session_tags_tag"),
                 SchemaObject::Index("idx_session_tags_session"),
             ],
@@ -992,10 +1007,29 @@ pub fn migrations() -> Vec<Migration> {
             // db.ts `ensureRuntimeSchema` creates the same tables, backfill and
             // triggers.
             schema_effects: &[
-                SchemaObject::Table("segments_fts"),
-                SchemaObject::Table("notes_fts"),
-                SchemaObject::Table("sessions_fts"),
-                SchemaObject::Table("dictations_fts"),
+                SchemaObject::VirtualTable(
+                    "segments_fts",
+                    "CREATE VIRTUAL TABLE segments_fts USING fts5(segment_id UNINDEXED, \
+                     session_id UNINDEXED, text, \
+                     tokenize = 'porter unicode61 remove_diacritics 2')",
+                ),
+                SchemaObject::VirtualTable(
+                    "notes_fts",
+                    "CREATE VIRTUAL TABLE notes_fts USING fts5(note_id UNINDEXED, \
+                     session_id UNINDEXED, content, \
+                     tokenize = 'porter unicode61 remove_diacritics 2')",
+                ),
+                SchemaObject::VirtualTable(
+                    "sessions_fts",
+                    "CREATE VIRTUAL TABLE sessions_fts USING fts5(session_id UNINDEXED, \
+                     title, tokenize = 'porter unicode61 remove_diacritics 2')",
+                ),
+                SchemaObject::VirtualTable(
+                    "dictations_fts",
+                    "CREATE VIRTUAL TABLE dictations_fts USING fts5(dictation_id UNINDEXED, \
+                     output_text, input_text, \
+                     tokenize = 'porter unicode61 remove_diacritics 2')",
+                ),
                 SchemaObject::Trigger("segments_ai"),
                 SchemaObject::Trigger("segments_ad"),
                 SchemaObject::Trigger("segments_au"),
