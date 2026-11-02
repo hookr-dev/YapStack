@@ -21,6 +21,9 @@ const K_CLIENT_SEQ: &str = "client_seq"; // our monotonic outgoing counter
 /// table so it is held in memory for the lifetime of the open connection ONLY and is never
 /// written to the DB file (see [`seq_reconciled`]).
 const K_SESSION_SEQ_RECONCILED: &str = "seq_reconciled";
+/// Connection-scoped session marker: the relay enforces the capability gate (O2, see
+/// [`capability_gate_proven`]).
+const K_SESSION_CAPABILITY_GATE_PROVEN: &str = "capability_gate_proven";
 
 pub fn ensure_meta_table(conn: &Connection) -> Result<(), SyncError> {
     conn.execute_batch(
@@ -151,23 +154,31 @@ fn ensure_session_table(conn: &Connection) -> Result<(), SyncError> {
 /// no marker, so reconcile runs exactly ONCE per spawn and every restore self-heals. One extra
 /// `GET /sync/completeness` per app session is the whole cost.
 pub fn seq_reconciled(conn: &Connection) -> Result<bool, SyncError> {
-    ensure_session_table(conn)?;
-    let n: i64 = conn.query_row(
-        "SELECT count(*) FROM temp._yapstack_sync_session WHERE key=?1",
-        [K_SESSION_SEQ_RECONCILED],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
+    session_marker(conn, K_SESSION_SEQ_RECONCILED)
 }
 
 /// Record that this connection has reconciled its counter against the relay tail this spawn
 /// (G1). Set after a successful completeness comparison (whether or not a regression was
 /// repaired). Connection-scoped / in-memory only (see [`seq_reconciled`]).
 pub fn mark_seq_reconciled(conn: &Connection) -> Result<(), SyncError> {
+    set_session_marker(conn, K_SESSION_SEQ_RECONCILED)
+}
+
+fn session_marker(conn: &Connection, key: &str) -> Result<bool, SyncError> {
+    ensure_session_table(conn)?;
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM temp._yapstack_sync_session WHERE key=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn set_session_marker(conn: &Connection, key: &str) -> Result<(), SyncError> {
     ensure_session_table(conn)?;
     conn.execute(
         "INSERT OR IGNORE INTO _yapstack_sync_session(key) VALUES(?1)",
-        [K_SESSION_SEQ_RECONCILED],
+        [key],
     )?;
     Ok(())
 }
@@ -180,6 +191,136 @@ pub fn clear_seq_reconciled(conn: &Connection) -> Result<(), SyncError> {
     conn.execute(
         "DELETE FROM _yapstack_sync_session WHERE key=?1",
         [K_SESSION_SEQ_RECONCILED],
+    )?;
+    Ok(())
+}
+
+/// True once THIS drain connection has seen proof that the relay enforces the sync capability
+/// gate (ADR 0006 §5.4, O2): a floor raise it answered (accepted or refused naming blockers), a
+/// 409 `sync_capability_floor`, or a 426. A relay that predates the gate ignores a batch's
+/// declared level, so no batch above level 0 is sent until this holds.
+///
+/// Connection-scoped like [`seq_reconciled`], so every drain spawn (app launch, re-login, an
+/// account switch) proves it again against the relay it is talking to now.
+pub fn capability_gate_proven(conn: &Connection) -> Result<bool, SyncError> {
+    session_marker(conn, K_SESSION_CAPABILITY_GATE_PROVEN)
+}
+
+/// Record that this connection has seen the relay enforce the capability gate.
+pub fn mark_capability_gate_proven(conn: &Connection) -> Result<(), SyncError> {
+    set_session_marker(conn, K_SESSION_CAPABILITY_GATE_PROVEN)
+}
+
+/// The first wait after a refused floor raise, doubled per further refusal up to
+/// [`RAISE_BACKOFF_MAX_MS`] (O3).
+pub const RAISE_BACKOFF_INITIAL_MS: i64 = 60_000;
+/// The longest wait between floor raises while they keep being refused.
+pub const RAISE_BACKOFF_MAX_MS: i64 = 15 * 60_000;
+
+/// A refused floor raise this connection is still waiting out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedRaise {
+    pub level: i32,
+    pub blockers: Vec<yapstack_common::sync::CapabilityBlocker>,
+}
+
+/// The connection-scoped TEMP table holding the raise backoff (at most one row). TEMP for the
+/// same reason as [`seq_reconciled`]: a respawn starts over and asks the relay again.
+fn ensure_raise_backoff_table(conn: &Connection) -> Result<(), SyncError> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS _yapstack_sync_raise_backoff (\
+            id INTEGER PRIMARY KEY CHECK (id = 0), \
+            level INTEGER NOT NULL, \
+            blockers TEXT NOT NULL, \
+            retry_at_ms INTEGER NOT NULL, \
+            delay_ms INTEGER NOT NULL, \
+            requested INTEGER);",
+    )?;
+    Ok(())
+}
+
+/// The refused raise to report instead of asking the relay again, while `now_ms` is inside its
+/// backoff. `None` once the wait is over (or never started). A clock that jumped back by more
+/// than the wait ends it early rather than stretching it.
+pub fn raise_backoff(conn: &Connection, now_ms: i64) -> Result<Option<RefusedRaise>, SyncError> {
+    ensure_raise_backoff_table(conn)?;
+    let row = conn.query_row(
+        "SELECT level, blockers, retry_at_ms, delay_ms FROM temp._yapstack_sync_raise_backoff",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    );
+    let (level, blockers, retry_at, delay) = match row {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if now_ms >= retry_at || retry_at - now_ms > delay {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&blockers)
+        .ok()
+        .map(|blockers| RefusedRaise { level, blockers }))
+}
+
+/// Start (or lengthen) the backoff after the relay refused a raise to `level`: 60 s after the
+/// first refusal, doubling per refusal at the same level, at most 15 min.
+pub fn record_refused_raise(
+    conn: &Connection,
+    level: i32,
+    blockers: &[yapstack_common::sync::CapabilityBlocker],
+    now_ms: i64,
+) -> Result<(), SyncError> {
+    ensure_raise_backoff_table(conn)?;
+    let previous: Option<i64> = conn
+        .query_row(
+            "SELECT delay_ms FROM temp._yapstack_sync_raise_backoff WHERE level = ?1",
+            [level],
+            |r| r.get(0),
+        )
+        .ok();
+    let delay = previous.map_or(RAISE_BACKOFF_INITIAL_MS, |d| {
+        (d * 2).min(RAISE_BACKOFF_MAX_MS)
+    });
+    let blockers = serde_json::to_string(blockers)
+        .map_err(|e| SyncError::Codec(format!("capability blockers: {e}")))?;
+    conn.execute(
+        "INSERT INTO temp._yapstack_sync_raise_backoff \
+         (id, level, blockers, retry_at_ms, delay_ms) VALUES (0, ?1, ?2, ?3, ?4) \
+         ON CONFLICT(id) DO UPDATE SET level = excluded.level, blockers = excluded.blockers, \
+         retry_at_ms = excluded.retry_at_ms, delay_ms = excluded.delay_ms",
+        rusqlite::params![level, blockers, now_ms + delay, delay],
+    )?;
+    Ok(())
+}
+
+/// Forget the raise backoff, so the next gated batch asks the relay again: after a raise
+/// succeeds, and on the events that may have unblocked it (an SSE wake, a device removed).
+pub fn clear_raise_backoff(conn: &Connection) -> Result<(), SyncError> {
+    ensure_raise_backoff_table(conn)?;
+    conn.execute("DELETE FROM temp._yapstack_sync_raise_backoff", [])?;
+    Ok(())
+}
+
+/// Feed the relay's `requested` level from a pull into the backoff: the first value seen
+/// during a backoff is remembered, and a different one later ends the backoff (another
+/// device raised or asked for a level, so the blockers may have changed).
+pub fn note_relay_requested(conn: &Connection, requested: i32) -> Result<(), SyncError> {
+    ensure_raise_backoff_table(conn)?;
+    conn.execute(
+        "DELETE FROM temp._yapstack_sync_raise_backoff \
+         WHERE requested IS NOT NULL AND requested <> ?1",
+        [requested],
+    )?;
+    conn.execute(
+        "UPDATE temp._yapstack_sync_raise_backoff SET requested = ?1 WHERE requested IS NULL",
+        [requested],
     )?;
     Ok(())
 }

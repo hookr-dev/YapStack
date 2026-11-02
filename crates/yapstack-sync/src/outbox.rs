@@ -608,6 +608,24 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
     client_id: uuid::Uuid,
     transport: &T,
 ) -> Result<(usize, Option<i64>), SyncError> {
+    push_outbox_at(conn, client_id, transport, unix_now_ms()).await
+}
+
+/// Milliseconds since the Unix epoch, the clock the raise backoff runs on.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// [`push_outbox`] at an explicit `now_ms`, so the raise backoff is testable without
+/// waiting.
+async fn push_outbox_at<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    client_id: uuid::Uuid,
+    transport: &T,
+    now_ms: i64,
+) -> Result<(usize, Option<i64>), SyncError> {
     ensure_outbox_table(conn)?;
     let mut total_acked = 0usize;
     // R12: the tenant tip disclosed by the last push response this cycle. `None` when we
@@ -696,7 +714,15 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
             }
         }
 
-        let resp = match push_gated(transport, PushRequest { changes }, batch_level).await {
+        let resp = match push_gated(
+            conn,
+            transport,
+            PushRequest { changes },
+            batch_level,
+            now_ms,
+        )
+        .await
+        {
             Ok(r) => r,
             // G3 — the relay returned 409 Conflict: our counter regressed and re-minted a seq
             // the relay already holds under DIFFERENT ciphertext. Recover in-band (reseed past
@@ -786,20 +812,64 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
 /// [`SyncError::CapabilityFloor`] refusal, ask the relay to raise the floor and retry ONCE.
 /// A refused raise surfaces as [`SyncError::CapabilityBlocked`], which stops the push in
 /// `client_seq` order (nothing is skipped or reordered) while the pull carries on.
+///
+/// Two guards come first (O2, O3). Until this connection has seen the relay enforce the gate
+/// ([`state::capability_gate_proven`]) the raise is asked first, so a relay that predates the
+/// gate (and would store the batch whatever level it declares) answers
+/// [`SyncError::CapabilityGateMissing`] before any gated batch is sent. And while a refused
+/// raise is backing off ([`state::raise_backoff`]) the cached refusal is returned without
+/// pushing or asking; a cached refusal only ever withholds, it never authorizes.
 async fn push_gated<T: SyncTransport + ?Sized>(
+    conn: &Connection,
     transport: &T,
     req: PushRequest,
     level: i32,
+    now_ms: i64,
 ) -> Result<yapstack_common::sync::PushResponse, SyncError> {
     if level == 0 {
         return transport.push(req).await;
     }
+    if let Some(refused) = state::raise_backoff(conn, now_ms)? {
+        if level >= refused.level {
+            return Err(SyncError::CapabilityBlocked {
+                level: refused.level,
+                blockers: refused.blockers,
+            });
+        }
+    }
+    if !state::capability_gate_proven(conn)? {
+        raise_floor(conn, transport, level, now_ms).await?;
+    }
     match transport.push_batch(req.clone(), level).await {
         Err(SyncError::CapabilityFloor { .. }) => {
-            transport.raise_sync_capability(level).await?;
+            state::mark_capability_gate_proven(conn)?;
+            raise_floor(conn, transport, level, now_ms).await?;
             transport.push_batch(req, level).await
         }
         other => other,
+    }
+}
+
+/// Ask the relay to raise the floor to `level`, recording what its answer proves: any typed
+/// answer shows it enforces the gate, and a refusal starts or lengthens the raise backoff.
+async fn raise_floor<T: SyncTransport + ?Sized>(
+    conn: &Connection,
+    transport: &T,
+    level: i32,
+    now_ms: i64,
+) -> Result<(), SyncError> {
+    match transport.raise_sync_capability(level).await {
+        Ok(_) => {
+            state::mark_capability_gate_proven(conn)?;
+            state::clear_raise_backoff(conn)?;
+            Ok(())
+        }
+        Err(SyncError::CapabilityBlocked { level, blockers }) => {
+            state::mark_capability_gate_proven(conn)?;
+            state::record_refused_raise(conn, level, &blockers, now_ms)?;
+            Err(SyncError::CapabilityBlocked { level, blockers })
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -878,6 +948,14 @@ pub async fn drain_once_with_progress<T: SyncTransport + ?Sized>(
     // on `pull_error`; whatever it managed to apply before failing is retained (F1).
     if let Err(e) = pull_direction(conn, cipher, transport, &mut report, on_applied).await {
         report.pull_error = Some(e);
+    }
+    // O2/O3: a 426 proves the relay enforces the capability gate, and a change in its
+    // `requested` level ends a raise backoff.
+    if matches!(report.pull_error, Some(SyncError::UpdateRequired { .. })) {
+        state::mark_capability_gate_proven(conn)?;
+    }
+    if let Some(levels) = report.relay_capability {
+        state::note_relay_requested(conn, levels.requested_sync_capability)?;
     }
 
     // R12: record the pull watermark reached this cycle so the caller can decide the honest
@@ -1339,14 +1417,18 @@ mod tests {
             (0, 1, 1),
             "one raise; requested recorded"
         );
-        // Batches never mix levels: the level-0 prefix went alone, then the gated entry alone.
+        // Batches never mix levels: the level-0 prefix went alone. The gated entry was never
+        // sent: this connection had no proof the relay enforces the gate, so it asked for the
+        // raise first (O2), and the refusal held it.
         let batches = relay.batches.lock().unwrap().clone();
-        assert_eq!(batches, vec![(vec![1, 2], 0), (vec![3], 1)]);
+        assert_eq!(batches, vec![(vec![1, 2], 0)]);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn floor_refusal_raises_and_retries_once_then_publishes_in_order() {
         let conn = outbox_with_levels(&[(1, 0), (2, 1), (3, 1), (4, 0)]);
+        // A connection that already saw the relay enforce the gate offers the batch first.
+        state::mark_capability_gate_proven(&conn).unwrap();
         let relay = recording_relay();
         let me = Uuid::from_u128(1);
 
@@ -1560,6 +1642,173 @@ mod tests {
         // (`outbox_level_column_is_added_to_an_older_table`). That is sound: such a build
         // only ever converted the cutover tables, so its entries can't hold a gated row.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relay_without_the_capability_gate_never_receives_a_gated_batch() {
+        // O2: a relay that predates the gate ignores the batch header, so the client must see
+        // proof the gate is enforced before it sends anything above level 0.
+        let conn = outbox_with_levels(&[(1, 0), (2, 1), (3, 0)]);
+        let relay = RecordingRelay {
+            inner: MockRelay::new().without_capability_gate(),
+            batches: Mutex::new(Vec::new()),
+        };
+        let me = Uuid::from_u128(1);
+
+        for cycle in 1..=2 {
+            let err = push_outbox(&conn, me, &relay).await.unwrap_err();
+            assert!(
+                matches!(err, SyncError::CapabilityGateMissing { level: 1 }),
+                "got {err:?}"
+            );
+            assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
+            assert_eq!(unacked(&conn), vec![2, 3], "held in client_seq order");
+            assert_eq!(
+                relay.inner.capability_state().2,
+                cycle,
+                "each cycle asks again, in case the relay was updated"
+            );
+        }
+        let batches = relay.batches.lock().unwrap().clone();
+        assert_eq!(batches, vec![(vec![1], 0)], "no gated batch was ever sent");
+        assert!(!state::capability_gate_proven(&conn).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_gate_proof_is_per_connection_so_a_respawn_proves_it_again() {
+        // The proof lives with the drain's connection, like `seq_reconciled`: a respawn (app
+        // launch, re-login, account switch, a relay swapped for an older one) starts unproven.
+        let dir = std::env::temp_dir().join(format!("yapstack-proof-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sync.db");
+        let me = Uuid::from_u128(1);
+        let insert = |conn: &Connection, seq: i64| {
+            conn.execute(
+                "INSERT INTO _yapstack_outbox (client_seq, ciphertext, schema_version, \
+                 engine_version, acked, required_sync_capability) VALUES (?1, x'01', 1, 16003, 0, 1)",
+                [seq],
+            )
+            .unwrap();
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            ensure_outbox_table(&conn).unwrap();
+            insert(&conn, 1);
+            let gated = recording_relay();
+            push_outbox(&conn, me, &gated).await.unwrap();
+            assert_eq!(gated.inner.stored_pairs(), vec![(me, 1)]);
+            assert!(state::capability_gate_proven(&conn).unwrap());
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert!(!state::capability_gate_proven(&conn).unwrap());
+        insert(&conn, 2);
+        let older = MockRelay::new().without_capability_gate();
+        let err = push_outbox(&conn, me, &older).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::CapabilityGateMissing { .. }),
+            "got {err:?}"
+        );
+        assert!(older.stored_pairs().is_empty());
+        assert_eq!(unacked(&conn), vec![2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_pull_proves_the_gate() {
+        let db = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&db);
+        let refusing = Faulty {
+            pull_err: Some(Box::new(|| SyncError::UpdateRequired {
+                level: 1,
+                required: 2,
+                requested: 2,
+            })),
+            ..Faulty::new(Arc::new(MockRelay::new()))
+        };
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        let report = drain_once(
+            db.conn(),
+            &f1_cipher(),
+            &refusing,
+            Uuid::from_u128(1),
+            sv,
+            ev,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            report.pull_error,
+            Some(SyncError::UpdateRequired { .. })
+        ));
+        assert!(state::capability_gate_proven(db.conn()).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_raise_backs_off_and_retries_on_wake() {
+        // O3: after a refused raise the client asks again after 60 s, doubling to 15 min, and
+        // pushes nothing meanwhile. A wake, a device removal or a change in the relay's
+        // `requested` level starts over.
+        const S: i64 = 1_000;
+        let conn = outbox_with_levels(&[(1, 1)]);
+        let relay = recording_relay();
+        relay
+            .inner
+            .set_capability_blockers(vec![blocker("old laptop")]);
+        let me = Uuid::from_u128(1);
+        let raises = || relay.inner.capability_state().2;
+        let sent = || relay.batches.lock().unwrap().len();
+        let held = |r: Result<(usize, Option<i64>), SyncError>| match r {
+            Err(SyncError::CapabilityBlocked { level: 1, blockers }) => {
+                assert_eq!(blockers[0].label, "old laptop");
+            }
+            other => panic!("expected a held push, got {other:?}"),
+        };
+
+        let mut t = 1_000_000 * S;
+        held(push_outbox_at(&conn, me, &relay, t).await);
+        assert_eq!(raises(), 1);
+        held(push_outbox_at(&conn, me, &relay, t + 59 * S).await);
+        assert_eq!(
+            (raises(), sent()),
+            (1, 0),
+            "the cached refusal holds without asking"
+        );
+
+        // Each refusal doubles the wait: 60 s, 120, 240, 480, then 900 s (15 min) for good.
+        for (wait, expected_raises) in [(60, 2), (120, 3), (240, 4), (480, 5), (900, 6), (900, 7)] {
+            held(push_outbox_at(&conn, me, &relay, t + (wait - 1) * S).await);
+            assert_eq!(
+                raises(),
+                expected_raises - 1,
+                "still backing off before {wait} s"
+            );
+            t += wait * S;
+            let before = sent();
+            held(push_outbox_at(&conn, me, &relay, t).await);
+            assert_eq!(raises(), expected_raises, "asks again after {wait} s");
+            assert_eq!(sent(), before + 1, "the retry re-offers the batch first");
+        }
+
+        state::clear_raise_backoff(&conn).unwrap();
+        held(push_outbox_at(&conn, me, &relay, t + S).await);
+        assert_eq!(raises(), 8, "a wake starts over");
+
+        state::note_relay_requested(&conn, 1).unwrap();
+        held(push_outbox_at(&conn, me, &relay, t + 2 * S).await);
+        assert_eq!(
+            raises(),
+            8,
+            "an unchanged requested level keeps the backoff"
+        );
+        state::note_relay_requested(&conn, 2).unwrap();
+        held(push_outbox_at(&conn, me, &relay, t + 3 * S).await);
+        assert_eq!(raises(), 9, "a changed requested level starts over");
+
+        relay.inner.set_capability_blockers(Vec::new());
+        state::clear_raise_backoff(&conn).unwrap();
+        push_outbox_at(&conn, me, &relay, t + 4 * S).await.unwrap();
+        assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
+        assert_eq!(relay.inner.capability_state().0, 1);
     }
 
     #[test]

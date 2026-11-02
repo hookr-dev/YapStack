@@ -386,6 +386,13 @@ impl SyncTransport for HttpTransport {
             .send()
             .await
             .map_err(map_send_error)?;
+        // No such route: the relay predates the gate (O2), so it would ignore a batch's level.
+        if matches!(
+            resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(SyncError::CapabilityGateMissing { level });
+        }
         let r = check_auth(check_capability(resp, level).await?)?;
         Ok(r.json().await?)
     }
@@ -706,6 +713,9 @@ struct MockInner {
     requested: i32,
     blockers: Vec<CapabilityBlocker>,
     raise_calls: usize,
+    // A relay that predates the gate: the raise route is missing and declared levels are
+    // ignored, so a gated batch would simply be stored.
+    gate_missing: bool,
 }
 
 impl MockRelay {
@@ -721,6 +731,13 @@ impl MockRelay {
     /// Overwrite the floor, e.g. to model a relay restored from a backup.
     pub fn set_capability_floor(&self, floor: i32) {
         self.inner.lock().unwrap().floor = floor;
+    }
+
+    /// Model a relay that predates the capability gate: the raise answers as a missing
+    /// route and push stores a batch whatever level it declares.
+    pub fn without_capability_gate(self) -> Self {
+        self.inner.lock().unwrap().gate_missing = true;
+        self
     }
 
     /// `(required, requested, raise calls so far)`.
@@ -811,7 +828,7 @@ impl SyncTransport for MockRelay {
     ) -> Result<PushResponse, SyncError> {
         {
             let g = self.inner.lock().unwrap();
-            if batch_capability > g.floor {
+            if !g.gate_missing && batch_capability > g.floor {
                 return Err(SyncError::CapabilityFloor {
                     batch: batch_capability,
                     required: g.floor,
@@ -825,6 +842,9 @@ impl SyncTransport for MockRelay {
     async fn raise_sync_capability(&self, level: i32) -> Result<SyncCapabilityLevels, SyncError> {
         let mut g = self.inner.lock().unwrap();
         g.raise_calls += 1;
+        if g.gate_missing {
+            return Err(SyncError::CapabilityGateMissing { level });
+        }
         if level > g.floor {
             let blocking: Vec<CapabilityBlocker> = g
                 .blockers
@@ -875,7 +895,7 @@ impl SyncTransport for MockRelay {
         content_capability: i32,
     ) -> Result<(), SyncError> {
         let mut g = self.inner.lock().unwrap();
-        if content_capability > g.floor {
+        if !g.gate_missing && content_capability > g.floor {
             return Err(SyncError::CapabilityFloor {
                 batch: content_capability,
                 required: g.floor,
@@ -1166,6 +1186,28 @@ mod tests {
             "the presign declares the content level: {}",
             heads[0]
         );
+    }
+
+    /// O2: a relay without `PUT /sync/capability` predates the gate. Only 404 and 405 say
+    /// so; any other failure stays an ordinary error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_the_relay_has_no_route_for_means_it_predates_the_gate() {
+        let (addr, server) = canned_server(vec![
+            status_only("404 Not Found"),
+            status_only("405 Method Not Allowed"),
+            status_only("500 Internal Server Error"),
+        ]);
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        for _ in 0..2 {
+            let e = t.raise_sync_capability(1).await.unwrap_err();
+            assert!(
+                matches!(e, SyncError::CapabilityGateMissing { level: 1 }),
+                "got {e:?}"
+            );
+        }
+        let e = t.raise_sync_capability(1).await.unwrap_err();
+        assert!(matches!(e, SyncError::Http(_)), "got {e:?}");
+        server.join().unwrap();
     }
 
     #[test]

@@ -119,6 +119,13 @@ pub enum SyncError {
         level: i32,
         blockers: Vec<yapstack_common::sync::CapabilityBlocker>,
     },
+    /// The relay has no floor-raise route (HTTP 404 or 405 on `PUT /sync/capability`): it
+    /// predates the capability gate and would accept a gated batch without checking it. A
+    /// push needing level `level` holds in `client_seq` order until the relay is updated.
+    #[error(
+        "the sync server needs an update before changes that need sync capability {level} can sync"
+    )]
+    CapabilityGateMissing { level: i32 },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 }
