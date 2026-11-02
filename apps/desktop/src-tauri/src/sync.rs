@@ -534,11 +534,13 @@ fn cred_encode_blob(value: &str) -> Vec<u8> {
 }
 
 /// Decode a keyring credential blob (little-endian UTF-16) back to a `String`. Trailing odd
-/// byte (should never occur for a keyring-written blob) is ignored via `chunks_exact`.
+/// byte (should never occur for a keyring-written blob) is ignored via `as_chunks`.
 fn cred_decode_blob(bytes: &[u8]) -> String {
     let u16s: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&u16s)
 }
@@ -1190,7 +1192,8 @@ fn anchor_account_name(server_url: &str, email: &str) -> String {
     h.update(base_url(server_url).as_bytes());
     h.update([0u8]); // domain separator between the two fields
     h.update(email.to_ascii_lowercase().as_bytes());
-    format!("{}{:x}", KEYCHAIN_ACCOUNT_ANCHOR_PREFIX, h.finalize())
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{KEYCHAIN_ACCOUNT_ANCHOR_PREFIX}{digest}")
 }
 
 /// Read the per-account anchor (survives sign-out). `None` when this account has never been
@@ -6893,6 +6896,30 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anchor_account_name_is_lowercase_sha256_hex() {
+        // sha256("https://relay.example.com\0alice@example.com"), lowercase hex, 64 chars.
+        let expected =
+            "account-anchor-v1:e7fa988bb460213ac1e338eaf4989e8f5629b6cfaedcee98cc83e0508954bea2";
+        assert_eq!(
+            super::anchor_account_name("https://relay.example.com", "alice@example.com"),
+            expected
+        );
+        assert_eq!(
+            super::anchor_account_name("HTTPS://Relay.Example.com/", "Alice@Example.com"),
+            expected
+        );
+    }
+
+    #[test]
+    fn cred_blob_round_trips_and_ignores_odd_trailing_byte() {
+        let blob = super::cred_encode_blob("héllo");
+        assert_eq!(super::cred_decode_blob(&blob), "héllo");
+        let mut odd = blob.clone();
+        odd.push(0x41);
+        assert_eq!(super::cred_decode_blob(&odd), "héllo");
+    }
+
     use super::*;
 
     #[test]
