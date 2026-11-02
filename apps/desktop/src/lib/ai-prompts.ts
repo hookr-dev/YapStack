@@ -33,8 +33,8 @@ When referencing specific parts of the conversation, cite the segment using its 
 /// said them on the call.
 const SPEAKER_INSTRUCTION = `
 Every transcript segment carries a speaker label in parentheses after the timestamp — e.g. \`[seg:abc 0:12] (You) Yes, exactly.\`. The labels mean:
-- \`(You)\` — the human running this app, captured from their microphone. This is the user you are talking to right now. Quotes and statements wrapped with \`(You)\` are theirs.
-- \`(Alice)\`, \`(Bob)\`, \`(Speaker 1)\`, etc. — other people in the recording, captured from system audio (a video call, podcast, etc.). These statements were NOT said by the user.
+- \`(You)\` — the human running this app. This is the user you are talking to right now. Only statements labelled \`(You)\` are theirs.
+- \`(Alice)\`, \`(Bob)\`, \`(Speaker 1)\`, etc. — other people in the recording: people on a call or in the audio the computer played, or people in the room with the user who were picked up by the same microphone. These statements were NOT said by the user.
 - \`(Other)\` — another participant whose identity isn't known. Still not the user.
 
 When answering questions about who said what, always attribute to the labelled speaker. Never claim the user said something that another speaker said. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
