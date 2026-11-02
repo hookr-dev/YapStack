@@ -1,6 +1,6 @@
 # 0004. Cross-platform rollout: Windows first, Linux deferred
 
-- **Status**: Accepted
+- **Status**: Superseded in part by [0005](0005-parakeet-only.md)
 - **Date**: 2026-07-01
 
 ## Context
