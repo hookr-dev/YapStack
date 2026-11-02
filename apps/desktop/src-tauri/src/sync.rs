@@ -534,11 +534,13 @@ fn cred_encode_blob(value: &str) -> Vec<u8> {
 }
 
 /// Decode a keyring credential blob (little-endian UTF-16) back to a `String`. Trailing odd
-/// byte (should never occur for a keyring-written blob) is ignored via `chunks_exact`.
+/// byte (should never occur for a keyring-written blob) is ignored via `as_chunks`.
 fn cred_decode_blob(bytes: &[u8]) -> String {
     let u16s: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&u16s)
 }
@@ -1190,7 +1192,8 @@ fn anchor_account_name(server_url: &str, email: &str) -> String {
     h.update(base_url(server_url).as_bytes());
     h.update([0u8]); // domain separator between the two fields
     h.update(email.to_ascii_lowercase().as_bytes());
-    format!("{}{:x}", KEYCHAIN_ACCOUNT_ANCHOR_PREFIX, h.finalize())
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{KEYCHAIN_ACCOUNT_ANCHOR_PREFIX}{digest}")
 }
 
 /// Read the per-account anchor (survives sign-out). `None` when this account has never been
@@ -1571,6 +1574,8 @@ fn clear_session() -> Result<(), String> {
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
@@ -1664,6 +1669,38 @@ pub struct SyncStatusDto {
     /// tokens are dying (refresh family revoked, writes refused); the page tells the user
     /// to sign out and, if they want it back, sign in again to be re-approved.
     removed: bool,
+    /// ADR 0006 §5: a sync capability notice for lane status, or `None`.
+    capability_notice: Option<SyncCapabilityNoticeDto>,
+    /// ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
+    /// at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
+    version_advisory: Option<VersionAdvisory>,
+}
+
+/// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SyncCapabilityNoticeDto {
+    /// The relay refused this device's pull: the workspace floor is above this build's
+    /// level. Only an app update clears it.
+    UpdateRequired,
+    /// Another device asked for a level this build doesn't have. A nudge, not a block.
+    AnotherDeviceNeedsUpdate,
+    /// This device's push is held behind a change that needs a higher floor, and the relay
+    /// named the devices that must update (or be removed) first.
+    WaitingForDevices { blockers: Vec<CapabilityBlockerDto> },
+}
+
+/// One device holding up a floor raise, as lane status shows it.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityBlockerDto {
+    label: Option<String>,
+    platform: Option<String>,
+    /// RFC 3339 time of the device's last recorded pull.
+    last_seen: String,
+    /// The roster fingerprint, so the panel can offer the existing Remove; `None` when the
+    /// device isn't in the current roster.
+    fingerprint: Option<String>,
 }
 
 // ----- Typed relay connection probe (T025) -----
@@ -1702,7 +1739,7 @@ pub struct RelayProbeOk {
 
 /// Advisory that this client is behind the relay's published minimum (mirrors
 /// `RelayVersionAdvisory` in `lib/sync.ts`). Rides on probe SUCCESS, never a failure.
-#[derive(Debug, Serialize, specta::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionAdvisory {
     /// Minimum client version the relay publishes.
@@ -3346,6 +3383,192 @@ struct DrainProgress {
 /// never synced".
 static DRAIN_PROGRESS: PubCell<DrainProgress> = PubCell::new();
 
+// ----- Sync capability notice (ADR 0006 §5) -----
+
+/// The drain's latest sync capability state, published each cycle for lane status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum CapabilityNotice {
+    #[default]
+    None,
+    UpdateRequired,
+    AnotherDeviceNeedsUpdate,
+    WaitingFor(Vec<yapstack_common::sync::CapabilityBlocker>),
+}
+
+static CAPABILITY_NOTICE: PubCell<CapabilityNotice> = PubCell::new();
+
+/// The drain's latest version advisory (ADR 0006 §5.9), published for lane status.
+static VERSION_ADVISORY: PubCell<Option<VersionAdvisory>> = PubCell::new();
+
+/// The notice a drain starts with, from the levels persisted by earlier runs: the nudge
+/// survives a restart while the relay is unreachable. Refusals and holds are not seeded;
+/// they come back from the first cycle that meets them.
+fn seeded_capability_notice(
+    persisted: Option<yapstack_common::sync::SyncCapabilityLevels>,
+    own_level: i32,
+) -> CapabilityNotice {
+    match persisted {
+        Some(l) if l.requested_sync_capability > own_level => {
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        }
+        _ => CapabilityNotice::None,
+    }
+}
+
+/// The relay `min_client_version` to keep after one refresh: a fetched value (or its
+/// absence) replaces the last-seen one; a failed fetch keeps it.
+fn refreshed_min_client_version(
+    fetched: Result<Option<String>, String>,
+    last_seen: Option<String>,
+) -> Option<String> {
+    fetched.unwrap_or(last_seen)
+}
+
+/// Apply one advisory fetch result: keep, replace or clear the last-seen minimum, and
+/// persist the change (a clear included) so a restart sees the same value.
+fn apply_min_client_version(
+    conn: &rusqlite::Connection,
+    workspace: Uuid,
+    last_seen: &mut Option<String>,
+    fetched: Result<Option<String>, String>,
+) {
+    let refreshed = refreshed_min_client_version(fetched, last_seen.clone());
+    if refreshed == *last_seen {
+        return;
+    }
+    let persisted = match refreshed.as_deref() {
+        Some(min) => yapstack_sync::state::set_relay_min_client_version(conn, workspace, min),
+        None => yapstack_sync::state::clear_relay_min_client_version(conn, workspace),
+    };
+    if let Err(e) = persisted {
+        tracing::warn!("sync drain: could not persist the relay's minimum version: {e}");
+    }
+    *last_seen = refreshed;
+}
+
+/// How often the drain re-reads the relay's `min_client_version` when nothing changes.
+const ADVISORY_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// When the drain should re-read the relay's `min_client_version`: on the first cycle,
+/// whenever the relay's reachability flips (lost, or reconnected), and otherwise at most
+/// every [`ADVISORY_REFRESH_INTERVAL`]. SSE wakes and local-write kicks run extra cycles;
+/// none of them refetch.
+#[derive(Debug, Default)]
+struct AdvisoryThrottle {
+    last_fetch: Option<Instant>,
+    last_reachable: Option<bool>,
+}
+
+impl AdvisoryThrottle {
+    fn should_fetch(&mut self, now: Instant, reachable: bool) -> bool {
+        let transition = self.last_reachable.is_some_and(|r| r != reachable);
+        self.last_reachable = Some(reachable);
+        let due = self
+            .last_fetch
+            .is_none_or(|t| now.duration_since(t) >= ADVISORY_REFRESH_INTERVAL);
+        if due || transition {
+            self.last_fetch = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The drain's non-blocking advisory refresh. A fetch is spawned on the drain's own
+/// runtime and only makes progress while the drain is already awaiting (a drain cycle or
+/// its idle wait), so a slow relay never delays the cycle, the first-cycle latch or the
+/// stop check. One fetch at a time, on the transport's shared client.
+struct AdvisoryRefresher {
+    client: reqwest::Client,
+    server_url: String,
+    throttle: AdvisoryThrottle,
+    in_flight: Option<tokio::task::JoinHandle<Result<Option<String>, String>>>,
+}
+
+impl AdvisoryRefresher {
+    fn new(client: reqwest::Client, server_url: String) -> Self {
+        Self {
+            client,
+            server_url,
+            throttle: AdvisoryThrottle::default(),
+            in_flight: None,
+        }
+    }
+
+    /// Hand over a finished fetch, if any, and start the next one when it's due. Never
+    /// waits on the network.
+    fn tick(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        now: Instant,
+        reachable: bool,
+    ) -> Option<Result<Option<String>, String>> {
+        let mut done = None;
+        if self.in_flight.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.in_flight.take() {
+                // Already finished, so this returns at once.
+                done = Some(rt.block_on(h).unwrap_or_else(|e| Err(e.to_string())));
+            }
+        }
+        if self.in_flight.is_none() && self.throttle.should_fetch(now, reachable) {
+            self.in_flight = Some(rt.spawn(fetch_min_client_version(
+                self.client.clone(),
+                self.server_url.clone(),
+            )));
+        }
+        done
+    }
+}
+
+fn advisory_for(app_version: &str, min_client_version: Option<&str>) -> Option<VersionAdvisory> {
+    min_client_version.and_then(|min| compute_version_advisory(app_version, min))
+}
+
+/// The error lane status shows for a cycle. A capability refusal the notice already shows
+/// (a held push, a refused pull) is skipped so it isn't repeated as "Connection problem",
+/// but the other direction's error is never hidden behind it.
+fn reportable_error(report: &outbox::DrainReport) -> Option<&yapstack_sync::SyncError> {
+    use yapstack_sync::SyncError;
+    let push = report
+        .push_error
+        .as_ref()
+        .filter(|e| !matches!(e, SyncError::CapabilityBlocked { .. }));
+    let pull = report
+        .pull_error
+        .as_ref()
+        .filter(|e| !matches!(e, SyncError::UpdateRequired { .. }));
+    push.or(pull)
+}
+
+/// Fold one drain cycle into the capability notice. A refused pull wins (nothing syncs in
+/// until the app updates), then a held push (names the blockers), then the nudge when the
+/// relay's `requested` level is above this build's. A cycle whose pull returned nothing
+/// (e.g. the relay was unreachable) keeps the previous nudge rather than flickering it.
+fn capability_notice(
+    report: &outbox::DrainReport,
+    previous: CapabilityNotice,
+    own_level: i32,
+) -> CapabilityNotice {
+    use yapstack_sync::SyncError;
+    if matches!(report.pull_error, Some(SyncError::UpdateRequired { .. })) {
+        return CapabilityNotice::UpdateRequired;
+    }
+    if let Some(SyncError::CapabilityBlocked { blockers, .. }) = &report.push_error {
+        return CapabilityNotice::WaitingFor(blockers.clone());
+    }
+    match report.relay_capability {
+        Some(l) if l.requested_sync_capability > own_level => {
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        }
+        Some(_) => CapabilityNotice::None,
+        None => match previous {
+            CapabilityNotice::AnotherDeviceNeedsUpdate => previous,
+            _ => CapabilityNotice::None,
+        },
+    }
+}
+
 // ----- Audio upload lane status (S2) -----
 //
 // The audio uploader runs on its OWN thread (independent of the changeset drain — a
@@ -3695,6 +3918,8 @@ fn spawn_drain(
     // progress slate (session ack count resets; no stale backlog shown, T024).
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
@@ -3804,7 +4029,21 @@ fn spawn_drain(
             // proactively so the first cycle doesn't have to eat a 401 first. Staleness is
             // only a scheduling hint (unverified `exp`).
             let stale = access_token_stale(&bearer, 60);
+            let info_url = server_url.clone();
             let transport = HttpTransport::new(server_url, bearer);
+            let mut advisory = AdvisoryRefresher::new(transport.http_client(), info_url);
+            // ADR 0006 §5: start from what earlier runs persisted for this workspace, so the
+            // nudge and the version advisory show even before the relay answers.
+            CAPABILITY_NOTICE.set_if_changed(seeded_capability_notice(
+                yapstack_sync::state::relay_capability(conn, tenant_id).unwrap_or(None),
+                yapstack_sync::SYNC_CAPABILITY_LEVEL,
+            ));
+            let mut last_min_client_version =
+                yapstack_sync::state::relay_min_client_version(conn, tenant_id).unwrap_or(None);
+            VERSION_ADVISORY.set_if_changed(advisory_for(
+                env!("CARGO_PKG_VERSION"),
+                last_min_client_version.as_deref(),
+            ));
             if stale {
                 match rt.block_on(refresh_access_token()) {
                     Ok(new_access) => transport.set_bearer(&new_access),
@@ -3906,8 +4145,8 @@ fn spawn_drain(
             // Set whenever a cycle merged work; consumed by the next CLEAN (fully-drained) cycle
             // so deterministic maintenance still runs when the merge and the drained-to-tip cycle
             // fall apart (a pull that failed mid-backlog advances the watermark but returns an
-            // error). In-memory: on restart the first inbound merge re-arms it.
-            let mut maintenance_pending = false;
+            // error). In-memory, so it starts armed: a skip recorded before a restart is lost.
+            let mut maintenance = MaintenanceSchedule::at_startup();
 
             // Seed the SSE lane's watermark gate with our starting local pull position so an
             // early wake for an already-merged seq is skipped (deliverable 1).
@@ -4035,17 +4274,19 @@ fn spawn_drain(
                 // the wrong winner and permanently tombstone a genuine row. So only run on a CLEAN,
                 // fully-drained pull (`pull_error.is_none()` — the same drained-to-tip signal
                 // `drain_once` uses), where every column's latest edit up to the tip is present.
-                if maintenance_ready(
-                    report.applied + report.replayed > 0,
-                    report.pull_error.is_none(),
-                    &mut maintenance_pending,
-                ) {
-                    if let Err(e) = cascade::cascade_gc(conn) {
-                        tracing::warn!("sync drain: cascade_gc: {e}");
+                // FP1: also held while stashed rows fail to replay (a later value may be
+                // stuck behind an earlier one), and rerun once a table it skipped appears.
+                if maintenance.due(&report, || schema::crr_sync_tables(conn).ok()) {
+                    let mut skipped = 0usize;
+                    match cascade::cascade_gc(conn) {
+                        Ok(s) => skipped += s.skipped,
+                        Err(e) => tracing::warn!("sync drain: cascade_gc: {e}"),
                     }
-                    if let Err(e) = uniqueness::enforce_uniqueness(conn) {
-                        tracing::warn!("sync drain: enforce_uniqueness: {e}");
+                    match uniqueness::enforce_uniqueness(conn) {
+                        Ok(s) => skipped += s.skipped,
+                        Err(e) => tracing::warn!("sync drain: enforce_uniqueness: {e}"),
                     }
+                    maintenance.ran(skipped, schema::crr_sync_tables(conn).ok());
                 }
 
                 // Item 3 (R6): pull-side observability. The push transitions log above; before
@@ -4054,10 +4295,13 @@ fn spawn_drain(
                 // — never per idle cycle, counts only, no row content or secrets.
                 if report.applied > 0 || report.quarantined > 0 || report.replayed > 0 {
                     tracing::info!(
-                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed)",
+                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed; \
+                         {} waiting for an app update, {} failed to apply)",
                         report.applied,
                         report.quarantined,
-                        report.replayed
+                        report.replayed,
+                        report.replay_waiting,
+                        report.replay_failed
                     );
                 }
 
@@ -4072,10 +4316,44 @@ fn spawn_drain(
                     }
                 }
 
+                // ADR 0006 §5: the capability notice for lane status (update required, held
+                // push with its blockers, or the "another device needs you to update" nudge),
+                // and the levels persisted per workspace for UX (never for authorization).
+                CAPABILITY_NOTICE.set_if_changed(capability_notice(
+                    &report,
+                    CAPABILITY_NOTICE.get(),
+                    yapstack_sync::SYNC_CAPABILITY_LEVEL,
+                ));
+                if let Some(levels) = report.relay_capability {
+                    if let Err(e) =
+                        yapstack_sync::state::record_relay_capability(conn, tenant_id, levels)
+                    {
+                        tracing::warn!("sync drain: could not persist the relay floor: {e}");
+                    }
+                }
+                // ADR 0006 §5.9: refresh the version advisory on the first cycle, on a
+                // reachability flip, and otherwise every 15 min, without ever waiting on it;
+                // keep the last-seen minimum while the relay is unreachable.
+                let reachable = !report
+                    .first_transport_error()
+                    .is_some_and(yapstack_sync::SyncError::is_network);
+                if let Some(fetched) = advisory.tick(&rt, Instant::now(), reachable) {
+                    apply_min_client_version(
+                        conn,
+                        tenant_id,
+                        &mut last_min_client_version,
+                        fetched,
+                    );
+                }
+                VERSION_ADVISORY.set_if_changed(advisory_for(
+                    env!("CARGO_PKG_VERSION"),
+                    last_min_client_version.as_deref(),
+                ));
+
                 // F2: surface the tolerated push/pull transport errors via the existing
                 // DrainHealth channel — before this the owner had ZERO feedback while a push or
                 // pull silently failed every cycle.
-                match report.first_transport_error() {
+                match reportable_error(&report) {
                     // Bug B4: a guaranteed-413 entry too large to push as a single request. Its
                     // own sticky Blocked state (not a transient flap), surfaced ONCE — the push
                     // guard already blocked the HTTP call, so no 5s hot-loop.
@@ -4111,9 +4389,17 @@ fn spawn_drain(
                         }
                     }
                     // A fully clean cycle — clear the run and any prior failing/blocked state.
+                    // A clean relay cycle still isn't healthy while stashed peer changes keep
+                    // failing to apply (FP1): that is a possible corruption signal, distinct from
+                    // rows merely waiting for an app update, which stay Ok.
                     None => {
                         fail_surface_step(&mut consecutive_errors, false);
-                        DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+                        let health = replay_health(report.replay_failed);
+                        if DRAIN_HEALTH.set_if_changed(health.clone()) {
+                            if let DrainHealth::Failing(msg) = &health {
+                                tracing::warn!("sync drain: {msg}");
+                            }
+                        }
                     }
                 }
 
@@ -4674,6 +4960,66 @@ fn sign_roster_for_upload(
     Ok((device_list_value, B64.encode(signature), roster_fp))
 }
 
+/// Drain health for a cycle with no relay error, given the stashed rows that failed to apply
+/// (or are held behind one) in this cycle's replay.
+fn replay_health(replay_failed: usize) -> DrainHealth {
+    if replay_failed == 0 {
+        return DrainHealth::Ok;
+    }
+    DrainHealth::Failing(format!(
+        "{replay_failed} change(s) from another device couldn't be applied and are held on this \
+         device. Other changes keep syncing. This can mean the data is damaged."
+    ))
+}
+
+/// When deterministic maintenance runs, across drain cycles.
+#[derive(Debug, Default)]
+struct MaintenanceSchedule {
+    /// A merge or replay happened that a clean cycle hasn't maintained yet.
+    pending: bool,
+    /// Set when the last run skipped passes for tables that weren't CRRs: the CRR'd sync
+    /// tables it saw. A change to that set reruns maintenance even on an idle cycle.
+    skipped_at: Option<Vec<&'static str>>,
+}
+
+impl MaintenanceSchedule {
+    /// The schedule a drain starts with: one pass armed. The schedule is in memory, so a skip
+    /// recorded before a restart is gone; arming once covers a table that appeared meanwhile.
+    /// It still waits for a clean cycle with no failing replay rows, like any other pass.
+    fn at_startup() -> Self {
+        Self {
+            pending: true,
+            skipped_at: None,
+        }
+    }
+
+    /// Whether maintenance runs after this cycle. Held while the pull failed or stashed rows
+    /// failed to replay: a column's newer value may be stuck behind an older one that already
+    /// landed, and a dedup on the stale value could tombstone the real winner. `crr_now` is
+    /// called only when the last run skipped something.
+    fn due(
+        &mut self,
+        report: &outbox::DrainReport,
+        crr_now: impl FnOnce() -> Option<Vec<&'static str>>,
+    ) -> bool {
+        let readiness_changed = self
+            .skipped_at
+            .as_ref()
+            .is_some_and(|prev| crr_now().is_some_and(|now| &now != prev));
+        maintenance_ready(
+            report.applied + report.replayed > 0 || readiness_changed,
+            report.pull_error.is_none() && report.replay_failed == 0,
+            &mut self.pending,
+        )
+    }
+
+    /// Record a run: `skipped` passes were skipped for tables that weren't CRRs, against the
+    /// CRR set `crr_now`.
+    fn ran(&mut self, skipped: usize, crr_now: Option<Vec<&'static str>>) {
+        self.skipped_at = if skipped > 0 { crr_now } else { None };
+    }
+}
+
 /// Whether deterministic maintenance (`cascade_gc` / `enforce_uniqueness`) may run this drain
 /// cycle. It runs ONLY on a clean, fully-drained pull (`pull_error_none`): the proven-guards make
 /// it safe against synthetic-default partial rows, but a proven-but-STALE editable LWW winner read
@@ -4970,6 +5316,8 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
     let mut roster = Vec::new();
     let mut last_error = None;
     let mut removed = false;
+    let mut fingerprints: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::new();
     match http_get_devices(session).await {
         Ok(devs) => {
             for d in devs.devices {
@@ -4982,8 +5330,10 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
                     continue;
                 }
                 let pk = B64.decode(d.ed25519_pub.as_bytes()).unwrap_or_default();
+                let fingerprint = sha256_fingerprint(&pk);
+                fingerprints.insert(d.client_id, fingerprint.clone());
                 roster.push(DeviceRosterEntryDto {
-                    fingerprint: sha256_fingerprint(&pk),
+                    fingerprint,
                     is_self: d.client_id == session.client_id,
                     pending: d.status == "pending",
                     label: if d.label.is_empty() {
@@ -5066,6 +5416,35 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         audio_uploaded_total: audio.uploaded_total,
         audio_backfill_complete: audio.backfill_complete,
         removed,
+        capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
+        version_advisory: VERSION_ADVISORY.get(),
+    }
+}
+
+fn capability_notice_dto(
+    notice: CapabilityNotice,
+    fingerprints: &std::collections::HashMap<Uuid, String>,
+) -> Option<SyncCapabilityNoticeDto> {
+    let non_empty = |s: String| if s.is_empty() { None } else { Some(s) };
+    match notice {
+        CapabilityNotice::None => None,
+        CapabilityNotice::UpdateRequired => Some(SyncCapabilityNoticeDto::UpdateRequired),
+        CapabilityNotice::AnotherDeviceNeedsUpdate => {
+            Some(SyncCapabilityNoticeDto::AnotherDeviceNeedsUpdate)
+        }
+        CapabilityNotice::WaitingFor(blockers) => {
+            Some(SyncCapabilityNoticeDto::WaitingForDevices {
+                blockers: blockers
+                    .into_iter()
+                    .map(|b| CapabilityBlockerDto {
+                        fingerprint: fingerprints.get(&b.client_id).cloned(),
+                        label: non_empty(b.label),
+                        platform: non_empty(b.platform),
+                        last_seen: b.capability_seen_at,
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 
@@ -5084,40 +5463,68 @@ fn normalize_relay_url(input: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
-/// Parse the `major.minor.patch` release core from a semver-ish string, tolerating a
-/// missing minor/patch. A pre-release tag (`-…`) and build metadata (`+…`) are ignored (see
-/// the POLICY on `client_is_older`). Returns `None` on a non-numeric core so an unparseable
-/// value yields NO advisory rather than a fake one.
-fn parse_semver_core(v: &str) -> Option<(u64, u64, u64)> {
-    let core = v.split('+').next().unwrap_or(v);
-    let core = core.split_once('-').map_or(core, |(c, _)| c);
+/// A parsed semver-ish version: the `major.minor.patch` core (missing minor/patch read as 0)
+/// plus the dot-separated pre-release identifiers. Build metadata (`+…`) is dropped, as
+/// semver precedence ignores it. `None` on a non-numeric core, so an unparseable value
+/// yields NO advisory rather than a fake one.
+fn parse_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
+    let v = v.trim();
+    let v = v.split('+').next().unwrap_or(v);
+    let (core, pre) = v.split_once('-').map_or((v, ""), |(c, p)| (c, p));
     let mut parts = core.split('.');
     let major = parts.next()?.trim().parse().ok()?;
     let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
     let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((major, minor, patch))
+    let pre = if pre.is_empty() {
+        Vec::new()
+    } else {
+        pre.split('.').map(str::to_owned).collect()
+    };
+    Some(((major, minor, patch), pre))
+}
+
+/// Semver 2.0.0 §11 precedence of two pre-release identifier lists. An empty list (a
+/// release) ranks above any pre-release of the same core.
+fn cmp_prerelease(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    for (x, y) in a.iter().zip(b) {
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(n), Ok(m)) => n.cmp(&m),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// True when `app_version` is strictly older than the relay's published
-/// `min_client_version` (→ "update this app"). Unparseable inputs → `false` (no advisory);
-/// we never manufacture an advisory from garbage.
+/// `min_client_version` (→ "update this app"), by semver precedence. Unparseable inputs →
+/// `false` (no advisory); we never manufacture an advisory from garbage.
 ///
-/// POLICY (T029 Bug B): compare RELEASE CORES ONLY — a pre-release of `X.Y.Z` SATISFIES a
-/// minimum of `X.Y.Z` and is NOT flagged. Rationale: the advisory exists solely to nag
-/// genuinely outdated clients, and the relay publishes a single release-shaped minimum — it
-/// cannot meaningfully express a prerelease floor (a server that wanted to bar
-/// `1.0.0-alpha.11` but allow `1.0.0-alpha.12` has no way to say so). Treating our own
-/// in-development `1.0.0-alpha.12` as "older than 1.0.0" produced a false "update YapStack"
-/// nag against the relay's own advertised `1.0.0` during Windows UAT; comparing cores only
-/// fixes that without ever hiding a real major/minor/patch gap.
+/// Prerelease-aware (ADR 0006 §5.9): `1.0.0-alpha.11 < 1.0.0-alpha.12 < 1.0.0`. This
+/// replaces the T029 cores-only compare, under which every alpha compared equal and the
+/// relay couldn't express "at least alpha.12". The relay's default floor is a prerelease
+/// (`1.0.0-alpha.0`), so alpha builds aren't nagged by a relay left at its default.
 fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
-    let (Some(a), Some(m)) = (
-        parse_semver_core(app_version),
-        parse_semver_core(min_client_version),
-    ) else {
+    let (Some((a_core, a_pre)), Some((m_core, m_pre))) =
+        (parse_semver(app_version), parse_semver(min_client_version))
+    else {
         return false;
     };
-    a < m
+    a_core
+        .cmp(&m_core)
+        .then_with(|| cmp_prerelease(&a_pre, &m_pre))
+        .is_lt()
 }
 
 /// Build the version advisory when this client is behind the relay's minimum. Advisory
@@ -5272,6 +5679,25 @@ async fn probe_relay(
     })
 }
 
+/// The relay's published `min_client_version` (`GET /sync/info`), for the per-cycle
+/// advisory refresh. `Ok(None)` when the relay publishes none; `Err` when it can't be read.
+async fn fetch_min_client_version(
+    client: reqwest::Client,
+    server_url: String,
+) -> Result<Option<String>, String> {
+    let endpoint = format!("{}/sync/info", normalize_relay_url(&server_url));
+    let resp = client
+        .get(&endpoint)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let body: RelayProbeBody = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body.min_client_version)
+}
+
 /// The LIVE `yapstack.db` path from managed state — the one DB every sync command touches
 /// (post-A3 the live DB *is* the CRR database).
 fn live_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -5341,6 +5767,8 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             audio_uploaded_total: 0,
             audio_backfill_complete: false,
             removed: false,
+            capability_notice: None,
+            version_advisory: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -5602,6 +6030,8 @@ pub async fn sync_disable(runtime: State<'_, SyncRuntimeState>) -> Result<SyncSt
     // backlog or health from the drain that just stopped.
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     let session = update_session(|s| s.sync_enabled = false)?;
     Ok(build_status_dto(&session).await)
@@ -6893,6 +7323,30 @@ pub async fn sync_approve_device(fingerprint: String) -> Result<SyncStatusDto, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anchor_account_name_is_lowercase_sha256_hex() {
+        // sha256("https://relay.example.com\0alice@example.com"), lowercase hex, 64 chars.
+        let expected =
+            "account-anchor-v1:e7fa988bb460213ac1e338eaf4989e8f5629b6cfaedcee98cc83e0508954bea2";
+        assert_eq!(
+            super::anchor_account_name("https://relay.example.com", "alice@example.com"),
+            expected
+        );
+        assert_eq!(
+            super::anchor_account_name("HTTPS://Relay.Example.com/", "Alice@Example.com"),
+            expected
+        );
+    }
+
+    #[test]
+    fn cred_blob_round_trips_and_ignores_odd_trailing_byte() {
+        let blob = super::cred_encode_blob("héllo");
+        assert_eq!(super::cred_decode_blob(&blob), "héllo");
+        let mut odd = blob.clone();
+        odd.push(0x41);
+        assert_eq!(super::cred_decode_blob(&odd), "héllo");
+    }
+
     use super::*;
 
     #[test]
@@ -6932,6 +7386,252 @@ mod tests {
             "a merge of peer rows carries the counts to the frontend"
         );
         assert_eq!(SYNC_APPLIED_EVENT, "sync://applied");
+    }
+
+    #[test]
+    fn a_capability_hold_never_hides_the_other_directions_error() {
+        use yapstack_sync::SyncError;
+        let blocked = || SyncError::CapabilityBlocked {
+            level: 1,
+            blockers: vec![],
+        };
+        let update = || SyncError::UpdateRequired {
+            level: 1,
+            required: 2,
+            requested: 2,
+        };
+        // Push held by the capability gate, pull failing for an unrelated reason: the pull
+        // error is what lane status must show.
+        let r = outbox::DrainReport {
+            push_error: Some(blocked()),
+            pull_error: Some(SyncError::Transport("HTTP 403 forbidden".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            reportable_error(&r).unwrap().to_string(),
+            "transport error: HTTP 403 forbidden"
+        );
+        // Pull refused for an update, push hitting a quota: the push error still shows.
+        let r = outbox::DrainReport {
+            push_error: Some(SyncError::Transport("quota exceeded".into())),
+            pull_error: Some(update()),
+            ..Default::default()
+        };
+        assert_eq!(
+            reportable_error(&r).unwrap().to_string(),
+            "transport error: quota exceeded"
+        );
+        // Only capability errors: nothing generic to show; the notice covers both.
+        let r = outbox::DrainReport {
+            push_error: Some(blocked()),
+            pull_error: Some(update()),
+            ..Default::default()
+        };
+        assert!(reportable_error(&r).is_none());
+    }
+
+    #[test]
+    fn advisory_refresh_is_throttled_across_a_burst_of_wakes() {
+        let t0 = Instant::now();
+        let mut throttle = AdvisoryThrottle::default();
+        assert!(throttle.should_fetch(t0, true), "the first cycle fetches");
+        // A burst of SSE wakes and local-write kicks: no further fetch.
+        for i in 1..200u64 {
+            assert!(
+                !throttle.should_fetch(t0 + Duration::from_millis(i * 50), true),
+                "wake {i} must not refetch"
+            );
+        }
+        // Losing and regaining the relay is a transition: refetch once on each.
+        assert!(throttle.should_fetch(t0 + Duration::from_secs(20), false));
+        assert!(!throttle.should_fetch(t0 + Duration::from_secs(25), false));
+        assert!(
+            throttle.should_fetch(t0 + Duration::from_secs(30), true),
+            "reconnect"
+        );
+        assert!(!throttle.should_fetch(t0 + Duration::from_secs(35), true));
+        // Otherwise at most every ADVISORY_REFRESH_INTERVAL.
+        assert!(!throttle.should_fetch(t0 + ADVISORY_REFRESH_INTERVAL, true));
+        assert!(throttle.should_fetch(
+            t0 + Duration::from_secs(30) + ADVISORY_REFRESH_INTERVAL,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_slow_relay_never_blocks_the_drain_cycle() {
+        // A relay that accepts the connection and never answers. Starting the refresh must
+        // return at once (the fetch runs on the drain runtime only while the drain is already
+        // waiting), so the first-cycle latch and the stop check are never delayed by it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let conn = listener.accept();
+            std::thread::sleep(Duration::from_millis(500));
+            drop(conn);
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut refresher =
+            AdvisoryRefresher::new(reqwest::Client::new(), format!("http://{addr}"));
+        let t = Instant::now();
+        assert!(
+            refresher.tick(&rt, Instant::now(), true).is_none(),
+            "nothing finished yet"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "starting the refresh must not wait on the relay ({:?})",
+            t.elapsed()
+        );
+        // Still in flight: the next cycle neither waits nor starts a second fetch.
+        let t = Instant::now();
+        assert!(refresher.tick(&rt, Instant::now(), true).is_none());
+        assert!(t.elapsed() < Duration::from_millis(100));
+        // Once the drain's idle wait drives the runtime, the fetch resolves (here as an error,
+        // the relay hung up) and the next tick hands it over.
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(800)).await });
+        assert!(matches!(
+            refresher.tick(&rt, Instant::now(), true),
+            Some(Err(_))
+        ));
+        hold.join().unwrap();
+    }
+
+    #[test]
+    fn a_cleared_advisory_minimum_stays_cleared_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ys-adv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.db");
+        let ws = Uuid::from_u128(5);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut last = None;
+            apply_min_client_version(&conn, ws, &mut last, Ok(Some("1.0.0-alpha.12".into())));
+            assert_eq!(last.as_deref(), Some("1.0.0-alpha.12"));
+            // The relay stops publishing a minimum: cleared in memory AND on disk.
+            apply_min_client_version(&conn, ws, &mut last, Ok(None));
+            assert_eq!(last, None);
+            // A failed fetch changes nothing.
+            apply_min_client_version(&conn, ws, &mut last, Err("down".into()));
+            assert_eq!(last, None);
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            yapstack_sync::state::relay_min_client_version(&conn, ws).unwrap(),
+            None,
+            "the clear survives a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_levels_seed_the_nudge_at_drain_start() {
+        use yapstack_common::sync::SyncCapabilityLevels;
+        let l = |requested| SyncCapabilityLevels {
+            required_sync_capability: 0,
+            requested_sync_capability: requested,
+        };
+        assert_eq!(seeded_capability_notice(None, 1), CapabilityNotice::None);
+        assert_eq!(
+            seeded_capability_notice(Some(l(1)), 1),
+            CapabilityNotice::None
+        );
+        assert_eq!(
+            seeded_capability_notice(Some(l(2)), 1),
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        );
+    }
+
+    #[test]
+    fn advisory_refresh_keeps_the_last_seen_minimum_when_the_relay_is_unreachable() {
+        let last = Some("1.0.0-alpha.12".to_string());
+        assert_eq!(
+            refreshed_min_client_version(Ok(Some("1.0.0".into())), last.clone()),
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(
+            refreshed_min_client_version(Ok(None), last.clone()),
+            None,
+            "a relay that publishes no minimum clears it"
+        );
+        assert_eq!(
+            refreshed_min_client_version(Err("connection refused".into()), last.clone()),
+            last,
+            "an unreachable relay keeps the last-seen value"
+        );
+        assert!(advisory_for("1.0.0-alpha.11", last.as_deref()).is_some());
+        assert!(advisory_for("1.0.0-alpha.12", last.as_deref()).is_none());
+        assert!(advisory_for("1.0.0-alpha.11", None).is_none());
+    }
+
+    #[test]
+    fn capability_notice_ranks_refusal_then_held_push_then_nudge() {
+        use yapstack_common::sync::{CapabilityBlocker, SyncCapabilityLevels};
+        use yapstack_sync::SyncError;
+        let levels = |required, requested| {
+            Some(SyncCapabilityLevels {
+                required_sync_capability: required,
+                requested_sync_capability: requested,
+            })
+        };
+        let blocker = CapabilityBlocker {
+            client_id: Uuid::from_u128(9),
+            label: "old laptop".into(),
+            platform: "windows".into(),
+            sync_capability: 0,
+            capability_seen_at: "2026-10-30T00:00:00+00:00".into(),
+        };
+
+        // A refused pull wins over everything.
+        let r = outbox::DrainReport {
+            pull_error: Some(SyncError::UpdateRequired {
+                level: 1,
+                required: 2,
+                requested: 2,
+            }),
+            push_error: Some(SyncError::CapabilityBlocked {
+                level: 2,
+                blockers: vec![blocker.clone()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            capability_notice(&r, CapabilityNotice::None, 1),
+            CapabilityNotice::UpdateRequired
+        );
+
+        // A held push names its blockers; pull still ran.
+        let r = outbox::DrainReport {
+            push_error: Some(SyncError::CapabilityBlocked {
+                level: 2,
+                blockers: vec![blocker.clone()],
+            }),
+            relay_capability: levels(1, 2),
+            ..Default::default()
+        };
+        assert_eq!(
+            capability_notice(&r, CapabilityNotice::None, 1),
+            CapabilityNotice::WaitingFor(vec![blocker])
+        );
+
+        // Below `requested`: the nudge. It survives a cycle whose pull returned nothing,
+        // and clears once the relay reports nothing above this build.
+        let r = outbox::DrainReport {
+            relay_capability: levels(0, 2),
+            ..Default::default()
+        };
+        let nudge = capability_notice(&r, CapabilityNotice::None, 1);
+        assert_eq!(nudge, CapabilityNotice::AnotherDeviceNeedsUpdate);
+        let silent = outbox::DrainReport::default();
+        assert_eq!(capability_notice(&silent, nudge.clone(), 1), nudge);
+        let r = outbox::DrainReport {
+            relay_capability: levels(1, 1),
+            ..Default::default()
+        };
+        assert_eq!(capability_notice(&r, nudge, 1), CapabilityNotice::None);
     }
 
     #[test]
@@ -7158,6 +7858,8 @@ mod tests {
             platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         };
 
         let entries = build_roster_membership(&verified_prev, &[], &target).unwrap();
@@ -7179,6 +7881,8 @@ mod tests {
                 platform: String::new(),
                 status: "active".into(),
                 added_at: "2026-01-01T00:00:00Z".into(),
+                sync_capability: 0,
+                capability_seen_at: None,
             },
         )
         .unwrap();
@@ -7204,6 +7908,167 @@ mod tests {
         assert!(!maintenance_ready(false, true, &mut pending));
     }
 
+    /// FP1 P1b: a note's newer `updated_at` is stuck in the stash (its replay fails) while its
+    /// older one already landed. Dedup on that stale value would keep the wrong note and
+    /// tombstone the real winner, so maintenance waits until the replay recovers.
+    #[test]
+    fn maintenance_holds_while_stashed_rows_fail_and_runs_after_recovery() {
+        use yapstack_sync::change::read_local_changes_since;
+        use yapstack_sync::quarantine::{merge_changeset, replay_pending};
+        use yapstack_sync::CrsqlDb;
+        const NOTES: &str = "CREATE TABLE notes(id TEXT NOT NULL PRIMARY KEY, \
+            session_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', \
+            updated_at TEXT NOT NULL DEFAULT '');";
+        let crr = |db: &CrsqlDb| {
+            db.conn().execute_batch(NOTES).unwrap();
+            db.conn()
+                .query_row("SELECT crsql_as_crr('notes')", [], |_| Ok(()))
+                .unwrap();
+        };
+        let a = CrsqlDb::open_in_memory().unwrap();
+        crr(&a);
+        a.conn()
+            .execute_batch(
+                "INSERT INTO notes VALUES('na','s1','a','2026-01-02'); \
+                 INSERT INTO notes VALUES('nb','s1','b','2026-01-01');",
+            )
+            .unwrap();
+        let first = read_local_changes_since(a.conn(), 0).unwrap();
+        let v: i64 = a
+            .conn()
+            .query_row("SELECT crsql_db_version()", [], |r| r.get(0))
+            .unwrap();
+        a.conn()
+            .execute("UPDATE notes SET updated_at='2026-01-03' WHERE id='nb'", [])
+            .unwrap();
+        let newer = read_local_changes_since(a.conn(), v).unwrap();
+
+        // Both arrive while B lacks `notes`, so both wait; then B gains the table, and a
+        // trigger stands in for whatever makes the newer value fail to apply.
+        let b = CrsqlDb::open_in_memory().unwrap();
+        merge_changeset(b.conn(), &first).unwrap();
+        merge_changeset(b.conn(), &newer).unwrap();
+        crr(&b);
+        b.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_newer BEFORE UPDATE ON notes \
+                 WHEN NEW.updated_at = '2026-01-03' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        let cycle = |b: &CrsqlDb| {
+            let r = replay_pending(b.conn()).unwrap();
+            outbox::DrainReport {
+                replayed: r.replayed,
+                replay_failed: r.failed + r.blocked,
+                ..Default::default()
+            }
+        };
+        let mut schedule = MaintenanceSchedule::default();
+        let report = cycle(&b);
+        assert!(report.replayed > 0 && report.replay_failed > 0);
+        assert!(
+            !schedule.due(&report, || None),
+            "held while a replay row fails"
+        );
+        assert!(
+            !schedule.due(&cycle(&b), || None),
+            "still held on the next idle cycle"
+        );
+
+        b.conn().execute_batch("DROP TRIGGER fail_newer;").unwrap();
+        let report = cycle(&b);
+        assert_eq!(report.replay_failed, 0);
+        assert!(
+            schedule.due(&report, || None),
+            "runs once the replay recovers"
+        );
+        let stats = yapstack_sync::uniqueness::enforce_uniqueness(b.conn()).unwrap();
+        assert_eq!(stats.notes_removed, 1);
+        let kept: String = b
+            .conn()
+            .query_row("SELECT id FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "nb", "the note with the newest updated_at wins");
+    }
+
+    /// FP1 P2a: maintenance that skipped passes for a missing table reruns when that table
+    /// becomes a CRR, even on an idle cycle; it doesn't rerun while nothing changed.
+    #[test]
+    fn maintenance_reruns_when_a_skipped_table_appears_on_an_idle_cycle() {
+        let idle = outbox::DrainReport::default();
+        let merged = outbox::DrainReport {
+            applied: 1,
+            ..Default::default()
+        };
+        let mut schedule = MaintenanceSchedule::default();
+        assert!(schedule.due(&merged, || panic!("not consulted before a skipping run")));
+        schedule.ran(2, Some(vec!["sessions", "tags"]));
+        assert!(!schedule.due(&idle, || Some(vec!["sessions", "tags"])));
+        assert!(schedule.due(&idle, || Some(vec!["sessions", "tags", "session_tags"])));
+        schedule.ran(0, Some(vec!["sessions", "tags", "session_tags"]));
+        assert!(!schedule.due(&idle, || panic!("nothing skipped, nothing to watch")));
+    }
+
+    /// FP1 P2a: a skip recorded before a restart is lost with the in-memory schedule, so the
+    /// drain arms one pass at startup. Skip, restart, an idle first cycle runs it (recording
+    /// the skip again), then the table appearing on a later idle cycle reruns it.
+    #[test]
+    fn maintenance_runs_after_restart_then_again_when_the_table_appears() {
+        let idle = outbox::DrainReport::default();
+        let before = vec!["sessions", "tags"];
+        let after = vec!["sessions", "tags", "session_tags"];
+        let mut old = MaintenanceSchedule::at_startup();
+        assert!(old.due(&idle, || None));
+        old.ran(1, Some(before.clone()));
+        drop(old); // restart
+
+        let mut schedule = MaintenanceSchedule::at_startup();
+        assert!(
+            schedule.due(&idle, || Some(before.clone())),
+            "armed at startup"
+        );
+        schedule.ran(1, Some(before.clone()));
+        assert!(!schedule.due(&idle, || Some(before.clone())));
+        assert!(
+            schedule.due(&idle, || Some(after.clone())),
+            "table appeared while idle"
+        );
+
+        let failing = outbox::DrainReport {
+            replay_failed: 1,
+            ..Default::default()
+        };
+        let mut held = MaintenanceSchedule::at_startup();
+        assert!(
+            !held.due(&failing, || None),
+            "the startup pass still waits on failing rows"
+        );
+    }
+
+    /// FP1 P2b: stashed rows that keep failing make the drain unhealthy on every clean cycle,
+    /// with zero merges, while rows merely waiting for an app update don't.
+    #[test]
+    fn replay_failures_keep_health_failing_with_no_merges() {
+        assert_eq!(replay_health(0), DrainHealth::Ok);
+        for _ in 0..3 {
+            let idle_failing = outbox::DrainReport {
+                replay_failed: 2,
+                replay_waiting: 5,
+                ..Default::default()
+            };
+            assert!(idle_failing.first_transport_error().is_none());
+            match replay_health(idle_failing.replay_failed) {
+                DrainHealth::Failing(msg) => assert!(msg.starts_with("2 change(s)"), "{msg}"),
+                other => panic!("expected Failing, got {other:?}"),
+            }
+        }
+        let waiting_only = outbox::DrainReport {
+            replay_waiting: 5,
+            ..Default::default()
+        };
+        assert_eq!(replay_health(waiting_only.replay_failed), DrainHealth::Ok);
+    }
+
     #[test]
     fn build_roster_membership_hard_fails_on_member_pubkey_substitution() {
         // Finding #2 (f): if the relay reports a DIFFERENT ed25519_pub for an existing
@@ -7223,6 +8088,8 @@ mod tests {
             platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         };
         // Relay reports self with a SUBSTITUTED key.
         let get_devices = vec![DeviceInfo {
@@ -7232,6 +8099,8 @@ mod tests {
             platform: String::new(),
             status: "active".into(),
             added_at: "2026-01-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         }];
         let err = build_roster_membership(&verified_prev, &get_devices, &target).unwrap_err();
         assert!(err.contains("different ed25519_pub"), "got: {err}");
@@ -9311,11 +10180,31 @@ mod tests {
             // Equal or newer → no advisory (never "the server is behind").
             assert!(compute_version_advisory("1.0.0", "1.0.0").is_none());
             assert!(compute_version_advisory("1.2.0", "1.0.0").is_none());
-            // T029 Bug B policy: a pre-release of the required release SATISFIES the minimum
-            // (compare release cores only). The owner's own `1.0.0-alpha.12` build must NOT
-            // nag itself against the relay's advertised `1.0.0`.
-            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_none());
-            // A release is NOT older than its own pre-release (cores equal → satisfied).
+            // ADR 0006 §5.9: semver precedence, prerelease-aware. A pre-release is older than
+            // its release, so the relay's default floor is itself a prerelease
+            // (`1.0.0-alpha.0`) and the owner's alpha builds aren't nagged.
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0-alpha.0").is_none());
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_some());
+            assert!(client_is_older("1.0.0-alpha.11", "1.0.0-alpha.12"));
+            assert!(!client_is_older("1.0.0-alpha.12", "1.0.0-alpha.12"));
+            assert!(client_is_older("1.0.0-alpha.12", "1.0.0"));
+            assert!(
+                client_is_older("1.0.0-alpha.9", "1.0.0-alpha.10"),
+                "numeric identifiers"
+            );
+            assert!(
+                client_is_older("1.0.0-alpha", "1.0.0-alpha.1"),
+                "fewer fields is lower"
+            );
+            assert!(
+                client_is_older("1.0.0-alpha.1", "1.0.0-beta"),
+                "alphanumeric order"
+            );
+            assert!(
+                !client_is_older("1.0.0+build.5", "1.0.0"),
+                "build metadata is ignored"
+            );
+            // A release is NOT older than its own pre-release.
             assert!(compute_version_advisory("1.0.0", "1.0.0-alpha.1").is_none());
             // A genuinely older core is still flagged even when it carries a pre-release tag.
             assert!(compute_version_advisory("0.9.0-beta.1", "1.0.0").is_some());

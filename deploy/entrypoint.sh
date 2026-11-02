@@ -48,7 +48,7 @@ toml_escape() {
 
     printf '\n[sync]\n'
     printf 'protocol_version = 2\n'
-    printf 'min_client_version = "1.0.0"\n'
+    printf 'min_client_version = "1.0.0-alpha.0"\n'
     printf 'engine_version = "0.16.3"\n'
     # billing_url intentionally omitted: self-host advertises no control plane.
 

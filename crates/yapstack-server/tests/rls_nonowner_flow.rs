@@ -343,3 +343,157 @@ async fn serving_role_is_rls_subject() {
          pointing at a different workspace"
     );
 }
+
+// ============================================================================
+// ADR 0006 §5.5 — the sync capability floor row works as the non-owner role, and one
+// tenant can neither read nor raise another's floor.
+// ============================================================================
+
+async fn authed(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> axum::response::Response {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"));
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let body = body.map_or_else(Body::empty, |v| Body::from(v.to_string()));
+    app.clone().oneshot(b.body(body).unwrap()).await.unwrap()
+}
+
+/// Sign up a fresh account as the app role; returns `(access_token, tenant_id, client_id)`.
+async fn signup_tenant(app: &axum::Router) -> (String, uuid::Uuid, uuid::Uuid) {
+    let email = format!("cap-{}@example.com", uuid::Uuid::new_v4());
+    let salt_enc = [0x26u8; 16];
+    let auth_key = client_auth_key("capability floor pw", &salt_enc);
+    let body = signup_body(&email, &salt_enc, &auth_key);
+    let client_id: uuid::Uuid = body["device_list"]["client_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let resp = post(app, "/auth/signup", body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    (
+        v["access_token"].as_str().unwrap().to_string(),
+        v["tenant_id"].as_str().unwrap().parse().unwrap(),
+        client_id,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn sync_capability_floor_works_and_isolates_under_app_role() {
+    let owner = owner_pool().await;
+    let app_pool = app_role_pool().await;
+    let app = build_router(AppState::new(app_pool.clone(), test_config()));
+
+    let (tok_a, ws_a, dev_a) = signup_tenant(&app).await;
+    let (tok_b, ws_b, _) = signup_tenant(&app).await;
+    let level1 = [("x-yapstack-sync-capability", "1")];
+
+    // Bootstrap + FOR SHARE (pull), then FOR UPDATE + GREATEST (raise), then FOR SHARE ahead
+    // of tenant_seq (gated push): all as yapstack_app.
+    let resp = authed(&app, "GET", "/sync/pull?since=0", &tok_a, &level1, None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "pull bootstraps + locks the floor row"
+    );
+    let resp = authed(
+        &app,
+        "PUT",
+        "/sync/capability",
+        &tok_a,
+        &level1,
+        Some(json!({ "required_sync_capability": 1 })),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the raise works as the app role"
+    );
+    assert_eq!(body_json(resp).await["required_sync_capability"], 1);
+    let change = json!({ "changes": [{
+        "client_id": dev_a, "client_seq": 1, "ciphertext": B64.encode(b"gated"),
+        "schema_version": 22, "engine_version": 16003
+    }]});
+    let resp = authed(
+        &app,
+        "POST",
+        "/sync/push",
+        &tok_a,
+        &[("x-yapstack-batch-capability", "1")],
+        Some(change),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a gated push at the floor is accepted"
+    );
+
+    // Tenant B is untouched by A's raise.
+    let resp = authed(&app, "GET", "/sync/pull?since=0", &tok_b, &[], None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["required_sync_capability"], 0);
+
+    // Direct SQL as the app role in tenant A's context: B's floor row is invisible, can't be
+    // updated, and can't be inserted.
+    let mut tx = yapstack_server::db::begin_tenant_tx(&app_pool, ws_a)
+        .await
+        .unwrap();
+    let seen: i64 =
+        sqlx::query("SELECT count(*) FROM tenant_sync_capability WHERE workspace_id = $1")
+            .bind(ws_b)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get(0);
+    assert_eq!(seen, 0, "tenant A must not read tenant B's floor");
+    let updated = sqlx::query(
+        "UPDATE tenant_sync_capability SET required_sync_capability = 9 WHERE workspace_id = $1",
+    )
+    .bind(ws_b)
+    .execute(&mut *tx)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(updated, 0, "tenant A must not raise tenant B's floor");
+    tx.commit().await.unwrap();
+    let mut tx = yapstack_server::db::begin_tenant_tx(&app_pool, ws_a)
+        .await
+        .unwrap();
+    let insert = sqlx::query(
+        "INSERT INTO tenant_sync_capability (workspace_id, required_sync_capability) \
+         VALUES ($1, 9) ON CONFLICT DO NOTHING",
+    )
+    .bind(ws_b)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        insert.is_err(),
+        "RLS WITH CHECK refuses another tenant's row"
+    );
+    drop(tx);
+
+    let floor_b: i32 = sqlx::query(
+        "SELECT required_sync_capability FROM tenant_sync_capability WHERE workspace_id = $1",
+    )
+    .bind(ws_b)
+    .fetch_one(&owner)
+    .await
+    .unwrap()
+    .get(0);
+    assert_eq!(floor_b, 0);
+}

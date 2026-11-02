@@ -23,7 +23,7 @@ export const SegmentReference = Node.create<SegmentReferenceOptions>({
   atom: true,
 
   renderMarkdown(node) {
-    return `[${node.attrs?.timestamp ?? ""}]`;
+    return node.attrs?.timestamp ? `[${node.attrs.timestamp}]` : "";
   },
 
   addOptions() {
@@ -84,6 +84,15 @@ export const SegmentReference = Node.create<SegmentReferenceOptions>({
       path2.setAttribute("d", "M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z");
       svg.appendChild(path2);
       dom.appendChild(svg);
+
+      // No label: a citation whose segment isn't available (not synced yet,
+      // or never existed). Keep the node, show it as an unavailable source.
+      if (!node.attrs.timestamp) {
+        dom.setAttribute("aria-disabled", "true");
+        dom.setAttribute("aria-label", "Source unavailable");
+        dom.title = "Source unavailable";
+        return { dom };
+      }
 
       const text = document.createElement("span");
       text.textContent = node.attrs.timestamp;

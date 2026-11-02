@@ -248,6 +248,12 @@ pub struct DeviceInfo {
     /// `"revoked"` (removed from the roster by another device; must re-enrol via login).
     pub status: String,
     pub added_at: String,
+    /// The sync capability level the device last reported on a pull (ADR 0006 §5).
+    #[serde(default)]
+    pub sync_capability: i32,
+    /// RFC 3339 time of that report; `None` until its first pull on a capability relay.
+    #[serde(default)]
+    pub capability_seen_at: Option<String>,
 }
 
 /// `GET /devices` — the account's device index (pending + active) for the approving

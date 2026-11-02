@@ -10,10 +10,13 @@ import {
   tauriCommandsMock,
 } from "@/test/tauri-mocks";
 
-const { getNoteMock, saveNoteMock } = vi.hoisted(() => ({
-  getNoteMock: vi.fn(),
-  saveNoteMock: vi.fn(),
-}));
+const { getNoteMock, saveNoteMock, getSessionSegmentsMock } = vi.hoisted(
+  () => ({
+    getNoteMock: vi.fn(),
+    saveNoteMock: vi.fn(),
+    getSessionSegmentsMock: vi.fn(),
+  }),
+);
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
 vi.mock("@tauri-apps/api/event", () => tauriEventMock());
@@ -34,7 +37,7 @@ vi.mock("@/lib/db", async () => {
     ...actual,
     getNote: getNoteMock,
     saveNote: saveNoteMock,
-    getSessionSegments: vi.fn().mockResolvedValue([]),
+    getSessionSegments: getSessionSegmentsMock,
   };
 });
 
@@ -93,6 +96,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   getNoteMock.mockResolvedValue({ content: "<p>original</p>" });
   saveNoteMock.mockResolvedValue(undefined);
+  getSessionSegmentsMock.mockResolvedValue([]);
   useAppStore.setState({ noteEditingSessionId: null, remoteNoteUpdate: null });
 });
 
@@ -135,6 +139,127 @@ describe("NoteEditor — sync-down of an open note (A1c)", () => {
 
     await waitFor(() => expect(screen.getByText("half a thought")).toBeTruthy());
     expect(screen.queryByText("remote text")).toBeNull();
+  });
+});
+
+function segRow(id: string, audio_offset_seconds: number) {
+  return {
+    id,
+    session_id: "s1",
+    source: "Mic",
+    text: "t",
+    audio_offset_seconds,
+    chunk_duration_seconds: 5,
+    confidence: 0.9,
+    created_at: "",
+    chunk_index: 0,
+    original_text: null,
+    edited_at: null,
+    deleted_at: null,
+    hidden: 0,
+  };
+}
+
+/** A real user edit that keeps the existing content: add a paragraph. */
+async function addParagraph(text: string) {
+  const dom = editorDom();
+  const p = document.createElement("p");
+  p.textContent = text;
+  dom.appendChild(p);
+  fireEvent.input(dom, { bubbles: true });
+  await waitFor(() =>
+    expect(useAppStore.getState().noteEditingSessionId).toBe("s1"),
+  );
+}
+
+function pillEl(): HTMLElement | null {
+  return editorDom()?.querySelector("[data-segment-ref]") ?? null;
+}
+
+// Notes are never rewritten on load (notes.content is last-writer-wins, so a
+// background write could clobber a concurrent edit on another device).
+// Conversion happens in the editor only and is saved with the next real edit.
+describe("NoteEditor — citations convert in the editor, never saved on load", () => {
+  const ID = "89ea3e1d-6adb-45f5-b0e5-7ca605644c60";
+  const LATE_ID = "48e2014f-ac1c-4c13-bb83-f4c2799df9dc";
+
+  it("leaves citations untouched while the session has no segments", async () => {
+    getNoteMock.mockResolvedValue({ content: `<p>Hiring is costly [[seg:${ID}]].</p>` });
+
+    renderEditor();
+    await waitFor(() =>
+      expect(editorDom()?.textContent).toContain(`[[seg:${ID}]]`),
+    );
+    expect(getSessionSegmentsMock).toHaveBeenCalledWith("s1");
+    expect(saveNoteMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["legacy [[seg:]]", `<p>Hiring is costly [[seg:${ID}]].</p>`],
+    ["single-bracket shape", `<p>Tooling [seg:${ID} 2:07].</p>`],
+  ])("converts %s on load without saving, then saves it with the next edit", async (_label, content) => {
+    getNoteMock.mockResolvedValue({ content });
+    getSessionSegmentsMock.mockResolvedValue([segRow(ID, 127)]);
+
+    renderEditor();
+    await waitFor(() => expect(pillEl()?.textContent).toBe("2:07"));
+    expect(saveNoteMock).not.toHaveBeenCalled();
+
+    await addParagraph("my edit");
+    fireEvent.blur(editorDom());
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    const saved = saveNoteMock.mock.calls[0][1] as string;
+    expect(saved).toContain(`data-segment-id="${ID}" data-timestamp="2:07"`);
+    expect(saved).toContain("my edit");
+    expect(saved).not.toContain("seg:");
+    // Converting on load is not a remote edit: no conflict toast.
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it("shows a citation to an unsynced segment as unavailable, resolves it once the segment exists, and never saves on load", async () => {
+    getNoteMock.mockResolvedValue({
+      content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
+    });
+    // Partial sync: some of the session's segments are here, not the cited one.
+    getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
+
+    renderEditor();
+    await waitFor(() => expect(pillEl()).not.toBeNull());
+    const pill = pillEl()!;
+    expect(pill.getAttribute("aria-disabled")).toBe("true");
+    expect(pill.getAttribute("aria-label")).toBe("Source unavailable");
+    expect(pill.getAttribute("data-segment-id")).toBe(LATE_ID);
+    expect(pill.textContent).toBe("");
+    expect(saveNoteMock).not.toHaveBeenCalled();
+
+    // The segment syncs in; the next load resolves it, still without a save.
+    cleanup();
+    getSessionSegmentsMock.mockResolvedValue([
+      segRow("other-seg", 3),
+      segRow(LATE_ID, 1025),
+    ]);
+    renderEditor();
+    await waitFor(() => expect(pillEl()?.textContent).toBe("17:05"));
+    expect(pillEl()?.getAttribute("aria-disabled")).toBeNull();
+    expect(saveNoteMock).not.toHaveBeenCalled();
+  });
+
+  it("saves a pending pill with its full id when the user edits", async () => {
+    getNoteMock.mockResolvedValue({
+      content: `<p>Status values [[seg:${LATE_ID}]].</p>`,
+    });
+    getSessionSegmentsMock.mockResolvedValue([segRow("other-seg", 3)]);
+
+    renderEditor();
+    await waitFor(() => expect(pillEl()).not.toBeNull());
+    await addParagraph("my edit");
+    fireEvent.blur(editorDom());
+
+    await waitFor(() => expect(saveNoteMock).toHaveBeenCalledTimes(1));
+    expect(saveNoteMock.mock.calls[0][1]).toContain(
+      `data-segment-id="${LATE_ID}" data-timestamp=""`,
+    );
   });
 });
 

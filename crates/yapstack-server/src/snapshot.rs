@@ -10,6 +10,7 @@
 //! through the relay.
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,7 @@ use crate::error::AppError;
 use crate::extract::AuthTenant;
 use crate::state::{storage_cfg, AppState};
 use crate::storage;
+use crate::sync::capability;
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotPresignRequest {
@@ -47,12 +49,21 @@ pub struct SnapshotPresignResponse {
 pub async fn presign(
     State(st): State<AppState>,
     auth: AuthTenant,
+    headers: HeaderMap,
     Json(req): Json<SnapshotPresignRequest>,
 ) -> Result<Json<SnapshotPresignResponse>, AppError> {
     // Write gate (§7.5, SYNC_SPEC §15.B): only an ACTIVE device may reserve snapshot bytes.
+    // A snapshot carries the same content a pull does, so it also passes the capability
+    // read gate (ADR 0006 §5.5). Its declared content level must not exceed the floor: the
+    // check here refuses early, and each publication transaction below re-checks under the
+    // floor lock. Readers must be at or above the floor, which only rises, so every reader
+    // of a recorded snapshot can apply it.
+    let content_level =
+        capability::header_level(&headers, yapstack_common::sync::SNAPSHOT_CAPABILITY_HEADER)?;
     {
-        let mut gate = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+        let (mut gate, levels) = capability::begin_gated_read(&st.pool, &auth, &headers).await?;
         crate::devices::require_active_caller(&mut gate, auth.tenant_id, auth.client_id).await?;
+        capability::admit_publication(levels, content_level)?;
         gate.commit().await?;
     }
     let cfg = storage_cfg(&st)?;
@@ -64,6 +75,10 @@ pub async fn presign(
     let generation = i64::try_from(req.generation).unwrap_or(i64::MAX);
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+    // The publication gate, under the floor lock held through the INSERT below.
+    let levels =
+        capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
+    capability::admit_publication(levels, content_level)?;
 
     // A row for this generation may already exist. Read its hash AND the size we metered.
     let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
@@ -129,6 +144,9 @@ pub async fn presign(
         // NOT blind-overwrite it (that could orphan a valid object and point the row at a
         // missing one) — we roll back our metering and report a conflict instead.
         let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+        let levels =
+            capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
+        capability::admit_publication(levels, content_level)?;
         let delta = req.size.saturating_sub(existing_size);
         choke::admit(&mut tx, auth.tenant_id, &limits, delta, &help_url).await?;
         let updated = sqlx::query(
@@ -200,14 +218,17 @@ pub struct SnapshotHeadResponse {
 }
 
 /// `GET /snapshot` — return the latest snapshot's metadata + a presigned GET. A READ:
-/// never gated (a bootstrapping device must never be locked out of its own data).
+/// never gated by entitlements (a bootstrapping device must never be locked out of its own
+/// data), but gated by sync capability like pull (ADR 0006 §5.5): the snapshot holds the
+/// same content, so a client below the floor is refused with 426 before anything else.
 pub async fn head(
     State(st): State<AppState>,
     auth: AuthTenant,
+    headers: HeaderMap,
 ) -> Result<Json<SnapshotHeadResponse>, AppError> {
+    let (mut tx, _) = capability::begin_gated_read(&st.pool, &auth, &headers).await?;
     let cfg = storage_cfg(&st)?;
 
-    let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
     let row: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(
         "SELECT generation, ciphertext_sha256, baseline_seq FROM snapshots \
          WHERE workspace_id = $1 ORDER BY generation DESC LIMIT 1",
