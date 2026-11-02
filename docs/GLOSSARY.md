@@ -14,7 +14,7 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 
 ## Transcription
 
-- **Engine** — `Whisper | Parakeet`. User-selectable in settings; backed by separate sidecar features.
+- **Engine** — `Parakeet` (Parakeet TDT v3), the only engine since ADR 0005. `EngineKind` stays as the extension point; the sidecar compiles it under the `parakeet` feature.
 - **Sidecar** — `yapstack-transcription-sidecar` binary. Spawned by the desktop app; communicates over JSON-line IPC on stdin/stdout. Logs to stderr.
 - **IPC protocol** — tagged JSON unions (`SidecarRequest::Transcribe`, `SidecarResponse::Transcription`, etc.). One `id: u64` per request for correlation.
 - **VAD (voice activity detection)** — Silero V5 ONNX model, shared singleton. Per-source state machines emit speech/silence transitions.
@@ -25,7 +25,6 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 - **Source kind** — `LiveSourceKind::Session | Dictation`. Routing identity of a live-transcription runtime, threaded onto every emitted event (segment / status / backfill-complete) and accepted on `start_live_transcription` / `stop_live_transcription` / `get_live_transcription_status`. Frontend listeners filter on source kind + `session_id` (two-prong) so dictation lifecycle never leaks into session UI state and stale events from a recovered session can't clobber a freshly-active one.
 - **Runtime slot** — one of two named slots (`session`, `dictation`) on `LiveTranscriptionState`, each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. Stays non-`Idle` until the spawned task's finalizer transitions it back, so same-kind double-start is rejected even during finalization. Engine shutdown (`shutdown_transcription_client`) is gated on every slot being `Idle`.
 - **Mic-ownership window** — durable `[start, end)` mic ring-buffer interval recorded by `DictationOwnsMic` for each dictation. Dictation start opens a window with the captured `start_pos` (also threaded into the dictation runtime's mic VAD cursor + WAV flush position so audio between hotkey press and live-loop spawn is captured); the dictation finalizer reads the final mic position and closes the window. The session loop drives off the closed-window list, so a dictation that opens-and-closes between two session polls still appears as a closed window and is consumed cleanly. Replaces the prior boolean+atomic flag, which had a fundamental race with sub-poll-interval dictations.
-- **Prompt context** — Whisper-only feature: prior text fed into the next inference window for continuity. Decays after silence.
 - **Diarization** — speaker labelling. Parakeet + Sortformer post-pass only. Produces `speaker_id: Some(u8)` on segments.
 - **Hallucination filter** — drops empty / token-only / known-pattern segments (e.g., `"thank you"`) at low confidence.
 
@@ -35,7 +34,7 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 - **Segment** — one transcribed snippet with timestamps. Persisted in the `segments` table.
 - **Part** — one continuous audio file segment of a session. A session has N parts (resumed sessions add parts). Stored as WAV (then optionally re-encoded to MP3 on stop). Tracked in `session_audio_parts`.
 - **Note** — Tiptap rich-text doc associated with a session. `notes` table; versions in `note_versions`.
-- **Folder** — primary organizational primitive. Hierarchical, with icons and colors. Folder names flow into AI vocabulary hints.
+- **Folder** — primary organizational primitive. Hierarchical, with icons and colors. Folder names drive live auto-tag folder suggestions.
 - **Tag** — flat metadata applied by AI during summarization. Lighter than folders.
 - **Dictation** — short voice-to-text utterance, processed via a per-slot system prompt and routed to paste/copy/note. Distinct from sessions; persisted in `dictation_history`. Can run concurrently with an active session — the dictation runtime opens a **mic-ownership window** that the session honors (its own mic-side dispatch suspends, WAV mutes the overlap) so dictated audio doesn't appear in the session transcript or recording.
 - **Slot** — named dictation configuration with its own keybind, mode (hold/toggle), AI prompt, and output action.
@@ -51,7 +50,6 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 
 - **Live controller** — the long-running async loop in `commands/live_transcription.rs` that pulls audio, runs VAD, dispatches to the sidecar, and emits segment events.
 - **Pressure event** — telemetry log + frontend event marking real-time-factor (RTFx) and stream lag. Used to detect "transcripts falling behind."
-- **Vocabulary hints** — folder/tag-derived prompt prefix sent to Whisper; updated mid-recording via `update_vocabulary_hints`.
 
 ## CI & process
 

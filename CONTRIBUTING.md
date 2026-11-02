@@ -12,7 +12,7 @@ pnpm tauri dev          # full app
 pnpm check              # gate command — must pass before opening a PR
 ```
 
-Prerequisites: Rust per [`rust-toolchain.toml`](rust-toolchain.toml) (installed automatically by [rustup](https://rustup.rs)), Node.js 24, pnpm (`corepack enable && corepack prepare pnpm@latest-10 --activate`), cmake (only if building with the `whisper` feature flag).
+Prerequisites: Rust per [`rust-toolchain.toml`](rust-toolchain.toml) (installed automatically by [rustup](https://rustup.rs)), Node.js 24, pnpm (`corepack enable && corepack prepare pnpm@latest-10 --activate`).
 
 ## Where to start
 
@@ -128,7 +128,7 @@ Full command list: [`AGENTS.md` § Build & test commands](AGENTS.md#build--test-
 - Platform-support fixes for macOS Apple Silicon and Windows x64 (supported) and Intel Macs (best-effort).
 
 **Won't**:
-- New transcription engines without an [ADR](docs/adr/) demonstrating why Whisper + Parakeet aren't enough.
+- New transcription engines without an [ADR](docs/adr/) demonstrating why Parakeet isn't enough.
 - New abstraction layers ("provider interface", "engine plugin system") for hypothetical future engines.
 - Platform-specific changes that break another supported platform. Linux desktop support isn't a target yet.
 - Changes that touch the Tauri minisign **public key** in `tauri.conf.json` — breaks every existing install's auto-updater.

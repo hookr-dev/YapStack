@@ -983,7 +983,7 @@ Additional schema is also created by the **frontend's** `getDb()` (`ensureRuntim
 
 ### Settings Persistence (Zustand)
 
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v31**).
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v32**).
 
 | Version | Description |
 |---------|-------------|
@@ -1018,6 +1018,7 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 28→29 | Insight cadence presets renamed (`summary`/`jargon`/`topic` → tempo tiers `responsive`/`balanced`/`relaxed`); added Insight `type`. |
 | 29→30 | Dropped the redundant per-Insight `enabled` flag. |
 | 30→31 | Remove the redundant `_legacyAi` snapshot written by an early build of the AI refactor (duplicate of legacy `ai`, including plaintext keys, never read). |
+| 31→32 | Whisper removed (ADR 0005): `coerceWhisperSettings` maps `selectedEngine: "Whisper"` to `"Parakeet"` and sets `whisperRemovedNotice: true`, and deletes `selectedModelSize`, `silenceDurationMs`, `maxChunkSeconds`, `promptContextChars`, `promptDecaySilenceSeconds`. The same idempotent coercion also runs in `merge`. |
 
 ---
 

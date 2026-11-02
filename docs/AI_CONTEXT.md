@@ -79,13 +79,13 @@ Tone: "viewing dictation history." Plain list of entries, no tools, no citations
 The prompt can grow fast when sessions are long or folders aggregate many items. Rules we follow today:
 
 - **Transcripts carry IDs, not timestamps.** `assembleTranscriptContext` emits `[seg:ID]` tokens; the model maps these back to moments without consuming tokens on `MM:SS` strings.
-- **Speaker prefix only when diarized.** No `(Speaker 1)` on Whisper sessions — that's wasted budget when every line is the same unknown speaker.
+- **Speaker prefix only when diarized.** No `(Speaker 1)` on undiarized sessions — that's wasted budget when every line is the same unknown speaker.
 - **Notes are passed as text, not HTML.** Tiptap's HTML is stripped before assembly (`assembleNoteContext`).
 - **Multi-session aggregation is titles + notes, not transcripts.** If you're viewing a folder with 200 sessions, the prompt lists titles and (optionally) notes — it does **not** concatenate transcripts. Attempting to do so would blow past any reasonable context budget.
 - **Folder-description layer is scoped to the active path.** `resolveListContext` walks `getFolderPath(folders, folderId)` and attaches only folders whose `description` is set. Deep empty trees contribute nothing.
 - **Content-scale guidance tells the model to self-limit.** For a 5,000-word transcript, the prompt asks for ≤ 1,000 words out — don't also ask for "detailed" or "exhaustive" output in the directive.
 
-**Rule of thumb when adding a field:** if the field pushes a 60-minute session's prompt past the conservative context budget (~100k tokens on a Whisper/Parakeet transcript), gate it behind a user toggle or summarize it server-side first. Don't silently include it.
+**Rule of thumb when adding a field:** if the field pushes a 60-minute session's prompt past the conservative context budget (~100k tokens on a Parakeet transcript), gate it behind a user toggle or summarize it server-side first. Don't silently include it.
 
 ---
 
@@ -284,6 +284,6 @@ Design notes:
 
 ### Auto-folder suggestions during recording
 
-[`apps/desktop/src/lib/auto-tag.ts`](../apps/desktop/src/lib/auto-tag.ts) builds a keyword map from folder names (length ≥ 4) and scans transcript text for whole-word matches. `FolderSuggestionTracker` requires ≥ 2 matches before surfacing a suggestion chip — this prevents noisy single-mention false positives. Suggestions land as folder chips below the live recording header; on accept, the session gains the folder via `dbAddSessionToFolder` and the folder name is pushed to the live transcription as a vocabulary hint via `update_vocabulary_hints` (Whisper-only — Parakeet's TDT decoder ignores `initial_prompt`).
+[`apps/desktop/src/lib/auto-tag.ts`](../apps/desktop/src/lib/auto-tag.ts) builds a keyword map from folder names (length ≥ 4) and scans transcript text for whole-word matches. `FolderSuggestionTracker` requires ≥ 2 matches before surfacing a suggestion chip — this prevents noisy single-mention false positives. Suggestions land as folder chips below the live recording header; on accept, the session gains the folder via `dbAddSessionToFolder`.
 
 Suggestions are **folder-only**, not tag-only. Folder names double as the vocabulary for auto-categorization, which keeps the organizational hierarchy coherent. Tags are applied *after* recording, by the AI during summarization, against the (now-classified) session.

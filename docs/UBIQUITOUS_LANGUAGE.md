@@ -39,11 +39,11 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 | Term                | Definition                                                                                                          | Aliases to avoid                |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| **Engine**          | A transcription backend the sidecar can run: `Whisper` or `Parakeet`. Selected per session.                         | Backend, model type, provider   |
+| **Engine**          | A transcription backend the sidecar can run. Today only `Parakeet` (ADR 0005).                                      | Backend, model type, provider   |
 | **Variant**         | A specific weights bundle for an engine, e.g. a Parakeet TDT v3 directory.                                          | Model size, flavor              |
-| **Model**           | The downloaded weights on disk: a single ggml file (Whisper) or a multi-file ONNX directory (Parakeet, Sortformer). | Weights, checkpoint             |
+| **Model**           | The downloaded weights on disk: a multi-file ONNX directory (Parakeet) or a single ONNX file (Sortformer).          | Weights, checkpoint             |
 | **Sidecar**         | A standalone worker process spawned by the desktop app that speaks JSON-line IPC. Generic pattern; today the only sidecar is the transcription sidecar. | Worker, helper process          |
-| **Transcription sidecar** | The `yapstack-transcription-sidecar` binary that hosts Whisper or Parakeet for one session.                   | Whisper sidecar, ASR worker     |
+| **Transcription sidecar** | The `yapstack-transcription-sidecar` binary that hosts the engine (Parakeet) for one session.                 | Whisper sidecar, ASR worker     |
 | **Embedding sidecar** | Reserved name (`yapstack-embedding-sidecar`) for the planned embedding worker. Not yet implemented.              | Vectorizer, embedder            |
 | **Execution provider** | The ORT runtime backend for Parakeet: `cpu`, `coreml`, or `webgpu`. Chosen per spawn via `YAPSTACK_PARAKEET_ACCEL`. | Accelerator, EP only            |
 | **Transcription client** | The Rust-side handle that owns the sidecar process and sends transcribe/load/shutdown requests.                | Whisper client (legacy alias)   |
@@ -56,11 +56,8 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **VAD**               | Voice Activity Detection. YapStack uses Silero V5 ONNX, one shared session, with per-source LSTM state.                     | Speech detection          |
 | **Source**            | One audio origin in the live loop, either `mic` or `system`. Each source has independent VAD state and cursors.             | Channel, track            |
 | **Chunk**             | A contiguous span of speech extracted from one source between VAD start and end, sent as one transcribe request.            | Segment (in raw audio)    |
-| **Pre-roll**          | Audio retained before VAD start to avoid clipping the first phoneme (Parakeet: 250 ms; Whisper: 0).                         | Lookback, lead-in         |
-| **Initial prompt**    | The text fed to Whisper as decoding context. Honored only by Whisper; Parakeet has no text prompt input.                    | Prompt, context prompt    |
-| **Prompt context**    | The most recent transcribed text retained per source as the next initial prompt (default 350 chars).                        | Context window            |
-| **Prompt decay**      | Clearing prompt context after a configurable all-source silence window so stale context can't seed hallucinations.          | Prompt reset, context expiry |
-| **Hallucination filter** | The sidecar's engine-aware reject pass: drops `[BLANK_AUDIO]`, low-confidence noise (< 0.4 always; 0.4–0.6 when marginal), and known phantom phrases. Whisper uses an aggressive always-reject list ("thank you", "thanks for watching"); Parakeet demotes the same phrases to marginal-only. | Output filter, blacklist  |
+| **Pre-roll**          | Audio retained before VAD start to avoid clipping the first phoneme (250 ms).                                               | Lookback, lead-in         |
+| **Hallucination filter** | The sidecar's reject pass: drops `[BLANK_AUDIO]`-style tokens, low-confidence noise (< 0.4), canned outros at any confidence ("thanks for watching"), and short fillers ("yeah", "thank you") below 0.6. | Output filter, blacklist  |
 
 ## Overlay windows
 
@@ -207,17 +204,13 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Domain expert:** "No. Each **source** has its own Silero stream state and its own **chunk** cursor. They share the Silero ONNX session, but a mic utterance ending doesn't close a system utterance."
 
-> **Dev:** "And the **initial prompt** — is that per-source too?"
-
-> **Domain expert:** "Per-source on Whisper, yes — each source carries its own **prompt context**. On Parakeet the engine has no text prompt at all, so we drop it. **Prompt decay** still runs on both engines so we don't preserve stale state across long silences."
-
 > **Dev:** "If **diarization** is on, when does the **speaker ID** show up on a **segment**?"
 
-> **Domain expert:** "Only with the **Parakeet** engine. The **sidecar** runs **Sortformer** on the same chunk audio, picks the max-overlap speaker per segment, and returns it inline. The frontend then groups consecutive same-ID segments under a **speaker label** the user can rename."
+> **Domain expert:** "Only when the sidecar has a **Sortformer** model. The **sidecar** runs **Sortformer** on the same chunk audio, picks the max-overlap speaker per segment, and returns it inline. The frontend then groups consecutive same-ID segments under a **speaker label** the user can rename."
 
 > **Dev:** "And **backfill** segments — do they go through the same path?"
 
-> **Domain expert:** "Same transcribe call, just submitted to the **scheduler** at `Backfill` priority and emitted with `origin: \"backfill\"`. Backfill seeds the prompt context once at start; after that, **prompt decay** can clear it like any other run."
+> **Domain expert:** "Same transcribe call, just submitted to the **scheduler** at `Backfill` priority and emitted with `origin: \"backfill\"`."
 
 > **Dev:** "When a **Session** finalizes, what determines whether we end up with a WAV or an MP3?"
 
@@ -274,10 +267,10 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 ## Flagged ambiguities
 
 - **"Whisper client"** (legacy, no longer in code) vs **Transcription client** (current). The engine-agnostic Rust type is `TranscriptionClient` and the Tauri managed-state alias is `TranscriptionClientState`. The legacy `WhisperClient` / `WhisperClientState` aliases have been removed; "Whisper client" is dead terminology — always say **Transcription client**.
-- **"Segment"** is overloaded: it means both a transcribed unit (the domain segment, persisted in SQLite) and, internally, a `WhisperSegment` from the whisper-rs API. In domain language, **Segment** always means the persisted transcribed unit. Use "whisper-rs segment" or "raw segment" when referring to the library type.
+- **"Segment"** is overloaded: it means both a transcribed unit (the domain segment, persisted in SQLite) and, internally, an engine library's raw output unit. In domain language, **Segment** always means the persisted transcribed unit. Use "raw segment" when referring to the library type.
 - **"Chunk"** vs **Segment**: a **chunk** is the *audio slice* sent to the sidecar between VAD start/end; a **segment** is what comes back transcribed. Don't use "chunk" to mean transcribed text.
 - **"Source"** has two distinct meanings: (1) a **Capture source** enum (`MicOnly`/`SystemOnly`/`Mixed`) chosen at session start, and (2) a single audio origin (`mic` or `system`) within the live loop. The first is a *configuration*, the second is a *runtime entity* with its own VAD and cursor. Prefer **Capture source** for the enum and **Source** alone only inside the live-transcription context.
-- **"Model"** vs **Variant** vs **Engine**: an **Engine** is the algorithm family (Whisper/Parakeet); a **Variant** is a specific weights bundle for that engine; a **Model** is the on-disk artifact. "Switching models" is ambiguous — say "switching engine" or "switching variant" depending on intent.
+- **"Model"** vs **Variant** vs **Engine**: an **Engine** is the algorithm family (today only Parakeet); a **Variant** is a specific weights bundle for that engine; a **Model** is the on-disk artifact. "Switching models" is ambiguous — say "switching engine" or "switching variant" depending on intent.
 - **"Speaker name"** vs **Speaker label**: code uses `speakerNames` (the persisted Zustand map). In domain prose prefer **Speaker label** to make clear it's a user-facing display string mapped from a numeric **Speaker ID**.
 - **"Recording"** is used loosely in UI copy. In domain language a **Session** is the persisted record and a **Capture** is the live act. Avoid "recording" as a noun unless quoting UI text.
 - **"Session WAV"** vs **"Session audio"** vs **"Session MP3"** vs **"Session audio part"**: **Session audio** is the umbrella term for a session's persisted audio. A session is composed of one or more **Session audio parts** (one row per resume in `session_audio_parts`); each part is exactly one file — a **Session WAV** *or* a **Session MP3**, never both — at the user's chosen **Audio export format** at the time that part finalized. Different parts can have different formats if the user changed `audioExportFormat` between resumes. Don't say "the session's audio file" generically — say **Session audio part** when you mean one file, **Session audio** when you mean the whole concatenated thing, and **Session WAV** / **Session MP3** when the format matters.
