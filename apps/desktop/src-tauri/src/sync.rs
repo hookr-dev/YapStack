@@ -3906,8 +3906,8 @@ fn spawn_drain(
             // Set whenever a cycle merged work; consumed by the next CLEAN (fully-drained) cycle
             // so deterministic maintenance still runs when the merge and the drained-to-tip cycle
             // fall apart (a pull that failed mid-backlog advances the watermark but returns an
-            // error). In-memory: on restart the first inbound merge re-arms it.
-            let mut maintenance_pending = false;
+            // error). In-memory, so it starts armed: a skip recorded before a restart is lost.
+            let mut maintenance = MaintenanceSchedule::at_startup();
 
             // Seed the SSE lane's watermark gate with our starting local pull position so an
             // early wake for an already-merged seq is skipped (deliverable 1).
@@ -4035,17 +4035,19 @@ fn spawn_drain(
                 // the wrong winner and permanently tombstone a genuine row. So only run on a CLEAN,
                 // fully-drained pull (`pull_error.is_none()` — the same drained-to-tip signal
                 // `drain_once` uses), where every column's latest edit up to the tip is present.
-                if maintenance_ready(
-                    report.applied + report.replayed > 0,
-                    report.pull_error.is_none(),
-                    &mut maintenance_pending,
-                ) {
-                    if let Err(e) = cascade::cascade_gc(conn) {
-                        tracing::warn!("sync drain: cascade_gc: {e}");
+                // FP1: also held while stashed rows fail to replay (a later value may be
+                // stuck behind an earlier one), and rerun once a table it skipped appears.
+                if maintenance.due(&report, || schema::crr_sync_tables(conn).ok()) {
+                    let mut skipped = 0usize;
+                    match cascade::cascade_gc(conn) {
+                        Ok(s) => skipped += s.skipped,
+                        Err(e) => tracing::warn!("sync drain: cascade_gc: {e}"),
                     }
-                    if let Err(e) = uniqueness::enforce_uniqueness(conn) {
-                        tracing::warn!("sync drain: enforce_uniqueness: {e}");
+                    match uniqueness::enforce_uniqueness(conn) {
+                        Ok(s) => skipped += s.skipped,
+                        Err(e) => tracing::warn!("sync drain: enforce_uniqueness: {e}"),
                     }
+                    maintenance.ran(skipped, schema::crr_sync_tables(conn).ok());
                 }
 
                 // Item 3 (R6): pull-side observability. The push transitions log above; before
@@ -4054,10 +4056,13 @@ fn spawn_drain(
                 // — never per idle cycle, counts only, no row content or secrets.
                 if report.applied > 0 || report.quarantined > 0 || report.replayed > 0 {
                     tracing::info!(
-                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed)",
+                        "sync: pulled and applied {} change(s) ({} quarantined, {} replayed; \
+                         {} waiting for an app update, {} failed to apply)",
                         report.applied,
                         report.quarantined,
-                        report.replayed
+                        report.replayed,
+                        report.replay_waiting,
+                        report.replay_failed
                     );
                 }
 
@@ -4111,9 +4116,17 @@ fn spawn_drain(
                         }
                     }
                     // A fully clean cycle — clear the run and any prior failing/blocked state.
+                    // A clean relay cycle still isn't healthy while stashed peer changes keep
+                    // failing to apply (FP1): that is a possible corruption signal, distinct from
+                    // rows merely waiting for an app update, which stay Ok.
                     None => {
                         fail_surface_step(&mut consecutive_errors, false);
-                        DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+                        let health = replay_health(report.replay_failed);
+                        if DRAIN_HEALTH.set_if_changed(health.clone()) {
+                            if let DrainHealth::Failing(msg) = &health {
+                                tracing::warn!("sync drain: {msg}");
+                            }
+                        }
                     }
                 }
 
@@ -4672,6 +4685,66 @@ fn sign_roster_for_upload(
     let device_list_value =
         serde_json::to_value(roster).map_err(|e| format!("roster encode: {e}"))?;
     Ok((device_list_value, B64.encode(signature), roster_fp))
+}
+
+/// Drain health for a cycle with no relay error, given the stashed rows that failed to apply
+/// (or are held behind one) in this cycle's replay.
+fn replay_health(replay_failed: usize) -> DrainHealth {
+    if replay_failed == 0 {
+        return DrainHealth::Ok;
+    }
+    DrainHealth::Failing(format!(
+        "{replay_failed} change(s) from another device couldn't be applied and are held on this \
+         device. Other changes keep syncing. This can mean the data is damaged."
+    ))
+}
+
+/// When deterministic maintenance runs, across drain cycles.
+#[derive(Debug, Default)]
+struct MaintenanceSchedule {
+    /// A merge or replay happened that a clean cycle hasn't maintained yet.
+    pending: bool,
+    /// Set when the last run skipped passes for tables that weren't CRRs: the CRR'd sync
+    /// tables it saw. A change to that set reruns maintenance even on an idle cycle.
+    skipped_at: Option<Vec<&'static str>>,
+}
+
+impl MaintenanceSchedule {
+    /// The schedule a drain starts with: one pass armed. The schedule is in memory, so a skip
+    /// recorded before a restart is gone; arming once covers a table that appeared meanwhile.
+    /// It still waits for a clean cycle with no failing replay rows, like any other pass.
+    fn at_startup() -> Self {
+        Self {
+            pending: true,
+            skipped_at: None,
+        }
+    }
+
+    /// Whether maintenance runs after this cycle. Held while the pull failed or stashed rows
+    /// failed to replay: a column's newer value may be stuck behind an older one that already
+    /// landed, and a dedup on the stale value could tombstone the real winner. `crr_now` is
+    /// called only when the last run skipped something.
+    fn due(
+        &mut self,
+        report: &outbox::DrainReport,
+        crr_now: impl FnOnce() -> Option<Vec<&'static str>>,
+    ) -> bool {
+        let readiness_changed = self
+            .skipped_at
+            .as_ref()
+            .is_some_and(|prev| crr_now().is_some_and(|now| &now != prev));
+        maintenance_ready(
+            report.applied + report.replayed > 0 || readiness_changed,
+            report.pull_error.is_none() && report.replay_failed == 0,
+            &mut self.pending,
+        )
+    }
+
+    /// Record a run: `skipped` passes were skipped for tables that weren't CRRs, against the
+    /// CRR set `crr_now`.
+    fn ran(&mut self, skipped: usize, crr_now: Option<Vec<&'static str>>) {
+        self.skipped_at = if skipped > 0 { crr_now } else { None };
+    }
 }
 
 /// Whether deterministic maintenance (`cascade_gc` / `enforce_uniqueness`) may run this drain
@@ -7202,6 +7275,167 @@ mod tests {
         assert!(!pending);
         // Idle clean cycle with nothing pending → no-op.
         assert!(!maintenance_ready(false, true, &mut pending));
+    }
+
+    /// FP1 P1b: a note's newer `updated_at` is stuck in the stash (its replay fails) while its
+    /// older one already landed. Dedup on that stale value would keep the wrong note and
+    /// tombstone the real winner, so maintenance waits until the replay recovers.
+    #[test]
+    fn maintenance_holds_while_stashed_rows_fail_and_runs_after_recovery() {
+        use yapstack_sync::change::read_local_changes_since;
+        use yapstack_sync::quarantine::{merge_changeset, replay_pending};
+        use yapstack_sync::CrsqlDb;
+        const NOTES: &str = "CREATE TABLE notes(id TEXT NOT NULL PRIMARY KEY, \
+            session_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', \
+            updated_at TEXT NOT NULL DEFAULT '');";
+        let crr = |db: &CrsqlDb| {
+            db.conn().execute_batch(NOTES).unwrap();
+            db.conn()
+                .query_row("SELECT crsql_as_crr('notes')", [], |_| Ok(()))
+                .unwrap();
+        };
+        let a = CrsqlDb::open_in_memory().unwrap();
+        crr(&a);
+        a.conn()
+            .execute_batch(
+                "INSERT INTO notes VALUES('na','s1','a','2026-01-02'); \
+                 INSERT INTO notes VALUES('nb','s1','b','2026-01-01');",
+            )
+            .unwrap();
+        let first = read_local_changes_since(a.conn(), 0).unwrap();
+        let v: i64 = a
+            .conn()
+            .query_row("SELECT crsql_db_version()", [], |r| r.get(0))
+            .unwrap();
+        a.conn()
+            .execute("UPDATE notes SET updated_at='2026-01-03' WHERE id='nb'", [])
+            .unwrap();
+        let newer = read_local_changes_since(a.conn(), v).unwrap();
+
+        // Both arrive while B lacks `notes`, so both wait; then B gains the table, and a
+        // trigger stands in for whatever makes the newer value fail to apply.
+        let b = CrsqlDb::open_in_memory().unwrap();
+        merge_changeset(b.conn(), &first).unwrap();
+        merge_changeset(b.conn(), &newer).unwrap();
+        crr(&b);
+        b.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_newer BEFORE UPDATE ON notes \
+                 WHEN NEW.updated_at = '2026-01-03' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        let cycle = |b: &CrsqlDb| {
+            let r = replay_pending(b.conn()).unwrap();
+            outbox::DrainReport {
+                replayed: r.replayed,
+                replay_failed: r.failed + r.blocked,
+                ..Default::default()
+            }
+        };
+        let mut schedule = MaintenanceSchedule::default();
+        let report = cycle(&b);
+        assert!(report.replayed > 0 && report.replay_failed > 0);
+        assert!(
+            !schedule.due(&report, || None),
+            "held while a replay row fails"
+        );
+        assert!(
+            !schedule.due(&cycle(&b), || None),
+            "still held on the next idle cycle"
+        );
+
+        b.conn().execute_batch("DROP TRIGGER fail_newer;").unwrap();
+        let report = cycle(&b);
+        assert_eq!(report.replay_failed, 0);
+        assert!(
+            schedule.due(&report, || None),
+            "runs once the replay recovers"
+        );
+        let stats = yapstack_sync::uniqueness::enforce_uniqueness(b.conn()).unwrap();
+        assert_eq!(stats.notes_removed, 1);
+        let kept: String = b
+            .conn()
+            .query_row("SELECT id FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "nb", "the note with the newest updated_at wins");
+    }
+
+    /// FP1 P2a: maintenance that skipped passes for a missing table reruns when that table
+    /// becomes a CRR, even on an idle cycle; it doesn't rerun while nothing changed.
+    #[test]
+    fn maintenance_reruns_when_a_skipped_table_appears_on_an_idle_cycle() {
+        let idle = outbox::DrainReport::default();
+        let merged = outbox::DrainReport {
+            applied: 1,
+            ..Default::default()
+        };
+        let mut schedule = MaintenanceSchedule::default();
+        assert!(schedule.due(&merged, || panic!("not consulted before a skipping run")));
+        schedule.ran(2, Some(vec!["sessions", "tags"]));
+        assert!(!schedule.due(&idle, || Some(vec!["sessions", "tags"])));
+        assert!(schedule.due(&idle, || Some(vec!["sessions", "tags", "session_tags"])));
+        schedule.ran(0, Some(vec!["sessions", "tags", "session_tags"]));
+        assert!(!schedule.due(&idle, || panic!("nothing skipped, nothing to watch")));
+    }
+
+    /// FP1 P2a: a skip recorded before a restart is lost with the in-memory schedule, so the
+    /// drain arms one pass at startup. Skip, restart, an idle first cycle runs it (recording
+    /// the skip again), then the table appearing on a later idle cycle reruns it.
+    #[test]
+    fn maintenance_runs_after_restart_then_again_when_the_table_appears() {
+        let idle = outbox::DrainReport::default();
+        let before = vec!["sessions", "tags"];
+        let after = vec!["sessions", "tags", "session_tags"];
+        let mut old = MaintenanceSchedule::at_startup();
+        assert!(old.due(&idle, || None));
+        old.ran(1, Some(before.clone()));
+        drop(old); // restart
+
+        let mut schedule = MaintenanceSchedule::at_startup();
+        assert!(
+            schedule.due(&idle, || Some(before.clone())),
+            "armed at startup"
+        );
+        schedule.ran(1, Some(before.clone()));
+        assert!(!schedule.due(&idle, || Some(before.clone())));
+        assert!(
+            schedule.due(&idle, || Some(after.clone())),
+            "table appeared while idle"
+        );
+
+        let failing = outbox::DrainReport {
+            replay_failed: 1,
+            ..Default::default()
+        };
+        let mut held = MaintenanceSchedule::at_startup();
+        assert!(
+            !held.due(&failing, || None),
+            "the startup pass still waits on failing rows"
+        );
+    }
+
+    /// FP1 P2b: stashed rows that keep failing make the drain unhealthy on every clean cycle,
+    /// with zero merges, while rows merely waiting for an app update don't.
+    #[test]
+    fn replay_failures_keep_health_failing_with_no_merges() {
+        assert_eq!(replay_health(0), DrainHealth::Ok);
+        for _ in 0..3 {
+            let idle_failing = outbox::DrainReport {
+                replay_failed: 2,
+                replay_waiting: 5,
+                ..Default::default()
+            };
+            assert!(idle_failing.first_transport_error().is_none());
+            match replay_health(idle_failing.replay_failed) {
+                DrainHealth::Failing(msg) => assert!(msg.starts_with("2 change(s)"), "{msg}"),
+                other => panic!("expected Failing, got {other:?}"),
+            }
+        }
+        let waiting_only = outbox::DrainReport {
+            replay_waiting: 5,
+            ..Default::default()
+        };
+        assert_eq!(replay_health(waiting_only.replay_failed), DrainHealth::Ok);
     }
 
     #[test]

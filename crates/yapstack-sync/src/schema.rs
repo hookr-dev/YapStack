@@ -210,6 +210,29 @@ pub fn is_crr(conn: &Connection, table: &str) -> Result<bool, SyncError> {
     Ok(n == 1)
 }
 
+/// True when every one of `tables` is a CRR here. For passes that read clock tables and must
+/// skip a table this device doesn't have, or hasn't converted, yet.
+pub(crate) fn all_crr(conn: &Connection, tables: &[&str]) -> Result<bool, SyncError> {
+    for t in tables {
+        if !is_crr(conn, t)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The `SYNC_TABLES` members that are CRRs here right now. Changes when a table added after
+/// cutover is created and converted, which is when maintenance that skipped it must rerun.
+pub fn crr_sync_tables(conn: &Connection) -> Result<Vec<&'static str>, SyncError> {
+    let mut out = Vec::with_capacity(SYNC_TABLES.len());
+    for t in SYNC_TABLES {
+        if is_crr(conn, t)? {
+            out.push(*t);
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuild one table into its CRR-compatible shape (preserving app triggers such as
 /// the FTS sync triggers) then `crsql_as_crr` it. Idempotent: a table already
 /// converted is skipped.
@@ -257,8 +280,15 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
 
 /// R3 entry point: transform + CRRify every sync table on a (COPY of a) local DB.
 /// NEVER call against the live DB — operate on a `.backup` copy (T001 procedure).
+///
+/// A `SYNC_TABLES` member this DB doesn't have is skipped, not an error (ADR 0006 §4): a
+/// table added after cutover is created and converted by its own migration, and rows for it
+/// that arrive first wait in the quarantine.
 pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
     for t in SYNC_TABLES {
+        if !table_exists(conn, t)? {
+            continue;
+        }
         transform_and_crrify(conn, t)?;
     }
     Ok(())
