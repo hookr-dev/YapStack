@@ -38,6 +38,21 @@ async fn setup() -> AppState {
     AppState::new(pool, cfg)
 }
 
+/// A relay with a well-formed but unreachable object store: snapshot presign only signs a
+/// URL string, so no MinIO is needed (mirrors `snapshot_flow.rs`).
+async fn setup_with_storage() -> AppState {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for --ignored tests");
+    let pool = yapstack_server::db::connect(&url).await.unwrap();
+    yapstack_server::db::migrate(&pool).await.unwrap();
+    let cfg = Config::from_toml_str(&format!(
+        "database_url = \"{url}\"\njwt_secret = \"test-secret\"\nserver_pepper = \"test-pepper\"\n\
+         \n[storage]\nendpoint = \"http://127.0.0.1:1\"\nregion = \"us-east-1\"\n\
+         bucket = \"yapstack\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\n"
+    ))
+    .unwrap();
+    AppState::new(pool, cfg)
+}
+
 struct Tenant {
     tenant: Uuid,
     user: Uuid,
@@ -655,4 +670,127 @@ async fn raise_cannot_slip_between_a_pulls_check_and_its_read() {
         pull_at(&app, &no_device, None).await.status(),
         StatusCode::UPGRADE_REQUIRED
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn a_raise_racing_the_callers_revocation_is_refused() {
+    // The caller's device row is checked under a lock taken after the floor row, so a
+    // revocation that commits while the raise waits is seen and the raise is refused.
+    let st = setup().await;
+    let app = build_router(st.clone());
+    let t = signup(&st, &app).await;
+
+    let mut revoker = st.pool.begin().await.unwrap();
+    let (revoker_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *revoker)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE devices SET status = 'revoked' WHERE client_id = $1")
+        .bind(t.owner_device)
+        .execute(&mut *revoker)
+        .await
+        .unwrap();
+
+    let raise_task = {
+        let app = app.clone();
+        let tok = t.owner_token.clone();
+        tokio::spawn(async move { raise(&app, &tok, "1", 1).await.status() })
+    };
+    while lock_waiters(&st.pool, revoker_pid).await.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    revoker.commit().await.unwrap();
+
+    assert_eq!(
+        raise_task.await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "a caller revoked before the raise read its row must be refused"
+    );
+    // The refused transaction rolled back, bootstrap included: no floor, or floor 0.
+    let floor: Option<(i32,)> = sqlx::query_as(
+        "SELECT required_sync_capability FROM tenant_sync_capability WHERE workspace_id = $1",
+    )
+    .bind(t.tenant)
+    .fetch_optional(&st.pool)
+    .await
+    .unwrap();
+    assert_eq!(floor.map_or(0, |(f,)| f), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via DATABASE_URL"]
+async fn gated_snapshot_publication_is_refused_above_the_floor() {
+    let st = setup_with_storage().await;
+    let app = build_router(st.clone());
+    let t = signup(&st, &app).await;
+    let presign = |generation: u64| {
+        json!({ "sha256": format!("{generation:02x}").repeat(32), "size": 1,
+                "generation": generation, "baseline_seq": 0 })
+    };
+    let gated = [
+        ("x-yapstack-sync-capability", "1"),
+        ("x-yapstack-snapshot-capability", "1"),
+    ];
+    let snapshot_rows = |pool: PgPool, tenant: Uuid| async move {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM snapshots WHERE workspace_id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        n
+    };
+
+    // Floor 0: a snapshot holding level-1 content is refused and nothing is recorded.
+    let resp = send(
+        &app,
+        "POST",
+        "/snapshot/presign",
+        Some(&t.owner_token),
+        &gated,
+        Some(presign(1)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["code"], "sync_capability_floor");
+    assert_eq!(snapshot_rows(st.pool.clone(), t.tenant).await, 0);
+
+    // After the raise it publishes, and a headerless (level-0) reader can't fetch it.
+    assert_eq!(
+        raise(&app, &t.owner_token, "1", 1).await.status(),
+        StatusCode::OK
+    );
+    let resp = send(
+        &app,
+        "POST",
+        "/snapshot/presign",
+        Some(&t.owner_token),
+        &gated,
+        Some(presign(1)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(snapshot_rows(st.pool.clone(), t.tenant).await, 1);
+    let resp = send(&app, "GET", "/snapshot", Some(&t.owner_token), &[], None).await;
+    assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+
+    // A relay restored to floor 0 refuses the next gated publication again.
+    sqlx::query(
+        "UPDATE tenant_sync_capability SET required_sync_capability = 0 WHERE workspace_id = $1",
+    )
+    .bind(t.tenant)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let resp = send(
+        &app,
+        "POST",
+        "/snapshot/presign",
+        Some(&t.owner_token),
+        &gated,
+        Some(presign(2)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(snapshot_rows(st.pool.clone(), t.tenant).await, 1);
 }

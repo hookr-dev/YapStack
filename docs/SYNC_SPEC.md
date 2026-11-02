@@ -543,7 +543,7 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `GET /sync/stream` | access JWT | SSE `wakeup` events carrying only the seq |
 | `POST /audio/presign?sha256&size&part_id&session_id` | access JWT | dedup + refcount + existence-checked presigned PUT |
 | `GET /audio/part/{part_id}` | access JWT | 302 to a presigned GET, never gated |
-| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller); same capability read gate as pull |
+| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller); same capability read gate as pull; presign refuses content (`X-YapStack-Snapshot-Capability`) above the floor |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
 Every device-authored write is gated on the caller's device row: push, audio presign,
@@ -596,8 +596,14 @@ row first, then `tenant_seq`:
 - push locks it `FOR SHARE` and refuses a batch whose `X-YapStack-Batch-Capability` is
   above the floor the relay holds right then (409 `sync_capability_floor`). A client's
   cached floor never authorizes a push, so a restored relay at floor 0 refuses again;
-- `PUT /sync/capability` locks it `FOR UPDATE`, records the caller's own header, then
-  re-reads `devices`. Both levels only rise (`GREATEST`). A refused raise records
+- `POST /snapshot/presign` also declares the snapshot's content level
+  (`X-YapStack-Snapshot-Capability`, absent = 0). Each transaction that records or
+  re-points a snapshot row takes the floor row `FOR SHARE` and refuses content above the
+  floor (409 `sync_capability_floor`). Readers must be at or above the floor, which only
+  rises, so every reader of a recorded snapshot can apply it;
+- `PUT /sync/capability` locks it `FOR UPDATE`, then the caller's own device row
+  `FOR SHARE` (a caller revoked meanwhile is refused with 403), records the caller's
+  header, then re-reads `devices`. Both levels only rise (`GREATEST`). A refused raise records
   `requested`, which every pull returns so a straggler can be nudged.
 
 Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).

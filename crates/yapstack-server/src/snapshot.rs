@@ -54,10 +54,16 @@ pub async fn presign(
 ) -> Result<Json<SnapshotPresignResponse>, AppError> {
     // Write gate (§7.5, SYNC_SPEC §15.B): only an ACTIVE device may reserve snapshot bytes.
     // A snapshot carries the same content a pull does, so it also passes the capability
-    // read gate (ADR 0006 §5.5).
+    // read gate (ADR 0006 §5.5). Its declared content level must not exceed the floor: the
+    // check here refuses early, and each publication transaction below re-checks under the
+    // floor lock. Readers must be at or above the floor, which only rises, so every reader
+    // of a recorded snapshot can apply it.
+    let content_level =
+        capability::header_level(&headers, yapstack_common::sync::SNAPSHOT_CAPABILITY_HEADER)?;
     {
-        let (mut gate, _) = capability::begin_gated_read(&st.pool, &auth, &headers).await?;
+        let (mut gate, levels) = capability::begin_gated_read(&st.pool, &auth, &headers).await?;
         crate::devices::require_active_caller(&mut gate, auth.tenant_id, auth.client_id).await?;
+        capability::admit_publication(levels, content_level)?;
         gate.commit().await?;
     }
     let cfg = storage_cfg(&st)?;
@@ -69,6 +75,10 @@ pub async fn presign(
     let generation = i64::try_from(req.generation).unwrap_or(i64::MAX);
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+    // The publication gate, under the floor lock held through the INSERT below.
+    let levels =
+        capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
+    capability::admit_publication(levels, content_level)?;
 
     // A row for this generation may already exist. Read its hash AND the size we metered.
     let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
@@ -134,6 +144,9 @@ pub async fn presign(
         // NOT blind-overwrite it (that could orphan a valid object and point the row at a
         // missing one) — we roll back our metering and report a conflict instead.
         let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
+        let levels =
+            capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
+        capability::admit_publication(levels, content_level)?;
         let delta = req.size.saturating_sub(existing_size);
         choke::admit(&mut tx, auth.tenant_id, &limits, delta, &help_url).await?;
         let updated = sqlx::query(
