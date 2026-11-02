@@ -490,7 +490,10 @@ fn value_ref_to_json(v: ValueRef<'_>) -> JsonValue {
 /// migration. Newly-applied migrations are recorded in the same table shape so
 /// the bookkeeping stays coherent. A migration that fails on a divergent dev DB
 /// is logged and skipped rather than aborting startup (matching the app's
-/// existing idempotent runtime-schema safety net); on a fresh DB all succeed.
+/// existing idempotent runtime-schema safety net); on a fresh DB all succeed. When
+/// that safety net (or cutover) already created every object the failed migration
+/// declares in [`crate::db::Migration::schema_effects`], it is recorded instead, so
+/// it isn't retried and logged as an error on every boot.
 ///
 /// Returns the list of versions applied by this call (empty when already
 /// up-to-date).
@@ -549,6 +552,14 @@ pub fn run_migrations_list(
         }
         match apply_migration(conn, m) {
             Ok(()) => newly_applied.push(m.version),
+            Err(e) if record_if_schema_present(conn, m) => {
+                tracing::info!(
+                    "migration v{} ({}) could not apply ({e}), but every object it creates \
+                     is already present; recorded it as applied",
+                    m.version,
+                    m.description
+                );
+            }
             Err(e) => {
                 tracing::error!(
                     "migration v{} ({}) failed; skipping (runtime schema patches will \
@@ -560,6 +571,54 @@ pub fn run_migrations_list(
         }
     }
     Ok(newly_applied)
+}
+
+/// For a migration that couldn't apply: record it when its declared
+/// [`crate::db::Migration::schema_effects`] are all present already (put there out
+/// of band), so it isn't retried and failed on every boot. False when it declares
+/// none, any is missing, or the probe or bookkeeping insert errors, leaving the
+/// migration unrecorded.
+fn record_if_schema_present(conn: &Connection, m: &crate::db::Migration) -> bool {
+    !m.schema_effects.is_empty()
+        && schema_effects_present(conn, m.schema_effects).unwrap_or(false)
+        && record_migration(conn, m, 0).is_ok()
+}
+
+/// True when every object exists. On a CRR-prepared DB a table that sync covers
+/// must also be a CRR (have its clock table), whether the object is the table or a
+/// column of it: a plain table there is invisible to sync.
+fn schema_effects_present(
+    conn: &Connection,
+    effects: &[crate::db::SchemaObject],
+) -> rusqlite::Result<bool> {
+    use crate::db::SchemaObject;
+    let named = |ty: &str, name: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2")?
+            .exists([ty, name])
+    };
+    let crr_prepared = named("table", "sessions__crsql_clock")?;
+    for effect in effects {
+        let (present, table) = match *effect {
+            SchemaObject::Table(t) => (named("table", t)?, Some(t)),
+            SchemaObject::Column(t, c) => (
+                conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+                    .exists([t, c])?,
+                Some(t),
+            ),
+            SchemaObject::Index(i) => (named("index", i)?, None),
+            SchemaObject::Trigger(t) => (named("trigger", t)?, None),
+        };
+        if !present {
+            return Ok(false);
+        }
+        if let Some(t) = table {
+            if crr_prepared && names_sync_table(t) && !named("table", &format!("{t}__crsql_clock"))?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Insert the sqlx-compatible bookkeeping row for an applied migration. Empty
@@ -1390,6 +1449,7 @@ mod tests {
             description: "test: add column to a CRR sync table",
             sql: "ALTER TABLE segments ADD COLUMN a3_test_col TEXT",
             kind: crate::db::MigrationKind::Plain,
+            schema_effects: &[],
         };
         // A synthetic v901 migration: touches a NON-sync table (applied plainly).
         let plain = crate::db::Migration {
@@ -1397,6 +1457,7 @@ mod tests {
             description: "test: create a local (non-sync) table",
             sql: "CREATE TABLE a3_local (id TEXT PRIMARY KEY)",
             kind: crate::db::MigrationKind::Plain,
+            schema_effects: &[],
         };
         let applied = run_migrations_list(conn, &[alter, plain]).unwrap();
         assert_eq!(applied, vec![900, 901]);
@@ -1494,6 +1555,7 @@ mod tests {
             description: "test: unsafe multi-statement sync-table change",
             sql: "ALTER TABLE sessions ADD COLUMN f3_bad TEXT; CREATE INDEX ix_f3 ON sessions(f3_bad)",
             kind: crate::db::MigrationKind::Plain,
+            schema_effects: &[],
         };
         // apply_migration surfaces the loud, named error.
         let err = apply_migration(conn, &bad).expect_err("must refuse");
@@ -1720,6 +1782,7 @@ mod tests {
             description: "test: sync index",
             sql,
             kind: crate::db::MigrationKind::SyncIndex,
+            schema_effects: &[],
         }
     }
 
@@ -2014,6 +2077,7 @@ mod tests {
             description: "test: plain index on a sync table",
             sql,
             kind: crate::db::MigrationKind::Plain,
+            schema_effects: &[],
         };
         assert!(
             apply_migration(conn, &plain).is_err(),
@@ -2048,5 +2112,161 @@ mod tests {
             "SyncIndex is for sync tables"
         );
         assert_crr_triggers_fresh(conn);
+    }
+
+    // ── Bookkeeping for migrations whose schema was put in place out of band ──
+
+    fn recorded_versions(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    fn forget_versions(conn: &Connection, versions: &[i64]) {
+        for v in versions {
+            conn.execute("DELETE FROM _sqlx_migrations WHERE version = ?1", [v])
+                .unwrap();
+        }
+    }
+
+    /// A dev DB whose `_sqlx_migrations` history skipped v11–v14 while their schema
+    /// landed anyway (the misaligned-history case the runtime patches cover). None
+    /// of the four can re-run cleanly (`tags` exists, `tool_calls` is a duplicate
+    /// column…), so each one used to fail and stay unrecorded on every boot. Every
+    /// object they create is present, so the runner records them.
+    #[test]
+    fn migrations_record_failed_versions_whose_schema_is_already_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        forget_versions(&conn, &[11, 12, 13, 14]);
+
+        let applied = run_migrations(&conn).unwrap();
+        assert!(applied.is_empty(), "nothing was applied: {applied:?}");
+        assert_eq!(recorded_versions(&conn), all_versions());
+        assert!(run_migrations(&conn).unwrap().is_empty());
+    }
+
+    /// A migration that fails while any object it creates is missing stays
+    /// unrecorded, so a DB really missing that schema keeps the loud error.
+    #[test]
+    fn failed_migration_with_missing_schema_stays_unrecorded() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        forget_versions(&conn, &[12]);
+        // v12 fails on `segments_fts` (already exists) while `sessions_fts` is gone.
+        conn.execute_batch("DROP TABLE sessions_fts;").unwrap();
+
+        run_migrations(&conn).unwrap();
+        assert!(!recorded_versions(&conn).contains(&12));
+        assert!(!table_exists_for_test(&conn, "sessions_fts"));
+
+        // A failing migration that declares no schema effects is never recorded,
+        // even when what it would create exists.
+        let undeclared = crate::db::Migration {
+            version: 940,
+            description: "test: fails, declares nothing",
+            sql: "CREATE TABLE tags (id TEXT PRIMARY KEY)",
+            kind: crate::db::MigrationKind::Plain,
+            schema_effects: &[],
+        };
+        assert!(run_migrations_list(&conn, &[undeclared])
+            .unwrap()
+            .is_empty());
+        assert!(!recorded_versions(&conn).contains(&940));
+    }
+
+    /// Each declared object is one its migration creates: all present after the
+    /// full chain on a fresh DB, and not all present just before the migration runs,
+    /// so the presence check tells the two states apart.
+    #[test]
+    fn declared_schema_effects_match_what_each_migration_creates() {
+        let fresh = Connection::open_in_memory().unwrap();
+        run_migrations(&fresh).unwrap();
+        for m in crate::db::migrations() {
+            if m.schema_effects.is_empty() {
+                continue;
+            }
+            assert!(
+                schema_effects_present(&fresh, m.schema_effects).unwrap(),
+                "v{}: declared objects exist on a fresh DB",
+                m.version
+            );
+            let before = Connection::open_in_memory().unwrap();
+            run_migrations_list(&before, &migrations_below(m.version)).unwrap();
+            for effect in m.schema_effects {
+                assert!(
+                    !schema_effects_present(&before, std::slice::from_ref(effect)).unwrap(),
+                    "v{}: {effect:?} exists before the migration runs",
+                    m.version
+                );
+            }
+        }
+    }
+
+    /// The owner's dev DB: CRR-prepared, `_sqlx_migrations` holds 1–10 and 15–18,
+    /// and the runtime patches already gave it everything v11–v14 create (`tags`
+    /// and `session_tags` as CRRs, the FTS tables, the chat_messages columns). v11,
+    /// v12 and v14 are refused by the CRR guard and v13 hits a duplicate column, on
+    /// every boot. They are recorded once, after which a boot has nothing to retry.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn crr_db_records_refused_versions_whose_schema_is_already_present() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        cut_over(conn, &crate::db::migrations());
+        forget_versions(conn, &[11, 12, 13, 14]);
+        for v in [11, 12, 14] {
+            let m = crate::db::migrations()
+                .into_iter()
+                .find(|m| m.version == v)
+                .unwrap();
+            let err = apply_migration(conn, &m).expect_err("refused on a CRR DB");
+            assert!(err.to_string().contains("Refusing to apply"), "v{v}: {err}");
+        }
+
+        let applied = run_migrations(conn).unwrap();
+        assert!(applied.is_empty(), "nothing was applied: {applied:?}");
+        assert_eq!(recorded_versions(conn), all_versions());
+        assert!(run_migrations(conn).unwrap().is_empty());
+        assert_crr_triggers_fresh(conn);
+    }
+
+    /// On a CRR DB a refused migration stays unrecorded unless its schema is
+    /// present AND its synced tables are CRRs: a plain, never-converted `tags`
+    /// doesn't sync, so it doesn't count.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn crr_db_refused_version_with_missing_or_unconverted_schema_stays_unrecorded() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        cut_over(conn, &migrations_below(11));
+
+        run_migrations(conn).unwrap();
+        let recorded = recorded_versions(conn);
+        assert!(!recorded.contains(&11), "tags absent: {recorded:?}");
+        assert!(!recorded.contains(&12), "FTS tables absent: {recorded:?}");
+        assert!(!table_exists_for_test(conn, "tags"));
+
+        // Every v11 object, but as plain tables.
+        conn.execute_batch(
+            "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+             CREATE INDEX idx_tags_name ON tags(name); \
+             CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
+               source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+               PRIMARY KEY (session_id, tag_id)); \
+             CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
+             CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
+        )
+        .unwrap();
+        run_migrations(conn).unwrap();
+        assert!(!recorded_versions(conn).contains(&11), "tags is not a CRR");
     }
 }
