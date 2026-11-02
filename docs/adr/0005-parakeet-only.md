@@ -86,7 +86,8 @@ explicitly accepted the loss of the languages outside Parakeet's 25.
 - **Confidence-gated hallucination tiers stay inert** until a Parakeet build
   exposes token log-probabilities. Low-confidence styling on old Whisper-era
   segments keeps working because the stored confidence is unchanged.
-- **Whisper upgraders download Parakeet once** (about 670 MB for int8). An
+- **Whisper upgraders download Parakeet once** (about 670 MB for int8 on Apple Silicon and Windows;
+  about 2.5 GB for the fp32 bundle Intel Macs use). An
   upgrader who is offline at first launch sees the engine error and Retry; the
   release notes call out the one-time download.
 - **IPC change (host and sidecar ship in one bundle):** `EngineKind::Whisper`,
