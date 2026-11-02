@@ -171,7 +171,28 @@ export interface SyncStatus {
   /** This device was removed from the account by another device (§15.D): its sign-in is
    *  dying and writes are refused. Optional so older status snapshots read as false. */
   removed?: boolean;
+  /** ADR 0006 §5: a sync capability notice for lane status. Optional so older status
+   *  snapshots read as none. */
+  capabilityNotice?: SyncCapabilityNotice | null;
 }
+
+/** One device holding up a sync capability raise (it reports a lower level). */
+export interface CapabilityBlocker {
+  label: string | null;
+  platform: string | null;
+  /** RFC 3339 time of the device's last pull. */
+  lastSeen: string;
+  /** Roster fingerprint when the device is in the current roster (so it can be removed). */
+  fingerprint: string | null;
+}
+
+export type SyncCapabilityNotice =
+  /** The relay refused this device's pull: only an app update clears it. */
+  | { kind: "update-required" }
+  /** Another device asked for a level this build lacks. A nudge, not a block. */
+  | { kind: "another-device-needs-update" }
+  /** This device's push is held until these devices update or are removed. */
+  | { kind: "waiting-for-devices"; blockers: CapabilityBlocker[] };
 
 export interface SignupRequest {
   serverUrl: string;

@@ -929,6 +929,19 @@ export type AudioPreparePartDto =
  */
 { state: "error"; message: string }
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
+/**
+ * One device holding up a floor raise, as lane status shows it.
+ */
+export type CapabilityBlockerDto = { label: string | null; platform: string | null;
+/**
+ * RFC 3339 time of the device's last recorded pull.
+ */
+lastSeen: string;
+/**
+ * The roster fingerprint, so the panel can offer the existing Remove; `None` when the
+ * device isn't in the current roster.
+ */
+fingerprint: string | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
 export type CaptureStateDto = "Idle" | "Capturing" | "Error"
@@ -1198,6 +1211,24 @@ export type SignupArgs = { serverUrl: string; email: string; password: string }
 export type SignupResultDto = { recoveryCode: string; deviceFingerprint: string }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
+/**
+ * A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
+ */
+export type SyncCapabilityNoticeDto =
+/**
+ * The relay refused this device's pull: the workspace floor is above this build's
+ * level. Only an app update clears it.
+ */
+{ kind: "update-required" } |
+/**
+ * Another device asked for a level this build doesn't have. A nudge, not a block.
+ */
+{ kind: "another-device-needs-update" } |
+/**
+ * This device's push is held behind a change that needs a higher floor, and the relay
+ * named the devices that must update (or be removed) first.
+ */
+{ kind: "waiting-for-devices"; blockers: CapabilityBlockerDto[] }
 export type SyncStatusDto = { phase: string; serverUrl: string; email: string | null; deviceFingerprint: string | null; roster: DeviceRosterEntryDto[]; vaultKeyEpoch: number | null; rosterFingerprint: string | null; syncEnabled: boolean; lastError: string | null;
 /**
  * T024 push progress. Unacked outbox entries still to push (0 == up to date).
@@ -1258,7 +1289,11 @@ audioBackfillComplete: boolean;
  * tokens are dying (refresh family revoked, writes refused); the page tells the user
  * to sign out and, if they want it back, sign in again to be re-approved.
  */
-removed: boolean }
+removed: boolean;
+/**
+ * ADR 0006 §5: a sync capability notice for lane status, or `None`.
+ */
+capabilityNotice: SyncCapabilityNoticeDto | null }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

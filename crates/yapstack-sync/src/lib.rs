@@ -41,6 +41,12 @@ pub const CRSQLITE_ENGINE_VERSION: u32 = 16_003;
 /// synced schema changes; drives the §6 quarantine/handshake gate.
 pub const SYNC_SCHEMA_VERSION: u32 = 1;
 
+/// This build's sync capability level, sent on every pull and snapshot request
+/// (`X-YapStack-Sync-Capability`, ADR 0006 §5.1). Level 1 = "has the table-readiness
+/// quarantine" (ADR 0006 §4): a row for a table that isn't a CRR locally never fails a
+/// changeset, so this device can safely receive rows for tables added after it shipped.
+pub const SYNC_CAPABILITY_LEVEL: i32 = 1;
+
 /// Every fallible operation's error. All crypto/codec variants are quarantine/deny
 /// paths (never a panic on attacker-supplied bytes, CRYPTO_SPEC §11.3).
 #[derive(Debug, thiserror::Error)]
@@ -78,8 +84,51 @@ pub enum SyncError {
     /// token material (the bearer travels as an HTTP header, not in the error).
     #[error("relay unreachable: {0}")]
     Network(String),
+    /// The relay refused a pull or snapshot read because this build's sync capability is
+    /// below the workspace floor (HTTP 426, ADR 0006 §5.7). Only an app update clears it.
+    #[error("Update YapStack to keep syncing (this device's sync capability {level} is below the workspace's {required})")]
+    UpdateRequired {
+        level: i32,
+        required: i32,
+        requested: i32,
+    },
+    /// The relay refused a push batch whose capability level is above the floor it holds
+    /// right now (HTTP 409 `sync_capability_floor`, ADR 0006 §5.4). Distinct from the
+    /// `client_seq`-regression 409, which drops the unacked outbox: this one must not.
+    #[error("relay sync capability floor {required} is below this batch's level {batch}")]
+    CapabilityFloor {
+        batch: i32,
+        required: i32,
+        requested: i32,
+    },
+    /// A floor raise was refused because other recently seen devices report a lower level
+    /// (HTTP 409 `sync_capability_blocked`). Push holds in `client_seq` order behind the
+    /// gated entry until they update or are removed; pull carries on.
+    #[error("waiting for {} to update YapStack", blocker_names(.blockers))]
+    CapabilityBlocked {
+        level: i32,
+        blockers: Vec<yapstack_common::sync::CapabilityBlocker>,
+    },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+}
+
+fn blocker_names(blockers: &[yapstack_common::sync::CapabilityBlocker]) -> String {
+    let names: Vec<&str> = blockers
+        .iter()
+        .map(|b| {
+            if b.label.is_empty() {
+                "another device"
+            } else {
+                b.label.as_str()
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        "another device".into()
+    } else {
+        names.join(", ")
+    }
 }
 
 impl SyncError {

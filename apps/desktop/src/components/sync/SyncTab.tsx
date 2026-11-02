@@ -50,6 +50,7 @@ import {
   deriveAudioBackup,
 } from "@/lib/sync";
 import type { AudioCacheStats, DeviceRosterEntry, SyncStatus } from "@/lib/sync";
+import { formatRelativeTime } from "@/lib/utils";
 import { deriveSyncDisplay, type SyncDisplay } from "@/lib/syncDisplay";
 import { DevicesIllustration } from "./DevicesIllustration";
 import { SyncSetupWizard, type WizardStart } from "./SyncSetupWizard";
@@ -256,6 +257,9 @@ export function SyncTab() {
   const pendingDevices = pendingPeerDevices(status);
   const roster = status.roster.filter((d) => !(d.pending && !d.isSelf));
   const authExpired = status.phase === "auth_expired";
+  const capabilityHold =
+    status.capabilityNotice?.kind === "update-required" ||
+    status.capabilityNotice?.kind === "waiting-for-devices";
 
   return (
     <>
@@ -272,8 +276,9 @@ export function SyncTab() {
         <SyncStatusLine status={status} display={display} />
       </div>
 
-      {/* Pinned verbatim connection error (never auto-routed, must-preserve). */}
-      {status.lastError && !authExpired && (
+      {/* Pinned verbatim connection error (never auto-routed, must-preserve). The capability
+          refusals carry their own alert below, so they aren't repeated here. */}
+      {status.lastError && !authExpired && !capabilityHold && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Connection problem</AlertTitle>
@@ -308,6 +313,10 @@ export function SyncTab() {
           </AlertDescription>
         </Alert>
       )}
+      <SyncCapabilityNoticeRow
+        status={status}
+        onRemove={status.removed ? undefined : handleRemoveDevice}
+      />
       <UnreadableChangesWarning status={status} onRetried={() => void refreshSyncStatus()} />
 
       {/* Devices */}
@@ -485,7 +494,6 @@ function DeviceTile({
 }) {
   const { Icon, name } = platformLook(device.platform);
   const label = device.label ?? "Unnamed device";
-  const [password, setPassword] = useState("");
   return (
     <TileShell className={device.isSelf ? "border-primary/40" : ""}>
       <span className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-primary">
@@ -497,56 +505,142 @@ function DeviceTile({
           {device.isSelf ? "This device" : (name ?? "Approved")}
         </p>
       </div>
-      {!device.isSelf && onRemove && (
-        <AlertDialog>
-          <AlertDialogTrigger asChild>
-            <button
-              type="button"
-              className="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
-              aria-label={`Remove ${label}`}
-            >
-              Remove
-            </button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Remove {label}?</AlertDialogTitle>
-              <AlertDialogDescription>
-                Its sign-in is cancelled and it can no longer send changes. It keeps
-                what it already has. To bring it back, sign in on it and approve it
-                again. If whoever has it knows your password, also change your
-                password from the Account row.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <div className="space-y-1.5">
-              <Label htmlFor={`remove-pw-${device.fingerprint}`} className="text-xs text-muted-foreground">
-                Your password
-              </Label>
-              <Input
-                id={`remove-pw-${device.fingerprint}`}
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="h-9"
-              />
-            </div>
-            <AlertDialogFooter>
-              <AlertDialogCancel onClick={() => setPassword("")}>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                disabled={password.length === 0}
-                onClick={() => {
-                  onRemove(device, password);
-                  setPassword("");
-                }}
-              >
-                Remove device
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-      )}
+      {!device.isSelf && onRemove && <RemoveDeviceButton device={device} onRemove={onRemove} />}
     </TileShell>
+  );
+}
+
+/** The roster's Remove action (asks for the password), shared by the device tile and the
+ *  sync capability blocker list. */
+function RemoveDeviceButton({
+  device,
+  onRemove,
+}: {
+  device: DeviceRosterEntry;
+  onRemove: (device: DeviceRosterEntry, password: string) => void;
+}) {
+  const label = device.label ?? "Unnamed device";
+  const [password, setPassword] = useState("");
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>
+        <button
+          type="button"
+          className="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+          aria-label={`Remove ${label}`}
+        >
+          Remove
+        </button>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Remove {label}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Its sign-in is cancelled and it can no longer send changes. It keeps
+            what it already has. To bring it back, sign in on it and approve it
+            again. If whoever has it knows your password, also change your
+            password from the Account row.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <div className="space-y-1.5">
+          <Label htmlFor={`remove-pw-${device.fingerprint}`} className="text-xs text-muted-foreground">
+            Your password
+          </Label>
+          <Input
+            id={`remove-pw-${device.fingerprint}`}
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="h-9"
+          />
+        </div>
+        <AlertDialogFooter>
+          <AlertDialogCancel onClick={() => setPassword("")}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={password.length === 0}
+            onClick={() => {
+              onRemove(device, password);
+              setPassword("");
+            }}
+          >
+            Remove device
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+/** ADR 0006 §5: the sync capability notice. "Update required" stops this device's pull;
+ *  "waiting for devices" holds its push behind a change that needs every recently active
+ *  device on a newer build (named, with Remove); the nudge tells a lagging device it is
+ *  holding the others up. */
+function SyncCapabilityNoticeRow({
+  status,
+  onRemove,
+}: {
+  status: SyncStatus;
+  onRemove?: (device: DeviceRosterEntry, password: string) => void;
+}) {
+  const notice = status.capabilityNotice;
+  if (!notice) return null;
+  const amber = "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-400";
+  if (notice.kind === "update-required") {
+    return (
+      <Alert className={amber}>
+        <ShieldAlert className="h-4 w-4" />
+        <AlertTitle>Update YapStack to keep syncing</AlertTitle>
+        <AlertDescription className="text-xs">
+          Your account now holds changes this version can't apply, so syncing is paused on
+          this device. Your local notes are untouched. Update to resume.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+  if (notice.kind === "another-device-needs-update") {
+    return (
+      <Alert className={amber}>
+        <ShieldAlert className="h-4 w-4" />
+        <AlertTitle>Another device needs you to update YapStack</AlertTitle>
+        <AlertDescription className="text-xs">
+          Sync still works here. Another device is waiting for this one to run a newer
+          version before it can share some changes.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+  return (
+    <Alert className={amber}>
+      <ShieldAlert className="h-4 w-4" />
+      <AlertTitle>Waiting for other devices to update</AlertTitle>
+      <AlertDescription className="space-y-2 text-xs">
+        <p>
+          Some changes on this device need every device you've used in the last 30 days to
+          run a newer YapStack. They'll send once these update. Changes from your other
+          devices still arrive. Remove any you no longer use.
+        </p>
+        <ul className="space-y-1">
+          {notice.blockers.map((b, i) => {
+            const rosterDevice = b.fingerprint
+              ? status.roster.find((d) => d.fingerprint === b.fingerprint && !d.isSelf)
+              : undefined;
+            const { name } = platformLook(b.platform);
+            return (
+              <li key={b.fingerprint ?? i} className="flex items-center justify-between gap-3">
+                <span className="min-w-0 truncate">
+                  <span className="font-medium">{b.label ?? "Unnamed device"}</span>
+                  {name ? ` · ${name}` : ""} · last seen {formatRelativeTime(b.lastSeen).toLowerCase()}
+                </span>
+                {rosterDevice && onRemove && (
+                  <RemoveDeviceButton device={rosterDevice} onRemove={onRemove} />
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </AlertDescription>
+    </Alert>
   );
 }
 

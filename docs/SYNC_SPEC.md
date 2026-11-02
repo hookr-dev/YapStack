@@ -602,6 +602,24 @@ row first, then `tenant_seq`:
 
 Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).
 
+**Client side.** Builds send level 1 (`SYNC_CAPABILITY_LEVEL`) on every pull, snapshot
+request and raise. Each outbox entry stores the highest level among its rows
+(`_yapstack_outbox.required_sync_capability`, local, added by `ensure_outbox_table`; a
+table's level is declared in `GATED_SYNC_TABLES` beside `SYNC_TABLES`, and every cutover
+table is 0). The push planner cuts a batch wherever the level changes, so batches are
+single-level and an ungated prefix still ships. A gated batch carries
+`X-YapStack-Batch-Capability`. On 409 `sync_capability_floor` the drain tries the raise
+and retries once. A refused raise holds the push in `client_seq` order and lane status
+names the blocking devices, offering the roster's Remove; pull carries on. A 426 shows
+"Update YapStack to keep syncing". A device below `requested` sees "Another device needs
+you to update YapStack". The transport classifies capability 409s by body `code`, so they
+never reach the `client_seq`-regression recovery that drops the unacked outbox. The
+client keeps no copy of the floor: only the relay's answer authorizes a push.
+
+`min_client_version` is compared by semver precedence (`1.0.0-alpha.11 <
+1.0.0-alpha.12 < 1.0.0`). The relay's default is the prerelease floor `1.0.0-alpha.0`,
+so alpha builds aren't nagged.
+
 ### 9.3 Isolation
 
 Every tenant table is `ENABLE` + `FORCE ROW LEVEL SECURITY` on a transaction-local

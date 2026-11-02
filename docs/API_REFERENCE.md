@@ -829,6 +829,11 @@ pub struct SyncStatusDto {
     audio_upload_outstanding: u64, audio_backfill_outstanding: u64, audio_upload_failed: u64,
     audio_uploaded_total: u64, audio_backfill_complete: bool,
     removed: bool,                     // this device was removed from the account by another device (SYNC_SPEC §5.7)
+    capability_notice: Option<SyncCapabilityNoticeDto>, // ADR 0006 §5 lane-status notice
+}
+pub enum SyncCapabilityNoticeDto {     // tagged on `kind`, kebab-case
+    UpdateRequired, AnotherDeviceNeedsUpdate,
+    WaitingForDevices { blockers: Vec<CapabilityBlockerDto { label?, platform?, last_seen, fingerprint? }> },
 }
 pub struct SignupResultDto { recovery_code: String, device_fingerprint: String }
 pub struct LoginBeginResultDto { salt_mismatch: bool }

@@ -1571,6 +1571,7 @@ fn clear_session() -> Result<(), String> {
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
     AUDIO_LANE.reset();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
@@ -1664,6 +1665,35 @@ pub struct SyncStatusDto {
     /// tokens are dying (refresh family revoked, writes refused); the page tells the user
     /// to sign out and, if they want it back, sign in again to be re-approved.
     removed: bool,
+    /// ADR 0006 §5: a sync capability notice for lane status, or `None`.
+    capability_notice: Option<SyncCapabilityNoticeDto>,
+}
+
+/// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SyncCapabilityNoticeDto {
+    /// The relay refused this device's pull: the workspace floor is above this build's
+    /// level. Only an app update clears it.
+    UpdateRequired,
+    /// Another device asked for a level this build doesn't have. A nudge, not a block.
+    AnotherDeviceNeedsUpdate,
+    /// This device's push is held behind a change that needs a higher floor, and the relay
+    /// named the devices that must update (or be removed) first.
+    WaitingForDevices { blockers: Vec<CapabilityBlockerDto> },
+}
+
+/// One device holding up a floor raise, as lane status shows it.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityBlockerDto {
+    label: Option<String>,
+    platform: Option<String>,
+    /// RFC 3339 time of the device's last recorded pull.
+    last_seen: String,
+    /// The roster fingerprint, so the panel can offer the existing Remove; `None` when the
+    /// device isn't in the current roster.
+    fingerprint: Option<String>,
 }
 
 // ----- Typed relay connection probe (T025) -----
@@ -3346,6 +3376,48 @@ struct DrainProgress {
 /// never synced".
 static DRAIN_PROGRESS: PubCell<DrainProgress> = PubCell::new();
 
+// ----- Sync capability notice (ADR 0006 §5) -----
+
+/// The drain's latest sync capability state, published each cycle for lane status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum CapabilityNotice {
+    #[default]
+    None,
+    UpdateRequired,
+    AnotherDeviceNeedsUpdate,
+    WaitingFor(Vec<yapstack_common::sync::CapabilityBlocker>),
+}
+
+static CAPABILITY_NOTICE: PubCell<CapabilityNotice> = PubCell::new();
+
+/// Fold one drain cycle into the capability notice. A refused pull wins (nothing syncs in
+/// until the app updates), then a held push (names the blockers), then the nudge when the
+/// relay's `requested` level is above this build's. A cycle whose pull returned nothing
+/// (e.g. the relay was unreachable) keeps the previous nudge rather than flickering it.
+fn capability_notice(
+    report: &outbox::DrainReport,
+    previous: CapabilityNotice,
+    own_level: i32,
+) -> CapabilityNotice {
+    use yapstack_sync::SyncError;
+    if matches!(report.pull_error, Some(SyncError::UpdateRequired { .. })) {
+        return CapabilityNotice::UpdateRequired;
+    }
+    if let Some(SyncError::CapabilityBlocked { blockers, .. }) = &report.push_error {
+        return CapabilityNotice::WaitingFor(blockers.clone());
+    }
+    match report.relay_capability {
+        Some(l) if l.requested_sync_capability > own_level => {
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        }
+        Some(_) => CapabilityNotice::None,
+        None => match previous {
+            CapabilityNotice::AnotherDeviceNeedsUpdate => previous,
+            _ => CapabilityNotice::None,
+        },
+    }
+}
+
 // ----- Audio upload lane status (S2) -----
 //
 // The audio uploader runs on its OWN thread (independent of the changeset drain — a
@@ -3695,6 +3767,7 @@ fn spawn_drain(
     // progress slate (session ack count resets; no stale backlog shown, T024).
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
     AUDIO_LANE.reset();
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
@@ -4071,6 +4144,14 @@ fn spawn_drain(
                         tracing::warn!("sync drain: emit {SYNC_APPLIED_EVENT} failed: {e}");
                     }
                 }
+
+                // ADR 0006 §5: the capability notice for lane status (update required, held
+                // push with its blockers, or the "another device needs you to update" nudge).
+                CAPABILITY_NOTICE.set_if_changed(capability_notice(
+                    &report,
+                    CAPABILITY_NOTICE.get(),
+                    yapstack_sync::SYNC_CAPABILITY_LEVEL,
+                ));
 
                 // F2: surface the tolerated push/pull transport errors via the existing
                 // DrainHealth channel — before this the owner had ZERO feedback while a push or
@@ -4970,6 +5051,8 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
     let mut roster = Vec::new();
     let mut last_error = None;
     let mut removed = false;
+    let mut fingerprints: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::new();
     match http_get_devices(session).await {
         Ok(devs) => {
             for d in devs.devices {
@@ -4982,8 +5065,10 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
                     continue;
                 }
                 let pk = B64.decode(d.ed25519_pub.as_bytes()).unwrap_or_default();
+                let fingerprint = sha256_fingerprint(&pk);
+                fingerprints.insert(d.client_id, fingerprint.clone());
                 roster.push(DeviceRosterEntryDto {
-                    fingerprint: sha256_fingerprint(&pk),
+                    fingerprint,
                     is_self: d.client_id == session.client_id,
                     pending: d.status == "pending",
                     label: if d.label.is_empty() {
@@ -5066,6 +5151,34 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         audio_uploaded_total: audio.uploaded_total,
         audio_backfill_complete: audio.backfill_complete,
         removed,
+        capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
+    }
+}
+
+fn capability_notice_dto(
+    notice: CapabilityNotice,
+    fingerprints: &std::collections::HashMap<Uuid, String>,
+) -> Option<SyncCapabilityNoticeDto> {
+    let non_empty = |s: String| if s.is_empty() { None } else { Some(s) };
+    match notice {
+        CapabilityNotice::None => None,
+        CapabilityNotice::UpdateRequired => Some(SyncCapabilityNoticeDto::UpdateRequired),
+        CapabilityNotice::AnotherDeviceNeedsUpdate => {
+            Some(SyncCapabilityNoticeDto::AnotherDeviceNeedsUpdate)
+        }
+        CapabilityNotice::WaitingFor(blockers) => {
+            Some(SyncCapabilityNoticeDto::WaitingForDevices {
+                blockers: blockers
+                    .into_iter()
+                    .map(|b| CapabilityBlockerDto {
+                        fingerprint: fingerprints.get(&b.client_id).cloned(),
+                        label: non_empty(b.label),
+                        platform: non_empty(b.platform),
+                        last_seen: b.capability_seen_at,
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 
@@ -5084,40 +5197,68 @@ fn normalize_relay_url(input: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
-/// Parse the `major.minor.patch` release core from a semver-ish string, tolerating a
-/// missing minor/patch. A pre-release tag (`-…`) and build metadata (`+…`) are ignored (see
-/// the POLICY on `client_is_older`). Returns `None` on a non-numeric core so an unparseable
-/// value yields NO advisory rather than a fake one.
-fn parse_semver_core(v: &str) -> Option<(u64, u64, u64)> {
-    let core = v.split('+').next().unwrap_or(v);
-    let core = core.split_once('-').map_or(core, |(c, _)| c);
+/// A parsed semver-ish version: the `major.minor.patch` core (missing minor/patch read as 0)
+/// plus the dot-separated pre-release identifiers. Build metadata (`+…`) is dropped, as
+/// semver precedence ignores it. `None` on a non-numeric core, so an unparseable value
+/// yields NO advisory rather than a fake one.
+fn parse_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
+    let v = v.trim();
+    let v = v.split('+').next().unwrap_or(v);
+    let (core, pre) = v.split_once('-').map_or((v, ""), |(c, p)| (c, p));
     let mut parts = core.split('.');
     let major = parts.next()?.trim().parse().ok()?;
     let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
     let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((major, minor, patch))
+    let pre = if pre.is_empty() {
+        Vec::new()
+    } else {
+        pre.split('.').map(str::to_owned).collect()
+    };
+    Some(((major, minor, patch), pre))
+}
+
+/// Semver 2.0.0 §11 precedence of two pre-release identifier lists. An empty list (a
+/// release) ranks above any pre-release of the same core.
+fn cmp_prerelease(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    for (x, y) in a.iter().zip(b) {
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(n), Ok(m)) => n.cmp(&m),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// True when `app_version` is strictly older than the relay's published
-/// `min_client_version` (→ "update this app"). Unparseable inputs → `false` (no advisory);
-/// we never manufacture an advisory from garbage.
+/// `min_client_version` (→ "update this app"), by semver precedence. Unparseable inputs →
+/// `false` (no advisory); we never manufacture an advisory from garbage.
 ///
-/// POLICY (T029 Bug B): compare RELEASE CORES ONLY — a pre-release of `X.Y.Z` SATISFIES a
-/// minimum of `X.Y.Z` and is NOT flagged. Rationale: the advisory exists solely to nag
-/// genuinely outdated clients, and the relay publishes a single release-shaped minimum — it
-/// cannot meaningfully express a prerelease floor (a server that wanted to bar
-/// `1.0.0-alpha.11` but allow `1.0.0-alpha.12` has no way to say so). Treating our own
-/// in-development `1.0.0-alpha.12` as "older than 1.0.0" produced a false "update YapStack"
-/// nag against the relay's own advertised `1.0.0` during Windows UAT; comparing cores only
-/// fixes that without ever hiding a real major/minor/patch gap.
+/// Prerelease-aware (ADR 0006 §5.9): `1.0.0-alpha.11 < 1.0.0-alpha.12 < 1.0.0`. This
+/// replaces the T029 cores-only compare, under which every alpha compared equal and the
+/// relay couldn't express "at least alpha.12". The relay's default floor is a prerelease
+/// (`1.0.0-alpha.0`), so alpha builds aren't nagged by a relay left at its default.
 fn client_is_older(app_version: &str, min_client_version: &str) -> bool {
-    let (Some(a), Some(m)) = (
-        parse_semver_core(app_version),
-        parse_semver_core(min_client_version),
-    ) else {
+    let (Some((a_core, a_pre)), Some((m_core, m_pre))) =
+        (parse_semver(app_version), parse_semver(min_client_version))
+    else {
         return false;
     };
-    a < m
+    a_core
+        .cmp(&m_core)
+        .then_with(|| cmp_prerelease(&a_pre, &m_pre))
+        .is_lt()
 }
 
 /// Build the version advisory when this client is behind the relay's minimum. Advisory
@@ -5341,6 +5482,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             audio_uploaded_total: 0,
             audio_backfill_complete: false,
             removed: false,
+            capability_notice: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -5602,6 +5744,7 @@ pub async fn sync_disable(runtime: State<'_, SyncRuntimeState>) -> Result<SyncSt
     // backlog or health from the drain that just stopped.
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
     AUDIO_LANE.reset();
     let session = update_session(|s| s.sync_enabled = false)?;
     Ok(build_status_dto(&session).await)
@@ -6932,6 +7075,73 @@ mod tests {
             "a merge of peer rows carries the counts to the frontend"
         );
         assert_eq!(SYNC_APPLIED_EVENT, "sync://applied");
+    }
+
+    #[test]
+    fn capability_notice_ranks_refusal_then_held_push_then_nudge() {
+        use yapstack_common::sync::{CapabilityBlocker, SyncCapabilityLevels};
+        use yapstack_sync::SyncError;
+        let levels = |required, requested| {
+            Some(SyncCapabilityLevels {
+                required_sync_capability: required,
+                requested_sync_capability: requested,
+            })
+        };
+        let blocker = CapabilityBlocker {
+            client_id: Uuid::from_u128(9),
+            label: "old laptop".into(),
+            platform: "windows".into(),
+            sync_capability: 0,
+            capability_seen_at: "2026-10-30T00:00:00+00:00".into(),
+        };
+
+        // A refused pull wins over everything.
+        let r = outbox::DrainReport {
+            pull_error: Some(SyncError::UpdateRequired {
+                level: 1,
+                required: 2,
+                requested: 2,
+            }),
+            push_error: Some(SyncError::CapabilityBlocked {
+                level: 2,
+                blockers: vec![blocker.clone()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            capability_notice(&r, CapabilityNotice::None, 1),
+            CapabilityNotice::UpdateRequired
+        );
+
+        // A held push names its blockers; pull still ran.
+        let r = outbox::DrainReport {
+            push_error: Some(SyncError::CapabilityBlocked {
+                level: 2,
+                blockers: vec![blocker.clone()],
+            }),
+            relay_capability: levels(1, 2),
+            ..Default::default()
+        };
+        assert_eq!(
+            capability_notice(&r, CapabilityNotice::None, 1),
+            CapabilityNotice::WaitingFor(vec![blocker])
+        );
+
+        // Below `requested`: the nudge. It survives a cycle whose pull returned nothing,
+        // and clears once the relay reports nothing above this build.
+        let r = outbox::DrainReport {
+            relay_capability: levels(0, 2),
+            ..Default::default()
+        };
+        let nudge = capability_notice(&r, CapabilityNotice::None, 1);
+        assert_eq!(nudge, CapabilityNotice::AnotherDeviceNeedsUpdate);
+        let silent = outbox::DrainReport::default();
+        assert_eq!(capability_notice(&silent, nudge.clone(), 1), nudge);
+        let r = outbox::DrainReport {
+            relay_capability: levels(1, 1),
+            ..Default::default()
+        };
+        assert_eq!(capability_notice(&r, nudge, 1), CapabilityNotice::None);
     }
 
     #[test]
@@ -9319,11 +9529,31 @@ mod tests {
             // Equal or newer → no advisory (never "the server is behind").
             assert!(compute_version_advisory("1.0.0", "1.0.0").is_none());
             assert!(compute_version_advisory("1.2.0", "1.0.0").is_none());
-            // T029 Bug B policy: a pre-release of the required release SATISFIES the minimum
-            // (compare release cores only). The owner's own `1.0.0-alpha.12` build must NOT
-            // nag itself against the relay's advertised `1.0.0`.
-            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_none());
-            // A release is NOT older than its own pre-release (cores equal → satisfied).
+            // ADR 0006 §5.9: semver precedence, prerelease-aware. A pre-release is older than
+            // its release, so the relay's default floor is itself a prerelease
+            // (`1.0.0-alpha.0`) and the owner's alpha builds aren't nagged.
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0-alpha.0").is_none());
+            assert!(compute_version_advisory("1.0.0-alpha.12", "1.0.0").is_some());
+            assert!(client_is_older("1.0.0-alpha.11", "1.0.0-alpha.12"));
+            assert!(!client_is_older("1.0.0-alpha.12", "1.0.0-alpha.12"));
+            assert!(client_is_older("1.0.0-alpha.12", "1.0.0"));
+            assert!(
+                client_is_older("1.0.0-alpha.9", "1.0.0-alpha.10"),
+                "numeric identifiers"
+            );
+            assert!(
+                client_is_older("1.0.0-alpha", "1.0.0-alpha.1"),
+                "fewer fields is lower"
+            );
+            assert!(
+                client_is_older("1.0.0-alpha.1", "1.0.0-beta"),
+                "alphanumeric order"
+            );
+            assert!(
+                !client_is_older("1.0.0+build.5", "1.0.0"),
+                "build metadata is ignored"
+            );
+            // A release is NOT older than its own pre-release.
             assert!(compute_version_advisory("1.0.0", "1.0.0-alpha.1").is_none());
             // A genuinely older core is still flagged even when it carries a pre-release tag.
             assert!(compute_version_advisory("0.9.0-beta.1", "1.0.0").is_some());

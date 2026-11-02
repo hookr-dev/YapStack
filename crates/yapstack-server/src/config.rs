@@ -202,7 +202,7 @@ impl Default for SyncInfoConfig {
     fn default() -> Self {
         Self {
             protocol_version: 2,
-            min_client_version: "1.0.0".to_string(),
+            min_client_version: "1.0.0-alpha.0".to_string(),
             engine_version: "0.16.3".to_string(),
             billing_url: None,
         }

@@ -327,6 +327,60 @@ describe("SyncTab — on", () => {
     );
   });
 
+  it("a held push names the blocking devices and offers Remove for roster members", async () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({
+        roster: [SELF, PEER],
+        lastError: "waiting for Work Laptop, old install to update YapStack",
+        capabilityNotice: {
+          kind: "waiting-for-devices",
+          blockers: [
+            { label: PEER.label, platform: "windows", lastSeen: new Date().toISOString(), fingerprint: PEER.fingerprint },
+            { label: "old install", platform: null, lastSeen: new Date().toISOString(), fingerprint: null },
+          ],
+        },
+      }),
+    });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation(async () => makeStatus({ roster: [SELF] }));
+    render(<SyncTab />);
+    const alert = screen.getByText("Waiting for other devices to update").closest("[role=alert]") as HTMLElement;
+    expect(within(alert).getByText("Work Laptop")).toBeInTheDocument();
+    expect(within(alert).getByText("old install")).toBeInTheDocument();
+    // The verbatim drain error isn't repeated as a "Connection problem".
+    expect(screen.queryByText("Connection problem")).not.toBeInTheDocument();
+    // Only the roster member gets Remove, and it is the same password-confirmed removal.
+    const removes = within(alert).getAllByRole("button", { name: /^Remove / });
+    expect(removes).toHaveLength(1);
+    await userEvent.click(removes[0]);
+    const dialog = screen.getByRole("alertdialog");
+    await userEvent.type(within(dialog).getByLabelText("Your password"), "hunter22");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Remove device" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("sync_remove_device", {
+        fingerprint: PEER.fingerprint,
+        password: "hunter22",
+      }),
+    );
+  });
+
+  it("update required and the another-device nudge each get their own notice", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ capabilityNotice: { kind: "update-required" } }),
+    });
+    const { unmount } = render(<SyncTab />);
+    expect(screen.getByText("Update YapStack to keep syncing")).toBeInTheDocument();
+    unmount();
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ capabilityNotice: { kind: "another-device-needs-update" } }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Another device needs you to update YapStack")).toBeInTheDocument();
+  });
+
   it("a removed device is told so, offered Sign out, and cannot remove others", async () => {
     setup({ email: "user@example.com", status: makeStatus({ roster: [PEER], removed: true }) });
     render(<SyncTab />);
