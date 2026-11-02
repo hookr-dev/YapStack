@@ -144,3 +144,51 @@ fn crr_migration_roundtrip_real_db() {
         assert_eq!(h, *ph, "{t}: fingerprint drifted");
     }
 }
+
+/// I-NT2 (cutover half): the CRR rebuild keeps every non-UNIQUE secondary index.
+/// Before the fix `DROP TABLE` took the indexes with it and only triggers were
+/// replayed, so a synced DB lost every one of them (segments-by-session and
+/// sessions-by-day turned into full scans). A UNIQUE index is not kept: cr-sqlite
+/// refuses a CRR with a non-PK UNIQUE index, and uniqueness is app-layer.
+#[test]
+fn crr_migration_preserves_secondary_indexes() {
+    let db = CrsqlDb::open_in_memory().unwrap();
+    let conn = db.conn();
+    support::create_original_schema(conn);
+    conn.execute_batch(support::SECONDARY_INDEXES).unwrap();
+    // A partial index, to prove the replay is the captured SQL verbatim.
+    conn.execute_batch(
+        "CREATE INDEX idx_segments_live ON segments(session_id) WHERE deleted_at IS NULL;",
+    )
+    .unwrap();
+    support::populate(conn);
+    let before = support::index_set(conn, SYNC_TABLES);
+    assert_eq!(before.len(), 20, "precondition: fixture indexes present");
+    // An explicit UNIQUE index is the one shape the rebuild must NOT carry over.
+    conn.execute_batch("CREATE UNIQUE INDEX idx_tags_color_u ON tags(color, name);")
+        .unwrap();
+
+    schema::crr_migrate(conn).expect("cutover");
+
+    assert_eq!(
+        support::index_set(conn, SYNC_TABLES),
+        before,
+        "every non-UNIQUE secondary index survives cutover, shape for shape"
+    );
+    for t in SYNC_TABLES {
+        assert!(schema::is_crr(conn, t).unwrap(), "{t}: not a CRR");
+    }
+    // The planner actually uses the restored indexes.
+    let mut stmt = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT * FROM segments WHERE session_id = 's0'")
+        .unwrap();
+    let detail: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    assert!(
+        detail.iter().any(|d| d.contains("USING INDEX")),
+        "segments-by-session must use an index after cutover: {detail:?}"
+    );
+}
