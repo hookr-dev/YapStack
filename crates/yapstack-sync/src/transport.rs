@@ -18,7 +18,7 @@ use yapstack_common::sync::{
     CapabilityBlocker, ClientTail, CompletenessResponse, PresignResponse, PullResponse,
     PulledChange, PushAck, PushRequest, PushResponse, RaiseSyncCapabilityRequest,
     SyncCapabilityBlocked, SyncCapabilityLevels, SyncCapabilityRefusal, BATCH_CAPABILITY_HEADER,
-    SYNC_CAPABILITY_HEADER,
+    SNAPSHOT_CAPABILITY_HEADER, SYNC_CAPABILITY_HEADER,
 };
 
 use crate::snapshot::SnapshotMeta;
@@ -66,10 +66,18 @@ pub trait SyncTransport: Send + Sync {
     }
 
     /// R2: publish the encrypted DB snapshot (the seed device's bootstrap artifact).
-    /// The relay stores it as an opaque blob and never reads it.
+    /// The relay stores it as an opaque blob and never reads it. `content_capability` is the
+    /// highest sync capability level among the tables the snapshot holds rows for
+    /// ([`crate::schema::snapshot_content_capability`], ADR 0006 §5.5); the relay refuses it
+    /// with [`SyncError::CapabilityFloor`] when its floor is lower.
     ///
     /// Default: unsupported (test transports that never touch the snapshot seam inherit this).
-    async fn put_snapshot(&self, _meta: SnapshotMeta, _ciphertext: &[u8]) -> Result<(), SyncError> {
+    async fn put_snapshot(
+        &self,
+        _meta: SnapshotMeta,
+        _ciphertext: &[u8],
+        _content_capability: i32,
+    ) -> Result<(), SyncError> {
         Err(SyncError::Transport("snapshot put not supported".into()))
     }
 
@@ -395,11 +403,13 @@ impl SyncTransport for HttpTransport {
     }
 
     // ADR 0006 §5.5: the relay refuses a snapshot whose declared content level
-    // (`X-YapStack-Snapshot-Capability`) is above its floor. No header = level 0, which is
-    // true while `schema::GATED_SYNC_TABLES` is empty. The seed path (no caller yet) must
-    // declare the highest level among the gated tables the snapshot holds rows for once one
-    // exists (FP2b).
-    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
+    // (`X-YapStack-Snapshot-Capability`) is above its floor.
+    async fn put_snapshot(
+        &self,
+        meta: SnapshotMeta,
+        ciphertext: &[u8],
+        content_capability: i32,
+    ) -> Result<(), SyncError> {
         // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
         // and byte-free — the bytes go directly to object storage).
         let sha = crate::snapshot::ciphertext_sha256_hex(ciphertext);
@@ -408,6 +418,7 @@ impl SyncTransport for HttpTransport {
             .post(format!("{}/snapshot/presign", self.base_url))
             .bearer_auth(self.bearer())
             .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
+            .header(SNAPSHOT_CAPABILITY_HEADER, content_capability.to_string())
             .json(&SnapshotPresignRequest {
                 sha256: sha,
                 size: ciphertext.len() as u64,
@@ -416,10 +427,22 @@ impl SyncTransport for HttpTransport {
             })
             .send()
             .await?;
-        let presign: SnapshotPresignResponse =
-            check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?
-                .json()
-                .await?;
+        // A 426 refers to this build's level, a 409 floor refusal to the content's.
+        let resp = match check_capability(resp, SYNC_CAPABILITY_LEVEL).await {
+            Err(SyncError::CapabilityFloor {
+                required,
+                requested,
+                ..
+            }) => {
+                return Err(SyncError::CapabilityFloor {
+                    batch: content_capability,
+                    required,
+                    requested,
+                })
+            }
+            r => r?,
+        };
+        let presign: SnapshotPresignResponse = check_auth(resp)?.json().await?;
         if presign.already_exists {
             return Ok(());
         }
@@ -845,8 +868,20 @@ impl SyncTransport for MockRelay {
         })
     }
 
-    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
+    async fn put_snapshot(
+        &self,
+        meta: SnapshotMeta,
+        ciphertext: &[u8],
+        content_capability: i32,
+    ) -> Result<(), SyncError> {
         let mut g = self.inner.lock().unwrap();
+        if content_capability > g.floor {
+            return Err(SyncError::CapabilityFloor {
+                batch: content_capability,
+                required: g.floor,
+                requested: g.requested,
+            });
+        }
         g.snapshot = Some((meta, ciphertext.to_vec()));
         Ok(())
     }
@@ -973,13 +1008,15 @@ mod tests {
     /// accept per element. Each accept drains the request until end-of-headers so the
     /// client's write completes before we reply+close. Returns the bound address and the
     /// responder's `JoinHandle` so the caller keeps its `server.join().unwrap()` (a panic in
-    /// the responder thread must still fail the test).
+    /// the responder thread must still fail the test). The handle yields each request's
+    /// head (request line and headers), in order.
     fn canned_server(
         responses: Vec<String>,
-    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
+            let mut heads = Vec::new();
             for resp in responses {
                 let (mut sock, _) = listener.accept().unwrap();
                 let mut buf = Vec::new();
@@ -994,9 +1031,11 @@ mod tests {
                         break;
                     }
                 }
+                heads.push(String::from_utf8_lossy(&buf).into_owned());
                 let _ = sock.write_all(resp.as_bytes());
                 let _ = sock.flush();
             }
+            heads
         });
         (addr, handle)
     }
@@ -1076,6 +1115,57 @@ mod tests {
             "a code-less 409 is not a conflict, got {e:?}"
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn put_snapshot_declares_the_content_level_and_is_refused_above_the_floor() {
+        let meta = SnapshotMeta {
+            generation: 1,
+            baseline_seq: 0,
+        };
+        let relay = MockRelay::new();
+        let e = relay.put_snapshot(meta, b"ct", 1).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                SyncError::CapabilityFloor {
+                    batch: 1,
+                    required: 0,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+        assert!(
+            relay.get_snapshot().await.unwrap().is_none(),
+            "nothing recorded"
+        );
+        relay.put_snapshot(meta, b"ct", 0).await.unwrap();
+        assert!(relay.get_snapshot().await.unwrap().is_some());
+
+        let floor = r#"{"code":"sync_capability_floor","message":"m","required_sync_capability":0,"requested_sync_capability":0}"#;
+        let (addr, server) = canned_server(vec![json_response("409 Conflict", floor)]);
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        let e = t.put_snapshot(meta, b"ct", 1).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                SyncError::CapabilityFloor {
+                    batch: 1,
+                    required: 0,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+        let heads = server.join().unwrap();
+        assert!(
+            heads[0]
+                .to_ascii_lowercase()
+                .contains("x-yapstack-snapshot-capability: 1\r\n"),
+            "the presign declares the content level: {}",
+            heads[0]
+        );
     }
 
     #[test]

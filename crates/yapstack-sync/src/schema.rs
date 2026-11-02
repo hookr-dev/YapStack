@@ -443,6 +443,22 @@ pub fn crr_tables(conn: &Connection) -> Result<Vec<String>, SyncError> {
     Ok(out)
 }
 
+/// The level a snapshot of this database must declare (ADR 0006 §5.5): the highest
+/// [`table_sync_capability`] among the CRR tables that hold at least one row.
+pub fn snapshot_content_capability(conn: &Connection) -> Result<i32, SyncError> {
+    let mut level = 0;
+    for t in crr_tables(conn)? {
+        let populated: bool =
+            conn.query_row(&format!("SELECT EXISTS (SELECT 1 FROM \"{t}\")"), [], |r| {
+                r.get(0)
+            })?;
+        if populated {
+            level = level.max(table_sync_capability(&t));
+        }
+    }
+    Ok(level)
+}
+
 /// Of the three triggers cr-sqlite generates per CRR table (`triggers.rs:12-20`), the two
 /// whose existence nothing else proves. ALL three must still exist: `is_crr` here probes
 /// the clock table, and cr-sqlite's own `is_crr` probes only `__crsql_itrig`
@@ -899,6 +915,35 @@ mod tests {
             assert!(*level >= crate::TABLE_READINESS_LEVEL, "{t} level {level}");
         }
         assert!(crate::SYNC_CAPABILITY_LEVEL >= crate::TABLE_READINESS_LEVEL);
+    }
+
+    #[test]
+    fn snapshot_content_level_is_the_highest_level_among_populated_crr_tables() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT); \
+             CREATE TABLE t_new(id TEXT NOT NULL PRIMARY KEY, v TEXT); \
+             CREATE TABLE t_local(id TEXT NOT NULL PRIMARY KEY, v TEXT); \
+             INSERT INTO tags VALUES ('g1', 'work'); \
+             INSERT INTO t_local VALUES ('l1', 'never synced');",
+        )
+        .unwrap();
+        for t in ["tags", "t_new"] {
+            conn.query_row(&format!("SELECT crsql_as_crr('{t}')"), [], |_| Ok(()))
+                .unwrap();
+        }
+        assert_eq!(
+            snapshot_content_capability(conn).unwrap(),
+            0,
+            "an empty CRR table and a populated non-CRR table add nothing"
+        );
+        conn.execute("INSERT INTO t_new VALUES ('n1', 'x')", [])
+            .unwrap();
+        assert_eq!(
+            snapshot_content_capability(conn).unwrap(),
+            crate::TABLE_READINESS_LEVEL
+        );
     }
 
     #[test]
