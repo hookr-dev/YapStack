@@ -160,11 +160,44 @@ app-layer passes reinstate what was stripped after each converged merge:
 | `_yapstack_sync_meta` | `client_id` (unused in production; the keychain identity wins), `pull_watermark`, `push_watermark`, `client_seq`, `seq_reconciled`, `bound_tenant_id` |
 | `_yapstack_sync_prep` | `schema_version` marker that the live DB has been CRR-prepared |
 | `_yapstack_outbox` | encrypted, chunked local changesets awaiting ack |
-| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for unknown columns, clock intact) |
+| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for tables that aren't a CRR here yet, or for unknown columns; clock intact) |
 | `_yapstack_crypto_quarantine` | undecryptable pulled changesets (ciphertext, durable, retryable) |
 | `_yapstack_audio_upload_queue` | audio upload state machine per part |
 
-### 4.3 Column additions that must be CRR-tracked
+### 4.3 Schema evolution on a CRR database
+
+Migrations (`db.rs`) carry a `kind` (ADR 0006 §1). On a CRR database the runner
+(`db_service::apply_migration`) treats them as follows; on a non-CRR database every kind
+is applied plainly.
+
+- **`Plain`**: a single `ALTER TABLE <sync_table>` is routed through `crsql_alter`;
+  any other statement that names a sync table is refused.
+- **`SyncIndex`**: only `CREATE INDEX IF NOT EXISTS … ON <sync_table>(…)`, plus
+  `DROP INDEX IF EXISTS <name>` when the same migration re-creates `<name>`; no SQL
+  comments. Names are bare `idx_[a-z0-9_]+` identifiers (no quotes, no schema prefix,
+  never `__crsql`) and tables bare sync-table names; a DROP target must be absent or a
+  declared, non-UNIQUE index on the table its re-create names. Applied plainly (an index touches no rows, columns or clocks, so CRR
+  triggers stay current). Every UNIQUE index is refused on every database, even one
+  over the PK: the vendored cr-sqlite rejects any UNIQUE index whose origin isn't the
+  PRIMARY KEY, and cutover drops UNIQUE indexes, so a fresh DB never holds one.
+
+**Indexes survive cutover.** The rebuild (`schema::transform_and_crrify`) captures each
+table's declared non-UNIQUE indexes from `sqlite_master` (never `sqlite_autoindex_*`,
+never UNIQUE) and replays them after the RENAME, alongside the app triggers. Builds
+before this dropped every secondary index at cutover; migration v18 (`SyncIndex`)
+re-declares every synced-table secondary index with `IF NOT EXISTS` to restore them on
+those databases (I-NT2). `IF NOT EXISTS` matches on the name only, so v18 drops and
+re-creates the two indexes whose shape has history (`idx_chat_messages_session`, v7's
+two-column shape; `idx_tags_name`, see below). A new index on a synced table is a
+`SyncIndex` migration.
+
+The rebuild does not carry a column `COLLATE` over, so after cutover `tags.name`
+compares BINARY rather than NOCASE (open follow-up: tag de-duplication by name becomes
+case-sensitive). v18 declares `idx_tags_name` as `tags(name COLLATE NOCASE)`, so the
+index itself stays NOCASE through cutover and serves `getTagByName`'s explicit
+`COLLATE NOCASE` lookup either way.
+
+#### Column additions that must be CRR-tracked
 
 `schema::OUT_OF_BAND_ALTERS` lists every column the front end historically added at
 runtime (`segments.speaker_id`, `sessions.recording_device_id`, six `chat_messages`
@@ -415,15 +448,37 @@ including its own echoes (idempotent; this is how a restored database re-acquire
 own history), one transaction per changeset with cooperative yields and a real pause
 every 32 merges so UI writers can take the lock. A changeset that fails to decrypt or
 decode is stored in the crypto quarantine and the watermark **advances past it**
-(§11.3 as amended: durable, surfaced, retryable, never wedging). Unknown-column rows go
-to the schema quarantine and replay after the column lands. The watermark is written
-once per page.
+(§11.3 as amended: durable, surfaced, retryable, never wedging). A row goes to the
+schema quarantine when its table isn't a CRR locally (absent, or present but not yet
+converted), **sentinel rows included**, or when its column is unknown; readiness is
+checked once per table per changeset. Any other failure to apply a row still fails the
+changeset and rides back as `pull_error`. The watermark is written once per page.
+
+Replay runs at the end of every drain cycle. It walks the stash in arrival (`id`) order,
+one row per write transaction, each under the process `WriteTurnstile` taken before
+`BEGIN IMMEDIATE`. A row that is still not ready waits; a ready row that fails rolls back
+alone, stays stashed and is retried next cycle, and every later stashed row for the same
+`(table, pk)` is skipped for that pass, so a column row never lands over a failed delete
+sentinel. A merge also stashes an incoming row behind any stashed row for the same
+`(table, pk)` that is ready here (failed, or not replayed yet), so an older live row can't
+land past a failed delete sentinel and resurrect the row. That barrier is derived from the
+stash inside the merge transaction, so it holds across a crash. Each pass persists its counts in `_yapstack_sync_meta`
+(`replay_waiting`: rows waiting for an app update; `replay_failed`: failed plus held behind
+a failure), read by `quarantine::replay_status`, so they hold across idle cycles and
+restarts. A non-zero `replay_failed` turns an otherwise clean cycle's health to `Failing`
+(a possible corruption signal); waiting rows don't. Lane status has no field for the
+waiting count yet. `crr_migrate`, `cascade_gc` and `enforce_uniqueness` skip a sync table
+this device doesn't have, or hasn't converted, yet, and report how many passes they skipped
+(ADR 0006 §4).
 
 ### 6.5 Maintenance
 
 `cascade_gc` and `enforce_uniqueness` run only on a cycle that merged something **and**
 completed a clean, fully-drained pull (`maintenance_ready`); a merge on a failed pull
-arms a flag consumed by the next clean cycle. Rationale: proven ≠ fresh.
+arms a flag consumed by the next clean cycle. Maintenance also waits while any stashed
+row fails to replay (a newer value may be stuck behind an older one that landed), and
+reruns on an idle cycle once a table it skipped becomes a CRR; a drain starts with one pass
+armed, since that schedule is in memory. Rationale: proven ≠ fresh.
 
 ### 6.6 Health and progress
 
@@ -725,6 +780,7 @@ onboarding completes.
 | I12 | Two devices converge through the relay; random programs converge | `runtime::two_devices_converge_through_relay`, `convergence_proptest` |
 | I13 | Independent UUID libraries merge as a lossless union; shared ancestry is lossy by design | `merge_semantics::*` |
 | I14 | Unknown-column changes quarantine and replay after migration | `remediations::r7_quarantine_replay_across_schema_gap` |
+| I-NT1 | A row for a table that isn't a CRR locally never fails a changeset: it waits in the schema quarantine, the watermark advances, and it replays once the table is a CRR; one failing stashed row never blocks the others | `outbox::tests::wedge_regression_new_table_sentinel`, `quarantine::tests::*`, `remediations::absent_tables_are_tolerated_by_migrate_cascade_and_uniqueness` |
 | I15 | Dedup and cascade never destroy a partially merged or not-yet-merged row | `data_integrity_prove::*` |
 | I16 | A restored DB re-acquires its own history (own echoes merge) | `outbox` restore tests |
 | I17 | Stale CRR triggers are detected and healed without touching sync state | `trigger_arity::*` |
@@ -739,6 +795,7 @@ onboarding completes.
 | I26 | Removing a device revokes its access, requires re-authentication, and re-enrols it pending with no grant; the removed device is told so and refuses to enable (§15.D) | `auth_flow::device_removal_revokes_access_and_requires_reapproval`, `device_removal_reauth_and_revoked_row_edges`, `SyncTab.test.tsx` ("a removed device is told so…") |
 | I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
+| I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses every UNIQUE index (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
 
 ---
 
@@ -808,6 +865,7 @@ points to §15. Nothing in this table is still open.
 | D23 | `lib/sync.ts` `SyncPhase` included `preparing`; `syncConfig.lastChangesetSeq` was persisted; `billingUrl` was a status field | Rust never emitted `preparing`; `lastChangesetSeq` had no writer; `build_status_dto` always set `billing_url: None` and the probe did not read it | **Done (78e0bf3):** removed (the relay's `GET /sync/info` still echoes an operator-configured `billing_url`; no client reads it) |
 | D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (78e0bf3):** removed |
 | D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | Design written up as [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md); **awaiting ratification** (§15.F) |
+| D26 | ADR 0006 §2: the CRR rebuild keeps a table's secondary indexes | `transform_and_crrify` replayed triggers only, so cutover dropped every secondary index (the owner's synced DB kept just the two `lib/db.ts` re-creates); sessions-by-day and segments-by-session became full scans | **Done (FP2a):** indexes captured and replayed at cutover; migration v18 (`SyncIndex`) restores them on databases already cut over (§4.3, I-NT2) |
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
 
 ---

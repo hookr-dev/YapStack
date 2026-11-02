@@ -11,7 +11,10 @@ whisper = ["dep:whisper-rs"]
 metal = ["whisper-rs/metal"]
 # Sortformer (speaker diarization) ships under the same parakeet feature
 # so it travels with the engine that needs it.
-parakeet = ["dep:parakeet-rs"]
+# `ort` comes in directly (same pin parakeet-rs uses) so the sidecar can
+# configure sessions itself: strict EP registration and the opt-in
+# YAPSTACK_ORT_PLACEMENT session logger.
+parakeet = ["dep:parakeet-rs", "dep:ort"]
 # Apple-only CoreML execution provider for Parakeet. Strict superset of
 # `parakeet`. Adds ~Metal/ANE acceleration via ort-coreml; CPU is kept as
 # automatic fallback by parakeet-rs (`error_on_failure()`).
@@ -19,10 +22,10 @@ coreml = ["parakeet", "parakeet-rs/coreml"]
 # WebGPU execution provider for Parakeet (Metal under the hood on macOS,
 # Vulkan/Dawn elsewhere). Different ORT codepath than CoreML — doesn't
 # go through the cache-write step that fails on models with external
-# `.onnx.data` initializers. Pulls a direct `ort` dep (same pinned version
-# parakeet-rs uses) so the strict opt-in path can register the EP itself
-# with error_on_failure — parakeet-rs's own arm registers it soft.
-webgpu = ["parakeet", "parakeet-rs/webgpu", "dep:ort"]
+# `.onnx.data` initializers. The sidecar registers the EP itself through the
+# direct `ort` dep with error_on_failure — parakeet-rs's own arm registers
+# it soft.
+webgpu = ["parakeet", "parakeet-rs/webgpu"]
 
 [dependencies]
 yapstack-common = { path = "../yapstack-common" }

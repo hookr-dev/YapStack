@@ -210,8 +210,51 @@ pub fn is_crr(conn: &Connection, table: &str) -> Result<bool, SyncError> {
     Ok(n == 1)
 }
 
+/// The `CREATE INDEX` SQL of every secondary index on `table` that survives a CRR
+/// rebuild: declared indexes only (`sqlite_autoindex_*` rows have no SQL; they back
+/// PK/UNIQUE constraints the rebuild re-derives or deliberately drops), and never a
+/// UNIQUE one. cr-sqlite refuses a CRR with a non-PK UNIQUE index
+/// (`is_table_compatible`), and uniqueness is enforced in the app layer
+/// (`uniqueness`), so carrying one over would fail the conversion.
+fn secondary_index_sql(conn: &Connection, table: &str) -> Result<Vec<String>, SyncError> {
+    let mut stmt = conn.prepare(
+        "SELECT m.sql FROM sqlite_master m \
+         JOIN pragma_index_list(?1) il ON il.name = m.name \
+         WHERE m.type = 'index' AND m.tbl_name = ?1 AND m.sql IS NOT NULL \
+           AND il.\"unique\" = 0 \
+         ORDER BY m.name",
+    )?;
+    let v: Result<Vec<String>, _> = stmt
+        .query_map([table], |r| r.get::<_, String>(0))?
+        .collect();
+    Ok(v?)
+}
+
+/// True when every one of `tables` is a CRR here. For passes that read clock tables and must
+/// skip a table this device doesn't have, or hasn't converted, yet.
+pub(crate) fn all_crr(conn: &Connection, tables: &[&str]) -> Result<bool, SyncError> {
+    for t in tables {
+        if !is_crr(conn, t)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The `SYNC_TABLES` members that are CRRs here right now. Changes when a table added after
+/// cutover is created and converted, which is when maintenance that skipped it must rerun.
+pub fn crr_sync_tables(conn: &Connection) -> Result<Vec<&'static str>, SyncError> {
+    let mut out = Vec::with_capacity(SYNC_TABLES.len());
+    for t in SYNC_TABLES {
+        if is_crr(conn, t)? {
+            out.push(*t);
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuild one table into its CRR-compatible shape (preserving app triggers such as
-/// the FTS sync triggers) then `crsql_as_crr` it. Idempotent: a table already
+/// the FTS sync triggers, and its non-UNIQUE secondary indexes) then `crsql_as_crr` it. Idempotent: a table already
 /// converted is skipped.
 fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError> {
     if is_crr(conn, table)? {
@@ -230,6 +273,7 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
             .collect();
         v?
     };
+    let indexes = secondary_index_sql(conn, table)?;
 
     conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tmp = format!("{table}__crr_rebuild");
@@ -247,6 +291,11 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
     for t in &triggers {
         tx.execute_batch(&format!("{t};"))?;
     }
+    // `DROP TABLE` took the table's indexes with it; put the secondary ones back
+    // (I-NT2). Replayed verbatim, so partial and DESC indexes keep their shape.
+    for i in &indexes {
+        tx.execute_batch(&format!("{i};"))?;
+    }
     tx.commit()?;
 
     // AFTER the commit: `crsql_as_crr` must see the rebuilt table as committed schema.
@@ -257,8 +306,15 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
 
 /// R3 entry point: transform + CRRify every sync table on a (COPY of a) local DB.
 /// NEVER call against the live DB — operate on a `.backup` copy (T001 procedure).
+///
+/// A `SYNC_TABLES` member this DB doesn't have is skipped, not an error (ADR 0006 §4): a
+/// table added after cutover is created and converted by its own migration, and rows for it
+/// that arrive first wait in the quarantine.
 pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
     for t in SYNC_TABLES {
+        if !table_exists(conn, t)? {
+            continue;
+        }
         transform_and_crrify(conn, t)?;
     }
     Ok(())

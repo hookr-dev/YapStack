@@ -12,6 +12,7 @@
 
 use rusqlite::Connection;
 
+use crate::schema::all_crr;
 use crate::SyncError;
 
 /// Per-relationship counts from one GC pass.
@@ -19,6 +20,9 @@ use crate::SyncError;
 pub struct CascadeStats {
     pub deleted: usize,
     pub nulled: usize,
+    /// Relationships skipped because a table they name isn't a CRR here yet. Non-zero means
+    /// the pass must run again once that table is converted.
+    pub skipped: usize,
 }
 
 /// Child tables whose rows are deleted when their parent PK is gone (the stripped
@@ -86,7 +90,15 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
     // regardless of `busy_timeout` (same rationale as `quarantine::merge_changeset`).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut stats = CascadeStats::default();
+    // A relationship runs only when every table it names is a CRR here: a table added after
+    // cutover may not exist (or not be converted) on this device yet, and its clock tables
+    // are what `proven_deleted_pks` reads (ADR 0006 §4).
+    let ready = |tables: &[&str]| all_crr(&tx, tables);
     for (child, fk, parent, ppk, _nullable) in CASCADE_DELETE {
+        if !ready(&[child, parent])? {
+            stats.skipped += 1;
+            continue;
+        }
         // Cascade a delete only when the parent is PROVEN deleted — never on mere
         // absence, which a quarantine-and-advanced or DB-restored device reaches with
         // the parent still un-merged. A `NULL` fk never matches an `IN` set, so the
@@ -98,6 +110,10 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
         stats.deleted += tx.execute(&sql, [])?;
     }
     for (child, (fka, pa), (fkb, pb)) in CASCADE_JUNCTION {
+        if !ready(&[child, pa, pb])? {
+            stats.skipped += 1;
+            continue;
+        }
         // A junction row dies when EITHER parent is proven-deleted.
         let sql = format!(
             "DELETE FROM \"{child}\" WHERE \"{fka}\" IN ({}) OR \"{fkb}\" IN ({})",
@@ -107,6 +123,10 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
         stats.deleted += tx.execute(&sql, [])?;
     }
     for (table, fk, parent, ppk) in SET_NULL {
+        if !ready(&[table, parent])? {
+            stats.skipped += 1;
+            continue;
+        }
         // Null the FK only when its referent is PROVEN deleted — never on mere absence,
         // exactly as CASCADE_DELETE above. A merely-not-yet-merged / crypto-quarantined
         // parent (absent, but with NO delete sentinel) must NOT cause its children's fk to
