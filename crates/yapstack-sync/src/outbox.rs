@@ -18,6 +18,7 @@ use crate::state;
 use crate::transport::SyncTransport;
 use crate::SyncError;
 use yapstack_common::sync::{PushChange, PushRequest, MAX_PUSH_BYTES, MAX_PUSH_CHANGES};
+use yapstack_common::write_turnstile::WriteTurnstile;
 
 const PULL_LIMIT: i64 = 500;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -479,18 +480,21 @@ pub fn enqueue_local(
         client_id,
         schema_version,
         engine_version,
+        WriteTurnstile::process(),
         || {},
     )
 }
 
-/// [`enqueue_local`] with a hook that runs after each chunk's transaction commits — i.e. at
-/// exactly the points where the write lock is released and another writer can take it.
+/// [`enqueue_local`] on an explicit turnstile, with a hook that runs after each chunk's
+/// transaction commits and its turn is released — i.e. at exactly the points where the write
+/// lock is free and another writer can take it.
 pub(crate) fn enqueue_local_with(
     conn: &Connection,
     cipher: &ChangesetCipher,
     client_id: uuid::Uuid,
     schema_version: i32,
     engine_version: i32,
+    turnstile: &WriteTurnstile,
     mut after_chunk_commit: impl FnMut(),
 ) -> Result<Vec<i64>, SyncError> {
     state::ensure_meta_table(conn)?;
@@ -518,6 +522,13 @@ pub(crate) fn enqueue_local_with(
         // `SQLITE_BUSY` or a primary-key conflict on `client_seq`. IMMEDIATE + the connection's
         // `busy_timeout` (crsqlite::apply_sync_pragmas) makes the two writers serialize cleanly
         // (T023 Judge). `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
+        //
+        // The write turn is taken BEFORE `BEGIN` and released after `COMMIT`: SQLite's busy
+        // handler lets this loop re-take the lock microseconds after each commit, ahead of a
+        // writer that is already waiting, so without the turnstile that writer can wait out its
+        // whole busy_timeout across a long backlog. Each chunk draws a fresh ticket, behind
+        // every writer already queued.
+        let turn = turnstile.acquire();
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         assigned.push(insert_chunk(
@@ -532,6 +543,7 @@ pub(crate) fn enqueue_local_with(
             state::set_push_watermark(&tx, v)?;
         }
         tx.commit()?;
+        drop(turn);
         if let Some(v) = next_wm {
             committed_wm = v;
         }
@@ -3184,7 +3196,7 @@ mod tests {
         let other = Connection::open(&path).unwrap();
         other.busy_timeout(std::time::Duration::ZERO).unwrap();
         let mut seen: Vec<(i64, i64)> = Vec::new();
-        enqueue_local_with(conn, &cipher, cid, sv, ev, || {
+        enqueue_local_with(conn, &cipher, cid, sv, ev, &WriteTurnstile::new(), || {
             let n = seen.len() as i64;
             other
                 .execute_batch(&format!(
@@ -3224,5 +3236,178 @@ mod tests {
         );
         drop(other);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A WAL sync DB holding an uncaptured backlog of `rows` kv rows of `value_len` bytes,
+    /// written `rows_per_tx` per transaction (one `db_version` each).
+    fn capture_backlog_fixture(
+        tag: &str,
+        rows: usize,
+        value_len: usize,
+        rows_per_tx: usize,
+    ) -> (std::path::PathBuf, CrsqlDb) {
+        let dir = std::env::temp_dir().join(format!("yapstack-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = CrsqlDb::open(dir.join("cap.db")).unwrap();
+        dev.conn()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        make_kv(&dev);
+        let conn = dev.conn();
+        conn.execute_batch("CREATE TABLE probe_t(id INTEGER PRIMARY KEY, n INTEGER);")
+            .unwrap();
+        state::ensure_meta_table(conn).unwrap();
+        ensure_outbox_table(conn).unwrap();
+        let value: String = std::iter::repeat_n('x', value_len).collect();
+        let mut insert = conn.prepare("INSERT INTO kv(id,v) VALUES(?1,?2)").unwrap();
+        for batch in (0..rows).collect::<Vec<_>>().chunks(rows_per_tx) {
+            conn.execute_batch("BEGIN").unwrap();
+            for i in batch {
+                insert
+                    .execute(rusqlite::params![format!("k{i}"), value])
+                    .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        drop(insert);
+        (dir, dev)
+    }
+
+    #[test]
+    fn a_writer_waiting_mid_backlog_gets_the_next_turn_before_the_next_chunk() {
+        // SQLite's busy handler is not fair: capture re-takes the write lock microseconds
+        // after each commit, while a waiting writer only re-polls every few to ~100 ms, so
+        // across a long backlog that writer can time out. With the write turnstile, a writer
+        // that starts waiting while the turn is held mid-backlog must be served before
+        // capture's NEXT chunk, and must then find the SQLite lock free (zero busy wait).
+        //
+        // Deterministic: the writer is known to be queued (`waiting() == 1`) before the turn
+        // it waits behind is released, and capture draws its next ticket only after that.
+        let (dir, dev) = capture_backlog_fixture("capture-fair", 48, 200_000, 1);
+        let path = dir.join("cap.db");
+        let conn = dev.conn();
+        let cid = state::client_id(conn).unwrap();
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        let total_chunks =
+            plan_capture_chunks(read_local_changes_since(conn, 0).unwrap().rows).len();
+        assert!(total_chunks >= 8, "fixture must be a MULTI-chunk backlog");
+        let cut_in_after = total_chunks / 2;
+
+        let turnstile = WriteTurnstile::new();
+        let mut committed = 0usize;
+        let staged_when_served = std::thread::scope(|s| {
+            let mut competitor = None;
+            enqueue_local_with(conn, &cipher, cid, sv, ev, &turnstile, || {
+                committed += 1;
+                if committed != cut_in_after {
+                    return;
+                }
+                // Stand-in for "a writer holds the turn mid-backlog": the competitor arrives
+                // while the turn is taken and has to queue for it.
+                let held = turnstile.acquire();
+                let (turnstile, path) = (&turnstile, &path);
+                competitor = Some(s.spawn(move || {
+                    let other = Connection::open(path).unwrap();
+                    other.busy_timeout(std::time::Duration::ZERO).unwrap();
+                    let _turn = turnstile.acquire();
+                    other
+                        .execute_batch("BEGIN IMMEDIATE; INSERT INTO probe_t(n) VALUES(1); COMMIT;")
+                        .expect("the served writer must find the write lock free");
+                    other
+                        .query_row("SELECT count(*) FROM _yapstack_outbox", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                }));
+                while turnstile.waiting() < 1 {
+                    std::thread::yield_now();
+                }
+                drop(held);
+            })
+            .unwrap();
+            competitor.expect("competitor spawned").join().unwrap()
+        });
+
+        assert_eq!(
+            staged_when_served as usize, cut_in_after,
+            "the waiting writer must run after chunk {cut_in_after} commits and BEFORE capture \
+             takes the lock for the next chunk"
+        );
+        assert_eq!(
+            pending(conn).unwrap().entries as usize,
+            total_chunks,
+            "capture still stages every chunk after yielding its turn"
+        );
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Release-build measurement, not a gate: the longest a competing in-process writer
+    /// (db_service's role: one autocommit write at a time, 10 s busy_timeout) waits while a
+    /// large first-sync capture runs, with and without taking the write turnstile. Run with
+    /// `cargo test --release -p yapstack-sync --lib -- --ignored --nocapture
+    /// capture_competing_writer_wait` (`YAPSTACK_BENCH_ROWS` sizes the backlog).
+    #[test]
+    #[ignore = "benchmark; run in a release build"]
+    fn capture_competing_writer_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        // Shaped like a real library's first sync: many small rows, ~5000-row chunks.
+        let rows: usize = std::env::var("YAPSTACK_BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000);
+        for gated in [false, true] {
+            let (dir, dev) = capture_backlog_fixture("capture-bench", rows, 64, 100);
+            let path = dir.join("cap.db");
+            let conn = dev.conn();
+            let cid = state::client_id(conn).unwrap();
+            let cipher = f1_cipher();
+            let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+            let turnstile = WriteTurnstile::new();
+            let done = AtomicBool::new(false);
+            let (capture_time, chunks, waits, failures) = std::thread::scope(|s| {
+                let writer = s.spawn(|| {
+                    let other = Connection::open(&path).unwrap();
+                    other.busy_timeout(Duration::from_secs(10)).unwrap();
+                    let mut waits = Vec::new();
+                    let mut failures = 0usize;
+                    while !done.load(Ordering::Acquire) {
+                        let t = Instant::now();
+                        let turn = gated.then(|| turnstile.acquire());
+                        let r = other.execute("INSERT INTO probe_t(n) VALUES(1)", []);
+                        drop(turn);
+                        waits.push(t.elapsed());
+                        if r.is_err() {
+                            failures += 1;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    (waits, failures)
+                });
+                let t = Instant::now();
+                let n = enqueue_local_with(conn, &cipher, cid, sv, ev, &turnstile, || {})
+                    .unwrap()
+                    .len();
+                let capture_time = t.elapsed();
+                done.store(true, Ordering::Release);
+                let (waits, failures) = writer.join().unwrap();
+                (capture_time, n, waits, failures)
+            });
+            let mut sorted = waits;
+            sorted.sort();
+            let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+            println!(
+                "turnstile={gated}: capture {chunks} chunks in {capture_time:?}; competing \
+                 writes={} failures={failures} p50={:?} p99={:?} max={:?}",
+                sorted.len(),
+                pct(0.5),
+                pct(0.99),
+                sorted.last().unwrap(),
+            );
+            drop(dev);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
