@@ -507,8 +507,11 @@ fn value_ref_to_json(v: ValueRef<'_>) -> JsonValue {
 /// `col_version=1`. What you must know:
 ///   * Keep a sync-table schema migration to ONE `ALTER TABLE` statement so the
 ///     auto-wrap applies; split multi-step changes across migration versions.
-///   * `CREATE INDEX`/trigger changes and any migration touching a NON-sync table
-///     are applied plainly (unchanged) — only sync-table `ALTER`s are wrapped.
+///   * An index on a sync table is a [`crate::db::MigrationKind::SyncIndex`]
+///     migration: only `CREATE [UNIQUE] INDEX IF NOT EXISTS` statements, applied
+///     plainly (an index touches no rows or clocks), with a non-PK UNIQUE refused.
+///     Any other `Plain` migration that names a sync table is refused, and one
+///     touching only NON-sync tables is applied plainly.
 ///   * On a non-CRR DB (fresh install before cutover, or the `no-sync` build) every
 ///     migration is applied plainly, exactly as before.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
@@ -582,8 +585,14 @@ fn record_migration(
 fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Result<()> {
     let start = std::time::Instant::now();
 
+    if m.kind == crate::db::MigrationKind::SyncIndex {
+        // Validated the same way on CRR and non-CRR DBs, so a fresh DB can never
+        // gain an index that cutover would then drop (I-NT2).
+        validate_sync_index_migration(conn, m)?;
+    }
+
     #[cfg(feature = "sync")]
-    {
+    if m.kind == crate::db::MigrationKind::Plain {
         // On a CRR-prepared DB, sync-table schema changes MUST route through
         // cr-sqlite's alter wrapping or they silently desync the clock/pks shadow
         // tables. Enforce this (F3), don't merely document it.
@@ -625,6 +634,123 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
             Err(e)
         }
     }
+}
+
+/// Check a [`crate::db::MigrationKind::SyncIndex`] migration before it runs (ADR
+/// 0006 §1): every statement must be `CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON
+/// <table>(…)`, on a sync table when the build has sync, and a UNIQUE index must key
+/// exactly the table's PRIMARY KEY columns. A non-PK UNIQUE index would make
+/// cr-sqlite refuse (or fail to merge into) the table; uniqueness is app-layer.
+fn validate_sync_index_migration(
+    conn: &Connection,
+    m: &crate::db::Migration,
+) -> rusqlite::Result<()> {
+    let refuse = |why: String| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "SyncIndex migration v{} ({}): {why}. Refusing to apply.",
+                m.version, m.description
+            )),
+        )
+    };
+    for stmt in m.sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let idx = parse_create_index(stmt).ok_or_else(|| {
+            refuse(format!(
+                "not a `CREATE [UNIQUE] INDEX IF NOT EXISTS … ON <table>(…)` statement: {}",
+                sql_preview(stmt)
+            ))
+        })?;
+        #[cfg(feature = "sync")]
+        if !yapstack_sync::schema::SYNC_TABLES.contains(&idx.table.as_str()) {
+            return Err(refuse(format!("`{}` is not a sync table", idx.table)));
+        }
+        if idx.unique {
+            let pk: std::collections::BTreeSet<String> = {
+                let mut q =
+                    conn.prepare("SELECT lower(name) FROM pragma_table_info(?1) WHERE pk > 0")?;
+                let rows = q.query_map([&idx.table], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let cols: Option<std::collections::BTreeSet<String>> =
+                idx.columns.iter().cloned().collect();
+            if pk.is_empty() || cols.as_ref() != Some(&pk) {
+                return Err(refuse(format!(
+                    "UNIQUE index on `{}` does not key exactly its PRIMARY KEY; a non-PK \
+                     UNIQUE index can't live on a CRR table (enforce it in the app layer)",
+                    idx.table
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A parsed `CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON <table>(<cols>)`.
+struct CreateIndex {
+    unique: bool,
+    table: String,
+    /// Lower-cased key column names in order; `None` for an expression key.
+    columns: Vec<Option<String>>,
+}
+
+/// Parse one `CREATE [UNIQUE] INDEX IF NOT EXISTS` statement, or `None` if `stmt` is
+/// anything else (including a `CREATE INDEX` without `IF NOT EXISTS`, which would
+/// fail on a DB that already has the index).
+fn parse_create_index(stmt: &str) -> Option<CreateIndex> {
+    let unquote = |t: &str| {
+        t.trim()
+            .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+            .to_ascii_lowercase()
+    };
+    let open = stmt.find('(')?;
+    let head: Vec<&str> = stmt[..open].split_whitespace().collect();
+    let kw = |i: usize, w: &str| head.get(i).is_some_and(|t| t.eq_ignore_ascii_case(w));
+    let unique = kw(1, "UNIQUE");
+    let o = usize::from(unique);
+    if !(kw(0, "CREATE")
+        && kw(1 + o, "INDEX")
+        && kw(2 + o, "IF")
+        && kw(3 + o, "NOT")
+        && kw(4 + o, "EXISTS")
+        && kw(6 + o, "ON")
+        && head.len() == 8 + o)
+    {
+        return None;
+    }
+    let table = unquote(head[7 + o]);
+    // Split the key list on top-level commas up to its closing paren; a key that
+    // contains `(` is an expression, not a column.
+    let mut columns = Vec::new();
+    let (mut depth, mut from, mut closed) = (0usize, open + 1, false);
+    for (i, c) in stmt.char_indices().skip_while(|(i, _)| *i <= open) {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            ',' | ')' => {
+                let key = stmt[from..i].trim();
+                columns.push(if key.contains('(') {
+                    None
+                } else {
+                    key.split_whitespace().next().map(unquote)
+                });
+                from = i + 1;
+                if c == ')' {
+                    closed = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !closed || table.is_empty() || columns.is_empty() {
+        return None;
+    }
+    Some(CreateIndex {
+        unique,
+        table,
+        columns,
+    })
 }
 
 /// If `sql` references any CRR sync table as a whole identifier token, return the
@@ -1161,12 +1287,14 @@ mod tests {
             version: 900,
             description: "test: add column to a CRR sync table",
             sql: "ALTER TABLE segments ADD COLUMN a3_test_col TEXT",
+            kind: crate::db::MigrationKind::Plain,
         };
         // A synthetic v901 migration: touches a NON-sync table (applied plainly).
         let plain = crate::db::Migration {
             version: 901,
             description: "test: create a local (non-sync) table",
             sql: "CREATE TABLE a3_local (id TEXT PRIMARY KEY)",
+            kind: crate::db::MigrationKind::Plain,
         };
         let applied = run_migrations_list(conn, &[alter, plain]).unwrap();
         assert_eq!(applied, vec![900, 901]);
@@ -1263,6 +1391,7 @@ mod tests {
             version: 950,
             description: "test: unsafe multi-statement sync-table change",
             sql: "ALTER TABLE sessions ADD COLUMN f3_bad TEXT; CREATE INDEX ix_f3 ON sessions(f3_bad)",
+            kind: crate::db::MigrationKind::Plain,
         };
         // apply_migration surfaces the loud, named error.
         let err = apply_migration(conn, &bad).expect_err("must refuse");
@@ -1418,5 +1547,310 @@ mod tests {
         // Both classes still reach the rolling log — only the level differs.
         log_db_failure("writer", "insert into t", &busy);
         log_db_failure("writer", "insert into t", &constraint);
+    }
+
+    // ── ADR 0006 §2: synced-table indexes survive cutover (I-NT2) ──────────────
+
+    /// Tables whose index set I-NT2 covers. Hardcoded (not `SYNC_TABLES`) so the
+    /// non-sync build runs the same assertions.
+    const SYNCED: &[&str] = &[
+        "sessions",
+        "segments",
+        "notes",
+        "note_versions",
+        "folders",
+        "session_folders",
+        "chat_messages",
+        "dictation_history",
+        "tags",
+        "session_tags",
+        "session_audio_parts",
+        "shares",
+    ];
+
+    /// Declared indexes on synced tables as `name|table|unique|partial|col:desc,…`,
+    /// sorted. Shape, not SQL text, so `IF NOT EXISTS` spellings compare equal.
+    /// Collation is left out: the CRR rebuild doesn't carry a column `COLLATE`, so
+    /// `tags.name` (and so `idx_tags_name`) is NOCASE before cutover and BINARY after.
+    fn synced_index_set(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name, m.tbl_name, il.\"unique\", il.partial, \
+                        (SELECT group_concat(x.name || ':' || x.\"desc\", ',') FROM \
+                           (SELECT * FROM pragma_index_xinfo(m.name) WHERE key = 1 \
+                            ORDER BY seqno) x) \
+                 FROM sqlite_master m \
+                 JOIN pragma_index_list(m.tbl_name) il ON il.name = m.name \
+                 WHERE m.type = 'index' AND m.sql IS NOT NULL ORDER BY m.name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            ))
+        })
+        .unwrap()
+        .map(|x| x.unwrap())
+        .filter(|(_, t, ..)| SYNCED.contains(&t.as_str()))
+        .map(|(n, t, u, p, c)| format!("{n}|{t}|{u}|{p}|{c}"))
+        .collect()
+    }
+
+    /// The fresh, never-synced reference: the whole migration chain on a plain DB.
+    fn fresh_index_set() -> Vec<String> {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        synced_index_set(&conn)
+    }
+
+    fn migrations_below(v: i64) -> Vec<crate::db::Migration> {
+        crate::db::migrations()
+            .into_iter()
+            .filter(|m| m.version < v)
+            .collect()
+    }
+
+    fn sync_index(version: i64, sql: &'static str) -> crate::db::Migration {
+        crate::db::Migration {
+            version,
+            description: "test: sync index",
+            sql,
+            kind: crate::db::MigrationKind::SyncIndex,
+        }
+    }
+
+    /// v18 covers every secondary index the chain declares on a synced table, so
+    /// it alone can rebuild the set (and the list can't silently fall behind).
+    #[test]
+    fn v18_redeclares_every_synced_table_secondary_index() {
+        let fresh = fresh_index_set();
+        assert_eq!(fresh.len(), 19, "fresh synced-table indexes: {fresh:#?}");
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_list(&conn, &migrations_below(18)).unwrap();
+        for name in fresh.iter().map(|r| r.split('|').next().unwrap()) {
+            conn.execute_batch(&format!("DROP INDEX {name};")).unwrap();
+        }
+        assert!(synced_index_set(&conn).is_empty());
+        let applied = run_migrations(&conn).unwrap();
+        assert!(applied.contains(&18));
+        assert_eq!(synced_index_set(&conn), fresh);
+    }
+
+    /// Non-CRR DB unchanged: on a DB that never synced v18 is a no-op that records
+    /// itself.
+    #[test]
+    fn v18_is_a_no_op_on_a_non_crr_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations_list(&conn, &migrations_below(18)).unwrap();
+        let before = synced_index_set(&conn);
+        let applied = run_migrations(&conn).unwrap();
+        assert!(applied.contains(&18), "v18 recorded: {applied:?}");
+        assert_eq!(synced_index_set(&conn), before);
+    }
+
+    /// A non-PK UNIQUE index is refused even on a plain DB, so a fresh DB can never
+    /// hold an index cutover would drop. A UNIQUE index over exactly the PK is fine.
+    #[test]
+    fn sync_index_refuses_non_pk_unique_and_non_index_sql() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let bad = [
+            sync_index(960, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON tags(color)"),
+            sync_index(
+                961,
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON session_tags(session_id)",
+            ),
+            sync_index(962, "CREATE INDEX ix_no_guard ON sessions(title)"),
+            sync_index(963, "ALTER TABLE sessions ADD COLUMN nope TEXT"),
+            sync_index(
+                964,
+                "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title); DROP TABLE tags",
+            ),
+            sync_index(
+                965,
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON tags(lower(name))",
+            ),
+        ];
+        for m in &bad {
+            let err = apply_migration(&conn, m).expect_err("must refuse");
+            assert!(
+                err.to_string().contains("Refusing to apply"),
+                "v{}: {err}",
+                m.version
+            );
+        }
+        assert!(run_migrations_list(&conn, &bad).unwrap().is_empty());
+        assert!(table_exists_for_test(&conn, "tags"));
+        let ok = [
+            sync_index(970, "CREATE UNIQUE INDEX IF NOT EXISTS ix_pk ON session_tags(tag_id, session_id)"),
+            sync_index(971, "CREATE INDEX IF NOT EXISTS \"ix_q\" ON \"sessions\" (title COLLATE NOCASE, created_at DESC) WHERE status = 'done'"),
+        ];
+        assert_eq!(run_migrations_list(&conn, &ok).unwrap(), vec![970, 971]);
+    }
+
+    fn table_exists_for_test(conn: &Connection, t: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [t],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Prepare a CRR DB the way cutover does: the given migrations, the db.ts
+    /// out-of-band columns, then `crr_migrate`.
+    #[cfg(feature = "sync")]
+    fn cut_over(conn: &Connection, migrations: &[crate::db::Migration]) {
+        run_migrations_list(conn, migrations).unwrap();
+        for (table, col, coldef) in yapstack_sync::schema::OUT_OF_BAND_ALTERS {
+            if !yapstack_sync::schema::column_exists(conn, table, col).unwrap() {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {coldef};"))
+                    .unwrap();
+            }
+        }
+        yapstack_sync::schema::crr_migrate(conn).unwrap();
+        assert!(yapstack_sync::schema::is_crr(conn, "sessions").unwrap());
+    }
+
+    #[cfg(feature = "sync")]
+    fn assert_crr_triggers_fresh(conn: &Connection) {
+        for t in yapstack_sync::schema::crr_tables(conn).unwrap() {
+            assert!(
+                !yapstack_sync::schema::crr_triggers_are_stale(conn, &t).unwrap(),
+                "{t}: CRR triggers must not go stale"
+            );
+        }
+    }
+
+    /// I-NT2, the owner's case: a DB cut over by a build that dropped the indexes
+    /// (simulated by dropping them after cutover) gets the full fresh set back from
+    /// v18, through the SyncIndex path, without staling any CRR trigger.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        cut_over(conn, &migrations_below(18));
+        let legacy: Vec<String> = synced_index_set(conn)
+            .iter()
+            .map(|r| r.split('|').next().unwrap().to_string())
+            .collect();
+        for name in &legacy {
+            conn.execute_batch(&format!("DROP INDEX {name};")).unwrap();
+        }
+        // What the pre-fix cutover left, plus the two db.ts re-creates at boot.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_send \
+               ON chat_messages(context_key, send_id, sequence); \
+             CREATE INDEX IF NOT EXISTS idx_audio_parts_session \
+               ON session_audio_parts(session_id, part_index);",
+        )
+        .unwrap();
+        assert_eq!(synced_index_set(conn).len(), 2);
+
+        let applied = run_migrations(conn).unwrap();
+        assert_eq!(applied, vec![18], "only v18 is pending, and it applies");
+        assert_eq!(synced_index_set(conn), fresh_index_set());
+        assert_crr_triggers_fresh(conn);
+        // Writes still capture after the index restore.
+        conn.execute(
+            "INSERT INTO sessions (id, source) VALUES ('s18', 'Mic')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'sessions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n > 0);
+        // And the planner uses them.
+        for q in [
+            "SELECT * FROM segments WHERE session_id = 's18'",
+            "SELECT * FROM sessions ORDER BY created_at DESC",
+        ] {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {q}")).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("USING INDEX") || d.contains("USING COVERING INDEX")),
+                "{q}: {plan:?}"
+            );
+        }
+    }
+
+    /// I-NT2, the forward case: every DB cut over from here on (before or after
+    /// v18) keeps the fresh index set through cutover itself.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn cutover_keeps_the_fresh_index_set() {
+        for upto in [18, i64::MAX] {
+            let (_dir, path) = temp_db();
+            let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+            let conn = db.conn();
+            cut_over(conn, &migrations_below(upto));
+            run_migrations(conn).unwrap();
+            assert_eq!(
+                synced_index_set(conn),
+                fresh_index_set(),
+                "cut over below v{upto}"
+            );
+            assert_crr_triggers_fresh(conn);
+        }
+    }
+
+    /// On a CRR DB a SyncIndex migration bypasses the "names a sync table" refusal
+    /// (a Plain one with the same SQL is refused), and a non-PK UNIQUE is refused
+    /// before it can reach a CRR table.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_index_on_a_crr_db_applies_plainly_and_refuses_non_pk_unique() {
+        let (_dir, path) = temp_db();
+        let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        cut_over(conn, &crate::db::migrations());
+        let sql = "CREATE INDEX IF NOT EXISTS ix_title ON sessions(title)";
+        let plain = crate::db::Migration {
+            version: 980,
+            description: "test: plain index on a sync table",
+            sql,
+            kind: crate::db::MigrationKind::Plain,
+        };
+        assert!(
+            apply_migration(conn, &plain).is_err(),
+            "Plain is refused on a CRR table"
+        );
+        assert_eq!(
+            run_migrations_list(conn, &[sync_index(981, sql)]).unwrap(),
+            vec![981]
+        );
+        assert!(synced_index_set(conn)
+            .iter()
+            .any(|r| r.starts_with("ix_title|")));
+        let unique = sync_index(
+            982,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON notes(session_id)",
+        );
+        assert!(apply_migration(conn, &unique).is_err());
+        let local = sync_index(
+            983,
+            "CREATE INDEX IF NOT EXISTS ix_l ON _sqlx_migrations(description)",
+        );
+        assert!(
+            apply_migration(conn, &local).is_err(),
+            "SyncIndex is for sync tables"
+        );
+        assert_crr_triggers_fresh(conn);
     }
 }

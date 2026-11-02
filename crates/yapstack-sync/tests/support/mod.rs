@@ -309,3 +309,63 @@ pub fn direct_merge(from: &Connection, to: &Connection, since: i64) -> i64 {
     to.execute_batch("COMMIT;").unwrap();
     n
 }
+
+/// Every declared secondary index on a synced table, as the desktop migration chain
+/// (`apps/desktop/src-tauri/src/db.rs` v1–v15) leaves it on a fresh DB. The shape of
+/// `idx_chat_messages_session` is v8's (`session_id` alone), not v7's.
+pub const SECONDARY_INDEXES: &str = r#"
+    CREATE INDEX idx_segments_session_id ON segments(session_id);
+    CREATE INDEX idx_segments_offset ON segments(session_id, audio_offset_seconds);
+    CREATE INDEX idx_sessions_created ON sessions(created_at DESC);
+    CREATE INDEX idx_folders_parent ON folders(parent_id);
+    CREATE INDEX idx_sessions_folder ON sessions(folder_id);
+    CREATE INDEX idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
+    CREATE INDEX idx_note_versions_note ON note_versions(note_id, created_at DESC);
+    CREATE INDEX idx_shares_folder ON shares(folder_id);
+    CREATE INDEX idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
+    CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
+    CREATE INDEX idx_session_folders_folder ON session_folders(folder_id);
+    CREATE INDEX idx_session_folders_session ON session_folders(session_id);
+    CREATE INDEX idx_dictation_history_created ON dictation_history(created_at DESC);
+    CREATE INDEX idx_dictation_history_slot ON dictation_history(slot_id);
+    CREATE INDEX idx_tags_name ON tags(name);
+    CREATE INDEX idx_session_tags_tag ON session_tags(tag_id);
+    CREATE INDEX idx_session_tags_session ON session_tags(session_id);
+    CREATE INDEX idx_chat_messages_send ON chat_messages(context_key, send_id, sequence);
+    CREATE INDEX idx_audio_parts_session ON session_audio_parts(session_id, part_index);
+"#;
+
+/// The declared (non-automatic) indexes on `tables`, each as
+/// `name|table|unique|partial|col:desc,...` over its key columns, sorted by name.
+/// Compares index SHAPE, so `CREATE INDEX` vs `CREATE INDEX IF NOT EXISTS` spellings
+/// of the same index are equal. Collation is left out on purpose: an index inherits
+/// its column's collation, and the CRR rebuild does not carry a column `COLLATE`
+/// over (`tags.name` is `NOCASE` before cutover, `BINARY` after). That is a column
+/// property of the rebuild, not an index one.
+pub fn index_set(conn: &Connection, tables: &[&str]) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.name, m.tbl_name, il.\"unique\", il.partial, \
+                    (SELECT group_concat(x.name || ':' || x.\"desc\", ',') \
+                       FROM (SELECT * FROM pragma_index_xinfo(m.name) WHERE key = 1 ORDER BY seqno) x) \
+             FROM sqlite_master m \
+             JOIN pragma_index_list(m.tbl_name) il ON il.name = m.name \
+             WHERE m.type = 'index' AND m.sql IS NOT NULL \
+             ORDER BY m.name",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        ))
+    })
+    .unwrap()
+    .map(|x| x.unwrap())
+    .filter(|(_, t, ..)| tables.contains(&t.as_str()))
+    .map(|(n, t, u, p, c)| format!("{n}|{t}|{u}|{p}|{c}"))
+    .collect()
+}

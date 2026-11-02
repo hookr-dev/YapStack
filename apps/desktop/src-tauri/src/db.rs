@@ -3,11 +3,28 @@ use std::path::{Path, PathBuf};
 /// A single schema migration. Repo-owned (replaces `tauri_plugin_sql::Migration`
 /// after the Option A′ backend swap); applied by [`crate::db_service::run_migrations`],
 /// which preserves continuity with the plugin's `_sqlx_migrations` bookkeeping.
-/// All migrations are `Up`, so there is no `kind` discriminant.
+/// All migrations are `Up`; `kind` says how the runner may apply them on a CRR DB
+/// (ADR 0006 §1).
 pub struct Migration {
     pub version: i64,
     pub description: &'static str,
     pub sql: &'static str,
+    pub kind: MigrationKind,
+}
+
+/// How [`crate::db_service::run_migrations`] treats a migration on a cr-sqlite
+/// (CRR-prepared) DB. On a non-CRR DB every kind is applied plainly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationKind {
+    /// Ordinary SQL. On a CRR DB a single `ALTER TABLE <sync_table>` is routed
+    /// through `crsql_alter`; anything else that names a sync table is refused.
+    Plain,
+    /// Only `CREATE [UNIQUE] INDEX IF NOT EXISTS … ON <table>` statements. An index
+    /// changes no rows, columns or clocks, so it is applied plainly even on a CRR
+    /// sync table and leaves cr-sqlite's triggers alone. A UNIQUE index whose key
+    /// is not exactly the table's PRIMARY KEY is refused (cr-sqlite can't merge
+    /// under it; uniqueness is app-layer).
+    SyncIndex,
 }
 
 /// Row to insert into `session_audio_parts`. Mirrors the columns in the v15
@@ -618,6 +635,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_segments_offset ON segments(session_id, audio_offset_seconds);
             CREATE INDEX idx_sessions_created ON sessions(created_at DESC);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 2,
@@ -639,6 +657,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_sessions_folder ON sessions(folder_id);
             CREATE INDEX idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 3,
@@ -649,6 +668,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE segments ADD COLUMN deleted_at TEXT;
             ALTER TABLE segments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 4,
@@ -673,6 +693,7 @@ pub fn migrations() -> Vec<Migration> {
 
             ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'transcription';
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 5,
@@ -681,6 +702,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN wav_file_path TEXT;
             ALTER TABLE sessions ADD COLUMN wav_duration_seconds REAL;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 6,
@@ -699,6 +721,7 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_shares_folder ON shares(folder_id);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 7,
@@ -715,6 +738,7 @@ pub fn migrations() -> Vec<Migration> {
             );
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id, created_at ASC);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 8,
@@ -737,6 +761,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 9,
@@ -760,6 +785,7 @@ pub fn migrations() -> Vec<Migration> {
             INSERT INTO session_folders (session_id, folder_id)
             SELECT id, folder_id FROM sessions WHERE folder_id IS NOT NULL;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 10,
@@ -782,6 +808,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_dictation_history_created ON dictation_history(created_at DESC);
             CREATE INDEX idx_dictation_history_slot ON dictation_history(slot_id);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 11,
@@ -808,6 +835,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_session_tags_tag ON session_tags(tag_id);
             CREATE INDEX idx_session_tags_session ON session_tags(session_id);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 12,
@@ -921,6 +949,7 @@ pub fn migrations() -> Vec<Migration> {
                     VALUES (new.id, new.output_text, new.input_text);
             END;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 13,
@@ -928,6 +957,7 @@ pub fn migrations() -> Vec<Migration> {
             sql: r#"
             ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 14,
@@ -965,6 +995,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_chat_messages_send
                 ON chat_messages(context_key, send_id, sequence);
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 15,
@@ -1020,6 +1051,7 @@ pub fn migrations() -> Vec<Migration> {
             FROM sessions
             WHERE wav_file_path IS NOT NULL;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 16,
@@ -1034,6 +1066,7 @@ pub fn migrations() -> Vec<Migration> {
             sql: r#"
             ALTER TABLE sessions ADD COLUMN recording_device_id TEXT;
         "#,
+            kind: MigrationKind::Plain,
         },
         Migration {
             version: 17,
@@ -1053,6 +1086,41 @@ pub fn migrations() -> Vec<Migration> {
                 updated_at  TEXT NOT NULL
             );
         "#,
+            kind: MigrationKind::Plain,
+        },
+        Migration {
+            version: 18,
+            description: "restore synced-table secondary indexes lost at sync cutover",
+            // Before ADR 0006 the CRR cutover rebuilt each synced table without its
+            // indexes, so a DB that turned sync on kept only the two that db.ts
+            // re-creates. This re-declares every secondary index on a synced table
+            // exactly as v1–v15 leave it on a fresh DB (`idx_chat_messages_session` in
+            // its v8 shape). `IF NOT EXISTS` makes it a no-op on a DB that still has
+            // them (every non-synced DB, and any DB cut over after this release).
+            // Invariant I-NT2: a fresh non-CRR DB and a cut-over DB end with the
+            // same index set. Keep this list in step with any new synced-table index.
+            sql: r#"
+            CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id);
+            CREATE INDEX IF NOT EXISTS idx_segments_offset ON segments(session_id, audio_offset_seconds);
+            CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(note_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_folders_folder ON session_folders(folder_id);
+            CREATE INDEX IF NOT EXISTS idx_session_folders_session ON session_folders(session_id);
+            CREATE INDEX IF NOT EXISTS idx_dictation_history_created ON dictation_history(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_dictation_history_slot ON dictation_history(slot_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+            CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id);
+            CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(session_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_send ON chat_messages(context_key, send_id, sequence);
+            CREATE INDEX IF NOT EXISTS idx_audio_parts_session ON session_audio_parts(session_id, part_index);
+        "#,
+            kind: MigrationKind::SyncIndex,
         },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
