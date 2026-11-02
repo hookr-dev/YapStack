@@ -589,7 +589,7 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     if m.kind == crate::db::MigrationKind::SyncIndex {
         // Validated the same way on CRR and non-CRR DBs, so a fresh DB can never
         // gain an index that cutover would then drop (I-NT2).
-        validate_sync_index_migration(m)?;
+        validate_sync_index_migration(conn, m)?;
     }
 
     #[cfg(feature = "sync")]
@@ -638,12 +638,17 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
 }
 
 /// Check a [`crate::db::MigrationKind::SyncIndex`] migration before it runs (ADR
-/// 0006 §1). Each statement must be one of:
-///   * `CREATE INDEX IF NOT EXISTS <name> ON <table>(…) [WHERE …]`, on a sync table
-///     when the build has sync;
+/// 0006 §1). It restricts rather than parses. Each statement must be one of:
+///   * `CREATE INDEX IF NOT EXISTS <name> ON <table>(…) [WHERE …]`;
 ///   * `DROP INDEX IF EXISTS <name>`, only when a later statement of the same
 ///     migration re-creates `<name>` (the way to replace an index whose shape
 ///     changed, since `IF NOT EXISTS` matches on the name alone).
+///
+/// `<name>` is a bare `idx_[a-z0-9_]+` identifier, never a cr-sqlite internal
+/// (`__crsql`); `<table>` is a bare sync-table name. No quotes, no schema prefix, so
+/// what is checked is exactly what SQLite resolves. A DROP target must be absent or
+/// a declared, non-UNIQUE index on the same table its re-create names, so a DROP can
+/// never remove a constraint's autoindex, a UNIQUE index or another table's index.
 ///
 /// Every declared UNIQUE index is refused, even one over exactly the PK: the
 /// vendored cr-sqlite rejects any unique index whose origin isn't `pk`
@@ -651,7 +656,10 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
 /// wrapped ALTERs and trigger heal, and cutover drops UNIQUE indexes anyway.
 /// Uniqueness on a synced table is app-layer (`uniqueness`). SQL comments are
 /// refused outright, so no statement can hide from the per-statement check.
-fn validate_sync_index_migration(m: &crate::db::Migration) -> rusqlite::Result<()> {
+fn validate_sync_index_migration(
+    conn: &Connection,
+    m: &crate::db::Migration,
+) -> rusqlite::Result<()> {
     let refuse = |why: String| {
         rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -664,45 +672,82 @@ fn validate_sync_index_migration(m: &crate::db::Migration) -> rusqlite::Result<(
     if m.sql.contains("--") || m.sql.contains("/*") {
         return Err(refuse("SQL comments are not allowed".into()));
     }
-    let mut pending_drops: Vec<String> = Vec::new();
+    let mut stmts = Vec::new();
     for stmt in m.sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        match parse_index_stmt(stmt) {
-            Some(IndexStmt::Drop { name }) => pending_drops.push(name),
-            Some(IndexStmt::Create {
+        let parsed = parse_index_stmt(stmt).ok_or_else(|| {
+            refuse(format!(
+                "not a `CREATE INDEX IF NOT EXISTS idx_… ON <sync_table>(…)` or a re-created \
+                 `DROP INDEX IF EXISTS idx_…` statement: {}",
+                sql_preview(stmt)
+            ))
+        })?;
+        match &parsed {
+            IndexStmt::Create {
                 unique: true,
                 table,
                 ..
-            }) => {
+            } => {
                 return Err(refuse(format!(
                     "UNIQUE index on `{table}`: cr-sqlite refuses any UNIQUE index a \
                      CRR table doesn't get from its PRIMARY KEY (enforce it in the app layer)"
                 )));
             }
-            Some(IndexStmt::Create { name, table, .. }) => {
-                if !names_sync_table(&table) {
-                    return Err(refuse(format!("`{table}` is not a sync table")));
-                }
-                pending_drops.retain(|d| *d != name);
+            IndexStmt::Create { table, .. } if !names_sync_table(table) => {
+                return Err(refuse(format!("`{table}` is not a sync table")));
             }
-            None => {
+            _ => {}
+        }
+        stmts.push(parsed);
+    }
+    for (i, st) in stmts.iter().enumerate() {
+        let IndexStmt::Drop { name } = st else {
+            continue;
+        };
+        let Some(table) = stmts[i + 1..].iter().find_map(|later| match later {
+            IndexStmt::Create { name: n, table, .. } if n == name => Some(table),
+            _ => None,
+        }) else {
+            return Err(refuse(format!(
+                "`DROP INDEX IF EXISTS {name}` is not followed by a CREATE of the same index"
+            )));
+        };
+        let target: Option<(String, String, bool, i64)> = conn
+            .query_row(
+                "SELECT m.type, m.tbl_name, m.sql IS NOT NULL, \
+                        coalesce((SELECT il.\"unique\" FROM pragma_index_list(m.tbl_name) il \
+                                  WHERE il.name = m.name), 1) \
+                 FROM sqlite_master m WHERE m.name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        if let Some((ty, tbl, declared, unique)) = target {
+            if ty != "index" || tbl != *table || !declared || unique != 0 {
                 return Err(refuse(format!(
-                    "not a `CREATE INDEX IF NOT EXISTS … ON <table>(…)` or a re-created \
-                     `DROP INDEX IF EXISTS …` statement: {}",
-                    sql_preview(stmt)
+                    "`DROP INDEX IF EXISTS {name}` targets a {} on `{tbl}`; only a declared, \
+                     non-UNIQUE index on `{table}` (the table its re-create names) may be dropped",
+                    if ty != "index" {
+                        ty.as_str()
+                    } else if !declared {
+                        "constraint's autoindex"
+                    } else if unique != 0 {
+                        "UNIQUE index"
+                    } else {
+                        "index"
+                    }
                 )));
             }
         }
-    }
-    if let Some(name) = pending_drops.first() {
-        return Err(refuse(format!(
-            "`DROP INDEX IF EXISTS {name}` is not followed by a CREATE of the same index"
-        )));
     }
     Ok(())
 }
 
 /// Whether `table` is a CRR sync table. A build without sync can't tell, and has no
-/// CRR tables for the distinction to protect, so it accepts any table.
+/// CRR tables for the distinction to protect, so it accepts any bare table name.
 fn names_sync_table(table: &str) -> bool {
     #[cfg(feature = "sync")]
     return yapstack_sync::schema::SYNC_TABLES.contains(&table);
@@ -725,25 +770,37 @@ enum IndexStmt {
     },
 }
 
+/// A bare lower-case identifier (`[a-z_][a-z0-9_]*`): no quotes, no schema prefix.
+fn is_bare_ident(t: &str) -> bool {
+    t.bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A name a SyncIndex migration may create or drop: bare `idx_[a-z0-9_]+`, never a
+/// cr-sqlite internal.
+fn is_sync_index_name(t: &str) -> bool {
+    t.len() > 4 && t.starts_with("idx_") && is_bare_ident(t) && !t.contains("__crsql")
+}
+
 /// Parse a `CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON <table>(…) [WHERE …]` or a
-/// `DROP INDEX IF EXISTS <name>` statement, or `None` for anything else (including a
+/// `DROP INDEX IF EXISTS <name>` statement with bare names (see
+/// [`validate_sync_index_migration`]), or `None` for anything else (including a
 /// guard-less `CREATE INDEX`, which fails on a DB that already has the index).
-/// Identifiers are unquoted and lower-cased.
 fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
-    let unquote = |t: &str| {
-        t.trim()
-            .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
-            .to_ascii_lowercase()
-    };
     let words: Vec<&str> = stmt.split_whitespace().collect();
     let is = |ws: &[&str], i: usize, w: &str| ws.get(i).is_some_and(|t| t.eq_ignore_ascii_case(w));
     if is(&words, 0, "DROP") {
         let ok = words.len() == 5
             && is(&words, 1, "INDEX")
             && is(&words, 2, "IF")
-            && is(&words, 3, "EXISTS");
-        let name = unquote(words.get(4)?);
-        return (ok && !name.is_empty()).then_some(IndexStmt::Drop { name });
+            && is(&words, 3, "EXISTS")
+            && is_sync_index_name(words[4]);
+        return ok.then(|| IndexStmt::Drop {
+            name: words[4].to_string(),
+        });
     }
     let open = stmt.find('(')?;
     let head: Vec<&str> = stmt[..open].split_whitespace().collect();
@@ -759,8 +816,10 @@ fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
     {
         return None;
     }
-    let name = unquote(head[5 + o]);
-    let table = unquote(head[7 + o]);
+    let (name, table) = (head[5 + o], head[7 + o]);
+    if !is_sync_index_name(name) || !is_bare_ident(table) {
+        return None;
+    }
     // The key list ends at the paren matching `open`; after it only a partial-index
     // WHERE clause may follow.
     let mut depth = 0usize;
@@ -786,13 +845,13 @@ fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
             .split_whitespace()
             .next()
             .is_some_and(|w| w.eq_ignore_ascii_case("WHERE"));
-    if !where_ok || close == open + 1 || name.is_empty() || table.is_empty() {
+    if !where_ok || close == open + 1 {
         return None;
     }
     Some(IndexStmt::Create {
         unique,
-        name,
-        table,
+        name: name.to_string(),
+        table: table.to_string(),
     })
 }
 
@@ -1705,28 +1764,44 @@ mod tests {
         run_migrations(&conn).unwrap();
         let bad = [
             // UNIQUE, in every shape (non-PK, PK, PK-as-expression, PK with COLLATE).
-            sync_index(960, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON tags(color)"),
-            sync_index(961, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON sessions(id)"),
-            sync_index(962, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON sessions(id + 0)"),
-            sync_index(963, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON sessions(id COLLATE NOCASE)"),
-            sync_index(964, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON session_tags(tag_id, session_id)"),
-            sync_index(965, "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON tags(lower(name))"),
+            sync_index(960, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON tags(color)"),
+            sync_index(961, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON sessions(id)"),
+            sync_index(962, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON sessions(id + 0)"),
+            sync_index(963, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON sessions(id COLLATE NOCASE)"),
+            sync_index(964, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON session_tags(tag_id, session_id)"),
+            sync_index(965, "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON tags(lower(name))"),
             // Missing IF NOT EXISTS.
-            sync_index(966, "CREATE INDEX ix_no_guard ON sessions(title)"),
+            sync_index(966, "CREATE INDEX idx_no_guard ON sessions(title)"),
             // A non-index statement.
             sync_index(967, "ALTER TABLE sessions ADD COLUMN nope TEXT"),
             // Multiple statements, one of them not an index.
-            sync_index(968, "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title); DROP TABLE tags"),
+            sync_index(968, "CREATE INDEX IF NOT EXISTS idx_ok ON sessions(title); DROP TABLE tags"),
             // Comments hiding a second statement.
-            sync_index(969, "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title); /* x */ DROP TABLE tags"),
-            sync_index(970, "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title) -- ; DROP TABLE tags"),
-            sync_index(971, "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title) /* ; */"),
+            sync_index(969, "CREATE INDEX IF NOT EXISTS idx_ok ON sessions(title); /* x */ DROP TABLE tags"),
+            sync_index(970, "CREATE INDEX IF NOT EXISTS idx_ok ON sessions(title) -- ; DROP TABLE tags"),
+            sync_index(971, "CREATE INDEX IF NOT EXISTS idx_ok ON sessions(title) /* ; */"),
             // Trailing junk after the key list that isn't a WHERE clause.
-            sync_index(972, "CREATE INDEX IF NOT EXISTS ix_ok ON sessions(title) junk"),
+            sync_index(972, "CREATE INDEX IF NOT EXISTS idx_ok ON sessions(title) junk"),
             // A DROP that the same migration doesn't re-create.
             sync_index(973, "DROP INDEX IF EXISTS idx_sessions_created"),
             sync_index(974, "DROP INDEX idx_sessions_created; CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC)"),
+            // Names must be bare `idx_*` identifiers: no quotes, no schema prefix, no
+            // cr-sqlite internals.
+            sync_index(975, "CREATE INDEX IF NOT EXISTS \"idx_q\" ON sessions(title)"),
+            sync_index(976, "CREATE INDEX IF NOT EXISTS main.idx_q ON sessions(title)"),
+            sync_index(977, "CREATE INDEX IF NOT EXISTS ix_q ON sessions(title)"),
+            sync_index(978, "CREATE INDEX IF NOT EXISTS idx_q ON \"sessions\"(title)"),
+            sync_index(979, "CREATE INDEX IF NOT EXISTS idx_q ON main.sessions(title)"),
+            sync_index(990, "DROP INDEX IF EXISTS main.idx_sessions_created; CREATE INDEX IF NOT EXISTS \"main.idx_sessions_created\" ON sessions(title)"),
+            sync_index(991, "DROP INDEX IF EXISTS sessions__crsql_pks_pks; CREATE INDEX IF NOT EXISTS sessions__crsql_pks_pks ON sessions(id)"),
+            sync_index(992, "DROP INDEX IF EXISTS idx__crsql_x; CREATE INDEX IF NOT EXISTS idx__crsql_x ON sessions(id)"),
+            // A DROP target on another table than its re-create.
+            sync_index(993, "DROP INDEX IF EXISTS idx_sessions_created; CREATE INDEX IF NOT EXISTS idx_sessions_created ON segments(created_at)"),
+            // A DROP target that is a UNIQUE index (created below).
+            sync_index(994, "DROP INDEX IF EXISTS idx_u_existing; CREATE INDEX IF NOT EXISTS idx_u_existing ON tags(color)"),
         ];
+        conn.execute_batch("CREATE UNIQUE INDEX idx_u_existing ON tags(color);")
+            .unwrap();
         let before = synced_index_set(&conn);
         for m in &bad {
             let err = apply_migration(&conn, m).expect_err("must refuse");
@@ -1735,6 +1810,14 @@ mod tests {
                 "v{}: {err}",
                 m.version
             );
+            // The DROP-target cases are refused by the target check itself.
+            if [993, 994].contains(&m.version) {
+                assert!(
+                    err.to_string().contains("may be dropped"),
+                    "v{}: {err}",
+                    m.version
+                );
+            }
         }
         assert!(run_migrations_list(&conn, &bad).unwrap().is_empty());
         assert!(table_exists_for_test(&conn, "tags"));
@@ -1745,11 +1828,11 @@ mod tests {
             "nothing refused touched an index"
         );
         let ok = [
-            sync_index(980, "CREATE INDEX IF NOT EXISTS \"ix_q\" ON \"sessions\" (title COLLATE NOCASE, created_at DESC) WHERE status = 'done'"),
-            sync_index(981, "DROP INDEX IF EXISTS ix_q; CREATE INDEX IF NOT EXISTS ix_q ON sessions(title)"),
+            sync_index(980, "CREATE INDEX IF NOT EXISTS idx_q ON sessions (title COLLATE NOCASE, created_at DESC) WHERE status = 'done'"),
+            sync_index(981, "DROP INDEX IF EXISTS idx_q; CREATE INDEX IF NOT EXISTS idx_q ON sessions(title)"),
         ];
         assert_eq!(run_migrations_list(&conn, &ok).unwrap(), vec![980, 981]);
-        assert!(synced_index_set(&conn).contains(&"ix_q|sessions|0|0|title:0:BINARY".to_string()));
+        assert!(synced_index_set(&conn).contains(&"idx_q|sessions|0|0|title:0:BINARY".to_string()));
     }
 
     fn yapstack_column_exists(conn: &Connection, t: &str, c: &str) -> bool {
@@ -1925,7 +2008,7 @@ mod tests {
         let db = yapstack_sync::CrsqlDb::open(&path).unwrap();
         let conn = db.conn();
         cut_over(conn, &crate::db::migrations());
-        let sql = "CREATE INDEX IF NOT EXISTS ix_title ON sessions(title)";
+        let sql = "CREATE INDEX IF NOT EXISTS idx_title ON sessions(title)";
         let plain = crate::db::Migration {
             version: 980,
             description: "test: plain index on a sync table",
@@ -1942,15 +2025,15 @@ mod tests {
         );
         assert!(synced_index_set(conn)
             .iter()
-            .any(|r| r.starts_with("ix_title|")));
+            .any(|r| r.starts_with("idx_title|")));
         let unique = sync_index(
             982,
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_u ON notes(session_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON notes(session_id)",
         );
         assert!(apply_migration(conn, &unique).is_err());
         let pk_unique = sync_index(
             984,
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_pk ON sessions(id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pk ON sessions(id)",
         );
         assert!(
             apply_migration(conn, &pk_unique).is_err(),
@@ -1958,7 +2041,7 @@ mod tests {
         );
         let local = sync_index(
             983,
-            "CREATE INDEX IF NOT EXISTS ix_l ON _sqlx_migrations(description)",
+            "CREATE INDEX IF NOT EXISTS idx_l ON _sqlx_migrations(description)",
         );
         assert!(
             apply_migration(conn, &local).is_err(),

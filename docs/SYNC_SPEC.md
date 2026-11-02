@@ -174,7 +174,9 @@ is applied plainly.
   any other statement that names a sync table is refused.
 - **`SyncIndex`**: only `CREATE INDEX IF NOT EXISTS … ON <sync_table>(…)`, plus
   `DROP INDEX IF EXISTS <name>` when the same migration re-creates `<name>`; no SQL
-  comments. Applied plainly (an index touches no rows, columns or clocks, so CRR
+  comments. Names are bare `idx_[a-z0-9_]+` identifiers (no quotes, no schema prefix,
+  never `__crsql`) and tables bare sync-table names; a DROP target must be absent or a
+  declared, non-UNIQUE index on the table its re-create names. Applied plainly (an index touches no rows, columns or clocks, so CRR
   triggers stay current). Every UNIQUE index is refused on every database, even one
   over the PK: the vendored cr-sqlite rejects any UNIQUE index whose origin isn't the
   PRIMARY KEY, and cutover drops UNIQUE indexes, so a fresh DB never holds one.
