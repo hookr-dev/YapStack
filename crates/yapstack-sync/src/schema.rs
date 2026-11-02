@@ -221,6 +221,18 @@ pub(crate) fn all_crr(conn: &Connection, tables: &[&str]) -> Result<bool, SyncEr
     Ok(true)
 }
 
+/// The `SYNC_TABLES` members that are CRRs here right now. Changes when a table added after
+/// cutover is created and converted, which is when maintenance that skipped it must rerun.
+pub fn crr_sync_tables(conn: &Connection) -> Result<Vec<&'static str>, SyncError> {
+    let mut out = Vec::with_capacity(SYNC_TABLES.len());
+    for t in SYNC_TABLES {
+        if is_crr(conn, t)? {
+            out.push(*t);
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuild one table into its CRR-compatible shape (preserving app triggers such as
 /// the FTS sync triggers) then `crsql_as_crr` it. Idempotent: a table already
 /// converted is skipped.

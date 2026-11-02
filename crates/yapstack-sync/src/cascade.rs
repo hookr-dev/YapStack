@@ -20,6 +20,9 @@ use crate::SyncError;
 pub struct CascadeStats {
     pub deleted: usize,
     pub nulled: usize,
+    /// Relationships skipped because a table they name isn't a CRR here yet. Non-zero means
+    /// the pass must run again once that table is converted.
+    pub skipped: usize,
 }
 
 /// Child tables whose rows are deleted when their parent PK is gone (the stripped
@@ -93,6 +96,7 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
     let ready = |tables: &[&str]| all_crr(&tx, tables);
     for (child, fk, parent, ppk, _nullable) in CASCADE_DELETE {
         if !ready(&[child, parent])? {
+            stats.skipped += 1;
             continue;
         }
         // Cascade a delete only when the parent is PROVEN deleted — never on mere
@@ -107,6 +111,7 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
     }
     for (child, (fka, pa), (fkb, pb)) in CASCADE_JUNCTION {
         if !ready(&[child, pa, pb])? {
+            stats.skipped += 1;
             continue;
         }
         // A junction row dies when EITHER parent is proven-deleted.
@@ -119,6 +124,7 @@ pub fn cascade_gc(conn: &Connection) -> Result<CascadeStats, SyncError> {
     }
     for (table, fk, parent, ppk) in SET_NULL {
         if !ready(&[table, parent])? {
+            stats.skipped += 1;
             continue;
         }
         // Null the FK only when its referent is PROVEN deleted — never on mere absence,

@@ -26,6 +26,7 @@ use rusqlite::Connection;
 
 use crate::change::{apply_change, ChangeRow, Changeset, SENTINEL_CID};
 use crate::schema::{column_exists, is_crr};
+use crate::state;
 use crate::SyncError;
 use yapstack_common::write_turnstile::WriteTurnstile;
 
@@ -75,6 +76,97 @@ fn is_deferrable(conn: &Connection, crr: &mut CrrCache, r: &ChangeRow) -> Result
     Ok(!column_exists(conn, &r.table, &r.cid)?)
 }
 
+/// A stashed row's identity for ordering: rows for one `(table, pk)` apply in arrival order.
+type RowKey = (String, Vec<u8>);
+
+/// `_yapstack_sync_meta` keys for the last replay pass. Persisted so the state survives idle
+/// cycles and restarts. Local only, like the stash itself.
+const K_REPLAY_FAILED_KEYS: &str = "replay_failed_keys";
+const K_REPLAY_WAITING: &str = "replay_waiting";
+const K_REPLAY_FAILED: &str = "replay_failed";
+
+/// The `(table, pk)` keys whose stashed rows failed (or were held behind a failure) in the
+/// last replay pass. A freshly pulled row for one of these keys is stashed behind them rather
+/// than applied ahead: applying an older live row while its failed delete sentinel is still
+/// stashed would resurrect the row.
+fn load_failed_keys(conn: &Connection) -> Result<HashSet<RowKey>, SyncError> {
+    let Some(raw) = state::get_meta(conn, K_REPLAY_FAILED_KEYS)? else {
+        return Ok(HashSet::new());
+    };
+    let pairs: Vec<(String, String)> = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(pairs
+        .into_iter()
+        .filter_map(|(t, pk)| hex::decode(pk).ok().map(|pk| (t, pk)))
+        .collect())
+}
+
+/// Persisted outcome of the last replay pass (see [`replay_status`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayStatus {
+    /// Stashed rows waiting for an app update that adds their table or column.
+    pub waiting: u64,
+    /// Stashed rows that are ready but failed to apply, plus the rows for the same
+    /// `(table, pk)` held behind them. Not a schema gap: a possible corruption signal.
+    pub failed: u64,
+}
+
+/// The counts recorded by the last [`replay_pending`] pass, from the DB, so they are known on
+/// an idle cycle and after a restart.
+pub fn replay_status(conn: &Connection) -> Result<ReplayStatus, SyncError> {
+    let n = |k| -> Result<u64, SyncError> {
+        Ok(state::get_meta(conn, k)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    };
+    Ok(ReplayStatus {
+        waiting: n(K_REPLAY_WAITING)?,
+        failed: n(K_REPLAY_FAILED)?,
+    })
+}
+
+/// Record a replay pass's counts and failed keys. Writes only what changed, so an idle cycle
+/// with an unchanged stash takes no write lock.
+fn persist_replay_outcome(
+    conn: &Connection,
+    report: &ReplayReport,
+    failed_keys: &HashSet<RowKey>,
+) -> Result<(), SyncError> {
+    let mut keys: Vec<(String, String)> = failed_keys
+        .iter()
+        .map(|(t, pk)| (t.clone(), hex::encode(pk)))
+        .collect();
+    keys.sort();
+    let wanted = [
+        (
+            K_REPLAY_FAILED_KEYS,
+            serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into()),
+        ),
+        (K_REPLAY_WAITING, report.waiting.to_string()),
+        (
+            K_REPLAY_FAILED,
+            (report.failed + report.blocked).to_string(),
+        ),
+    ];
+    let mut changed = Vec::new();
+    for (k, v) in &wanted {
+        let current = state::get_meta(conn, k)?;
+        let unset_and_empty = current.is_none() && (v == "0" || v == "[]");
+        if current.as_deref() != Some(v.as_str()) && !unset_and_empty {
+            changed.push((*k, v));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let _turn = WriteTurnstile::process().acquire();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for (k, v) in changed {
+        state::set_meta(&tx, k, v)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Stash one change row (clock preserved) for later replay.
 fn stash(conn: &Connection, r: &ChangeRow) -> Result<(), SyncError> {
     let blob = Changeset {
@@ -88,14 +180,18 @@ fn stash(conn: &Connection, r: &ChangeRow) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Apply a change, or quarantine it if its table or column isn't ready locally. Returns true
-/// if the change was quarantined (deferred), false if applied.
+/// Apply a change, or quarantine it if its table or column isn't ready locally, or if an
+/// earlier stashed row for the same `(table, pk)` failed to replay (it queues behind that row).
+/// Returns true if the change was quarantined (deferred), false if applied.
 fn apply_or_quarantine(
     conn: &Connection,
     crr: &mut CrrCache,
+    failed_keys: &HashSet<RowKey>,
     r: &ChangeRow,
 ) -> Result<bool, SyncError> {
-    if is_deferrable(conn, crr, r)? {
+    let behind_failure =
+        !failed_keys.is_empty() && failed_keys.contains(&(r.table.clone(), r.pk.clone()));
+    if behind_failure || is_deferrable(conn, crr, r)? {
         stash(conn, r)?;
         Ok(true)
     } else {
@@ -127,10 +223,11 @@ pub fn merge_changeset(conn: &Connection, cs: &Changeset) -> Result<(usize, usiz
     // `new_unchecked` because we hold only a `&Connection` here, not `&mut`.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut crr = CrrCache::default();
+    let failed_keys = load_failed_keys(&tx)?;
     let mut applied = 0usize;
     let mut quarantined = 0usize;
     for r in &cs.rows {
-        if apply_or_quarantine(&tx, &mut crr, r)? {
+        if apply_or_quarantine(&tx, &mut crr, &failed_keys, r)? {
             quarantined += 1;
         } else {
             applied += 1;
@@ -163,7 +260,9 @@ pub struct ReplayReport {
 /// One row per write transaction, in stash (`id`, i.e. arrival) order, each under its own
 /// [`WriteTurnstile`] turn taken before `BEGIN IMMEDIATE`. A row that fails rolls back alone
 /// and stays stashed, so one bad row never strands the rest; every later row for the same
-/// `(table, pk)` is skipped for the rest of the pass. `BEGIN IMMEDIATE` for the same reason
+/// `(table, pk)` is skipped for the rest of the pass. The pass records its failed keys, so a
+/// row pulled later for one of them queues behind it too (see [`merge_changeset`]), and its
+/// counts, read back by [`replay_status`]. `BEGIN IMMEDIATE` for the same reason
 /// as [`merge_changeset`]: the apply reads before it writes, and a deferred transaction's
 /// lost read→write upgrade surfaces as `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` cannot
 /// retry. Only a local DB fault (opening a transaction, deleting a replayed row) is an `Err`.
@@ -181,7 +280,7 @@ pub fn replay_pending(conn: &Connection) -> Result<ReplayReport, SyncError> {
 
     let mut report = ReplayReport::default();
     let mut crr = CrrCache::default();
-    let mut failed_keys: HashSet<(String, Vec<u8>)> = HashSet::new();
+    let mut failed_keys: HashSet<RowKey> = HashSet::new();
     for (id, blob) in &candidates {
         let Some(r) = Changeset::decode(blob)?.rows.into_iter().next() else {
             // malformed/empty — drop it, do not wedge the queue.
@@ -220,6 +319,7 @@ pub fn replay_pending(conn: &Connection) -> Result<ReplayReport, SyncError> {
         tx.commit()?;
         report.replayed += 1;
     }
+    persist_replay_outcome(conn, &report, &failed_keys)?;
     Ok(report)
 }
 
@@ -428,6 +528,86 @@ mod tests {
             "n1 is held behind its failed delete; n2 applied"
         );
         assert_eq!(pending_count(b.conn()).unwrap(), (1 + n1_rows) as i64);
+    }
+
+    #[test]
+    fn fresh_pull_queues_behind_a_failed_stashed_row_for_the_same_pk() {
+        // n1 was created then deleted on A. The delete sentinel arrives first, while t_new is
+        // absent here, and later fails to replay. A later pull then brings n1's older live
+        // column rows. Applying them straight away would resurrect n1, because the delete
+        // never landed; they must queue behind the failed sentinel instead.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        crr(&a, T_NEW, "t_new");
+        a.conn()
+            .execute("INSERT INTO t_new(id,v) VALUES('n1','one')", [])
+            .unwrap();
+        let live = read_local_changes_since(a.conn(), 0).unwrap();
+        let after_insert: i64 = a
+            .conn()
+            .query_row("SELECT crsql_db_version()", [], |r| r.get(0))
+            .unwrap();
+        a.conn()
+            .execute("DELETE FROM t_new WHERE id='n1'", [])
+            .unwrap();
+        let mut delete = read_local_changes_since(a.conn(), after_insert).unwrap();
+        assert!(delete.rows.iter().all(|r| r.cid == SENTINEL_CID));
+        delete.rows = delete.rows.into_iter().map(unappliable).collect();
+
+        let b = CrsqlDb::open_in_memory().unwrap();
+        merge_changeset(b.conn(), &delete).unwrap();
+        crr(&b, T_NEW, "t_new");
+        assert_eq!(replay_pending(b.conn()).unwrap().failed, 1);
+
+        let (applied, quarantined) = merge_changeset(b.conn(), &live).unwrap();
+        assert_eq!((applied, quarantined), (0, live.rows.len()));
+        assert!(t_new_rows(b.conn()).is_empty(), "n1 must not resurrect");
+        let report = replay_pending(b.conn()).unwrap();
+        assert_eq!((report.failed, report.blocked), (1, live.rows.len()));
+        assert!(t_new_rows(b.conn()).is_empty());
+    }
+
+    #[test]
+    fn replay_status_persists_failed_and_waiting_across_idle_passes_and_reopen() {
+        // A failing row and a row waiting for an update, then repeated passes with nothing new
+        // merged: the counts stay put, stay distinct, and survive reopening the DB.
+        let dir = std::env::temp_dir().join(format!("yapstack-fp1-st-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.db");
+        let a = peer_with_t_new_rows();
+        let cs = read_local_changes_since(a.conn(), 0).unwrap();
+        let want = {
+            let b = CrsqlDb::open(&path).unwrap();
+            assert_eq!(replay_status(b.conn()).unwrap(), ReplayStatus::default());
+            crr(
+                &b,
+                "CREATE TABLE kv(id TEXT NOT NULL PRIMARY KEY, v TEXT);",
+                "kv",
+            );
+            b.conn()
+                .execute("INSERT INTO kv(id,v) VALUES('k','x')", [])
+                .unwrap();
+            let mut bad = read_local_changes_since(b.conn(), 0).unwrap();
+            bad.rows = bad.rows.into_iter().map(unappliable).collect();
+            ensure_pending_table(b.conn()).unwrap();
+            for r in &bad.rows {
+                stash(b.conn(), r).unwrap();
+            }
+            merge_changeset(b.conn(), &cs).unwrap(); // t_new is absent: waiting
+            for _ in 0..3 {
+                let r = replay_pending(b.conn()).unwrap();
+                assert_eq!(r.replayed, 0);
+            }
+            let want = ReplayStatus {
+                waiting: cs.rows.len() as u64,
+                failed: bad.rows.len() as u64,
+            };
+            assert_eq!(replay_status(b.conn()).unwrap(), want);
+            want
+        };
+        let b = CrsqlDb::open(&path).unwrap();
+        assert_eq!(replay_status(b.conn()).unwrap(), want, "survives a reopen");
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

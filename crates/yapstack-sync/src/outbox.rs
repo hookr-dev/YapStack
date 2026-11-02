@@ -2232,6 +2232,50 @@ mod tests {
         );
     }
 
+    /// FP1: only a table or column that isn't there yet is deferred. A known CRR table whose
+    /// row is rejected for a real reason (here a CHECK constraint) still fails the pull with
+    /// `pull_error`, leaves the watermark where it was and stashes nothing, so it can never
+    /// sit in the quarantine looking like "waiting for an app update".
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_row_constraint_error_still_fails_the_pull() {
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        let mk = |db: &CrsqlDb, check: &str| {
+            db.conn()
+                .execute_batch(&format!(
+                    "CREATE TABLE t_chk(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT ''{check});"
+                ))
+                .unwrap();
+            db.conn()
+                .query_row("SELECT crsql_as_crr('t_chk')", [], |_| Ok(()))
+                .unwrap();
+        };
+        mk(&a, "");
+        mk(&b, " CHECK (v <> 'bad')");
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        a.conn()
+            .execute("INSERT INTO t_chk(id,v) VALUES('c1','bad')", [])
+            .unwrap();
+        drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+            .await
+            .unwrap();
+
+        let report = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.pull_error.is_some(),
+            "a real apply error is not deferred"
+        );
+        assert_eq!(state::pull_watermark(b.conn()).unwrap(), 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(crate::quarantine::pending_count(b.conn()).unwrap(), 0);
+    }
+
     /// [`MockRelay`] with a forced page size, so a small backlog spans several pull pages.
     struct Paged {
         inner: Arc<MockRelay>,

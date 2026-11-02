@@ -426,16 +426,24 @@ one row per write transaction, each under the process `WriteTurnstile` taken bef
 `BEGIN IMMEDIATE`. A row that is still not ready waits; a ready row that fails rolls back
 alone, stays stashed and is retried next cycle, and every later stashed row for the same
 `(table, pk)` is skipped for that pass, so a column row never lands over a failed delete
-sentinel. The cycle reports `replay_waiting` (rows waiting for an app update) and
-`replay_failed` (failed plus held behind a failure); today they reach the drain log only,
-not lane status. `crr_migrate`, `cascade_gc` and `enforce_uniqueness` skip a sync table
-this device doesn't have, or hasn't converted, yet (ADR 0006 §4).
+sentinel. The pass records those failed keys, and a row pulled later for one of them is
+stashed behind it instead of applied ahead (an older live row applied past a failed delete
+sentinel would resurrect the row). Each pass persists its counts in `_yapstack_sync_meta`
+(`replay_waiting`: rows waiting for an app update; `replay_failed`: failed plus held behind
+a failure), read by `quarantine::replay_status`, so they hold across idle cycles and
+restarts. A non-zero `replay_failed` turns an otherwise clean cycle's health to `Failing`
+(a possible corruption signal); waiting rows don't. Lane status has no field for the
+waiting count yet. `crr_migrate`, `cascade_gc` and `enforce_uniqueness` skip a sync table
+this device doesn't have, or hasn't converted, yet, and report how many passes they skipped
+(ADR 0006 §4).
 
 ### 6.5 Maintenance
 
 `cascade_gc` and `enforce_uniqueness` run only on a cycle that merged something **and**
 completed a clean, fully-drained pull (`maintenance_ready`); a merge on a failed pull
-arms a flag consumed by the next clean cycle. Rationale: proven ≠ fresh.
+arms a flag consumed by the next clean cycle. Maintenance also waits while any stashed
+row fails to replay (a newer value may be stuck behind an older one that landed), and
+reruns on an idle cycle once a table it skipped becomes a CRR. Rationale: proven ≠ fresh.
 
 ### 6.6 Health and progress
 

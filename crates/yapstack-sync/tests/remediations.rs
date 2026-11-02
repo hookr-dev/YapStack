@@ -599,5 +599,33 @@ fn absent_tables_are_tolerated_by_migrate_cascade_and_uniqueness() {
         ),
         0
     );
-    enforce_uniqueness(conn).expect("uniqueness skips passes with a missing table");
+    // Two tags that collide case-insensitively arrive while `session_tags` is missing: the
+    // tag dedup pass is skipped (and says so) rather than run half-way.
+    conn.execute_batch("INSERT INTO tags(id,name) VALUES('tdup1','Dup'),('tdup2','dup');")
+        .unwrap();
+    let before = schema::crr_sync_tables(conn).unwrap();
+    let skipped = enforce_uniqueness(conn).expect("uniqueness skips passes with a missing table");
+    assert_eq!(skipped.tags_merged, 0);
+    assert_eq!(skipped.skipped, 2, "tag and audio-part passes skipped");
+    assert_eq!(
+        stats.skipped, 3,
+        "shares, session_audio_parts, session_tags relationships"
+    );
+
+    // The table appears later (its migration runs). The readiness set changes, which is the
+    // drain's cue to rerun maintenance even on an idle cycle, and the rerun dedups the tags.
+    conn.execute_batch(
+        "CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
+         source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
+         created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (session_id, tag_id));",
+    )
+    .unwrap();
+    schema::crr_migrate(conn).unwrap();
+    assert_ne!(schema::crr_sync_tables(conn).unwrap(), before);
+    let rerun = enforce_uniqueness(conn).unwrap();
+    assert_eq!(rerun.tags_merged, 1);
+    assert_eq!(
+        rerun.skipped, 1,
+        "only the audio-part pass is still skipped"
+    );
 }
