@@ -3906,8 +3906,8 @@ fn spawn_drain(
             // Set whenever a cycle merged work; consumed by the next CLEAN (fully-drained) cycle
             // so deterministic maintenance still runs when the merge and the drained-to-tip cycle
             // fall apart (a pull that failed mid-backlog advances the watermark but returns an
-            // error). In-memory: on restart the first inbound merge re-arms it.
-            let mut maintenance = MaintenanceSchedule::default();
+            // error). In-memory, so it starts armed: a skip recorded before a restart is lost.
+            let mut maintenance = MaintenanceSchedule::at_startup();
 
             // Seed the SSE lane's watermark gate with our starting local pull position so an
             // early wake for an already-merged seq is skipped (deliverable 1).
@@ -4710,6 +4710,16 @@ struct MaintenanceSchedule {
 }
 
 impl MaintenanceSchedule {
+    /// The schedule a drain starts with: one pass armed. The schedule is in memory, so a skip
+    /// recorded before a restart is gone; arming once covers a table that appeared meanwhile.
+    /// It still waits for a clean cycle with no failing replay rows, like any other pass.
+    fn at_startup() -> Self {
+        Self {
+            pending: true,
+            skipped_at: None,
+        }
+    }
+
     /// Whether maintenance runs after this cycle. Held while the pull failed or stashed rows
     /// failed to replay: a column's newer value may be stuck behind an older one that already
     /// landed, and a dedup on the stale value could tombstone the real winner. `crr_now` is
@@ -7366,6 +7376,42 @@ mod tests {
         assert!(schedule.due(&idle, || Some(vec!["sessions", "tags", "session_tags"])));
         schedule.ran(0, Some(vec!["sessions", "tags", "session_tags"]));
         assert!(!schedule.due(&idle, || panic!("nothing skipped, nothing to watch")));
+    }
+
+    /// FP1 P2a: a skip recorded before a restart is lost with the in-memory schedule, so the
+    /// drain arms one pass at startup. Skip, restart, an idle first cycle runs it (recording
+    /// the skip again), then the table appearing on a later idle cycle reruns it.
+    #[test]
+    fn maintenance_runs_after_restart_then_again_when_the_table_appears() {
+        let idle = outbox::DrainReport::default();
+        let before = vec!["sessions", "tags"];
+        let after = vec!["sessions", "tags", "session_tags"];
+        let mut old = MaintenanceSchedule::at_startup();
+        assert!(old.due(&idle, || None));
+        old.ran(1, Some(before.clone()));
+        drop(old); // restart
+
+        let mut schedule = MaintenanceSchedule::at_startup();
+        assert!(
+            schedule.due(&idle, || Some(before.clone())),
+            "armed at startup"
+        );
+        schedule.ran(1, Some(before.clone()));
+        assert!(!schedule.due(&idle, || Some(before.clone())));
+        assert!(
+            schedule.due(&idle, || Some(after.clone())),
+            "table appeared while idle"
+        );
+
+        let failing = outbox::DrainReport {
+            replay_failed: 1,
+            ..Default::default()
+        };
+        let mut held = MaintenanceSchedule::at_startup();
+        assert!(
+            !held.due(&failing, || None),
+            "the startup pass still waits on failing rows"
+        );
     }
 
     /// FP1 P2b: stashed rows that keep failing make the drain unhealthy on every clean cycle,

@@ -426,9 +426,10 @@ one row per write transaction, each under the process `WriteTurnstile` taken bef
 `BEGIN IMMEDIATE`. A row that is still not ready waits; a ready row that fails rolls back
 alone, stays stashed and is retried next cycle, and every later stashed row for the same
 `(table, pk)` is skipped for that pass, so a column row never lands over a failed delete
-sentinel. The pass records those failed keys, and a row pulled later for one of them is
-stashed behind it instead of applied ahead (an older live row applied past a failed delete
-sentinel would resurrect the row). Each pass persists its counts in `_yapstack_sync_meta`
+sentinel. A merge also stashes an incoming row behind any stashed row for the same
+`(table, pk)` that is ready here (failed, or not replayed yet), so an older live row can't
+land past a failed delete sentinel and resurrect the row. That barrier is derived from the
+stash inside the merge transaction, so it holds across a crash. Each pass persists its counts in `_yapstack_sync_meta`
 (`replay_waiting`: rows waiting for an app update; `replay_failed`: failed plus held behind
 a failure), read by `quarantine::replay_status`, so they hold across idle cycles and
 restarts. A non-zero `replay_failed` turns an otherwise clean cycle's health to `Failing`
@@ -443,7 +444,8 @@ this device doesn't have, or hasn't converted, yet, and report how many passes t
 completed a clean, fully-drained pull (`maintenance_ready`); a merge on a failed pull
 arms a flag consumed by the next clean cycle. Maintenance also waits while any stashed
 row fails to replay (a newer value may be stuck behind an older one that landed), and
-reruns on an idle cycle once a table it skipped becomes a CRR. Rationale: proven ≠ fresh.
+reruns on an idle cycle once a table it skipped becomes a CRR; a drain starts with one pass
+armed, since that schedule is in memory. Rationale: proven ≠ fresh.
 
 ### 6.6 Health and progress
 
