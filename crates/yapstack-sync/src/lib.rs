@@ -41,11 +41,15 @@ pub const CRSQLITE_ENGINE_VERSION: u32 = 16_003;
 /// synced schema changes; drives the §6 quarantine/handshake gate.
 pub const SYNC_SCHEMA_VERSION: u32 = 1;
 
+/// The sync capability level that means "has the table-readiness quarantine" (ADR 0006 §4):
+/// a row for a table that isn't a CRR locally never fails a changeset, so the device can
+/// safely receive rows for tables added after it shipped. The lowest level any table added
+/// after cutover can need.
+pub const TABLE_READINESS_LEVEL: i32 = 1;
+
 /// This build's sync capability level, sent on every pull and snapshot request
-/// (`X-YapStack-Sync-Capability`, ADR 0006 §5.1). Level 1 = "has the table-readiness
-/// quarantine" (ADR 0006 §4): a row for a table that isn't a CRR locally never fails a
-/// changeset, so this device can safely receive rows for tables added after it shipped.
-pub const SYNC_CAPABILITY_LEVEL: i32 = 1;
+/// (`X-YapStack-Sync-Capability`, ADR 0006 §5.1).
+pub const SYNC_CAPABILITY_LEVEL: i32 = TABLE_READINESS_LEVEL;
 
 /// Every fallible operation's error. All crypto/codec variants are quarantine/deny
 /// paths (never a panic on attacker-supplied bytes, CRYPTO_SPEC §11.3).

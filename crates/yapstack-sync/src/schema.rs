@@ -35,21 +35,31 @@ pub const SYNC_TABLES: &[&str] = &[
     "shares",
 ];
 
-/// Synced tables that need a sync capability level above 0 (ADR 0006 §5.4). A peer below
-/// the level would wedge on the table's rows, so an outbox entry carrying them is published
-/// only once the relay's floor is at least that level. The 12 cutover tables are level 0 and
-/// aren't listed. A table added by a later `CreateSyncTable` migration is appended to
-/// `SYNC_TABLES` and listed here with the release-gate level.
+/// The first this-many [`SYNC_TABLES`] are the cutover tables every syncing build has had.
+/// Later entries were added after cutover, and only ever appended.
+pub const CUTOVER_SYNC_TABLE_COUNT: usize = 12;
+
+/// Synced tables that need a sync capability level above [`crate::TABLE_READINESS_LEVEL`]
+/// (ADR 0006 §5.4). A peer below the level would wedge on the table's rows, so an outbox
+/// entry carrying them is published only once the relay's floor is at least that level. The
+/// 12 cutover tables are level 0 and aren't listed. A table added by a later
+/// `CreateSyncTable` migration is appended to `SYNC_TABLES` and listed here with the
+/// release-gate level.
 pub const GATED_SYNC_TABLES: &[(&str, i32)] = &[];
 
-/// The sync capability level rows of `table` need (0 unless listed in
-/// [`GATED_SYNC_TABLES`]).
+/// The sync capability level rows of `table` need: 0 for a cutover table, the listed level
+/// for a [`GATED_SYNC_TABLES`] entry, and [`crate::TABLE_READINESS_LEVEL`] for any other
+/// table, so a table nobody listed still never reaches a peer without the table-readiness
+/// quarantine.
 #[must_use]
 pub fn table_sync_capability(table: &str) -> i32 {
+    if SYNC_TABLES[..CUTOVER_SYNC_TABLE_COUNT].contains(&table) {
+        return 0;
+    }
     GATED_SYNC_TABLES
         .iter()
         .find(|(t, _)| *t == table)
-        .map_or(0, |(_, level)| *level)
+        .map_or(crate::TABLE_READINESS_LEVEL, |(_, level)| *level)
 }
 
 /// One column's metadata as reported by `PRAGMA table_info`, in declared (`cid`)
@@ -865,6 +875,30 @@ mod tests {
         // No slots, and an unterminated identifier, both degrade without panicking.
         assert!(trigger_value_slots("SELECT 1").is_empty());
         assert!(trigger_value_slots("NEW.\"unterminated").is_empty());
+    }
+
+    #[test]
+    fn a_table_outside_the_cutover_set_needs_at_least_table_readiness() {
+        for t in &SYNC_TABLES[..CUTOVER_SYNC_TABLE_COUNT] {
+            assert_eq!(table_sync_capability(t), 0, "cutover table {t}");
+        }
+        // O1: a table nobody listed in GATED_SYNC_TABLES still needs a peer with the
+        // table-readiness quarantine, so forgetting to list one can't wedge an older peer.
+        assert_eq!(table_sync_capability("t_new"), crate::TABLE_READINESS_LEVEL);
+        for t in &SYNC_TABLES[CUTOVER_SYNC_TABLE_COUNT..] {
+            assert!(
+                table_sync_capability(t) >= crate::TABLE_READINESS_LEVEL,
+                "{t}"
+            );
+        }
+        for (t, level) in GATED_SYNC_TABLES {
+            assert!(
+                SYNC_TABLES[CUTOVER_SYNC_TABLE_COUNT..].contains(t),
+                "gated table {t} must be a post-cutover SYNC_TABLES entry"
+            );
+            assert!(*level >= crate::TABLE_READINESS_LEVEL, "{t} level {level}");
+        }
+        assert!(crate::SYNC_CAPABILITY_LEVEL >= crate::TABLE_READINESS_LEVEL);
     }
 
     #[test]

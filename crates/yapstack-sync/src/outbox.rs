@@ -375,6 +375,10 @@ pub fn retry_crypto_quarantine(
 /// each chunk becomes its own outbox entry AND its own write transaction (see
 /// [`enqueue_local`]), so this returns the plan rather than inserting inline.
 ///
+/// A chunk also ends wherever the rows' sync capability level changes (ADR 0006 §5.4), so an
+/// entry carries one level and the level-0 rows ahead of a gated table's rows ship while the
+/// gated ones are held.
+///
 /// A chunk boundary may fall INSIDE one `db_version` group (a single local transaction can
 /// author more rows than one chunk holds), which is why the watermark a chunk may commit is
 /// computed separately by [`chunk_commit_watermark`] — never assumed to be the chunk's max
@@ -383,13 +387,18 @@ fn plan_capture_chunks(rows: Vec<ChangeRow>) -> Vec<Vec<ChangeRow>> {
     let mut chunks: Vec<Vec<ChangeRow>> = Vec::new();
     let mut buf: Vec<ChangeRow> = Vec::new();
     let mut acc = 4usize; // Changeset::encode row-count header
+    let mut buf_level = 0;
     for row in rows {
         let sz = row_encoded_size(&row);
-        if !buf.is_empty() && (buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET) {
+        let level = crate::schema::table_sync_capability(&row.table);
+        if !buf.is_empty()
+            && (level != buf_level || buf.len() >= CHUNK_ROWS || acc + sz > CHUNK_PLAINTEXT_BUDGET)
+        {
             chunks.push(std::mem::take(&mut buf));
             acc = 4;
         }
         acc += sz;
+        buf_level = level;
         buf.push(row);
     }
     if !buf.is_empty() {
@@ -1385,6 +1394,214 @@ mod tests {
         assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
     }
 
+    /// Every table with a row in a changeset `relay` holds, decrypted.
+    async fn relay_tables(relay: &MockRelay, cipher: &ChangesetCipher) -> Vec<String> {
+        let pull = relay.pull(0, 100_000).await.unwrap();
+        let mut tables = Vec::new();
+        for pc in &pull.changes {
+            for r in decode_pulled_changeset(cipher, pc).unwrap().rows {
+                if !tables.contains(&r.table) {
+                    tables.push(r.table);
+                }
+            }
+        }
+        tables
+    }
+
+    fn outbox_levels(conn: &Connection) -> Vec<i32> {
+        let mut stmt = conn
+            .prepare("SELECT required_sync_capability FROM _yapstack_outbox ORDER BY client_seq")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// A device that has never synced: `tags` (a cutover table) holds a row, and `t_new` (a
+    /// table added after cutover that nobody listed in `GATED_SYNC_TABLES`) had a row before
+    /// it was converted, so `crsql_as_crr` backfills it.
+    fn post_cutover_db() -> CrsqlDb {
+        let db = CrsqlDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL DEFAULT ''); \
+                 CREATE TABLE t_new(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT ''); \
+                 INSERT INTO t_new(id, v) VALUES ('n1', 'before conversion');",
+            )
+            .unwrap();
+        db.conn()
+            .query_row("SELECT crsql_as_crr('tags')", [], |_| Ok(()))
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO tags(id, name) VALUES ('g1', 'work')", [])
+            .unwrap();
+        db.conn()
+            .query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
+            .unwrap();
+        db
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn never_synced_device_holds_rows_of_a_post_cutover_table_until_the_floor_rises() {
+        let db = post_cutover_db();
+        let me = Uuid::from_u128(1);
+        let relay = MockRelay::new();
+        relay.set_capability_blockers(vec![blocker("old laptop")]);
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        let report = drain_once(db.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            relay_tables(&relay, &cipher).await,
+            vec!["tags".to_string()],
+            "no t_new row reaches a relay whose floor is below its level"
+        );
+        assert_eq!(unacked(db.conn()), vec![2], "the level-0 prefix is acked");
+        assert!(
+            matches!(&report.push_error, Some(SyncError::CapabilityBlocked { blockers, .. }) if blockers[0].label == "old laptop"),
+            "got {:?}",
+            report.push_error
+        );
+        assert!(report.pull_error.is_none(), "the pull still ran");
+        assert!(report.relay_capability.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn captured_levels_cut_batches_and_the_ungated_prefix_acks() {
+        let db = post_cutover_db();
+        db.conn()
+            .execute("INSERT INTO tags(id, name) VALUES ('g2', 'home')", [])
+            .unwrap();
+        let me = Uuid::from_u128(1);
+        let relay = recording_relay();
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        enqueue_local(db.conn(), &cipher, me, sv, ev).unwrap();
+        assert_eq!(
+            outbox_levels(db.conn()),
+            vec![0, 1, 0],
+            "capture cuts an entry wherever the level changes, keeping change order"
+        );
+
+        push_outbox(db.conn(), me, &relay).await.unwrap();
+        assert!(unacked(db.conn()).is_empty());
+        assert_eq!(relay.inner.stored_pairs(), vec![(me, 1), (me, 2), (me, 3)]);
+        let mut batches = relay.batches.lock().unwrap().clone();
+        batches.dedup();
+        assert_eq!(batches, vec![(vec![1], 0), (vec![2], 1), (vec![3], 0)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_persisted_floor_never_authorizes_a_gated_push() {
+        let conn = outbox_with_levels(&[(1, 1)]);
+        let workspace = Uuid::from_u128(9);
+        let persisted = SyncCapabilityLevels {
+            required_sync_capability: 5,
+            requested_sync_capability: 5,
+        };
+        state::record_relay_capability(&conn, workspace, persisted).unwrap();
+        let relay = recording_relay();
+        relay.inner.set_capability_blockers(vec![blocker("tablet")]);
+        let me = Uuid::from_u128(1);
+
+        let err = push_outbox(&conn, me, &relay).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::CapabilityBlocked { .. }),
+            "got {err:?}"
+        );
+        assert!(relay.inner.stored_pairs().is_empty());
+        assert_eq!(relay.inner.capability_state().2, 1, "the raise was tried");
+        assert_eq!(
+            state::relay_capability(&conn, workspace).unwrap(),
+            Some(persisted),
+            "a refused raise leaves the persisted copy alone"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restored_outbox_keeps_entry_levels_and_stays_held() {
+        let dir = std::env::temp_dir().join(format!("yapstack-restore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (live, backup) = (dir.join("live.db"), dir.join("backup.db"));
+        {
+            let conn = Connection::open(&live).unwrap();
+            ensure_outbox_table(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO _yapstack_outbox (client_seq, ciphertext, schema_version, \
+                 engine_version, acked, required_sync_capability) VALUES \
+                 (1, x'01', 1, 16003, 0, 0), (2, x'02', 1, 16003, 0, 1);",
+            )
+            .unwrap();
+        }
+        std::fs::copy(&live, &backup).unwrap();
+
+        // The restored file opens on a fresh connection: no per-spawn state carries over, and
+        // the entry keeps the level it was captured at.
+        let conn = Connection::open(&backup).unwrap();
+        assert_eq!(outbox_levels(&conn), vec![0, 1]);
+        let relay = recording_relay();
+        relay
+            .inner
+            .set_capability_blockers(vec![blocker("old laptop")]);
+        let me = Uuid::from_u128(1);
+        let err = push_outbox(&conn, me, &relay).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::CapabilityBlocked { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
+        assert_eq!(unacked(&conn), vec![2]);
+        // An outbox restored from a build that predates the level column gets DEFAULT 0
+        // (`outbox_level_column_is_added_to_an_older_table`). That is sound: such a build
+        // only ever converted the cutover tables, so its entries can't hold a gated row.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cutover_order_puts_post_cutover_tables_last_so_the_level0_history_ships() {
+        // `crr_migrate` converts in `SYNC_TABLES` order and `crsql_as_crr` backfills a table's
+        // existing rows at the next db_version, so a post-cutover table (appended to
+        // `SYNC_TABLES`) is captured after every cutover table, even when its rows were written
+        // first. The level-0 history then forms its own leading entries that ship while the
+        // gated tail is held.
+        let db = CrsqlDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE t_new(id TEXT NOT NULL PRIMARY KEY, v TEXT); \
+                 INSERT INTO t_new VALUES ('n1', 'written first'); \
+                 CREATE TABLE tags(id TEXT PRIMARY KEY, name TEXT); \
+                 INSERT INTO tags VALUES ('g1', 'work');",
+            )
+            .unwrap();
+        crate::schema::crr_migrate(db.conn()).unwrap();
+        db.conn()
+            .query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
+            .unwrap();
+        let me = Uuid::from_u128(1);
+        let cipher = f1_cipher();
+        enqueue_local(
+            db.conn(),
+            &cipher,
+            me,
+            SYNC_SCHEMA_VERSION as i32,
+            CRSQLITE_ENGINE_VERSION as i32,
+        )
+        .unwrap();
+        assert_eq!(outbox_levels(db.conn()), vec![0, 1]);
+        let tables: Vec<String> = captured_rows(db.conn(), &cipher, me)
+            .into_iter()
+            .map(|r| r.table)
+            .collect();
+        let first_t_new = tables.iter().position(|t| t == "t_new").unwrap();
+        assert!(tables[..first_t_new].iter().all(|t| t == "tags"));
+        assert!(tables[first_t_new..].iter().all(|t| t == "t_new"));
+    }
+
     #[test]
     fn outbox_level_column_is_added_to_an_older_table() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1734,10 +1951,19 @@ mod tests {
     #[async_trait]
     impl SyncTransport for Faulty {
         async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
+            self.push_batch(r, 0).await
+        }
+        async fn push_batch(&self, r: PushRequest, level: i32) -> Result<PushResponse, SyncError> {
             match &self.push_err {
                 Some(err) => Err(err()),
-                None => self.inner.push(r).await,
+                None => self.inner.push_batch(r, level).await,
             }
+        }
+        async fn raise_sync_capability(
+            &self,
+            level: i32,
+        ) -> Result<SyncCapabilityLevels, SyncError> {
+            self.inner.raise_sync_capability(level).await
         }
         async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
             if let Some(err) = &self.pull_err {
@@ -2550,6 +2776,15 @@ mod tests {
     impl SyncTransport for Paged {
         async fn push(&self, r: PushRequest) -> Result<PushResponse, SyncError> {
             self.inner.push(r).await
+        }
+        async fn push_batch(&self, r: PushRequest, level: i32) -> Result<PushResponse, SyncError> {
+            self.inner.push_batch(r, level).await
+        }
+        async fn raise_sync_capability(
+            &self,
+            level: i32,
+        ) -> Result<SyncCapabilityLevels, SyncError> {
+            self.inner.raise_sync_capability(level).await
         }
         async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
             self.inner.pull(since, limit.min(self.page)).await
