@@ -27,7 +27,8 @@ pub struct Migration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaObject {
     /// An ordinary table: same columns, each in the same shape (type, primary-key
-    /// place, non-key NOT NULL). Declare its columns too.
+    /// place, NOT NULL, default; up to what a CRR cutover changes). Declare its
+    /// columns too.
     Table(&'static str),
     /// A column `(table, column)`: same shape as in the reference.
     Column(&'static str, &'static str),

@@ -632,21 +632,75 @@ fn master_sql(conn: &Connection, ty: &str, name: &str) -> rusqlite::Result<Optio
         })
 }
 
-/// `(name, shape)` of each column of `table`, sorted by name. The shape is the
-/// declared type, the column's place in the primary key (`pk0` = not in it), and
-/// `not null` for a non-key column declared NOT NULL — the parts a CRR cutover
-/// keeps (`derive_rebuild_body`, yapstack-sync schema.rs). Left out because cutover
-/// changes them: NOT NULL on a key column (cutover always adds it) and the default
-/// value (cutover gives a NOT NULL column without one a synthetic default, and
-/// re-spells the rest).
-fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<(String, String)>> {
-    let mut cols: Vec<(String, String)> = conn
+/// One column as `pragma_table_info` reports it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnShape {
+    name: String,
+    ty: String,
+    /// Place in the primary key; 0 = not in it.
+    pk: i64,
+    not_null: bool,
+    /// The default as `pragma_table_info` spells it, normalized.
+    default: Option<String>,
+}
+
+impl ColumnShape {
+    /// Whether `self` (live) is `want` (reference) after at most what a CRR cutover
+    /// does to a column (`derive_rebuild_body`, yapstack-sync schema.rs):
+    ///   * name, type and place in the primary key are kept;
+    ///   * a key column is made NOT NULL and its default dropped, so neither is
+    ///     compared for one;
+    ///   * a non-key column keeps NOT NULL and keeps its default (re-emitted, which
+    ///     `pragma_table_info` reads back the same); one that is NOT NULL without a
+    ///     default gets a synthetic one for its type, accepted only on a CRR DB.
+    fn matches(&self, want: &ColumnShape, crr_prepared: bool) -> bool {
+        if (&self.name, &self.ty, self.pk) != (&want.name, &want.ty, want.pk) {
+            return false;
+        }
+        if self.pk > 0 {
+            return true;
+        }
+        if self.not_null != want.not_null {
+            return false;
+        }
+        match (&self.default, &want.default) {
+            (live, Some(_)) => live == &want.default,
+            (None, None) => true,
+            (Some(live), None) => {
+                crr_prepared && want.not_null && is_cutover_default(live, &want.ty)
+            }
+        }
+    }
+}
+
+/// Whether `default` is the one cutover gives a NOT NULL column of type `ty` that
+/// had none. Only the sync build can know it; without sync a CRR DB is never
+/// recorded anyway (see [`schema_effects_present`]).
+fn is_cutover_default(default: &str, ty: &str) -> bool {
+    #[cfg(feature = "sync")]
+    return default == normalized_sql(yapstack_sync::schema::synthetic_default(ty));
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = (default, ty);
+        false
+    }
+}
+
+/// Each column of `table`, sorted by name.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<ColumnShape>> {
+    let mut cols: Vec<ColumnShape> = conn
         .prepare(
-            "SELECT name, upper(type) || ' pk' || pk || \
-                    CASE WHEN pk = 0 AND \"notnull\" THEN ' not null' ELSE '' END \
-             FROM pragma_table_info(?1)",
+            "SELECT name, upper(type), pk, \"notnull\", dflt_value FROM pragma_table_info(?1)",
         )?
-        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([table], |r| {
+            Ok(ColumnShape {
+                name: r.get(0)?,
+                ty: r.get(1)?,
+                pk: r.get(2)?,
+                not_null: r.get(3)?,
+                default: r.get::<_, Option<String>>(4)?.map(|d| normalized_sql(&d)),
+            })
+        })?
         .collect::<rusqlite::Result<_>>()?;
     cols.sort();
     Ok(cols)
@@ -654,8 +708,8 @@ fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<(String
 
 /// True when every declared object in `conn` has the definition it has in
 /// `reference` (the fresh-install schema, see [`reference_schema`]):
-///   * a table has the same columns, and a column the same shape (type, primary
-///     key place, non-key NOT NULL; see [`table_columns`]). Table SQL itself isn't
+///   * a table has the same columns, each matching ([`ColumnShape::matches`]: type,
+///     primary-key place, NOT NULL and default, up to what cutover changes). Table SQL itself isn't
 ///     compared: cutover rewrites it.
 ///   * an index, trigger or virtual table has the same normalized `CREATE`
 ///     statement ([`normalized_sql`]). Cutover replays non-UNIQUE indexes and app
@@ -686,22 +740,29 @@ fn schema_effects_present(
         let want = master_sql(reference, ty, name)?.flatten();
         Ok(matches!((live, want), (Some(l), Some(w)) if normalized_sql(&l) == normalized_sql(&w)))
     };
-    let column_type = |c: &Connection, t: &str, col: &str| -> rusqlite::Result<Option<String>> {
-        Ok(table_columns(c, t)?
-            .into_iter()
-            .find(|(n, _)| n == col)
-            .map(|(_, ty)| ty))
-    };
     let crr_prepared = named("table", "sessions__crsql_clock")?;
+    let column = |c: &Connection, t: &str, col: &str| -> rusqlite::Result<Option<ColumnShape>> {
+        Ok(table_columns(c, t)?.into_iter().find(|s| s.name == col))
+    };
     for effect in effects {
         let (present, table) = match *effect {
             SchemaObject::Table(t) => {
                 let want = table_columns(reference, t)?;
-                (!want.is_empty() && table_columns(conn, t)? == want, Some(t))
+                let live = table_columns(conn, t)?;
+                let same = !want.is_empty()
+                    && live.len() == want.len()
+                    && live
+                        .iter()
+                        .zip(&want)
+                        .all(|(l, w)| l.matches(w, crr_prepared));
+                (same, Some(t))
             }
             SchemaObject::Column(t, c) => {
-                let want = column_type(reference, t, c)?;
-                (want.is_some() && column_type(conn, t, c)? == want, Some(t))
+                let same = match (column(conn, t, c)?, column(reference, t, c)?) {
+                    (Some(l), Some(w)) => l.matches(&w, crr_prepared),
+                    _ => false,
+                };
+                (same, Some(t))
             }
             SchemaObject::Index(i) => (same_sql("index", i)?, None),
             SchemaObject::Trigger(t) => (same_sql("trigger", t)?, None),
@@ -2432,6 +2493,33 @@ mod tests {
                    created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
                  CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
             ),
+            // Same columns, key and NOT NULL, other defaults: `createTag` omits
+            // `created_at`, so without its default every insert fails.
+            (
+                11,
+                "DROP TABLE tags; \
+                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE, \
+                   color TEXT, created_at TEXT NOT NULL); \
+                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
+            ),
+            (
+                11,
+                "DROP TABLE session_tags; \
+                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
+                   source TEXT NOT NULL DEFAULT 'auto', confidence REAL, \
+                   created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                   PRIMARY KEY (session_id, tag_id)); \
+                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
+                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
+            ),
+            // A synthetic default is accepted only on a CRR DB (cutover's doing).
+            (
+                11,
+                "DROP TABLE tags; \
+                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '' COLLATE NOCASE, \
+                   color TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
+            ),
         ];
         let mut wrongly_recorded = Vec::new();
         for (v, damage) in cases {
@@ -2520,8 +2608,8 @@ mod tests {
                 }
                 "table" => {
                     out.insert(format!("table:{name}"), String::new());
-                    for (c, ty) in table_columns(conn, name).unwrap() {
-                        out.insert(format!("column:{name}.{c}"), ty);
+                    for col in table_columns(conn, name).unwrap() {
+                        out.insert(format!("column:{name}.{}", col.name), format!("{col:?}"));
                     }
                 }
                 "index" if sql.is_some() => {
