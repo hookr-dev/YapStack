@@ -444,19 +444,15 @@ pub fn crr_tables(conn: &Connection) -> Result<Vec<String>, SyncError> {
 }
 
 /// The level a snapshot of this database must declare (ADR 0006 §5.5): the highest
-/// [`table_sync_capability`] among the CRR tables that hold at least one row.
+/// [`table_sync_capability`] among its CRR tables. A table counts even with no rows: its
+/// clock table can still carry tombstones, and the schema itself is content a reader below
+/// the level can't hold, so this fails closed.
 pub fn snapshot_content_capability(conn: &Connection) -> Result<i32, SyncError> {
-    let mut level = 0;
-    for t in crr_tables(conn)? {
-        let populated: bool =
-            conn.query_row(&format!("SELECT EXISTS (SELECT 1 FROM \"{t}\")"), [], |r| {
-                r.get(0)
-            })?;
-        if populated {
-            level = level.max(table_sync_capability(&t));
-        }
-    }
-    Ok(level)
+    Ok(crr_tables(conn)?
+        .iter()
+        .map(|t| table_sync_capability(t))
+        .max()
+        .unwrap_or(0))
 }
 
 /// Of the three triggers cr-sqlite generates per CRR table (`triggers.rs:12-20`), the two
@@ -917,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_content_level_is_the_highest_level_among_populated_crr_tables() {
+    fn snapshot_content_level_counts_every_crr_table_even_when_empty() {
         let db = crate::CrsqlDb::open_in_memory().unwrap();
         let conn = db.conn();
         conn.execute_batch(
@@ -928,16 +924,16 @@ mod tests {
              INSERT INTO t_local VALUES ('l1', 'never synced');",
         )
         .unwrap();
-        for t in ["tags", "t_new"] {
-            conn.query_row(&format!("SELECT crsql_as_crr('{t}')"), [], |_| Ok(()))
-                .unwrap();
-        }
+        conn.query_row("SELECT crsql_as_crr('tags')", [], |_| Ok(()))
+            .unwrap();
         assert_eq!(
             snapshot_content_capability(conn).unwrap(),
             0,
-            "an empty CRR table and a populated non-CRR table add nothing"
+            "a cutover CRR table and a populated non-CRR table add nothing"
         );
-        conn.execute("INSERT INTO t_new VALUES ('n1', 'x')", [])
+        // Fail closed: an empty post-cutover CRR table (its rows deleted, tombstones in its
+        // clock table) still counts.
+        conn.query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
             .unwrap();
         assert_eq!(
             snapshot_content_capability(conn).unwrap(),
