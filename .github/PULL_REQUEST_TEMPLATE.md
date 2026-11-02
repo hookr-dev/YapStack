@@ -1,7 +1,7 @@
 <!--
 Thanks for the PR. A few quick reminders before you submit:
 
-- Run `pnpm check` locally — CI runs the same suite.
+- Run `pnpm check` locally. CI also runs the Rust checks on Windows (see AGENTS.md § Keeping CI green).
 - Update CHANGELOG.md under `## [Unreleased]` if your change is user-visible.
 - Keep the diff focused — one logical change per PR.
 - For UI changes, exercise the feature in a browser before submitting.
