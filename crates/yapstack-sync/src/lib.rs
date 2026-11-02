@@ -84,6 +84,12 @@ pub enum SyncError {
     /// token material (the bearer travels as an HTTP header, not in the error).
     #[error("relay unreachable: {0}")]
     Network(String),
+    /// The relay answered 409 with its generic `conflict` code. On push that is the G3
+    /// signal: the relay holds this `(client_id, client_seq)` under different ciphertext.
+    /// Only this positively identified body may trigger the reseed that drops unacked
+    /// entries; any other 409 stays an ordinary error.
+    #[error("relay conflict: {0}")]
+    RelayConflict(String),
     /// The relay refused a pull or snapshot read because this build's sync capability is
     /// below the workspace floor (HTTP 426, ADR 0006 §5.7). Only an app update clears it.
     #[error("Update YapStack to keep syncing (this device's sync capability {level} is below the workspace's {required})")]

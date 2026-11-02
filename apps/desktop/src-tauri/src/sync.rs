@@ -1572,6 +1572,7 @@ fn clear_session() -> Result<(), String> {
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
     CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
@@ -1667,6 +1668,9 @@ pub struct SyncStatusDto {
     removed: bool,
     /// ADR 0006 §5: a sync capability notice for lane status, or `None`.
     capability_notice: Option<SyncCapabilityNoticeDto>,
+    /// ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
+    /// every drain cycle (last-seen value kept while the relay is unreachable). Advisory.
+    version_advisory: Option<VersionAdvisory>,
 }
 
 /// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
@@ -1732,7 +1736,7 @@ pub struct RelayProbeOk {
 
 /// Advisory that this client is behind the relay's published minimum (mirrors
 /// `RelayVersionAdvisory` in `lib/sync.ts`). Rides on probe SUCCESS, never a failure.
-#[derive(Debug, Serialize, specta::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionAdvisory {
     /// Minimum client version the relay publishes.
@@ -3390,6 +3394,53 @@ enum CapabilityNotice {
 
 static CAPABILITY_NOTICE: PubCell<CapabilityNotice> = PubCell::new();
 
+/// The drain's latest version advisory (ADR 0006 §5.9), published for lane status.
+static VERSION_ADVISORY: PubCell<Option<VersionAdvisory>> = PubCell::new();
+
+/// The notice a drain starts with, from the levels persisted by earlier runs: the nudge
+/// survives a restart while the relay is unreachable. Refusals and holds are not seeded;
+/// they come back from the first cycle that meets them.
+fn seeded_capability_notice(
+    persisted: Option<yapstack_common::sync::SyncCapabilityLevels>,
+    own_level: i32,
+) -> CapabilityNotice {
+    match persisted {
+        Some(l) if l.requested_sync_capability > own_level => {
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        }
+        _ => CapabilityNotice::None,
+    }
+}
+
+/// The relay `min_client_version` to keep after one refresh: a fetched value (or its
+/// absence) replaces the last-seen one; a failed fetch keeps it.
+fn refreshed_min_client_version(
+    fetched: Result<Option<String>, String>,
+    last_seen: Option<String>,
+) -> Option<String> {
+    fetched.unwrap_or(last_seen)
+}
+
+fn advisory_for(app_version: &str, min_client_version: Option<&str>) -> Option<VersionAdvisory> {
+    min_client_version.and_then(|min| compute_version_advisory(app_version, min))
+}
+
+/// The error lane status shows for a cycle. A capability refusal the notice already shows
+/// (a held push, a refused pull) is skipped so it isn't repeated as "Connection problem",
+/// but the other direction's error is never hidden behind it.
+fn reportable_error(report: &outbox::DrainReport) -> Option<&yapstack_sync::SyncError> {
+    use yapstack_sync::SyncError;
+    let push = report
+        .push_error
+        .as_ref()
+        .filter(|e| !matches!(e, SyncError::CapabilityBlocked { .. }));
+    let pull = report
+        .pull_error
+        .as_ref()
+        .filter(|e| !matches!(e, SyncError::UpdateRequired { .. }));
+    push.or(pull)
+}
+
 /// Fold one drain cycle into the capability notice. A refused pull wins (nothing syncs in
 /// until the app updates), then a held push (names the blockers), then the nudge when the
 /// relay's `requested` level is above this build's. A cycle whose pull returned nothing
@@ -3768,6 +3819,7 @@ fn spawn_drain(
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
     CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
@@ -3877,7 +3929,20 @@ fn spawn_drain(
             // proactively so the first cycle doesn't have to eat a 401 first. Staleness is
             // only a scheduling hint (unverified `exp`).
             let stale = access_token_stale(&bearer, 60);
+            let info_url = server_url.clone();
             let transport = HttpTransport::new(server_url, bearer);
+            // ADR 0006 §5: start from what earlier runs persisted for this workspace, so the
+            // nudge and the version advisory show even before the relay answers.
+            CAPABILITY_NOTICE.set_if_changed(seeded_capability_notice(
+                yapstack_sync::state::relay_capability(conn, tenant_id).unwrap_or(None),
+                yapstack_sync::SYNC_CAPABILITY_LEVEL,
+            ));
+            let mut last_min_client_version =
+                yapstack_sync::state::relay_min_client_version(conn, tenant_id).unwrap_or(None);
+            VERSION_ADVISORY.set_if_changed(advisory_for(
+                env!("CARGO_PKG_VERSION"),
+                last_min_client_version.as_deref(),
+            ));
             if stale {
                 match rt.block_on(refresh_access_token()) {
                     Ok(new_access) => transport.set_bearer(&new_access),
@@ -4151,17 +4216,42 @@ fn spawn_drain(
                 }
 
                 // ADR 0006 §5: the capability notice for lane status (update required, held
-                // push with its blockers, or the "another device needs you to update" nudge).
+                // push with its blockers, or the "another device needs you to update" nudge),
+                // and the levels persisted per workspace for UX (never for authorization).
                 CAPABILITY_NOTICE.set_if_changed(capability_notice(
                     &report,
                     CAPABILITY_NOTICE.get(),
                     yapstack_sync::SYNC_CAPABILITY_LEVEL,
                 ));
+                if let Some(levels) = report.relay_capability {
+                    if let Err(e) =
+                        yapstack_sync::state::record_relay_capability(conn, tenant_id, levels)
+                    {
+                        tracing::warn!("sync drain: could not persist the relay floor: {e}");
+                    }
+                }
+                // ADR 0006 §5.9: refresh the version advisory every cycle; keep the last-seen
+                // minimum while the relay is unreachable.
+                let fetched = rt.block_on(fetch_min_client_version(&info_url));
+                let refreshed =
+                    refreshed_min_client_version(fetched, last_min_client_version.clone());
+                if refreshed != last_min_client_version {
+                    if let Some(min) = refreshed.as_deref() {
+                        let _ = yapstack_sync::state::set_relay_min_client_version(
+                            conn, tenant_id, min,
+                        );
+                    }
+                    last_min_client_version = refreshed;
+                }
+                VERSION_ADVISORY.set_if_changed(advisory_for(
+                    env!("CARGO_PKG_VERSION"),
+                    last_min_client_version.as_deref(),
+                ));
 
                 // F2: surface the tolerated push/pull transport errors via the existing
                 // DrainHealth channel — before this the owner had ZERO feedback while a push or
                 // pull silently failed every cycle.
-                match report.first_transport_error() {
+                match reportable_error(&report) {
                     // Bug B4: a guaranteed-413 entry too large to push as a single request. Its
                     // own sticky Blocked state (not a transient flap), surfaced ONCE — the push
                     // guard already blocked the HTTP call, so no 5s hot-loop.
@@ -5225,6 +5315,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         audio_backfill_complete: audio.backfill_complete,
         removed,
         capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
+        version_advisory: VERSION_ADVISORY.get(),
     }
 }
 
@@ -5486,6 +5577,25 @@ async fn probe_relay(
     })
 }
 
+/// The relay's published `min_client_version` (`GET /sync/info`), for the per-cycle
+/// advisory refresh. `Ok(None)` when the relay publishes none; `Err` when it can't be read.
+async fn fetch_min_client_version(server_url: &str) -> Result<Option<String>, String> {
+    let endpoint = format!("{}/sync/info", normalize_relay_url(server_url));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&endpoint)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let body: RelayProbeBody = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body.min_client_version)
+}
+
 /// The LIVE `yapstack.db` path from managed state — the one DB every sync command touches
 /// (post-A3 the live DB *is* the CRR database).
 fn live_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -5556,6 +5666,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             audio_backfill_complete: false,
             removed: false,
             capability_notice: None,
+            version_advisory: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -5818,6 +5929,7 @@ pub async fn sync_disable(runtime: State<'_, SyncRuntimeState>) -> Result<SyncSt
     DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
     DRAIN_PROGRESS.reset();
     CAPABILITY_NOTICE.reset();
+    VERSION_ADVISORY.reset();
     AUDIO_LANE.reset();
     let session = update_session(|s| s.sync_enabled = false)?;
     Ok(build_status_dto(&session).await)
@@ -7148,6 +7260,88 @@ mod tests {
             "a merge of peer rows carries the counts to the frontend"
         );
         assert_eq!(SYNC_APPLIED_EVENT, "sync://applied");
+    }
+
+    #[test]
+    fn a_capability_hold_never_hides_the_other_directions_error() {
+        use yapstack_sync::SyncError;
+        let blocked = || SyncError::CapabilityBlocked {
+            level: 1,
+            blockers: vec![],
+        };
+        let update = || SyncError::UpdateRequired {
+            level: 1,
+            required: 2,
+            requested: 2,
+        };
+        // Push held by the capability gate, pull failing for an unrelated reason: the pull
+        // error is what lane status must show.
+        let r = outbox::DrainReport {
+            push_error: Some(blocked()),
+            pull_error: Some(SyncError::Transport("HTTP 403 forbidden".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            reportable_error(&r).unwrap().to_string(),
+            "transport error: HTTP 403 forbidden"
+        );
+        // Pull refused for an update, push hitting a quota: the push error still shows.
+        let r = outbox::DrainReport {
+            push_error: Some(SyncError::Transport("quota exceeded".into())),
+            pull_error: Some(update()),
+            ..Default::default()
+        };
+        assert_eq!(
+            reportable_error(&r).unwrap().to_string(),
+            "transport error: quota exceeded"
+        );
+        // Only capability errors: nothing generic to show; the notice covers both.
+        let r = outbox::DrainReport {
+            push_error: Some(blocked()),
+            pull_error: Some(update()),
+            ..Default::default()
+        };
+        assert!(reportable_error(&r).is_none());
+    }
+
+    #[test]
+    fn persisted_levels_seed_the_nudge_at_drain_start() {
+        use yapstack_common::sync::SyncCapabilityLevels;
+        let l = |requested| SyncCapabilityLevels {
+            required_sync_capability: 0,
+            requested_sync_capability: requested,
+        };
+        assert_eq!(seeded_capability_notice(None, 1), CapabilityNotice::None);
+        assert_eq!(
+            seeded_capability_notice(Some(l(1)), 1),
+            CapabilityNotice::None
+        );
+        assert_eq!(
+            seeded_capability_notice(Some(l(2)), 1),
+            CapabilityNotice::AnotherDeviceNeedsUpdate
+        );
+    }
+
+    #[test]
+    fn advisory_refresh_keeps_the_last_seen_minimum_when_the_relay_is_unreachable() {
+        let last = Some("1.0.0-alpha.12".to_string());
+        assert_eq!(
+            refreshed_min_client_version(Ok(Some("1.0.0".into())), last.clone()),
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(
+            refreshed_min_client_version(Ok(None), last.clone()),
+            None,
+            "a relay that publishes no minimum clears it"
+        );
+        assert_eq!(
+            refreshed_min_client_version(Err("connection refused".into()), last.clone()),
+            last,
+            "an unreachable relay keeps the last-seen value"
+        );
+        assert!(advisory_for("1.0.0-alpha.11", last.as_deref()).is_some());
+        assert!(advisory_for("1.0.0-alpha.12", last.as_deref()).is_none());
+        assert!(advisory_for("1.0.0-alpha.11", None).is_none());
     }
 
     #[test]

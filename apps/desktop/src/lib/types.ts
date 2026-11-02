@@ -1293,7 +1293,12 @@ removed: boolean;
 /**
  * ADR 0006 §5: a sync capability notice for lane status, or `None`.
  */
-capabilityNotice: SyncCapabilityNoticeDto | null }
+capabilityNotice: SyncCapabilityNoticeDto | null;
+/**
+ * ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
+ * every drain cycle (last-seen value kept while the relay is unreachable). Advisory.
+ */
+versionAdvisory: VersionAdvisory | null }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

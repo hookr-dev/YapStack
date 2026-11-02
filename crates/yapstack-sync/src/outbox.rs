@@ -2382,8 +2382,18 @@ mod tests {
     /// changeset failed, the page watermark never advanced, and every later change from every
     /// peer stalled behind it. Now the rows wait in the quarantine, the pull reaches the relay
     /// tip, and once this device gains the table (an app update), the replay lands them.
-    #[tokio::test(flavor = "current_thread")]
-    async fn wedge_regression_new_table_sentinel() {
+    /// The FP1 scenario up to the pull: peer A writes rows (and a delete sentinel) for a table
+    /// B lacks, then an ordinary write. Asserts B's pull reaches the tip without wedging and
+    /// returns what the rest of the scenario needs.
+    async fn pull_past_unknown_table_sentinel() -> (
+        CrsqlDb,
+        Arc<MockRelay>,
+        ChangesetCipher,
+        Uuid,
+        i32,
+        i32,
+        &'static str,
+    ) {
         let a = CrsqlDb::open_in_memory().unwrap();
         let b = CrsqlDb::open_in_memory().unwrap();
         make_kv(&a);
@@ -2442,6 +2452,21 @@ mod tests {
         );
         assert!(crate::quarantine::pending_count(b.conn()).unwrap() > 0);
 
+        (b, relay, cipher, cb, sv, ev, create_t_new)
+    }
+
+    /// ADR 0006 §5.1: level 1 means "has the table-readiness quarantine". Whenever this build
+    /// advertises it, an unknown-table sentinel changeset must not wedge its pull.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertised_capability_level_holds_for_unknown_table_sentinels() {
+        if crate::SYNC_CAPABILITY_LEVEL >= 1 {
+            pull_past_unknown_table_sentinel().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wedge_regression_new_table_sentinel() {
+        let (b, relay, cipher, cb, sv, ev, create_t_new) = pull_past_unknown_table_sentinel().await;
         // The app update gives B the table; the next cycle's replay lands the waiting rows.
         b.conn().execute_batch(create_t_new).unwrap();
         b.conn()
@@ -3255,7 +3280,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             // Response 1: POST /sync/push → 409. Response 2: GET /sync/completeness → JSON.
             let bodies = [
-                ("409 Conflict".to_string(), String::new()),
+                (
+                    "409 Conflict".to_string(),
+                    r#"{"code":"conflict","message":"client_seq regression: (client_id, client_seq) already stored with different content"}"#.to_string(),
+                ),
                 ("200 OK".to_string(), completeness_json),
             ];
             for (status_line, body) in bodies {
@@ -3304,6 +3332,95 @@ mod tests {
             "the conflict recovery marks the counter reconciled this spawn"
         );
         server.join().unwrap();
+    }
+
+    /// Serve each raw HTTP response, verbatim, to one connection in turn.
+    fn raw_server(responses: Vec<String>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ambiguous_409_never_drops_the_unacked_outbox() {
+        // Only a positively identified `conflict` body may run the reseed that deletes the
+        // unacked entries. A truncated body, a malformed capability body, an unknown code or
+        // no body at all must surface as an error and leave the outbox intact, even when the
+        // relay would answer the completeness call the reseed makes.
+        use crate::transport::HttpTransport;
+        let cid = Uuid::from_u128(0xC0FFEE);
+        let completeness = format!(
+            "{{\"max_changeset_seq\":1,\"count\":1,\"contiguous\":true,\
+             \"per_client\":[{{\"client_id\":\"{cid}\",\"max_client_seq\":1}}]}}"
+        );
+        let full = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let truncated = "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\n\
+             content-length: 200\r\nconnection: close\r\n\r\n{\"code\":\"confl"
+            .to_string();
+        let cases = [
+            ("truncated body", truncated),
+            (
+                "malformed capability body",
+                full("409 Conflict", r#"{"code":"sync_capability_floor"}"#),
+            ),
+            (
+                "unknown code",
+                full("409 Conflict", r#"{"code":"something_else"}"#),
+            ),
+            ("not json", full("409 Conflict", "<html>conflict</html>")),
+            ("empty body", full("409 Conflict", "")),
+        ];
+        for (name, response) in cases {
+            let conn = seed_outbox(&[vec![7u8; 32]]);
+            let (addr, server) = raw_server(vec![response, full("200 OK", &completeness)]);
+            let transport = HttpTransport::new(format!("http://{addr}"), "access-token");
+            let res = push_outbox(&conn, cid, &transport).await;
+            assert!(
+                res.is_err(),
+                "{name}: must surface as an error, got {res:?}"
+            );
+            let unacked: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM _yapstack_outbox WHERE acked=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unacked, 1, "{name}: the unacked entry must survive");
+            assert_eq!(state::client_seq(&conn).unwrap(), 0, "{name}: no reseed");
+            drop(transport);
+            // Unblock the server if the client never made the second call.
+            let _ = std::net::TcpStream::connect(addr);
+            server.join().unwrap();
+        }
     }
 
     // ----- Chunked capture (lock-contention hardening) -----------------------------------

@@ -199,67 +199,80 @@ fn map_send_error(e: reqwest::Error) -> SyncError {
     }
 }
 
-/// True if `err` is the relay's HTTP 409 Conflict — the G3 signal that the relay already
-/// holds this `(client_id, client_seq)` under DIFFERENT ciphertext, so this client's counter
-/// regressed (a DB restore) and re-minted a seq the relay already passed. A 409 is not
-/// intercepted by [`classify_status`] (which isolates only 401), so it flows through
-/// `error_for_status` into [`SyncError::Http`], whose `reqwest::Error` carries the status.
-/// The drain matches on it to trigger the reseed-and-recover path instead of treating it as a
-/// permanent generic failure that wedges sync (the bug this closes). Kept a pure predicate
-/// over the surfaced error so it is unit-testable without a live server.
+/// True if `err` is the relay's positively identified 409 `conflict` (see
+/// [`check_capability`]) — the G3 signal that the relay already holds this
+/// `(client_id, client_seq)` under DIFFERENT ciphertext, so this client's counter regressed
+/// (a DB restore) and re-minted a seq the relay already passed. The drain matches on it to
+/// run the reseed-and-recover path, which drops the unacked outbox, so an unreadable or
+/// unrecognised 409 must never match. Kept a pure predicate so it is unit-testable.
 pub(crate) fn is_conflict(err: &SyncError) -> bool {
-    matches!(err, SyncError::Http(e) if e.status() == Some(StatusCode::CONFLICT))
+    matches!(err, SyncError::RelayConflict(_))
 }
 
-/// Map the relay's sync capability refusals (ADR 0006 §5) to their typed errors: 426
-/// `update_required`, 409 `sync_capability_floor` and 409 `sync_capability_blocked`. Any
-/// other response passes through untouched, and a 409 without a capability `code` stays the
-/// [`SyncError::Http`] that [`is_conflict`] recognises (the `client_seq`-regression path,
-/// which drops the unacked outbox and must never fire on a capability refusal).
-/// `level_sent` is the capability this request declared.
+/// Classify the relay's 409 and 426 answers by their body `code` (ADR 0006 §5): 426
+/// `update_required`, 409 `sync_capability_floor` and 409 `sync_capability_blocked` become
+/// their typed errors, and a 409 `conflict` becomes [`SyncError::RelayConflict`], the only
+/// error [`is_conflict`] recognises. Nothing is guessed: a body that can't be read, isn't
+/// JSON, carries an unknown code, or a known code with missing fields stays an error that
+/// names the status, and never reaches the reseed path that drops the unacked outbox.
+/// `level_sent` is the capability this request declared. Every other status passes
+/// through untouched.
 async fn check_capability(resp: Response, level_sent: i32) -> Result<Response, SyncError> {
     let status = resp.status();
     if status != StatusCode::UPGRADE_REQUIRED && status != StatusCode::CONFLICT {
         return Ok(resp);
     }
-    let Some(http_err) = resp.error_for_status_ref().err() else {
-        return Ok(resp);
+    let body = resp.bytes().await.map_err(map_send_error)?;
+    let unrecognised = |what: &str| {
+        SyncError::Transport(format!(
+            "relay answered {status} with {what}; nothing was changed locally"
+        ))
     };
-    let body = resp.bytes().await.unwrap_or_default();
-    let code = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned));
-    let refusal = || serde_json::from_slice::<SyncCapabilityRefusal>(&body).ok();
-    match code.as_deref() {
-        Some("update_required") => {
-            if let Some(r) = refusal() {
-                return Err(SyncError::UpdateRequired {
-                    level: level_sent,
-                    required: r.required_sync_capability,
-                    requested: r.requested_sync_capability,
-                });
-            }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| unrecognised("a body that isn't JSON"))?;
+    let code = value
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let refusal = || {
+        serde_json::from_value::<SyncCapabilityRefusal>(value.clone())
+            .map_err(|_| unrecognised(&format!("an incomplete `{code}` body")))
+    };
+    match (status, code.as_str()) {
+        (StatusCode::UPGRADE_REQUIRED, "update_required") => {
+            let r = refusal()?;
+            Err(SyncError::UpdateRequired {
+                level: level_sent,
+                required: r.required_sync_capability,
+                requested: r.requested_sync_capability,
+            })
         }
-        Some("sync_capability_floor") => {
-            if let Some(r) = refusal() {
-                return Err(SyncError::CapabilityFloor {
-                    batch: level_sent,
-                    required: r.required_sync_capability,
-                    requested: r.requested_sync_capability,
-                });
-            }
+        (StatusCode::CONFLICT, "sync_capability_floor") => {
+            let r = refusal()?;
+            Err(SyncError::CapabilityFloor {
+                batch: level_sent,
+                required: r.required_sync_capability,
+                requested: r.requested_sync_capability,
+            })
         }
-        Some("sync_capability_blocked") => {
-            if let Ok(b) = serde_json::from_slice::<SyncCapabilityBlocked>(&body) {
-                return Err(SyncError::CapabilityBlocked {
-                    level: level_sent,
-                    blockers: b.blockers,
-                });
-            }
+        (StatusCode::CONFLICT, "sync_capability_blocked") => {
+            let b = serde_json::from_value::<SyncCapabilityBlocked>(value.clone())
+                .map_err(|_| unrecognised("an incomplete `sync_capability_blocked` body"))?;
+            Err(SyncError::CapabilityBlocked {
+                level: level_sent,
+                blockers: b.blockers,
+            })
         }
-        _ => {}
+        (StatusCode::CONFLICT, "conflict") => Err(SyncError::RelayConflict(
+            value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        _ => Err(unrecognised(&format!("an unrecognised code `{code}`"))),
     }
-    Err(SyncError::Http(http_err))
 }
 
 /// Map a relay response to a distinct-401 result before decoding: a 401 is the
@@ -375,6 +388,11 @@ impl SyncTransport for HttpTransport {
         Ok(r.json().await?)
     }
 
+    // ADR 0006 §5.5: the relay refuses a snapshot whose declared content level
+    // (`X-YapStack-Snapshot-Capability`) is above its floor. No header = level 0, which is
+    // true while `schema::GATED_SYNC_TABLES` is empty. The seed path (no caller yet) must
+    // declare the highest level among the gated tables the snapshot holds rows for once one
+    // exists (FP2b).
     async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
         // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
         // and byte-free — the bytes go directly to object storage).
@@ -1048,8 +1066,8 @@ mod tests {
 
         let e = t.push(PushRequest::default()).await.unwrap_err();
         assert!(
-            is_conflict(&e),
-            "a code-less 409 is still the seq conflict, got {e:?}"
+            !is_conflict(&e),
+            "a code-less 409 is not a conflict, got {e:?}"
         );
         server.join().unwrap();
     }
@@ -1107,7 +1125,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn push_classifies_409_as_conflict() {
         let (addr, server) = canned_server(vec![
-            status_only("409 Conflict"),
+            json_response(
+                "409 Conflict",
+                r#"{"code":"conflict","message":"client_seq regression"}"#,
+            ),
             status_only("500 Internal Server Error"),
         ]);
 

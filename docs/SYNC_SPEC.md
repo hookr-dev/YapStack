@@ -641,12 +641,22 @@ and retries once. A refused raise holds the push in `client_seq` order and lane 
 names the blocking devices, offering the roster's Remove; pull carries on. A 426 shows
 "Update YapStack to keep syncing". A device below `requested` sees "Another device needs
 you to update YapStack". The transport classifies capability 409s by body `code`, so they
-never reach the `client_seq`-regression recovery that drops the unacked outbox. The
-client keeps no copy of the floor: only the relay's answer authorizes a push.
+never reach the `client_seq`-regression recovery that drops the unacked outbox; only a
+409 whose body is the relay's `conflict` code does, and an unreadable or unrecognised 409
+stays an error that leaves the outbox intact. Lane status shows a capability refusal once,
+in its notice, and still shows the other direction's error.
+
+The client persists the last `required`/`requested` levels the relay returned, per
+workspace id (`_yapstack_sync_meta` key `relay_capability:<workspace>`; an account switch
+starts from nothing). That copy is for UX and the feature gate only (ADR 0006 §5.4,
+§5.6): the nudge survives a restart from it, but it never authorizes a push, which the
+relay checks against the floor it holds right then.
 
 `min_client_version` is compared by semver precedence (`1.0.0-alpha.11 <
 1.0.0-alpha.12 < 1.0.0`). The relay's default is the prerelease floor `1.0.0-alpha.0`,
-so alpha builds aren't nagged.
+so alpha builds aren't nagged. The drain refreshes it from `GET /sync/info` every cycle,
+persists the last-seen value per workspace (`relay_min_client_version:<workspace>`, kept
+while the relay is unreachable) and shows the advisory in lane status (ADR 0006 §5.9).
 
 ### 9.3 Isolation
 

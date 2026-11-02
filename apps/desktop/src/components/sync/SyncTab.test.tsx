@@ -332,7 +332,7 @@ describe("SyncTab — on", () => {
       email: "user@example.com",
       status: makeStatus({
         roster: [SELF, PEER],
-        lastError: "waiting for Work Laptop, old install to update YapStack",
+        lastError: "HTTP 403 Forbidden from the relay on pull",
         capabilityNotice: {
           kind: "waiting-for-devices",
           blockers: [
@@ -348,8 +348,9 @@ describe("SyncTab — on", () => {
     const alert = screen.getByText("Waiting for other devices to update").closest("[role=alert]") as HTMLElement;
     expect(within(alert).getByText("Work Laptop")).toBeInTheDocument();
     expect(within(alert).getByText("old install")).toBeInTheDocument();
-    // The verbatim drain error isn't repeated as a "Connection problem".
-    expect(screen.queryByText("Connection problem")).not.toBeInTheDocument();
+    // An unrelated error from the other direction is still shown next to the notice.
+    expect(screen.getByText("Connection problem")).toBeInTheDocument();
+    expect(screen.getByText("HTTP 403 Forbidden from the relay on pull")).toBeInTheDocument();
     // Only the roster member gets Remove, and it is the same password-confirmed removal.
     const removes = within(alert).getAllByRole("button", { name: /^Remove / });
     expect(removes).toHaveLength(1);
@@ -363,6 +364,20 @@ describe("SyncTab — on", () => {
         password: "hunter22",
       }),
     );
+  });
+
+  it("the relay's version advisory shows in lane status", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({
+        versionAdvisory: {
+          minClientVersion: "1.0.0-alpha.13",
+          raw: "This app is version 1.0.0-alpha.12; the relay requires at least 1.0.0-alpha.13. Update YapStack to keep syncing.",
+        },
+      }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText(/the relay requires at least 1\.0\.0-alpha\.13/)).toBeInTheDocument();
   });
 
   it("update required and the another-device nudge each get their own notice", () => {

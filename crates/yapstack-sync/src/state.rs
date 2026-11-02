@@ -183,3 +183,132 @@ pub fn clear_seq_reconciled(conn: &Connection) -> Result<(), SyncError> {
     )?;
     Ok(())
 }
+
+fn relay_capability_key(workspace: Uuid) -> String {
+    format!("relay_capability:{workspace}")
+}
+
+fn relay_min_client_version_key(workspace: Uuid) -> String {
+    format!("relay_min_client_version:{workspace}")
+}
+
+/// The last sync capability levels the relay returned for `workspace` (ADR 0006 §5.4,
+/// §5.6), or `None` before the first pull. Keyed by workspace id, so an account switch
+/// starts again from nothing. UX and feature gating only: it NEVER authorizes a push, which
+/// the relay checks against the floor it holds right then.
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn relay_capability(
+    conn: &Connection,
+    workspace: Uuid,
+) -> Result<Option<yapstack_common::sync::SyncCapabilityLevels>, SyncError> {
+    Ok(
+        get_meta(conn, &relay_capability_key(workspace))?.and_then(|v| {
+            let (required, requested) = v.split_once(',')?;
+            Some(yapstack_common::sync::SyncCapabilityLevels {
+                required_sync_capability: required.parse().ok()?,
+                requested_sync_capability: requested.parse().ok()?,
+            })
+        }),
+    )
+}
+
+/// Persist the levels a pull returned, writing only when they changed. Returns whether it
+/// wrote. A lower value (a restored relay) is recorded as-is.
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn record_relay_capability(
+    conn: &Connection,
+    workspace: Uuid,
+    levels: yapstack_common::sync::SyncCapabilityLevels,
+) -> Result<bool, SyncError> {
+    if relay_capability(conn, workspace)? == Some(levels) {
+        return Ok(false);
+    }
+    set_meta(
+        conn,
+        &relay_capability_key(workspace),
+        &format!(
+            "{},{}",
+            levels.required_sync_capability, levels.requested_sync_capability
+        ),
+    )?;
+    Ok(true)
+}
+
+/// The relay's `min_client_version` as last seen for `workspace` (ADR 0006 §5.9), so the
+/// advisory survives a restart while the relay is unreachable.
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn relay_min_client_version(
+    conn: &Connection,
+    workspace: Uuid,
+) -> Result<Option<String>, SyncError> {
+    get_meta(conn, &relay_min_client_version_key(workspace))
+}
+
+/// Persist the relay's `min_client_version` for `workspace`.
+///
+/// # Errors
+/// Propagates any sqlite error.
+pub fn set_relay_min_client_version(
+    conn: &Connection,
+    workspace: Uuid,
+    min: &str,
+) -> Result<(), SyncError> {
+    set_meta(conn, &relay_min_client_version_key(workspace), min)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yapstack_common::sync::SyncCapabilityLevels;
+
+    #[test]
+    fn relay_capability_is_persisted_per_workspace_and_written_only_on_change() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert_eq!(relay_capability(&conn, a).unwrap(), None);
+        let l = SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        };
+        assert!(record_relay_capability(&conn, a, l).unwrap(), "first write");
+        assert!(
+            !record_relay_capability(&conn, a, l).unwrap(),
+            "unchanged: no write"
+        );
+        assert_eq!(relay_capability(&conn, a).unwrap(), Some(l));
+        assert_eq!(
+            relay_capability(&conn, b).unwrap(),
+            None,
+            "another workspace (an account switch) starts from nothing"
+        );
+        // A relay restored below the old floor is recorded as-is: this copy is UX only.
+        let lower = SyncCapabilityLevels {
+            required_sync_capability: 0,
+            requested_sync_capability: 0,
+        };
+        assert!(record_relay_capability(&conn, a, lower).unwrap());
+        assert_eq!(relay_capability(&conn, a).unwrap(), Some(lower));
+    }
+
+    #[test]
+    fn relay_min_client_version_is_persisted_per_workspace() {
+        let conn = Connection::open_in_memory().unwrap();
+        let a = Uuid::from_u128(1);
+        assert_eq!(relay_min_client_version(&conn, a).unwrap(), None);
+        set_relay_min_client_version(&conn, a, "1.0.0-alpha.12").unwrap();
+        assert_eq!(
+            relay_min_client_version(&conn, a).unwrap().as_deref(),
+            Some("1.0.0-alpha.12")
+        );
+        assert_eq!(
+            relay_min_client_version(&conn, Uuid::from_u128(2)).unwrap(),
+            None
+        );
+    }
+}

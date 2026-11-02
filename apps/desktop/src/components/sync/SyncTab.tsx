@@ -257,9 +257,6 @@ export function SyncTab() {
   const pendingDevices = pendingPeerDevices(status);
   const roster = status.roster.filter((d) => !(d.pending && !d.isSelf));
   const authExpired = status.phase === "auth_expired";
-  const capabilityHold =
-    status.capabilityNotice?.kind === "update-required" ||
-    status.capabilityNotice?.kind === "waiting-for-devices";
 
   return (
     <>
@@ -276,9 +273,9 @@ export function SyncTab() {
         <SyncStatusLine status={status} display={display} />
       </div>
 
-      {/* Pinned verbatim connection error (never auto-routed, must-preserve). The capability
-          refusals carry their own alert below, so they aren't repeated here. */}
-      {status.lastError && !authExpired && !capabilityHold && (
+      {/* Pinned verbatim connection error (never auto-routed, must-preserve). The drain
+          leaves out only the capability refusals the notice below already shows. */}
+      {status.lastError && !authExpired && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Connection problem</AlertTitle>
@@ -311,6 +308,13 @@ export function SyncTab() {
               Sign out
             </Button>
           </AlertDescription>
+        </Alert>
+      )}
+      {status.versionAdvisory && (
+        <Alert className="border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-400">
+          <ShieldAlert className="h-4 w-4" />
+          <AlertTitle>A newer YapStack is available for this relay</AlertTitle>
+          <AlertDescription className="text-xs">{status.versionAdvisory.raw}</AlertDescription>
         </Alert>
       )}
       <SyncCapabilityNoticeRow
