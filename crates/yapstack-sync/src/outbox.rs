@@ -97,6 +97,12 @@ pub struct DrainReport {
     pub applied: usize,
     pub quarantined: usize,
     pub replayed: usize,
+    /// Stashed rows still waiting, after this cycle's replay, for an app update that adds
+    /// their table or column (ADR 0006 §4). Not an error: the pull has moved past them.
+    pub replay_waiting: usize,
+    /// Stashed rows whose table and column exist but which failed to apply this cycle, plus
+    /// the later rows for the same `(table, pk)` held behind them. Kept and retried.
+    pub replay_failed: usize,
     /// Changesets this cycle that failed to decrypt/decode and were durably QUARANTINED
     /// (§11.3 crypto-quarantine). Item 1: quarantine-and-advance — an undecryptable
     /// changeset is stored in `_yapstack_crypto_quarantine` (never dropped), the pull
@@ -825,7 +831,10 @@ pub async fn drain_once_with_progress<T: SyncTransport + ?Sized>(
 
     // Replay quarantined rows now this cycle's merges have landed. A failure here is a LOCAL
     // (DB-level) fault, hence cycle-fatal — surfaced as `Err`, not a per-direction error.
-    report.replayed = replay_pending(conn)?;
+    let replay = replay_pending(conn)?;
+    report.replayed = replay.replayed;
+    report.replay_waiting = replay.waiting;
+    report.replay_failed = replay.failed + replay.blocked;
     Ok(report)
 }
 
@@ -2126,6 +2135,145 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "changeset {k} merged");
         }
+    }
+
+    /// FP1 (ADR 0006 §4, SYNC_SPEC §12 I-NT1): a peer on a newer build writes rows for a synced
+    /// table this device doesn't have yet. Its changesets carry delete/create sentinels for that
+    /// table, which cr-sqlite rejects outright for an unknown table. Before the fix the whole
+    /// changeset failed, the page watermark never advanced, and every later change from every
+    /// peer stalled behind it. Now the rows wait in the quarantine, the pull reaches the relay
+    /// tip, and once this device gains the table (an app update), the replay lands them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wedge_regression_new_table_sentinel() {
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        make_kv(&a);
+        make_kv(&b);
+        let create_t_new =
+            "CREATE TABLE t_new(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT '');";
+        a.conn().execute_batch(create_t_new).unwrap();
+        a.conn()
+            .query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
+            .unwrap();
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+
+        // seq 1: a row in the new table plus a delete (a delete always ships a sentinel row);
+        // seq 2: an ordinary kv write that must not stall behind it.
+        a.conn()
+            .execute_batch(
+                "INSERT INTO t_new(id,v) VALUES('n1','kept'); \
+                 INSERT INTO t_new(id,v) VALUES('n2','gone'); DELETE FROM t_new WHERE id='n2';",
+            )
+            .unwrap();
+        drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+            .await
+            .unwrap();
+        a.conn()
+            .execute("INSERT INTO kv(id,v) VALUES('k1','v1')", [])
+            .unwrap();
+        drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+            .await
+            .unwrap();
+
+        let report = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.pull_error.is_none(),
+            "a row for a table this device lacks must not fail the pull: {:?}",
+            report.pull_error
+        );
+        assert_eq!(
+            state::pull_watermark(b.conn()).unwrap(),
+            2,
+            "the watermark reaches the relay tip"
+        );
+        let k1: i64 = b
+            .conn()
+            .query_row("SELECT count(*) FROM kv WHERE id='k1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(k1, 1, "the later changeset merged");
+        assert!(
+            report.quarantined > 0,
+            "the t_new rows wait in the quarantine"
+        );
+        assert!(crate::quarantine::pending_count(b.conn()).unwrap() > 0);
+
+        // The app update gives B the table; the next cycle's replay lands the waiting rows.
+        b.conn().execute_batch(create_t_new).unwrap();
+        b.conn()
+            .query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
+            .unwrap();
+        let report = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(report.replayed > 0);
+        assert_eq!(crate::quarantine::pending_count(b.conn()).unwrap(), 0);
+        let rows: Vec<(String, String)> = {
+            let mut st = b
+                .conn()
+                .prepare("SELECT id, v FROM t_new ORDER BY id")
+                .unwrap();
+            let v = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            v
+        };
+        assert_eq!(
+            rows,
+            vec![("n1".to_string(), "kept".to_string())],
+            "n1 converged and the deleted n2 stayed deleted"
+        );
+    }
+
+    /// FP1: only a table or column that isn't there yet is deferred. A known CRR table whose
+    /// row is rejected for a real reason (here a CHECK constraint) still fails the pull with
+    /// `pull_error`, leaves the watermark where it was and stashes nothing, so it can never
+    /// sit in the quarantine looking like "waiting for an app update".
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_row_constraint_error_still_fails_the_pull() {
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = CrsqlDb::open_in_memory().unwrap();
+        let mk = |db: &CrsqlDb, check: &str| {
+            db.conn()
+                .execute_batch(&format!(
+                    "CREATE TABLE t_chk(id TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL DEFAULT ''{check});"
+                ))
+                .unwrap();
+            db.conn()
+                .query_row("SELECT crsql_as_crr('t_chk')", [], |_| Ok(()))
+                .unwrap();
+        };
+        mk(&a, "");
+        mk(&b, " CHECK (v <> 'bad')");
+        let ca = state::client_id(a.conn()).unwrap();
+        let cb = state::client_id(b.conn()).unwrap();
+        let relay = Arc::new(MockRelay::new());
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        a.conn()
+            .execute("INSERT INTO t_chk(id,v) VALUES('c1','bad')", [])
+            .unwrap();
+        drain_once(a.conn(), &cipher, relay.as_ref(), ca, sv, ev)
+            .await
+            .unwrap();
+
+        let report = drain_once(b.conn(), &cipher, relay.as_ref(), cb, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            report.pull_error.is_some(),
+            "a real apply error is not deferred"
+        );
+        assert_eq!(state::pull_watermark(b.conn()).unwrap(), 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(crate::quarantine::pending_count(b.conn()).unwrap(), 0);
     }
 
     /// [`MockRelay`] with a forced page size, so a small backlog spans several pull pages.
