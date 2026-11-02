@@ -99,9 +99,7 @@ pub async fn push(
     // the floor never authorizes a push: a restored relay can sit below it.
     let levels =
         capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
-    if batch_level > levels.required_sync_capability {
-        return Err(AppError::CapabilityFloor(levels));
-    }
+    capability::admit_publication(levels, batch_level)?;
 
     // (1) Bootstrap + (2) acquire the per-tenant push lock (held until commit).
     sqlx::query("INSERT INTO tenant_seq (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")

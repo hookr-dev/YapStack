@@ -100,6 +100,10 @@ pub const SYNC_CAPABILITY_HEADER: &str = "x-yapstack-sync-capability";
 /// Request header on `POST /sync/push`: the highest capability level among the batch's
 /// entries. An absent header is level 0. The relay refuses a batch above its floor.
 pub const BATCH_CAPABILITY_HEADER: &str = "x-yapstack-batch-capability";
+/// Request header on `POST /snapshot/presign`: the highest capability level among the
+/// tables the snapshot holds rows for. An absent header is level 0. The relay refuses to
+/// record a snapshot above its floor, so only readers at or above the floor can fetch it.
+pub const SNAPSHOT_CAPABILITY_HEADER: &str = "x-yapstack-snapshot-capability";
 /// A device whose last pull is older than this doesn't block a floor raise.
 pub const CAPABILITY_WINDOW_DAYS: i32 = 30;
 

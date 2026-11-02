@@ -162,6 +162,19 @@ pub async fn gate_read(
     Ok(levels)
 }
 
+/// Refuse to publish content above the floor held right now. `lock_floor` must already
+/// hold the row (`FOR SHARE`) in this transaction, so a concurrent restore-style reset can't
+/// slip between the check and the write.
+///
+/// # Errors
+/// [`AppError::CapabilityFloor`] when `content_level` is above the floor.
+pub fn admit_publication(levels: SyncCapabilityLevels, content_level: i32) -> Result<(), AppError> {
+    if content_level > levels.required_sync_capability {
+        return Err(AppError::CapabilityFloor(levels));
+    }
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct BlockerRow {
     client_id: Uuid,
@@ -173,7 +186,8 @@ struct BlockerRow {
 
 /// `PUT /sync/capability` — raise the workspace floor to at least `L`.
 ///
-/// Locks the floor row `FOR UPDATE`, records the caller's own header (so a device raising
+/// Locks the floor row `FOR UPDATE`, then the caller's device row `FOR SHARE` (refusing a
+/// caller that isn't active), records the caller's own header (so a device raising
 /// at cutover never blocks itself), then re-checks eligibility in the same transaction:
 /// every non-revoked device seen within [`CAPABILITY_WINDOW_DAYS`] must report at least `L`.
 /// If so the floor becomes `GREATEST(required, L)`. Otherwise `requested` becomes
@@ -195,8 +209,10 @@ pub async fn raise(
     let caller_level = header_level(&headers, SYNC_CAPABILITY_HEADER)?;
 
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
-    crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
     let levels = lock_floor(&mut tx, auth.tenant_id, FloorLock::Update).await?;
+    // After the floor lock (the one lock order), lock and check the caller's own row, so a
+    // revocation can't land between the check and the raise.
+    crate::devices::require_active_caller_locked(&mut tx, auth.tenant_id, auth.client_id).await?;
     record_caller_level(&mut tx, auth.tenant_id, auth.client_id, caller_level).await?;
 
     if target <= levels.required_sync_capability {

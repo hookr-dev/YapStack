@@ -870,7 +870,7 @@ pub struct PushChange { client_id, client_seq, ciphertext, schema_version, engin
 pub struct PushRequest { changes: Vec<PushChange> }               // ≤ 1000 changes, ≤ 5 MiB raw
 pub struct PushResponse { acks: Vec<PushAck { client_id, client_seq, changeset_seq, deduplicated }>, max_changeset_seq }
 pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more, required_sync_capability, requested_sync_capability }
-// Sync capability gate (ADR 0006 §5): request headers X-YapStack-Sync-Capability (pull, snapshot) and X-YapStack-Batch-Capability (push); absent = 0
+// Sync capability gate (ADR 0006 §5): request headers X-YapStack-Sync-Capability (pull, snapshot, raise), X-YapStack-Batch-Capability (push) and X-YapStack-Snapshot-Capability (snapshot presign content level); absent = 0
 pub struct RaiseSyncCapabilityRequest { required_sync_capability }          // PUT /sync/capability → SyncCapabilityLevels
 pub struct SyncCapabilityLevels { required_sync_capability, requested_sync_capability }
 pub struct SyncCapabilityRefusal { code: "update_required" (426) | "sync_capability_floor" (409), message, required_sync_capability, requested_sync_capability }

@@ -381,6 +381,17 @@ mod tests {
     }
 
     #[test]
+    fn default_min_client_version_is_a_prerelease_floor() {
+        // ADR 0006 §5.9: clients compare by semver precedence, so a `1.0.0` default would
+        // nag every alpha build. The default floor is the first prerelease instead.
+        let cfg = Config::from_toml_str(
+            "database_url = \"postgres://localhost/y\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sync.min_client_version, "1.0.0-alpha.0");
+    }
+
+    #[test]
     fn gc_section_overrides_defaults() {
         let toml = r#"
             database_url = "postgres://localhost/yapstack"

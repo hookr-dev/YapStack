@@ -111,7 +111,7 @@ deployed before the device-lifecycle work:
 | `0011` | `devices.recovered_at` | none (enables "set a new password" right after a recovery sign-in) |
 | `0012` | `revoked` device state | none until someone removes a device from Settings → Sync |
 | `0013` | `login_nonces` table; **revokes every device-bound refresh token** | **every device is asked to sign in once** after the upgrade; nothing else changes on the device (its encryption key and local data are untouched) |
-| `0014` | `devices.sync_capability` + `capability_seen_at`; the per-tenant `tenant_sync_capability` floor row | none at first. Each device's pull now records the sync capability level it reports. Once a release raises the floor, devices below it are asked to update before they can sync. Deploy this before the app release that sends the level |
+| `0014` | `devices.sync_capability` + `capability_seen_at`; the per-tenant `tenant_sync_capability` floor row | none at first. Each device's pull now records the sync capability level it reports. Once a release raises the floor, devices below it are asked to update before they can sync. Deploy this before the app release that sends the level. The default `min_client_version` also becomes the prerelease floor `1.0.0-alpha.0`; set it explicitly if you want a higher minimum |
 
 Two things to know about `0013`:
 
