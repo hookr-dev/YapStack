@@ -164,7 +164,31 @@ app-layer passes reinstate what was stripped after each converged merge:
 | `_yapstack_crypto_quarantine` | undecryptable pulled changesets (ciphertext, durable, retryable) |
 | `_yapstack_audio_upload_queue` | audio upload state machine per part |
 
-### 4.3 Column additions that must be CRR-tracked
+### 4.3 Schema evolution on a CRR database
+
+Migrations (`db.rs`) carry a `kind` (ADR 0006 §1). On a CRR database the runner
+(`db_service::apply_migration`) treats them as follows; on a non-CRR database every kind
+is applied plainly.
+
+- **`Plain`**: a single `ALTER TABLE <sync_table>` is routed through `crsql_alter`;
+  any other statement that names a sync table is refused.
+- **`SyncIndex`**: only `CREATE [UNIQUE] INDEX IF NOT EXISTS … ON <sync_table>(…)`,
+  applied plainly (an index touches no rows, columns or clocks, so CRR triggers stay
+  current). A UNIQUE index whose key is not exactly the table's PRIMARY KEY is refused
+  on every database, so a fresh DB never holds an index cutover would drop.
+
+**Indexes survive cutover.** The rebuild (`schema::transform_and_crrify`) captures each
+table's declared non-UNIQUE indexes from `sqlite_master` (never `sqlite_autoindex_*`,
+never UNIQUE) and replays them after the RENAME, alongside the app triggers. Builds
+before this dropped every secondary index at cutover; migration v18 (`SyncIndex`)
+re-declares every synced-table secondary index with `IF NOT EXISTS` to restore them on
+those databases (I-NT2). A new index on a synced table is a `SyncIndex` migration.
+
+The rebuild does not carry a column `COLLATE` over, so `tags.name` (and with it
+`idx_tags_name`) compares BINARY after cutover rather than NOCASE; the NOCASE rule
+itself is enforced by `uniqueness`.
+
+#### Column additions that must be CRR-tracked
 
 `schema::OUT_OF_BAND_ALTERS` lists every column the front end historically added at
 runtime (`segments.speaker_id`, `sessions.recording_device_id`, six `chat_messages`
@@ -704,6 +728,7 @@ onboarding completes.
 | I26 | Removing a device revokes its access, requires re-authentication, and re-enrols it pending with no grant; the removed device is told so and refuses to enable (§15.D) | `auth_flow::device_removal_revokes_access_and_requires_reapproval`, `device_removal_reauth_and_revoked_row_edges`, `SyncTab.test.tsx` ("a removed device is told so…") |
 | I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
+| I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses a non-PK UNIQUE (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
 
 ---
 
@@ -773,6 +798,7 @@ points to §15. Nothing in this table is still open.
 | D23 | `lib/sync.ts` `SyncPhase` included `preparing`; `syncConfig.lastChangesetSeq` was persisted; `billingUrl` was a status field | Rust never emitted `preparing`; `lastChangesetSeq` had no writer; `build_status_dto` always set `billing_url: None` and the probe did not read it | **Done (78e0bf3):** removed (the relay's `GET /sync/info` still echoes an operator-configured `billing_url`; no client reads it) |
 | D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (78e0bf3):** removed |
 | D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | Design written up as [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md); **awaiting ratification** (§15.F) |
+| D26 | ADR 0006 §2: the CRR rebuild keeps a table's secondary indexes | `transform_and_crrify` replayed triggers only, so cutover dropped every secondary index (the owner's synced DB kept just the two `lib/db.ts` re-creates); sessions-by-day and segments-by-session became full scans | **Done (FP2a):** indexes captured and replayed at cutover; migration v18 (`SyncIndex`) restores them on databases already cut over (§4.3, I-NT2) |
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
 
 ---
