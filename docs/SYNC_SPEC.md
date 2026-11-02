@@ -663,6 +663,38 @@ row first, then `tenant_seq`:
 
 Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).
 
+**Client side.** Builds send level 1 (`SYNC_CAPABILITY_LEVEL`) on every pull, snapshot
+request and raise. Each outbox entry stores the highest level among its rows
+(`_yapstack_outbox.required_sync_capability`, local, added by `ensure_outbox_table`; a
+table's level is declared in `GATED_SYNC_TABLES` beside `SYNC_TABLES`, and every cutover
+table is 0). The push planner cuts a batch wherever the level changes, so batches are
+single-level and an ungated prefix still ships. A gated batch carries
+`X-YapStack-Batch-Capability`. On 409 `sync_capability_floor` the drain tries the raise
+and retries once. A refused raise holds the push in `client_seq` order and lane status
+names the blocking devices, offering the roster's Remove; pull carries on. A 426 shows
+"Update YapStack to keep syncing". A device below `requested` sees "Another device needs
+you to update YapStack". The transport classifies capability 409s by body `code`, so they
+never reach the `client_seq`-regression recovery that drops the unacked outbox; only a
+409 whose body is the relay's `conflict` code does, and an unreadable or unrecognised 409
+stays an error that leaves the outbox intact. Lane status shows a capability refusal once,
+in its notice, and still shows the other direction's error.
+
+The client persists the last `required`/`requested` levels the relay returned, per
+workspace id (`_yapstack_sync_meta` key `relay_capability:<workspace>`; an account switch
+starts from nothing). That copy is for UX and the feature gate only (ADR 0006 §5.4,
+§5.6): the nudge survives a restart from it, but it never authorizes a push, which the
+relay checks against the floor it holds right then.
+
+`min_client_version` is compared by semver precedence (`1.0.0-alpha.11 <
+1.0.0-alpha.12 < 1.0.0`). The relay's default is the prerelease floor `1.0.0-alpha.0`,
+so alpha builds aren't nagged. The drain refreshes it from `GET /sync/info` on its first
+cycle, whenever the relay's reachability flips, and otherwise every 15 minutes, on the
+transport's client and without ever waiting on it: the fetch runs on the drain runtime only
+while the drain is already awaiting, so a slow relay can't delay a cycle, the first-cycle
+latch or the stop check. The last-seen value is persisted per workspace
+(`relay_min_client_version:<workspace>`, kept while the relay is unreachable, removed when
+the relay stops publishing one) and the advisory shows in lane status (ADR 0006 §5.9).
+
 ### 9.3 Isolation
 
 Every tenant table is `ENABLE` + `FORCE ROW LEVEL SECURITY` on a transaction-local

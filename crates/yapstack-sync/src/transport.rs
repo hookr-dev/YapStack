@@ -15,12 +15,14 @@ use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use yapstack_common::sync::{
-    ClientTail, CompletenessResponse, PresignResponse, PullResponse, PulledChange, PushAck,
-    PushRequest, PushResponse,
+    CapabilityBlocker, ClientTail, CompletenessResponse, PresignResponse, PullResponse,
+    PulledChange, PushAck, PushRequest, PushResponse, RaiseSyncCapabilityRequest,
+    SyncCapabilityBlocked, SyncCapabilityLevels, SyncCapabilityRefusal, BATCH_CAPABILITY_HEADER,
+    SYNC_CAPABILITY_HEADER,
 };
 
 use crate::snapshot::SnapshotMeta;
-use crate::SyncError;
+use crate::{SyncError, SYNC_CAPABILITY_LEVEL};
 
 // async_trait copies `Result`'s `#[must_use]` onto the boxed futures it
 // generates, which clippy ≥1.99 flags as double_must_use in macro output.
@@ -30,6 +32,38 @@ pub trait SyncTransport: Send + Sync {
     async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError>;
     async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError>;
     async fn completeness(&self) -> Result<CompletenessResponse, SyncError>;
+
+    /// Push a batch whose entries all need sync capability `batch_capability` (ADR 0006
+    /// §5.4). The relay refuses it with [`SyncError::CapabilityFloor`] when its floor is
+    /// lower. Level 0 is a plain [`Self::push`].
+    ///
+    /// Default: level 0 delegates to `push`; anything higher is refused as if the relay's
+    /// floor were 0 (test transports that never model the gate).
+    async fn push_batch(
+        &self,
+        req: PushRequest,
+        batch_capability: i32,
+    ) -> Result<PushResponse, SyncError> {
+        if batch_capability > 0 {
+            return Err(SyncError::CapabilityFloor {
+                batch: batch_capability,
+                required: 0,
+                requested: 0,
+            });
+        }
+        self.push(req).await
+    }
+
+    /// Ask the relay to raise the workspace floor to at least `level` (`PUT
+    /// /sync/capability`). The relay re-checks every recently seen device itself and
+    /// answers [`SyncError::CapabilityBlocked`] naming the ones below `level`.
+    ///
+    /// Default: unsupported.
+    async fn raise_sync_capability(&self, _level: i32) -> Result<SyncCapabilityLevels, SyncError> {
+        Err(SyncError::Transport(
+            "sync capability raise not supported".into(),
+        ))
+    }
 
     /// R2: publish the encrypted DB snapshot (the seed device's bootstrap artifact).
     /// The relay stores it as an opaque blob and never reads it.
@@ -165,16 +199,80 @@ fn map_send_error(e: reqwest::Error) -> SyncError {
     }
 }
 
-/// True if `err` is the relay's HTTP 409 Conflict — the G3 signal that the relay already
-/// holds this `(client_id, client_seq)` under DIFFERENT ciphertext, so this client's counter
-/// regressed (a DB restore) and re-minted a seq the relay already passed. A 409 is not
-/// intercepted by [`classify_status`] (which isolates only 401), so it flows through
-/// `error_for_status` into [`SyncError::Http`], whose `reqwest::Error` carries the status.
-/// The drain matches on it to trigger the reseed-and-recover path instead of treating it as a
-/// permanent generic failure that wedges sync (the bug this closes). Kept a pure predicate
-/// over the surfaced error so it is unit-testable without a live server.
+/// True if `err` is the relay's positively identified 409 `conflict` (see
+/// [`check_capability`]) — the G3 signal that the relay already holds this
+/// `(client_id, client_seq)` under DIFFERENT ciphertext, so this client's counter regressed
+/// (a DB restore) and re-minted a seq the relay already passed. The drain matches on it to
+/// run the reseed-and-recover path, which drops the unacked outbox, so an unreadable or
+/// unrecognised 409 must never match. Kept a pure predicate so it is unit-testable.
 pub(crate) fn is_conflict(err: &SyncError) -> bool {
-    matches!(err, SyncError::Http(e) if e.status() == Some(StatusCode::CONFLICT))
+    matches!(err, SyncError::RelayConflict(_))
+}
+
+/// Classify the relay's 409 and 426 answers by their body `code` (ADR 0006 §5): 426
+/// `update_required`, 409 `sync_capability_floor` and 409 `sync_capability_blocked` become
+/// their typed errors, and a 409 `conflict` becomes [`SyncError::RelayConflict`], the only
+/// error [`is_conflict`] recognises. Nothing is guessed: a body that can't be read, isn't
+/// JSON, carries an unknown code, or a known code with missing fields stays an error that
+/// names the status, and never reaches the reseed path that drops the unacked outbox.
+/// `level_sent` is the capability this request declared. Every other status passes
+/// through untouched.
+async fn check_capability(resp: Response, level_sent: i32) -> Result<Response, SyncError> {
+    let status = resp.status();
+    if status != StatusCode::UPGRADE_REQUIRED && status != StatusCode::CONFLICT {
+        return Ok(resp);
+    }
+    let body = resp.bytes().await.map_err(map_send_error)?;
+    let unrecognised = |what: &str| {
+        SyncError::Transport(format!(
+            "relay answered {status} with {what}; nothing was changed locally"
+        ))
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| unrecognised("a body that isn't JSON"))?;
+    let code = value
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let refusal = || {
+        serde_json::from_value::<SyncCapabilityRefusal>(value.clone())
+            .map_err(|_| unrecognised(&format!("an incomplete `{code}` body")))
+    };
+    match (status, code.as_str()) {
+        (StatusCode::UPGRADE_REQUIRED, "update_required") => {
+            let r = refusal()?;
+            Err(SyncError::UpdateRequired {
+                level: level_sent,
+                required: r.required_sync_capability,
+                requested: r.requested_sync_capability,
+            })
+        }
+        (StatusCode::CONFLICT, "sync_capability_floor") => {
+            let r = refusal()?;
+            Err(SyncError::CapabilityFloor {
+                batch: level_sent,
+                required: r.required_sync_capability,
+                requested: r.requested_sync_capability,
+            })
+        }
+        (StatusCode::CONFLICT, "sync_capability_blocked") => {
+            let b = serde_json::from_value::<SyncCapabilityBlocked>(value.clone())
+                .map_err(|_| unrecognised("an incomplete `sync_capability_blocked` body"))?;
+            Err(SyncError::CapabilityBlocked {
+                level: level_sent,
+                blockers: b.blockers,
+            })
+        }
+        (StatusCode::CONFLICT, "conflict") => Err(SyncError::RelayConflict(
+            value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        _ => Err(unrecognised(&format!("an unrecognised code `{code}`"))),
+    }
 }
 
 /// Map a relay response to a distinct-401 result before decoding: a 401 is the
@@ -216,6 +314,12 @@ impl HttpTransport {
             .clone()
     }
 
+    /// The transport's HTTP client (a cheap handle onto one shared connection pool), so a
+    /// lane's side requests reuse it instead of building a client per call.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
     /// Replace the access token after a successful refresh (Bug A). Interior
     /// mutability so the shared `&HttpTransport` the drain holds can be updated
     /// between cycles. Never logs the token.
@@ -227,28 +331,54 @@ impl HttpTransport {
 #[async_trait]
 impl SyncTransport for HttpTransport {
     async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError> {
-        let r = check_auth(
-            self.client
-                .post(format!("{}/sync/push", self.base_url))
-                .bearer_auth(self.bearer())
-                .json(&req)
-                .send()
-                .await
-                .map_err(map_send_error)?,
-        )?;
+        self.push_batch(req, 0).await
+    }
+
+    async fn push_batch(
+        &self,
+        req: PushRequest,
+        batch_capability: i32,
+    ) -> Result<PushResponse, SyncError> {
+        let resp = self
+            .client
+            .post(format!("{}/sync/push", self.base_url))
+            .bearer_auth(self.bearer())
+            .header(BATCH_CAPABILITY_HEADER, batch_capability.to_string())
+            .json(&req)
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let r = check_auth(check_capability(resp, batch_capability).await?)?;
         Ok(r.json().await?)
     }
 
     async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
-        let r = check_auth(
-            self.client
-                .get(format!("{}/sync/pull", self.base_url))
-                .bearer_auth(self.bearer())
-                .query(&[("since", since), ("limit", limit)])
-                .send()
-                .await
-                .map_err(map_send_error)?,
-        )?;
+        let resp = self
+            .client
+            .get(format!("{}/sync/pull", self.base_url))
+            .bearer_auth(self.bearer())
+            .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
+            .query(&[("since", since), ("limit", limit)])
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let r = check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?;
+        Ok(r.json().await?)
+    }
+
+    async fn raise_sync_capability(&self, level: i32) -> Result<SyncCapabilityLevels, SyncError> {
+        let resp = self
+            .client
+            .put(format!("{}/sync/capability", self.base_url))
+            .bearer_auth(self.bearer())
+            .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
+            .json(&RaiseSyncCapabilityRequest {
+                required_sync_capability: level,
+            })
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let r = check_auth(check_capability(resp, level).await?)?;
         Ok(r.json().await?)
     }
 
@@ -264,25 +394,32 @@ impl SyncTransport for HttpTransport {
         Ok(r.json().await?)
     }
 
+    // ADR 0006 §5.5: the relay refuses a snapshot whose declared content level
+    // (`X-YapStack-Snapshot-Capability`) is above its floor. No header = level 0, which is
+    // true while `schema::GATED_SYNC_TABLES` is empty. The seed path (no caller yet) must
+    // declare the highest level among the gated tables the snapshot holds rows for once one
+    // exists (FP2b).
     async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
         // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
         // and byte-free — the bytes go directly to object storage).
         let sha = crate::snapshot::ciphertext_sha256_hex(ciphertext);
-        let presign: SnapshotPresignResponse = check_auth(
-            self.client
-                .post(format!("{}/snapshot/presign", self.base_url))
-                .bearer_auth(self.bearer())
-                .json(&SnapshotPresignRequest {
-                    sha256: sha,
-                    size: ciphertext.len() as u64,
-                    generation: meta.generation,
-                    baseline_seq: meta.baseline_seq,
-                })
-                .send()
-                .await?,
-        )?
-        .json()
-        .await?;
+        let resp = self
+            .client
+            .post(format!("{}/snapshot/presign", self.base_url))
+            .bearer_auth(self.bearer())
+            .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
+            .json(&SnapshotPresignRequest {
+                sha256: sha,
+                size: ciphertext.len() as u64,
+                generation: meta.generation,
+                baseline_seq: meta.baseline_seq,
+            })
+            .send()
+            .await?;
+        let presign: SnapshotPresignResponse =
+            check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?
+                .json()
+                .await?;
         if presign.already_exists {
             return Ok(());
         }
@@ -301,15 +438,17 @@ impl SyncTransport for HttpTransport {
     }
 
     async fn get_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, SyncError> {
-        let head: SnapshotHeadResponse = check_auth(
-            self.client
-                .get(format!("{}/snapshot", self.base_url))
-                .bearer_auth(self.bearer())
-                .send()
-                .await?,
-        )?
-        .json()
-        .await?;
+        let resp = self
+            .client
+            .get(format!("{}/snapshot", self.base_url))
+            .bearer_auth(self.bearer())
+            .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
+            .send()
+            .await?;
+        let head: SnapshotHeadResponse =
+            check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?
+                .json()
+                .await?;
         if !head.present {
             return Ok(None);
         }
@@ -538,11 +677,39 @@ struct MockInner {
     audio_mappings: HashMap<String, String>,
     audio_present: HashMap<String, Vec<u8>>,
     audio_refcount: HashMap<String, i64>,
+    // Sync capability gate (ADR 0006 §5): the floor the relay holds, the highest level a
+    // refused raise asked for, and the devices that block a raise.
+    floor: i32,
+    requested: i32,
+    blockers: Vec<CapabilityBlocker>,
+    raise_calls: usize,
 }
 
 impl MockRelay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Devices the relay would report as blocking a raise (empty = every raise succeeds).
+    pub fn set_capability_blockers(&self, blockers: Vec<CapabilityBlocker>) {
+        self.inner.lock().unwrap().blockers = blockers;
+    }
+
+    /// Overwrite the floor, e.g. to model a relay restored from a backup.
+    pub fn set_capability_floor(&self, floor: i32) {
+        self.inner.lock().unwrap().floor = floor;
+    }
+
+    /// `(required, requested, raise calls so far)`.
+    pub fn capability_state(&self) -> (i32, i32, usize) {
+        let g = self.inner.lock().unwrap();
+        (g.floor, g.requested, g.raise_calls)
+    }
+
+    /// Every stored changeset's `(client_id, client_seq)`, in commit order.
+    pub fn stored_pairs(&self) -> Vec<(Uuid, i64)> {
+        let g = self.inner.lock().unwrap();
+        g.log.iter().map(|c| (c.client_id, c.client_seq)).collect()
     }
 }
 
@@ -609,7 +776,51 @@ impl SyncTransport for MockRelay {
             changes,
             next_seq: next,
             has_more,
-            ..PullResponse::default()
+            required_sync_capability: g.floor,
+            requested_sync_capability: g.requested,
+        })
+    }
+
+    async fn push_batch(
+        &self,
+        req: PushRequest,
+        batch_capability: i32,
+    ) -> Result<PushResponse, SyncError> {
+        {
+            let g = self.inner.lock().unwrap();
+            if batch_capability > g.floor {
+                return Err(SyncError::CapabilityFloor {
+                    batch: batch_capability,
+                    required: g.floor,
+                    requested: g.requested,
+                });
+            }
+        }
+        self.push(req).await
+    }
+
+    async fn raise_sync_capability(&self, level: i32) -> Result<SyncCapabilityLevels, SyncError> {
+        let mut g = self.inner.lock().unwrap();
+        g.raise_calls += 1;
+        if level > g.floor {
+            let blocking: Vec<CapabilityBlocker> = g
+                .blockers
+                .iter()
+                .filter(|b| b.sync_capability < level)
+                .cloned()
+                .collect();
+            if !blocking.is_empty() {
+                g.requested = g.requested.max(level);
+                return Err(SyncError::CapabilityBlocked {
+                    level,
+                    blockers: blocking,
+                });
+            }
+            g.floor = level;
+        }
+        Ok(SyncCapabilityLevels {
+            required_sync_capability: g.floor,
+            requested_sync_capability: g.requested,
         })
     }
 
@@ -795,6 +1006,78 @@ mod tests {
         format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
     }
 
+    fn json_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// ADR 0006 §5: the relay's capability refusals become typed errors, and a capability
+    /// 409 is NEVER read as the `client_seq`-regression conflict (which drops the unacked
+    /// outbox). A 409 without a capability code still is one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_refusals_are_typed_and_never_a_seq_conflict() {
+        let floor = r#"{"code":"sync_capability_floor","message":"m","required_sync_capability":0,"requested_sync_capability":0}"#;
+        let update = r#"{"code":"update_required","message":"Update YapStack to keep syncing","required_sync_capability":2,"requested_sync_capability":2}"#;
+        let blocked = r#"{"code":"sync_capability_blocked","message":"m","required_sync_capability":0,"requested_sync_capability":1,"blockers":[{"client_id":"00000000-0000-0000-0000-000000000007","label":"old laptop","platform":"windows","sync_capability":0,"capability_seen_at":"2026-10-30T00:00:00+00:00"}]}"#;
+        let (addr, server) = canned_server(vec![
+            json_response("409 Conflict", floor),
+            json_response("426 Upgrade Required", update),
+            json_response("409 Conflict", blocked),
+            status_only("409 Conflict"),
+        ]);
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+
+        let e = t.push_batch(PushRequest::default(), 1).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                SyncError::CapabilityFloor {
+                    batch: 1,
+                    required: 0,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+        assert!(
+            !is_conflict(&e),
+            "a capability 409 must not trigger the reseed path"
+        );
+
+        let e = t.pull(0, 10).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                SyncError::UpdateRequired {
+                    level: SYNC_CAPABILITY_LEVEL,
+                    required: 2,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+        assert!(e.to_string().starts_with("Update YapStack to keep syncing"));
+
+        let e = t.raise_sync_capability(1).await.unwrap_err();
+        match &e {
+            SyncError::CapabilityBlocked { level, blockers } => {
+                assert_eq!(*level, 1);
+                assert_eq!(blockers[0].label, "old laptop");
+                assert_eq!(e.to_string(), "waiting for old laptop to update YapStack");
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let e = t.push(PushRequest::default()).await.unwrap_err();
+        assert!(
+            !is_conflict(&e),
+            "a code-less 409 is not a conflict, got {e:?}"
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn classify_status_isolates_401() {
         // The pure classifier is the load-bearing distinction (Bug A): only 401 is the
@@ -848,7 +1131,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn push_classifies_409_as_conflict() {
         let (addr, server) = canned_server(vec![
-            status_only("409 Conflict"),
+            json_response(
+                "409 Conflict",
+                r#"{"code":"conflict","message":"client_seq regression"}"#,
+            ),
             status_only("500 Internal Server Error"),
         ]);
 

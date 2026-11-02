@@ -17,7 +17,9 @@ use crate::quarantine::{merge_changeset, replay_pending};
 use crate::state;
 use crate::transport::SyncTransport;
 use crate::SyncError;
-use yapstack_common::sync::{PushChange, PushRequest, MAX_PUSH_BYTES, MAX_PUSH_CHANGES};
+use yapstack_common::sync::{
+    PushChange, PushRequest, SyncCapabilityLevels, MAX_PUSH_BYTES, MAX_PUSH_CHANGES,
+};
 use yapstack_common::write_turnstile::WriteTurnstile;
 
 const PULL_LIMIT: i64 = 500;
@@ -126,6 +128,9 @@ pub struct DrainReport {
     /// last-known tip rather than regressing it. `changeset_seq` is dense/monotonic, so this
     /// is folded as a running max and never rewinds.
     pub server_max: Option<i64>,
+    /// The workspace's sync capability levels as of the last pull page this cycle (ADR 0006
+    /// §5.7). `None` when no pull page came back. UX only: it never authorizes a push.
+    pub relay_capability: Option<SyncCapabilityLevels>,
 }
 
 impl DrainReport {
@@ -197,6 +202,21 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
             changeset_seq INTEGER, \
             created_at TEXT NOT NULL DEFAULT (datetime('now')));",
     )?;
+    // ADR 0006 §5.4: the highest sync capability level among the entry's rows. Added
+    // idempotently; entries captured by older builds can't hold rows for gated tables, so
+    // the default 0 is correct for them.
+    let has_level: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_table_info('_yapstack_outbox') \
+         WHERE name = 'required_sync_capability'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_level {
+        conn.execute_batch(
+            "ALTER TABLE _yapstack_outbox \
+             ADD COLUMN required_sync_capability INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 
@@ -419,12 +439,17 @@ fn insert_chunk(
     rows: Vec<ChangeRow>,
 ) -> Result<i64, SyncError> {
     let seq = state::next_client_seq(tx)?;
+    let level = rows
+        .iter()
+        .map(|r| crate::schema::table_sync_capability(&r.table))
+        .max()
+        .unwrap_or(0);
     let blob = cipher.encrypt(client_id, seq, &Changeset { rows }.encode())?;
     tx.execute(
         "INSERT INTO _yapstack_outbox \
-         (client_seq, ciphertext, schema_version, engine_version, acked) \
-         VALUES (?1,?2,?3,?4,0)",
-        rusqlite::params![seq, blob, schema_version, engine_version],
+         (client_seq, ciphertext, schema_version, engine_version, acked, required_sync_capability) \
+         VALUES (?1,?2,?3,?4,0,?5)",
+        rusqlite::params![seq, blob, schema_version, engine_version, level],
     )?;
     Ok(seq)
 }
@@ -584,13 +609,16 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
 
     loop {
         // Phase 1 — plan the next batch from cheap (seq, ciphertext length) metadata.
-        let metas: Vec<(i64, i64)> = {
+        let metas: Vec<(i64, i64, i32)> = {
             let mut stmt = conn.prepare(
-                "SELECT client_seq, length(ciphertext) FROM _yapstack_outbox \
+                "SELECT client_seq, length(ciphertext), required_sync_capability \
+                 FROM _yapstack_outbox \
                  WHERE acked=0 ORDER BY client_seq LIMIT ?1",
             )?;
             let v = stmt
-                .query_map([MAX_PUSH_CHANGES as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map([MAX_PUSH_CHANGES as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             v
         };
@@ -605,7 +633,7 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
         // so this only fires for a pre-T021 dev-era entry no production install can have.
         // Refuse to make the HTTP call and return a DISTINCT error so the drain surfaces it
         // once instead of hot-looping every 5s.
-        let (first_seq, first_len) = metas[0];
+        let (first_seq, first_len, batch_level) = metas[0];
         let first_raw = first_len.max(0) as usize;
         let first_wire = b64_len(first_raw);
         if first_wire > PUSH_WIRE_BUDGET || first_raw > MAX_PUSH_BYTES {
@@ -618,14 +646,17 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
         let mut batch_seqs: Vec<i64> = Vec::new();
         let mut wire = 0usize;
         let mut raw = 0usize;
-        for (seq, len) in &metas {
+        for (seq, len, level) in &metas {
             let raw_len = (*len).max(0) as usize;
             let b64 = b64_len(raw_len);
             // The first (guard-checked, in-budget) entry always goes; subsequent entries
             // are added only while the batch stays under BOTH the wire budget and the raw
-            // byte cap.
+            // byte cap, AND at the first entry's capability level (ADR 0006 §5.4). Batches
+            // never mix levels, so an ungated prefix ships even when the gated entry behind
+            // it is held.
             if !batch_seqs.is_empty()
-                && (batch_seqs.len() >= MAX_PUSH_CHANGES
+                && (*level != batch_level
+                    || batch_seqs.len() >= MAX_PUSH_CHANGES
                     || wire + b64 > PUSH_WIRE_BUDGET
                     || raw + raw_len > MAX_PUSH_BYTES)
             {
@@ -656,7 +687,7 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
             }
         }
 
-        let resp = match transport.push(PushRequest { changes }).await {
+        let resp = match push_gated(transport, PushRequest { changes }, batch_level).await {
             Ok(r) => r,
             // G3 — the relay returned 409 Conflict: our counter regressed and re-minted a seq
             // the relay already holds under DIFFERENT ciphertext. Recover in-band (reseed past
@@ -739,6 +770,28 @@ async fn push_outbox<T: SyncTransport + ?Sized>(
     }
 
     Ok((total_acked, server_max))
+}
+
+/// Push one single-level batch. The relay holds the only floor that authorizes it (a
+/// client's cached copy never does: a restored relay can sit below it). On a
+/// [`SyncError::CapabilityFloor`] refusal, ask the relay to raise the floor and retry ONCE.
+/// A refused raise surfaces as [`SyncError::CapabilityBlocked`], which stops the push in
+/// `client_seq` order (nothing is skipped or reordered) while the pull carries on.
+async fn push_gated<T: SyncTransport + ?Sized>(
+    transport: &T,
+    req: PushRequest,
+    level: i32,
+) -> Result<yapstack_common::sync::PushResponse, SyncError> {
+    if level == 0 {
+        return transport.push(req).await;
+    }
+    match transport.push_batch(req.clone(), level).await {
+        Err(SyncError::CapabilityFloor { .. }) => {
+            transport.raise_sync_capability(level).await?;
+            transport.push_batch(req, level).await
+        }
+        other => other,
+    }
 }
 
 /// One full drain cycle: enqueue local writes, push, pull+decrypt+merge, replay.
@@ -1014,6 +1067,10 @@ async fn pull_direction<T: SyncTransport + ?Sized>(
     loop {
         let since = state::pull_watermark(conn)?;
         let resp = transport.pull(since, PULL_LIMIT).await?;
+        report.relay_capability = Some(SyncCapabilityLevels {
+            required_sync_capability: resp.required_sync_capability,
+            requested_sync_capability: resp.requested_sync_capability,
+        });
         if resp.changes.is_empty() {
             break;
         }
@@ -1169,6 +1226,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     use yapstack_common::sync::{CompletenessResponse, PullResponse, PushAck, PushResponse};
+
+    // ----- ADR 0006 §5.4: the publication gate -----
+
+    /// Records every push batch's `(client_seqs, level)` and forwards to a [`MockRelay`].
+    struct RecordingRelay {
+        inner: MockRelay,
+        batches: Mutex<Vec<(Vec<i64>, i32)>>,
+    }
+
+    #[async_trait]
+    impl SyncTransport for RecordingRelay {
+        async fn push(&self, req: PushRequest) -> Result<PushResponse, SyncError> {
+            self.push_batch(req, 0).await
+        }
+        async fn push_batch(
+            &self,
+            req: PushRequest,
+            level: i32,
+        ) -> Result<PushResponse, SyncError> {
+            let seqs = req.changes.iter().map(|c| c.client_seq).collect();
+            self.batches.lock().unwrap().push((seqs, level));
+            self.inner.push_batch(req, level).await
+        }
+        async fn pull(&self, since: i64, limit: i64) -> Result<PullResponse, SyncError> {
+            self.inner.pull(since, limit).await
+        }
+        async fn completeness(&self) -> Result<CompletenessResponse, SyncError> {
+            self.inner.completeness().await
+        }
+        async fn raise_sync_capability(
+            &self,
+            level: i32,
+        ) -> Result<SyncCapabilityLevels, SyncError> {
+            self.inner.raise_sync_capability(level).await
+        }
+    }
+
+    fn recording_relay() -> RecordingRelay {
+        RecordingRelay {
+            inner: MockRelay::new(),
+            batches: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn outbox_with_levels(levels: &[(i64, i32)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_outbox_table(&conn).unwrap();
+        for (seq, level) in levels {
+            conn.execute(
+                "INSERT INTO _yapstack_outbox \
+                 (client_seq, ciphertext, schema_version, engine_version, acked, \
+                  required_sync_capability) VALUES (?1, ?2, 1, 16003, 0, ?3)",
+                rusqlite::params![seq, vec![*seq as u8; 8], level],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn unacked(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT client_seq FROM _yapstack_outbox WHERE acked=0 ORDER BY client_seq")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn blocker(label: &str) -> yapstack_common::sync::CapabilityBlocker {
+        yapstack_common::sync::CapabilityBlocker {
+            client_id: Uuid::from_u128(7),
+            label: label.into(),
+            platform: "windows".into(),
+            sync_capability: 0,
+            capability_seen_at: "2026-10-30T00:00:00+00:00".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gated_entry_holds_in_order_and_the_ungated_prefix_still_ships() {
+        // Level-0 entries ahead of a gated one, the raise refused: the prefix is acked,
+        // the gated entry and everything after it stay queued in client_seq order, and the
+        // push error names the blocking device.
+        let conn = outbox_with_levels(&[(1, 0), (2, 0), (3, 1), (4, 0)]);
+        let relay = recording_relay();
+        relay
+            .inner
+            .set_capability_blockers(vec![blocker("old laptop")]);
+        let me = Uuid::from_u128(1);
+
+        let err = push_outbox(&conn, me, &relay).await.unwrap_err();
+        assert!(
+            matches!(&err, SyncError::CapabilityBlocked { level: 1, blockers } if blockers[0].label == "old laptop"),
+            "got {err:?}"
+        );
+        assert_eq!(relay.inner.stored_pairs(), vec![(me, 1), (me, 2)]);
+        assert_eq!(unacked(&conn), vec![3, 4], "nothing skipped or reordered");
+        let (floor, requested, raises) = relay.inner.capability_state();
+        assert_eq!(
+            (floor, requested, raises),
+            (0, 1, 1),
+            "one raise; requested recorded"
+        );
+        // Batches never mix levels: the level-0 prefix went alone, then the gated entry alone.
+        let batches = relay.batches.lock().unwrap().clone();
+        assert_eq!(batches, vec![(vec![1, 2], 0), (vec![3], 1)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn floor_refusal_raises_and_retries_once_then_publishes_in_order() {
+        let conn = outbox_with_levels(&[(1, 0), (2, 1), (3, 1), (4, 0)]);
+        let relay = recording_relay();
+        let me = Uuid::from_u128(1);
+
+        let (acked, _) = push_outbox(&conn, me, &relay).await.unwrap();
+        assert_eq!(acked, 4);
+        assert_eq!(
+            relay.inner.stored_pairs(),
+            vec![(me, 1), (me, 2), (me, 3), (me, 4)]
+        );
+        assert_eq!(relay.inner.capability_state(), (1, 0, 1));
+        let batches = relay.batches.lock().unwrap().clone();
+        assert_eq!(
+            batches,
+            vec![(vec![1], 0), (vec![2, 3], 1), (vec![2, 3], 1), (vec![4], 0)],
+            "single-level batches; the refused gated batch is retried exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restored_relay_below_the_old_floor_refuses_again() {
+        // The client never trusts a floor it saw earlier: a relay restored to floor 0 refuses
+        // the next gated batch, and the client tries the raise again.
+        let conn = outbox_with_levels(&[(1, 1)]);
+        let relay = recording_relay();
+        let me = Uuid::from_u128(1);
+        push_outbox(&conn, me, &relay).await.unwrap();
+        assert_eq!(relay.inner.capability_state().0, 1);
+
+        relay.inner.set_capability_floor(0);
+        relay.inner.set_capability_blockers(vec![blocker("tablet")]);
+        conn.execute(
+            "INSERT INTO _yapstack_outbox \
+             (client_seq, ciphertext, schema_version, engine_version, acked, \
+              required_sync_capability) VALUES (2, x'02', 1, 16003, 0, 1)",
+            [],
+        )
+        .unwrap();
+        let err = push_outbox(&conn, me, &relay).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::CapabilityBlocked { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(relay.inner.capability_state().2, 2, "the raise was retried");
+        assert_eq!(unacked(&conn), vec![2]);
+        assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
+    }
+
+    #[test]
+    fn outbox_level_column_is_added_to_an_older_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _yapstack_outbox (client_seq INTEGER PRIMARY KEY, \
+             ciphertext BLOB NOT NULL, schema_version INTEGER NOT NULL, \
+             engine_version INTEGER NOT NULL, acked INTEGER NOT NULL DEFAULT 0, \
+             changeset_seq INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+             INSERT INTO _yapstack_outbox (client_seq, ciphertext, schema_version, \
+             engine_version) VALUES (1, x'00', 1, 16003);",
+        )
+        .unwrap();
+        ensure_outbox_table(&conn).unwrap();
+        ensure_outbox_table(&conn).unwrap();
+        let level: i32 = conn
+            .query_row(
+                "SELECT required_sync_capability FROM _yapstack_outbox WHERE client_seq = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, 0, "entries captured by older builds are level 0");
+    }
 
     /// A transport that ASSERTS every push obeys the wire limits and records each
     /// request's `(entries, raw_bytes, base64_bytes)` so tests can prove batching.
@@ -2143,8 +2382,18 @@ mod tests {
     /// changeset failed, the page watermark never advanced, and every later change from every
     /// peer stalled behind it. Now the rows wait in the quarantine, the pull reaches the relay
     /// tip, and once this device gains the table (an app update), the replay lands them.
-    #[tokio::test(flavor = "current_thread")]
-    async fn wedge_regression_new_table_sentinel() {
+    /// The FP1 scenario up to the pull: peer A writes rows (and a delete sentinel) for a table
+    /// B lacks, then an ordinary write. Asserts B's pull reaches the tip without wedging and
+    /// returns what the rest of the scenario needs.
+    async fn pull_past_unknown_table_sentinel() -> (
+        CrsqlDb,
+        Arc<MockRelay>,
+        ChangesetCipher,
+        Uuid,
+        i32,
+        i32,
+        &'static str,
+    ) {
         let a = CrsqlDb::open_in_memory().unwrap();
         let b = CrsqlDb::open_in_memory().unwrap();
         make_kv(&a);
@@ -2203,6 +2452,21 @@ mod tests {
         );
         assert!(crate::quarantine::pending_count(b.conn()).unwrap() > 0);
 
+        (b, relay, cipher, cb, sv, ev, create_t_new)
+    }
+
+    /// ADR 0006 §5.1: level 1 means "has the table-readiness quarantine". Whenever this build
+    /// advertises it, an unknown-table sentinel changeset must not wedge its pull.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertised_capability_level_holds_for_unknown_table_sentinels() {
+        if crate::SYNC_CAPABILITY_LEVEL >= 1 {
+            pull_past_unknown_table_sentinel().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wedge_regression_new_table_sentinel() {
+        let (b, relay, cipher, cb, sv, ev, create_t_new) = pull_past_unknown_table_sentinel().await;
         // The app update gives B the table; the next cycle's replay lands the waiting rows.
         b.conn().execute_batch(create_t_new).unwrap();
         b.conn()
@@ -3016,7 +3280,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             // Response 1: POST /sync/push → 409. Response 2: GET /sync/completeness → JSON.
             let bodies = [
-                ("409 Conflict".to_string(), String::new()),
+                (
+                    "409 Conflict".to_string(),
+                    r#"{"code":"conflict","message":"client_seq regression: (client_id, client_seq) already stored with different content"}"#.to_string(),
+                ),
                 ("200 OK".to_string(), completeness_json),
             ];
             for (status_line, body) in bodies {
@@ -3065,6 +3332,95 @@ mod tests {
             "the conflict recovery marks the counter reconciled this spawn"
         );
         server.join().unwrap();
+    }
+
+    /// Serve each raw HTTP response, verbatim, to one connection in turn.
+    fn raw_server(responses: Vec<String>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ambiguous_409_never_drops_the_unacked_outbox() {
+        // Only a positively identified `conflict` body may run the reseed that deletes the
+        // unacked entries. A truncated body, a malformed capability body, an unknown code or
+        // no body at all must surface as an error and leave the outbox intact, even when the
+        // relay would answer the completeness call the reseed makes.
+        use crate::transport::HttpTransport;
+        let cid = Uuid::from_u128(0xC0FFEE);
+        let completeness = format!(
+            "{{\"max_changeset_seq\":1,\"count\":1,\"contiguous\":true,\
+             \"per_client\":[{{\"client_id\":\"{cid}\",\"max_client_seq\":1}}]}}"
+        );
+        let full = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let truncated = "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\n\
+             content-length: 200\r\nconnection: close\r\n\r\n{\"code\":\"confl"
+            .to_string();
+        let cases = [
+            ("truncated body", truncated),
+            (
+                "malformed capability body",
+                full("409 Conflict", r#"{"code":"sync_capability_floor"}"#),
+            ),
+            (
+                "unknown code",
+                full("409 Conflict", r#"{"code":"something_else"}"#),
+            ),
+            ("not json", full("409 Conflict", "<html>conflict</html>")),
+            ("empty body", full("409 Conflict", "")),
+        ];
+        for (name, response) in cases {
+            let conn = seed_outbox(&[vec![7u8; 32]]);
+            let (addr, server) = raw_server(vec![response, full("200 OK", &completeness)]);
+            let transport = HttpTransport::new(format!("http://{addr}"), "access-token");
+            let res = push_outbox(&conn, cid, &transport).await;
+            assert!(
+                res.is_err(),
+                "{name}: must surface as an error, got {res:?}"
+            );
+            let unacked: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM _yapstack_outbox WHERE acked=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unacked, 1, "{name}: the unacked entry must survive");
+            assert_eq!(state::client_seq(&conn).unwrap(), 0, "{name}: no reseed");
+            drop(transport);
+            // Unblock the server if the client never made the second call.
+            let _ = std::net::TcpStream::connect(addr);
+            server.join().unwrap();
+        }
     }
 
     // ----- Chunked capture (lock-contention hardening) -----------------------------------
