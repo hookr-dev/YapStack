@@ -81,9 +81,8 @@ body:
     attributes:
       label: Transcription engine in use
       options:
-        - Whisper
         - Parakeet TDT v3
-        - Both / N/A
+        - N/A
         - Not sure
 
   - type: textarea

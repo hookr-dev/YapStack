@@ -1,12 +1,13 @@
 //! Yapstack transcription sidecar.
 //!
-//! A standalone binary that owns the heavy ML runtime (whisper-rs, and
-//! later parakeet-rs/ort) and communicates with the main Tauri process
-//! over JSON-line IPC on stdin/stdout. Logs to stderr.
+//! A standalone binary that owns the heavy ML runtime (parakeet-rs/ort)
+//! and communicates with the main Tauri process over JSON-line IPC on
+//! stdin/stdout. Logs to stderr.
 //!
-//! The sidecar is spawned with `--engine whisper|parakeet` (default
-//! `whisper`) and instantiates the matching backend from `engines::`.
-//! The IPC dispatch loop is engine-agnostic.
+//! The sidecar is spawned with `--engine parakeet` (the default) and
+//! instantiates the matching backend from `engines::`. An unknown
+//! `--engine` value is a startup error. The IPC dispatch loop is
+//! engine-agnostic.
 
 use std::path::PathBuf;
 
@@ -14,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 use yapstack_common::types::{EngineKind, SidecarRequest, SidecarResponse};
 
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 use crate::engines::{TranscribeOpts, TranscriptionBackend, TranscriptionOutput};
 
 mod engines;
@@ -23,8 +24,6 @@ mod engines;
 struct CliArgs {
     engine: EngineKind,
     initial_model_path: Option<PathBuf>,
-    /// Whisper-only Silero VAD model.
-    vad_model_path: Option<PathBuf>,
     /// Parakeet-only Sortformer diarization model. Optional — when omitted,
     /// per-request `diarization: true` is silently treated as a no-op.
     sortformer_model_path: Option<PathBuf>,
@@ -33,11 +32,12 @@ struct CliArgs {
     coreml_cache_dir: Option<PathBuf>,
 }
 
-fn parse_args() -> CliArgs {
-    let args: Vec<String> = std::env::args().collect();
-    let mut engine = EngineKind::Whisper; // default preserves prior CLI behavior
+/// Parse the sidecar CLI. `args[0]` is the program name. An unknown
+/// `--engine` value is an error: the host must never get a sidecar running
+/// an engine it didn't ask for.
+fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut engine = EngineKind::Parakeet;
     let mut initial_model_path: Option<PathBuf> = None;
-    let mut vad_model_path: Option<PathBuf> = None;
     let mut sortformer_model_path: Option<PathBuf> = None;
     let mut coreml_cache_dir: Option<PathBuf> = None;
 
@@ -46,21 +46,13 @@ fn parse_args() -> CliArgs {
         match args[i].as_str() {
             "--engine" if i + 1 < args.len() => {
                 engine = match args[i + 1].as_str() {
-                    "whisper" => EngineKind::Whisper,
                     "parakeet" => EngineKind::Parakeet,
-                    other => {
-                        eprintln!("unknown --engine value: {other}; defaulting to whisper");
-                        EngineKind::Whisper
-                    }
+                    other => return Err(format!("unknown --engine value: {other}")),
                 };
                 i += 2;
             }
             "--model" if i + 1 < args.len() => {
                 initial_model_path = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--vad-model" if i + 1 < args.len() => {
-                vad_model_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--sortformer-model" if i + 1 < args.len() => {
@@ -77,60 +69,28 @@ fn parse_args() -> CliArgs {
         }
     }
 
-    CliArgs {
+    Ok(CliArgs {
         engine,
         initial_model_path,
-        vad_model_path,
         sortformer_model_path,
         coreml_cache_dir,
-    }
+    })
 }
 
 /// Construct the backend chosen by `--engine`. Returns `None` when the
 /// requested engine is not compiled in (so the dispatcher can return a
 /// clear error to every request).
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 fn build_backend(
     engine: EngineKind,
-    vad_model_path: Option<PathBuf>,
     sortformer_model_path: Option<PathBuf>,
     coreml_cache_dir: Option<PathBuf>,
 ) -> Option<Box<dyn TranscriptionBackend>> {
     match engine {
-        EngineKind::Whisper => {
-            // Whisper ignores Sortformer + CoreML cache; they're parakeet-only.
-            let _ = sortformer_model_path;
-            let _ = coreml_cache_dir;
-            #[cfg(feature = "whisper")]
-            {
-                Some(Box::new(engines::whisper::WhisperBackend::new(
-                    vad_model_path,
-                )))
-            }
-            #[cfg(not(feature = "whisper"))]
-            {
-                let _ = vad_model_path;
-                None
-            }
-        }
-        EngineKind::Parakeet => {
-            // Parakeet does its own VAD-style boundary detection; the
-            // Silero VAD path is whisper-only.
-            let _ = vad_model_path;
-            #[cfg(feature = "parakeet")]
-            {
-                Some(Box::new(engines::parakeet::ParakeetBackend::new(
-                    sortformer_model_path,
-                    coreml_cache_dir,
-                )))
-            }
-            #[cfg(not(feature = "parakeet"))]
-            {
-                let _ = sortformer_model_path;
-                let _ = coreml_cache_dir;
-                None
-            }
-        }
+        EngineKind::Parakeet => Some(Box::new(engines::parakeet::ParakeetBackend::new(
+            sortformer_model_path,
+            coreml_cache_dir,
+        ))),
     }
 }
 
@@ -171,12 +131,16 @@ async fn main() {
         .with_env_filter(filter)
         .init();
 
-    let cli = parse_args();
+    let argv: Vec<String> = std::env::args().collect();
+    let cli = match parse_args(&argv) {
+        Ok(cli) => cli,
+        Err(e) => {
+            error!("{e}; exiting");
+            std::process::exit(2);
+        }
+    };
     info!("sidecar starting: engine={}", cli.engine.as_str());
 
-    if let Some(ref vad_path) = cli.vad_model_path {
-        info!("VAD model path: {}", vad_path.display());
-    }
     if let Some(ref s_path) = cli.sortformer_model_path {
         info!("Sortformer model path: {}", s_path.display());
     }
@@ -184,15 +148,14 @@ async fn main() {
         info!("CoreML cache dir: {}", c_path.display());
     }
 
-    #[cfg(any(feature = "whisper", feature = "parakeet"))]
+    #[cfg(feature = "parakeet")]
     let mut backend: Option<Box<dyn TranscriptionBackend>> = build_backend(
         cli.engine,
-        cli.vad_model_path.clone(),
         cli.sortformer_model_path.clone(),
         cli.coreml_cache_dir.clone(),
     );
 
-    #[cfg(any(feature = "whisper", feature = "parakeet"))]
+    #[cfg(feature = "parakeet")]
     if let (Some(b), Some(model_path)) = (backend.as_mut(), cli.initial_model_path.as_ref()) {
         info!("loading initial model: {}", model_path.display());
         if let Err(e) = b.load_model(model_path) {
@@ -208,7 +171,7 @@ async fn main() {
         info!("model loaded successfully");
     }
 
-    #[cfg(not(any(feature = "whisper", feature = "parakeet")))]
+    #[cfg(not(feature = "parakeet"))]
     if cli.initial_model_path.is_some() {
         error!("no transcription engine compiled in; cannot load model");
     }
@@ -250,7 +213,7 @@ async fn main() {
             }
 
             SidecarRequest::QueryEngineInfo { id } => {
-                #[cfg(any(feature = "whisper", feature = "parakeet"))]
+                #[cfg(feature = "parakeet")]
                 {
                     let info = backend.as_ref().and_then(|b| b.engine_info());
                     let response = SidecarResponse::EngineInfo {
@@ -263,7 +226,7 @@ async fn main() {
                     }
                 }
 
-                #[cfg(not(any(feature = "whisper", feature = "parakeet")))]
+                #[cfg(not(feature = "parakeet"))]
                 {
                     let response = SidecarResponse::EngineInfo {
                         id,
@@ -277,7 +240,7 @@ async fn main() {
             SidecarRequest::LoadModel { id, model_path } => {
                 info!("loading model: {}", model_path.display());
 
-                #[cfg(any(feature = "whisper", feature = "parakeet"))]
+                #[cfg(feature = "parakeet")]
                 {
                     match backend.as_mut() {
                         Some(b) => match b.load_model(&model_path) {
@@ -309,7 +272,7 @@ async fn main() {
                     }
                 }
 
-                #[cfg(not(any(feature = "whisper", feature = "parakeet")))]
+                #[cfg(not(feature = "parakeet"))]
                 {
                     let _ = model_path;
                     send_error(id, "no transcription engine compiled in".to_string()).await;
@@ -320,18 +283,14 @@ async fn main() {
                 id,
                 audio_path,
                 language,
-                initial_prompt,
-                single_segment,
                 diarization,
             } => {
                 info!("transcribing: {}", audio_path.display());
 
-                #[cfg(any(feature = "whisper", feature = "parakeet"))]
+                #[cfg(feature = "parakeet")]
                 {
                     let opts = TranscribeOpts {
                         language: language.as_deref(),
-                        initial_prompt: initial_prompt.as_deref(),
-                        single_segment,
                         diarization,
                     };
                     match backend.as_mut() {
@@ -366,15 +325,9 @@ async fn main() {
                     }
                 }
 
-                #[cfg(not(any(feature = "whisper", feature = "parakeet")))]
+                #[cfg(not(feature = "parakeet"))]
                 {
-                    let _ = (
-                        audio_path,
-                        language,
-                        initial_prompt,
-                        single_segment,
-                        diarization,
-                    );
+                    let _ = (audio_path, language, diarization);
                     send_error(id, "no transcription engine compiled in".to_string()).await;
                 }
             }
@@ -382,4 +335,35 @@ async fn main() {
     }
 
     info!("sidecar exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("yapstack-transcription-sidecar")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn engine_defaults_to_parakeet() {
+        let cli = parse_args(&argv(&[])).unwrap();
+        assert_eq!(cli.engine, EngineKind::Parakeet);
+    }
+
+    #[test]
+    fn engine_parakeet_parses() {
+        let cli = parse_args(&argv(&["--engine", "parakeet", "--model", "/m"])).unwrap();
+        assert_eq!(cli.engine, EngineKind::Parakeet);
+        assert_eq!(cli.initial_model_path, Some(PathBuf::from("/m")));
+    }
+
+    #[test]
+    fn unknown_engine_is_an_error() {
+        let err = parse_args(&argv(&["--engine", "whisper"])).unwrap_err();
+        assert!(err.contains("whisper"), "{err}");
+    }
 }

@@ -125,7 +125,6 @@ pub struct JobRequest {
     pub source: JobSource,
     pub wav_path: PathBuf,
     pub language: Option<String>,
-    pub initial_prompt: Option<String>,
     pub diarization: bool,
 }
 
@@ -512,7 +511,6 @@ async fn process_job(inner: &Arc<SchedulerInner>, request: JobRequest) -> JobOut
         .transcribe_with(
             &request.wav_path,
             request.language.as_deref(),
-            request.initial_prompt.as_deref(),
             request.diarization,
         )
         .await;
@@ -547,7 +545,6 @@ async fn process_job(inner: &Arc<SchedulerInner>, request: JobRequest) -> JobOut
                             .transcribe_with(
                                 &request.wav_path,
                                 request.language.as_deref(),
-                                request.initial_prompt.as_deref(),
                                 request.diarization,
                             )
                             .await;
@@ -629,7 +626,6 @@ mod tests {
                 source,
                 wav_path: PathBuf::from("/tmp/placeholder.wav"),
                 language: None,
-                initial_prompt: None,
                 diarization: false,
             },
             respond: tx,

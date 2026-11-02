@@ -8,7 +8,7 @@
 //! - the Tauri command layer to compose engine descriptors with downloaded
 //!   model metadata when serving the frontend,
 //! - the frontend (indirectly via that command) to drive cascading
-//!   engine → model → language dropdowns.
+//!   the engine block and its supported-languages list.
 //!
 //! Model lists live in `yapstack-transcription` (their download URLs and
 //! sizes don't belong here). The frontend joins the two.
@@ -25,9 +25,6 @@ pub struct EngineDescriptor {
     /// True when the engine supports an optional speaker-diarization pass
     /// (today: Parakeet via Sortformer).
     pub supports_diarization: bool,
-    /// True when the engine accepts an `initial_prompt` for cross-chunk
-    /// continuity (today: Whisper only).
-    pub supports_initial_prompt: bool,
 }
 
 impl EngineDescriptor {
@@ -48,35 +45,12 @@ pub fn descriptor(kind: EngineKind) -> &'static EngineDescriptor {
         .expect("every EngineKind variant has a catalogue entry")
 }
 
-static CATALOGUE: [EngineDescriptor; 2] = [
-    EngineDescriptor {
-        kind: EngineKind::Whisper,
-        display_name: "Whisper",
-        languages: WHISPER_LANGUAGES,
-        supports_diarization: false,
-        supports_initial_prompt: true,
-    },
-    EngineDescriptor {
-        kind: EngineKind::Parakeet,
-        display_name: "Parakeet",
-        languages: PARAKEET_TDT_V3_LANGUAGES,
-        supports_diarization: true,
-        supports_initial_prompt: false,
-    },
-];
-
-/// Whisper supports 99 languages. Source: openai-whisper tokenizer
-/// (`whisper/tokenizer.py`). Codes are ISO-639-1 (a few are 639-3 like
-/// `yue`, `jw`); kept in the same order Whisper uses internally.
-static WHISPER_LANGUAGES: &[&str] = &[
-    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it",
-    "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur",
-    "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn",
-    "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si",
-    "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo",
-    "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln",
-    "ha", "ba", "jw", "su",
-];
+static CATALOGUE: [EngineDescriptor; 1] = [EngineDescriptor {
+    kind: EngineKind::Parakeet,
+    display_name: "Parakeet",
+    languages: PARAKEET_TDT_V3_LANGUAGES,
+    supports_diarization: true,
+}];
 
 /// Parakeet TDT-0.6b-v3 supports 25 European languages.
 /// Source: nvidia/parakeet-tdt-0.6b-v3 model card on HuggingFace.
@@ -92,23 +66,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_has_one_entry_per_engine_kind() {
-        assert!(engine_catalogue()
-            .iter()
-            .any(|d| d.kind == EngineKind::Whisper));
-        assert!(engine_catalogue()
-            .iter()
-            .any(|d| d.kind == EngineKind::Parakeet));
-    }
-
-    #[test]
-    fn whisper_catalogue_matches_99_language_count() {
-        let d = descriptor(EngineKind::Whisper);
-        assert_eq!(d.languages.len(), 99, "Whisper publishes 99 languages");
-        assert!(d.supports_initial_prompt);
-        assert!(!d.supports_diarization);
-        assert!(d.supports_language("en"));
-        assert!(d.supports_language("ja"));
+    fn catalogue_has_exactly_one_engine() {
+        let catalogue = engine_catalogue();
+        assert_eq!(catalogue.len(), 1);
+        assert_eq!(catalogue[0].kind, EngineKind::Parakeet);
     }
 
     #[test]
@@ -120,17 +81,13 @@ mod tests {
             "Parakeet TDT v3 publishes 25 languages"
         );
         assert!(d.supports_diarization);
-        assert!(!d.supports_initial_prompt);
         assert!(d.supports_language("en"));
         assert!(d.supports_language("de"));
-        // Whisper covers Japanese; Parakeet TDT v3 does not.
         assert!(!d.supports_language("ja"));
     }
 
     #[test]
     fn descriptor_lookup_is_total() {
-        for kind in [EngineKind::Whisper, EngineKind::Parakeet] {
-            assert_eq!(descriptor(kind).kind, kind);
-        }
+        assert_eq!(descriptor(EngineKind::Parakeet).kind, EngineKind::Parakeet);
     }
 }

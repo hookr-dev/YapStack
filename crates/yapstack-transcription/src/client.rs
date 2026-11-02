@@ -148,9 +148,9 @@ mod parse_sidecar_level_tests {
 
     #[test]
     fn native_line_without_level_returns_none() {
-        // Dawn / whisper.cpp raw output — no tracing level token up front.
+        // Dawn raw output — no tracing level token up front.
         assert_eq!(
-            parse_sidecar_level("whisper_init_state: loading model"),
+            parse_sidecar_level("Warning: Dawn device lost, reason: Destroyed"),
             None
         );
     }
@@ -212,7 +212,6 @@ pub struct TranscriptionClient {
     sidecar_path: PathBuf,
     engine: EngineKind,
     model_path: PathBuf,
-    vad_model_path: Option<PathBuf>,
     sortformer_model_path: Option<PathBuf>,
     coreml_cache_dir: Option<PathBuf>,
 }
@@ -228,17 +227,15 @@ struct SidecarParts {
 impl TranscriptionClient {
     /// Spawns the sidecar process and sets up JSON-line IPC.
     ///
-    /// `engine` selects which backend the sidecar instantiates (Whisper or
-    /// Parakeet). `vad_model_path` is honored only for Whisper (Silero VAD,
-    /// reduces hallucinations). `sortformer_model_path` is honored only for
-    /// Parakeet — when set, per-request `diarization: true` populates speaker IDs.
+    /// `engine` selects which backend the sidecar instantiates.
+    /// `sortformer_model_path`, when set, makes per-request
+    /// `diarization: true` populate speaker IDs.
     /// `coreml_cache_dir` is Parakeet+macOS only; persistent cache for compiled
     /// CoreML graphs to avoid the ~5 s recompile on every spawn.
     pub async fn spawn(
         sidecar_path: &Path,
         engine: EngineKind,
         model_path: &Path,
-        vad_model_path: Option<&Path>,
         sortformer_model_path: Option<&Path>,
         coreml_cache_dir: Option<&Path>,
     ) -> Result<Self> {
@@ -246,7 +243,6 @@ impl TranscriptionClient {
             sidecar_path,
             engine,
             model_path,
-            vad_model_path,
             sortformer_model_path,
             coreml_cache_dir,
         )
@@ -262,7 +258,6 @@ impl TranscriptionClient {
             sidecar_path: sidecar_path.to_path_buf(),
             engine,
             model_path: model_path.to_path_buf(),
-            vad_model_path: vad_model_path.map(|p| p.to_path_buf()),
             sortformer_model_path: sortformer_model_path.map(|p| p.to_path_buf()),
             coreml_cache_dir: coreml_cache_dir.map(|p| p.to_path_buf()),
         })
@@ -273,16 +268,14 @@ impl TranscriptionClient {
         sidecar_path: &Path,
         engine: EngineKind,
         model_path: &Path,
-        vad_model_path: Option<&Path>,
         sortformer_model_path: Option<&Path>,
         coreml_cache_dir: Option<&Path>,
     ) -> Result<SidecarParts> {
         info!(
-            "spawning sidecar: {} engine={} model={} vad_model={:?} sortformer_model={:?} coreml_cache_dir={:?}",
+            "spawning sidecar: {} engine={} model={} sortformer_model={:?} coreml_cache_dir={:?}",
             sidecar_path.display(),
             engine.as_str(),
             model_path.display(),
-            vad_model_path.map(|p| p.display().to_string()),
             sortformer_model_path.map(|p| p.display().to_string()),
             coreml_cache_dir.map(|p| p.display().to_string()),
         );
@@ -291,9 +284,6 @@ impl TranscriptionClient {
         cmd.arg("--engine").arg(engine.as_str());
         cmd.arg("--model").arg(model_path);
 
-        if let Some(vad_path) = vad_model_path {
-            cmd.arg("--vad-model").arg(vad_path);
-        }
         if let Some(s_path) = sortformer_model_path {
             cmd.arg("--sortformer-model").arg(s_path);
         }
@@ -424,15 +414,15 @@ impl TranscriptionClient {
 
     /// Reads stderr from the sidecar and forwards each line to tracing.
     /// Strips ANSI escape sequences defensively — the sidecar itself disables
-    /// ANSI but native libraries (ORT, Dawn, whisper.cpp) may still emit
+    /// ANSI but native libraries (ORT, Dawn) may still emit
     /// colored output that would render as boxes in the desktop log UI.
     ///
     /// Forwarding is **level-aware**: the sidecar formats its own lines as
     /// `<timestamp> LEVEL target: message`, so we recover that LEVEL and re-log
     /// at the matching level instead of flattening everything to INFO. That
     /// keeps sidecar WARN/ERROR distinguishable in the desktop log/grep, and
-    /// keeps sidecar DEBUG lines at DEBUG. Raw native framework chatter (Dawn,
-    /// whisper.cpp) carries no level token and is demoted to DEBUG so it stays
+    /// keeps sidecar DEBUG lines at DEBUG. Raw native framework chatter (Dawn)
+    /// carries no level token and is demoted to DEBUG so it stays
     /// off the default INFO log — the old unconditional `info!` re-log turned
     /// every one of those into an INFO line, amplifying the noise.
     async fn stderr_reader_task(stderr: tokio::process::ChildStderr) {
@@ -550,35 +540,28 @@ impl TranscriptionClient {
         &self,
         audio_path: &Path,
         language: Option<&str>,
-        initial_prompt: Option<&str>,
     ) -> Result<TranscriptionResult> {
-        self.transcribe_with(audio_path, language, initial_prompt, false)
-            .await
+        self.transcribe_with(audio_path, language, false).await
     }
 
     /// Transcribes an audio file with explicit per-request diarization control.
     /// `diarization: true` is honored only when the sidecar was spawned with
-    /// `engine = Parakeet` *and* a Sortformer model path; otherwise the flag
-    /// is silently a no-op.
+    /// a Sortformer model path; otherwise the flag is silently a no-op.
     ///
     /// Safe to call concurrently from multiple tasks holding `&TranscriptionClient`.
     pub async fn transcribe_with(
         &self,
         audio_path: &Path,
         language: Option<&str>,
-        initial_prompt: Option<&str>,
         diarization: bool,
     ) -> Result<TranscriptionResult> {
         let language = language.map(String::from);
-        let initial_prompt = initial_prompt.map(String::from);
         let audio_path = audio_path.to_path_buf();
         let (id, rx) = self
             .dispatch_request(|id| SidecarRequest::Transcribe {
                 id,
                 audio_path,
                 language,
-                initial_prompt,
-                single_segment: None,
                 diarization,
             })
             .await?;
@@ -716,7 +699,7 @@ impl TranscriptionClient {
     }
 
     /// Kills the current sidecar and spawns a fresh one with the same
-    /// model/VAD configuration. The model is loaded eagerly by the sidecar
+    /// model configuration. The model is loaded eagerly by the sidecar
     /// on startup (via --model arg), so no separate load_model call is needed.
     /// `next_id` is preserved to keep request IDs unique across respawns.
     ///
@@ -754,7 +737,6 @@ impl TranscriptionClient {
             &self.sidecar_path,
             self.engine,
             &self.model_path,
-            self.vad_model_path.as_deref(),
             self.sortformer_model_path.as_deref(),
             self.coreml_cache_dir.as_deref(),
         )
@@ -785,7 +767,7 @@ impl TranscriptionClient {
 /// target: message`, so the level appears as an early whitespace-delimited
 /// token. We scan only the first few tokens (level is token index 1 after the
 /// single-token RFC3339 timestamp) to avoid matching the word "INFO" inside a
-/// message body. Native library output (Dawn, whisper.cpp) has no such token
+/// message body. Native library output (Dawn) has no such token
 /// and returns `None`, so the caller can demote it to DEBUG.
 fn parse_sidecar_level(line: &str) -> Option<Level> {
     line.split_whitespace().take(3).find_map(|tok| match tok {

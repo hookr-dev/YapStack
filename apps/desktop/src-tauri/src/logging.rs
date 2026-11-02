@@ -229,7 +229,7 @@ const DEFAULT_FILTER: &str = "info,\
 /// ## Crash durability (R7)
 /// The rolling daily file layer keeps `tracing_appender::non_blocking` — its
 /// worker thread absorbs the high-rate sidecar-stderr bursts (native ORT / Dawn
-/// / whisper lines, one `tracing` event per line) off the emitting threads. The
+/// lines, one `tracing` event per line) off the emitting threads. The
 /// catch that cost us the fresh-install-crash diagnosis twice: that worker only
 /// flushes its user-space buffer when its `WorkerGuard` is dropped, and under
 /// the release profile's `panic = "abort"` a panic aborts the process WITHOUT

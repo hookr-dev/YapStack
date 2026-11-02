@@ -1,36 +1,31 @@
 //! Engine abstraction layer for the transcription sidecar.
 //!
-//! Each backend (Whisper, Parakeet) implements [`TranscriptionBackend`].
-//! The sidecar is spawned with `--engine whisper|parakeet` and constructs
-//! the matching backend; the IPC dispatch loop in `main.rs` is engine-agnostic.
+//! Each backend implements [`TranscriptionBackend`]. Parakeet is the only
+//! backend today (ADR 0005); the trait stays as the seam for later models.
+//! The sidecar is spawned with `--engine parakeet` and constructs the
+//! matching backend; the IPC dispatch loop in `main.rs` is engine-agnostic.
 
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 use std::path::Path;
 
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 use yapstack_common::types::TranscriptSegment;
-
-#[cfg(feature = "whisper")]
-pub mod whisper;
 
 #[cfg(feature = "parakeet")]
 pub mod parakeet;
 
 /// Per-request transcription options. Engines ignore options they don't
-/// support (e.g. Parakeet ignores `initial_prompt`; Whisper ignores
-/// `diarization`).
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+/// support (Parakeet auto-detects the language and ignores `language`).
+#[cfg(feature = "parakeet")]
 #[derive(Debug, Clone, Copy)]
 pub struct TranscribeOpts<'a> {
     pub language: Option<&'a str>,
-    pub initial_prompt: Option<&'a str>,
-    pub single_segment: Option<bool>,
-    /// Honored by Parakeet via Sortformer; ignored by Whisper.
+    /// Honored by Parakeet via Sortformer.
     #[allow(dead_code)]
     pub diarization: bool,
 }
 
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 #[derive(Debug, Clone)]
 pub struct TranscriptionOutput {
     pub text: String,
@@ -38,9 +33,9 @@ pub struct TranscriptionOutput {
     pub duration_ms: u64,
 }
 
-/// Read a WAV file, downmix to mono, and resample to 16 kHz. Both Whisper
-/// and Parakeet require this exact input shape.
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+/// Read a WAV file, downmix to mono, and resample to 16 kHz. Parakeet
+/// requires this exact input shape.
+#[cfg(feature = "parakeet")]
 pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String> {
     let mut reader =
         hound::WavReader::open(audio_path).map_err(|e| format!("failed to open WAV: {e}"))?;
@@ -69,7 +64,7 @@ pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String
 /// from frontend state. `accel` reflects the *resolved* execution
 /// provider including any runtime fallback (e.g. `"cpu"` when WebGPU
 /// init fails and the load chain falls back).
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 #[derive(Debug, Clone)]
 pub struct EngineInfo {
     pub accel: String,
@@ -77,9 +72,9 @@ pub struct EngineInfo {
 }
 
 /// What every transcription backend must implement. Engine-specific
-/// configuration (Whisper VAD model, Parakeet decoder cache, etc.) is
+/// configuration (Parakeet's Sortformer model, CoreML cache, etc.) is
 /// passed to the backend's constructor — not through this trait.
-#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[cfg(feature = "parakeet")]
 pub trait TranscriptionBackend: Send {
     /// (Re)load the primary transcription model from disk. May be called
     /// more than once per process if the user switches models.
@@ -106,16 +101,14 @@ pub trait TranscriptionBackend: Send {
 
 // ---------- Shared text post-processing ----------
 //
-// These helpers were originally Whisper-specific. They are mild enough
-// that running Parakeet output through them is harmless (Parakeet rarely
-// produces YouTube-artifact hallucinations or unicode quote marks, but
-// the filters are no-ops on clean text).
+// Mild filters: no-ops on clean text, so running every Parakeet segment
+// through them is harmless.
 
 /// Insert a space after sentence-ending punctuation (`.` `!` `?`) or commas
 /// when immediately followed by an uppercase letter. Fixes joined sentences
 /// like "First sentence.Then second" while preserving "e.g." abbreviations
 /// (which are followed by lowercase).
-#[cfg(any(feature = "whisper", feature = "parakeet", test))]
+#[cfg(any(feature = "parakeet", test))]
 pub(crate) fn normalize_spacing(text: &str) -> String {
     let mut result = String::with_capacity(text.len() + 10);
     let mut chars = text.chars().peekable();
@@ -135,9 +128,9 @@ pub(crate) fn normalize_spacing(text: &str) -> String {
 /// Replace common Unicode punctuation (smart quotes, em/en dashes, ellipsis)
 /// with ASCII equivalents, strip control characters, and collapse runs of
 /// multiple spaces. Other printable Unicode (accents, non-Latin scripts) is
-/// preserved verbatim — Parakeet TDT v3 supports 25 European languages and
-/// Whisper supports 99, including non-ASCII scripts.
-#[cfg(any(feature = "whisper", feature = "parakeet", test))]
+/// preserved verbatim — Parakeet TDT v3 supports 25 European languages,
+/// including non-ASCII scripts.
+#[cfg(any(feature = "parakeet", test))]
 pub(crate) fn sanitize_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut prev_space = false;
@@ -185,7 +178,7 @@ pub(crate) fn sanitize_text(text: &str) -> String {
 /// Normalize text for repetition detection: insert spaces around punctuation
 /// so "Yeah.Yeah.Yeah." becomes "Yeah . Yeah . Yeah ." and whitespace-based
 /// splitting catches the loop.
-#[cfg(any(feature = "whisper", feature = "parakeet", test))]
+#[cfg(any(feature = "parakeet", test))]
 pub(crate) fn normalize_for_repetition(text: &str) -> String {
     let mut result = String::with_capacity(text.len() * 2);
     for ch in text.chars() {
@@ -209,8 +202,8 @@ pub(crate) fn normalize_for_repetition(text: &str) -> String {
 /// The 6-repeat threshold (raised from 3) lets real conversational
 /// repetition like "no no no that's not what I meant" pass; the call site
 /// in `should_include_segment` additionally gates on confidence < 0.7 so
-/// high-confidence stutters survive on both engines.
-#[cfg(any(feature = "whisper", feature = "parakeet", test))]
+/// high-confidence stutters survive.
+#[cfg(any(feature = "parakeet", test))]
 pub(crate) fn has_excessive_repetition(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.len() < 6 {
@@ -249,16 +242,10 @@ pub(crate) fn has_excessive_repetition(text: &str) -> bool {
 /// special tokens (`[BLANK_AUDIO]`), low-confidence segments, known YouTube
 /// hallucination patterns, and excessive repetition.
 ///
-/// `engine` selects the per-engine hallucination tier (Whisper keeps the
-/// aggressive always-reject list; Parakeet uses a softer one). The repetition
-/// gate is shared but only fires at confidence < 0.7 so legitimate
-/// high-confidence stutters survive on both engines.
-#[cfg(any(feature = "whisper", feature = "parakeet", test))]
-pub(crate) fn should_include_segment(
-    text: &str,
-    confidence: f32,
-    engine: yapstack_common::types::EngineKind,
-) -> bool {
+/// The repetition gate only fires at confidence < 0.7 so legitimate
+/// high-confidence stutters survive.
+#[cfg(any(feature = "parakeet", test))]
+pub(crate) fn should_include_segment(text: &str, confidence: f32) -> bool {
     let trimmed = text.trim();
 
     if trimmed.is_empty() {
@@ -301,11 +288,11 @@ pub(crate) fn should_include_segment(
         return false;
     }
 
-    if yapstack_common::hallucination::is_always_reject(trimmed, engine) {
+    if yapstack_common::hallucination::is_always_reject(trimmed) {
         return false;
     }
 
-    if confidence < 0.6 && yapstack_common::hallucination::is_marginal_reject(trimmed, engine) {
+    if confidence < 0.6 && yapstack_common::hallucination::is_marginal_reject(trimmed) {
         return false;
     }
 
@@ -315,31 +302,14 @@ pub(crate) fn should_include_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yapstack_common::types::EngineKind;
-
-    // Convenience: most pre-existing tests asserted Whisper behavior; keep
-    // them readable by defaulting to Whisper.
-    fn include_w(text: &str, confidence: f32) -> bool {
-        should_include_segment(text, confidence, EngineKind::Whisper)
-    }
 
     fn include_p(text: &str, confidence: f32) -> bool {
-        should_include_segment(text, confidence, EngineKind::Parakeet)
+        should_include_segment(text, confidence)
     }
 
     #[test]
     fn normal_text_high_confidence_included() {
-        assert!(include_w("Hello, how are you?", 0.9));
         assert!(include_p("Hello, how are you?", 0.9));
-    }
-
-    #[test]
-    fn whisper_thank_you_excluded_all_confidences() {
-        assert!(!include_w("Thank you.", 0.3));
-        assert!(!include_w("Thank you.", 0.8));
-        assert!(!include_w("Thank you!", 0.95));
-        assert!(!include_w("Thank you?", 0.9));
-        assert!(!include_w("Thank you", 0.99));
     }
 
     #[test]
@@ -359,19 +329,13 @@ mod tests {
 
     #[test]
     fn empty_text_excluded() {
-        assert!(!include_w("", 0.9));
-        assert!(!include_w("   ", 0.9));
+        assert!(!include_p("", 0.9));
+        assert!(!include_p("   ", 0.9));
     }
 
     #[test]
     fn blank_audio_token_excluded() {
-        assert!(!include_w("[BLANK_AUDIO]", 0.9));
-    }
-
-    #[test]
-    fn whisper_you_always_excluded() {
-        assert!(!include_w("you", 0.5));
-        assert!(!include_w("you", 0.9));
+        assert!(!include_p("[BLANK_AUDIO]", 0.9));
     }
 
     #[test]
@@ -383,35 +347,18 @@ mod tests {
 
     #[test]
     fn longer_sentence_with_you_included() {
-        assert!(include_w("You should try this", 0.7));
         assert!(include_p("You should try this", 0.7));
     }
 
     #[test]
     fn below_confidence_threshold_excluded() {
-        assert!(!include_w("Some random text", 0.35));
         assert!(!include_p("Some random text", 0.35));
     }
 
     #[test]
-    fn whisper_hallucination_at_boundary_confidence() {
-        assert!(!include_w("Thank you.", 0.6));
-        assert!(!include_w("Thank you.", 0.59));
-        assert!(include_w("Yeah", 0.6));
-        assert!(!include_w("Yeah", 0.59));
-    }
-
-    #[test]
     fn special_tokens_excluded() {
-        assert!(!include_w("[MUSIC]", 0.9));
-        assert!(!include_w("[NOISE]", 0.9));
-    }
-
-    #[test]
-    fn whisper_youtube_outros_case_insensitive() {
-        assert!(!include_w("THANK YOU.", 0.9));
-        assert!(!include_w("Bye.", 0.9));
-        assert!(!include_w("Subscribe.", 0.9));
+        assert!(!include_p("[MUSIC]", 0.9));
+        assert!(!include_p("[NOISE]", 0.9));
     }
 
     #[test]
@@ -453,56 +400,55 @@ mod tests {
     #[test]
     fn real_speech_repetition_high_confidence_passes() {
         // "no no no that's not what I meant" is real speech — must not be
-        // dropped at high confidence on either engine.
-        assert!(include_w("no no no that's not what I meant", 0.85));
+        // dropped at high confidence.
         assert!(include_p("no no no that's not what I meant", 0.85));
     }
 
     #[test]
     fn long_repetition_low_confidence_filtered() {
-        // 6+ reps at confidence < 0.7 still drops — Whisper stuck-loop defense.
-        assert!(!include_w("the the the the the the the the the", 0.5));
+        // 6+ reps at confidence < 0.7 still drops — stuck-loop defense.
+        assert!(!include_p("the the the the the the the the the", 0.5));
     }
 
     #[test]
     fn long_repetition_high_confidence_passes() {
         // 6+ reps at confidence ≥ 0.7 passes — extreme but treated as real.
-        assert!(include_w("the the the the the the the the the", 0.85));
+        assert!(include_p("the the the the the the the the the", 0.85));
     }
 
     #[test]
     fn conversational_fillers_not_filtered_at_high_confidence() {
-        assert!(include_w("So", 0.7));
-        assert!(include_w("Okay.", 0.7));
-        assert!(include_w("Uh", 0.7));
-        assert!(include_w("Um", 0.7));
-        assert!(include_w("Hmm.", 0.7));
-        assert!(include_w("You know", 0.7));
-        assert!(include_w("I mean", 0.7));
-        assert!(include_w("Yeah", 0.7));
-        assert!(include_w("Right.", 0.7));
+        assert!(include_p("So", 0.7));
+        assert!(include_p("Okay.", 0.7));
+        assert!(include_p("Uh", 0.7));
+        assert!(include_p("Um", 0.7));
+        assert!(include_p("Hmm.", 0.7));
+        assert!(include_p("You know", 0.7));
+        assert!(include_p("I mean", 0.7));
+        assert!(include_p("Yeah", 0.7));
+        assert!(include_p("Right.", 0.7));
     }
 
     #[test]
     fn filler_patterns_filtered_at_marginal_confidence() {
-        assert!(!include_w("Yeah", 0.5));
-        assert!(!include_w("yeah.", 0.5));
-        assert!(!include_w("Okay.", 0.5));
-        assert!(!include_w("Um", 0.5));
-        assert!(!include_w("So", 0.5));
-        assert!(!include_w("Right.", 0.5));
+        assert!(!include_p("Yeah", 0.5));
+        assert!(!include_p("yeah.", 0.5));
+        assert!(!include_p("Okay.", 0.5));
+        assert!(!include_p("Um", 0.5));
+        assert!(!include_p("So", 0.5));
+        assert!(!include_p("Right.", 0.5));
     }
 
     #[test]
     fn punctuation_joined_short_repetition_passes_high_conf() {
         // 3 reps at high confidence used to be filtered; now they pass.
-        assert!(include_w("Yeah.Yeah.Yeah.", 0.9));
-        assert!(include_w("No.No.No.No.", 0.9));
+        assert!(include_p("Yeah.Yeah.Yeah.", 0.9));
+        assert!(include_p("No.No.No.No.", 0.9));
     }
 
     #[test]
     fn punctuation_joined_long_repetition_low_conf_filtered() {
-        assert!(!include_w("Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.", 0.5));
+        assert!(!include_p("Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.", 0.5));
     }
 
     #[test]
@@ -560,7 +506,7 @@ mod tests {
 
     #[test]
     fn sanitize_text_strips_invisible_formatting() {
-        // Zero-width space, ZWNJ, ZWJ, BOM are common Whisper noise.
+        // Zero-width space, ZWNJ, ZWJ, BOM are common decoder noise.
         assert_eq!(sanitize_text("text\u{200B}here"), "texthere");
         assert_eq!(sanitize_text("a\u{FEFF}b"), "ab");
         // Control chars (NUL, BEL) are dropped.
@@ -600,15 +546,15 @@ mod tests {
 
     #[test]
     fn punctuation_only_segments_excluded() {
-        assert!(!include_w("...", 0.9));
-        assert!(!include_w("---", 0.9));
-        assert!(!include_w(",", 0.9));
-        assert!(!include_w("\u{266A}", 0.9));
+        assert!(!include_p("...", 0.9));
+        assert!(!include_p("---", 0.9));
+        assert!(!include_p(",", 0.9));
+        assert!(!include_p("\u{266A}", 0.9));
     }
 
     #[test]
     fn text_with_punctuation_still_included() {
-        assert!(include_w("Hello, world.", 0.9));
-        assert!(include_w("Wait, what?", 0.9));
+        assert!(include_p("Hello, world.", 0.9));
+        assert!(include_p("Wait, what?", 0.9));
     }
 }

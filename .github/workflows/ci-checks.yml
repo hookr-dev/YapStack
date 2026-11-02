@@ -29,23 +29,8 @@ jobs:
     name: Rust (macos-latest)
     runs-on: macos-latest
     timeout-minutes: 60
-    # whisper-rs-sys bundles whisper.cpp; on Apple Silicon (macos-latest)
-    # ggml-cpu's ARM quants.c uses `vmmlaq_s32`, which requires the i8mm
-    # target feature. The bundled cmake build doesn't auto-enable it on
-    # plain `cargo build`, so the C compiler errors with:
-    #   error: always_inline function 'vmmlaq_s32' requires target feature 'i8mm'
-    # Setting CFLAGS / CXXFLAGS to `-march=native` lets clang detect and
-    # enable i8mm (and dotprod, etc.) on the runner. release.yml dodges
-    # this by building with `--target aarch64-apple-darwin --features
-    # whisper,parakeet,metal,...`, which routes through different paths.
-    env:
-      CFLAGS: "-march=native"
-      CXXFLAGS: "-march=native"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-
-      - name: Install cmake
-        run: brew install cmake
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
@@ -99,12 +84,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
-      - name: Check cmake
-        # windows-latest ships cmake in the runner image; the sidecar's
-        # whisper-rs / parakeet-rs cmake builds use it. Echo the version so
-        # runner-image updates that break the build are diagnosable.
-        run: cmake --version
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
@@ -141,8 +120,7 @@ jobs:
         # The default-feature clippy above does NOT compile the
         # `cfg(not(target_os = "macos"))` WebGPU arm in the parakeet engine.
         # Lint it explicitly so the non-macOS WebGPU codepath is actually
-        # compiled + checked on the Windows leg. Whisper stays CPU-only on
-        # Windows — no VULKAN_SDK / CUDA setup; only Parakeet gets webgpu.
+        # compiled + checked on the Windows leg.
         run: cargo clippy -p yapstack-transcription-sidecar --features webgpu -- -D warnings
 
       - name: Run tests

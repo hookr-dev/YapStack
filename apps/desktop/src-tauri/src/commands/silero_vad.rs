@@ -5,8 +5,8 @@
 //! doesn't false-trigger on music, keyboard clicks, fans, or HVAC, and it
 //! catches quiet / distant speech that sits below an RMS threshold.
 //!
-//! Used by both Whisper and Parakeet live sessions. The only things that
-//! stay engine-specific are the *timing* knobs (silence_duration,
+//! Used by every live session. The only things that stay engine-specific
+//! are the *timing* knobs (silence_duration,
 //! pre_roll, poll_interval, max_chunk_duration) in `VadTuning` — those
 //! are independent of what produces the speech signal.
 //!
@@ -54,8 +54,8 @@ impl SileroVad {
     /// stream state for the next call).
     ///
     /// The live loop needs all frames — not just the last — because a
-    /// poll window can straddle a complete speech event. A 300 ms Whisper
-    /// poll or even a 100 ms Parakeet poll can contain an utterance that
+    /// poll window can straddle a complete speech event. Even a 100 ms
+    /// Parakeet poll can contain an utterance that
     /// starts and ends inside the batch; if we returned only the trailing
     /// probability (silence), the VAD state machine would never see the
     /// speech onset.
