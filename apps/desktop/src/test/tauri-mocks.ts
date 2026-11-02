@@ -118,11 +118,12 @@ export const tauriCommandsMock = () => ({
       status: "ok",
       data: { mic: null, system: null },
     }),
-    getAvailableModels: vi
+    listLegacyModelFiles: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: [] }),
-    downloadModel: vi.fn().mockResolvedValue({ status: "ok", data: "" }),
-    deleteModel: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    deleteLegacyModelFiles: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
     initTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
@@ -190,9 +191,6 @@ export const tauriCommandsMock = () => ({
     requestScreenCapturePermission: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "Granted" }),
-    updateVocabularyHints: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     deleteAudioFiles: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),

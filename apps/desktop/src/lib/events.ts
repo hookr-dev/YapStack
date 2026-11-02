@@ -89,7 +89,7 @@ export type LiveTranscriptionPressureEvent = {
   wall_ms: number;
   /** Null when the transcribe call failed or wall_ms was 0. */
   rtfx: number | null;
-  engine: "Whisper" | "Parakeet";
+  engine: "Parakeet";
   /** Priority tier the scheduler ran this chunk at. Distinguishes live
    *  throughput from backfill drain rate in pressure telemetry. */
   origin: "live" | "backfill" | "final_flush";
@@ -100,8 +100,8 @@ export type LiveTranscriptionPressureEvent = {
   /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")
    *  captured at session start. Null if the sidecar didn't report one. */
   accel: string | null;
-  /** Variant directory name (e.g. "parakeet-tdt-v3-int8"). Null for Whisper
-   *  or when the sidecar didn't report a model_dir. */
+  /** Variant directory name (e.g. "parakeet-tdt-v3-int8"). Null when the
+   *  sidecar didn't report a model_dir. */
   variant: string | null;
 };
 

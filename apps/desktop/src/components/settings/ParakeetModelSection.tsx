@@ -12,10 +12,8 @@ import { formatBytes } from "@/lib/utils";
 /// (`get_recommended_parakeet_variant`) and coerced into the store at
 /// `autoSetup` time, so this UI only ever shows one row — the model that
 /// can actually run on the host. int8 vs fp32 is an implementation
-/// detail the user never picks. Mirrors the Whisper [`ModelSection`]
-/// row layout so the switcher feels the same regardless of engine.
+/// detail the user never picks.
 export function ParakeetModelSection() {
-  const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
   const selectedVariant = useAppStore(
     (s) => s.settings.selectedParakeetVariant,
   );
@@ -47,7 +45,6 @@ export function ParakeetModelSection() {
   const handleDelete = async (variant: ParakeetVariantDto) => {
     if (
       variant === selectedVariant &&
-      selectedEngine === "Parakeet" &&
       enginePhase === "ready"
     ) {
       toast.error("Cannot delete the active model");
@@ -70,7 +67,6 @@ export function ParakeetModelSection() {
   if (!model) return <div className="space-y-1" />;
 
   const isActive =
-    selectedEngine === "Parakeet" &&
     model.downloaded &&
     enginePhase === "ready";
   const showProgress =

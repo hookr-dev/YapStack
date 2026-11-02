@@ -7,8 +7,7 @@ import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
 import { resolveAndCreateClient, markdownToBasicHtml } from "@/lib/ai";
-import { buildVocabularyHints } from "@/lib/transcription";
-import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
+import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory } from "@/lib/db";
 import { toast } from "sonner";
 import { trackDictationStarted, trackDictationCompleted, trackDictationFailed, trackDictationCancelled } from "@/lib/analytics";
 
@@ -317,14 +316,10 @@ export function useDictation() {
       // Start live transcription (pass dictation ID for WAV saving)
       const { language } = s.settings;
       const result = await commands.startLiveTranscription({
-        silence_duration_ms: 400,
-        max_chunk_seconds: 10,
         backfill_seconds: 0,
         source: "MicOnly",
         mix_config: null,
         language: language,
-        prompt_context_chars: 350,
-        prompt_decay_silence_seconds: 0,
         session_id: dictationIdRef.current,
         // Dictations are not sessions — the synthetic id has no row in
         // `sessions`, so don't insert into `session_audio_parts`. The
@@ -334,9 +329,7 @@ export function useDictation() {
         audio_save_location: null,
         audio_export_format: s.settings.audioExportFormat,
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
-        diarization:
-          s.settings.selectedEngine === "Parakeet" && s.settings.diarizationEnabled,
-        vocabulary_hints: buildVocabularyHints(await listFolders(), await listTags()),
+        diarization: s.settings.diarizationEnabled,
         source_kind: "dictation",
       });
 

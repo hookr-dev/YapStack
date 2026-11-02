@@ -177,7 +177,6 @@ export function StatusPopover() {
   );
   const devices = useAppStore((s) => s.devices);
   const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
-  const selectedModelSize = useAppStore((s) => s.settings.selectedModelSize);
   const selectedParakeetVariant = useAppStore(
     (s) => s.settings.selectedParakeetVariant,
   );
@@ -242,12 +241,10 @@ export function StatusPopover() {
   // int8 vs fp32 is an implementation detail driven by host capability,
   // not a user-visible choice.
   const modelLabel =
-    selectedEngine === "Whisper"
-      ? selectedModelSize
-      : selectedParakeetVariant === "TdtV3" ||
-          selectedParakeetVariant === "TdtV3Int8"
-        ? "TDT v3"
-        : selectedParakeetVariant;
+    selectedParakeetVariant === "TdtV3" ||
+    selectedParakeetVariant === "TdtV3Int8"
+      ? "TDT v3"
+      : selectedParakeetVariant;
 
   const micActive = captureStatus?.mic_active ?? false;
   const systemActive = captureStatus?.system_audio_active ?? false;

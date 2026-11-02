@@ -26,7 +26,6 @@ import {
   trackFolderCreated,
   trackSessionPinned,
   trackShortcutUsed,
-  trackModelDownloaded,
   trackEngineError,
   trackSettingChanged,
   trackSegmentEdited,
@@ -42,7 +41,6 @@ describe("analytics", () => {
   it("trackAppLaunched sends correct event name and props", () => {
     trackAppLaunched({
       capture_source: "Mixed",
-      model_size: "Small",
       dictation_enabled: 1,
       dictation_slot_count: 2,
       theme: "dark",
@@ -50,7 +48,6 @@ describe("analytics", () => {
     });
     expect(mockTrackEvent).toHaveBeenCalledWith("app_launched", {
       capture_source: "Mixed",
-      model_size: "Small",
       dictation_enabled: 1,
       dictation_slot_count: 2,
       theme: "dark",
@@ -197,11 +194,6 @@ describe("analytics", () => {
     expect(mockTrackEvent).toHaveBeenCalledWith("shortcut_used", { shortcut_id: "toggle-recording" });
   });
 
-  it("trackModelDownloaded sends model size", () => {
-    trackModelDownloaded({ model_size: "Small" });
-    expect(mockTrackEvent).toHaveBeenCalledWith("model_downloaded", { model_size: "Small" });
-  });
-
   it("trackEngineError truncates error to 100 chars", () => {
     const longError = "e".repeat(200);
     trackEngineError({ error: longError, phase: "initializing" });
@@ -252,7 +244,6 @@ describe("analytics opt-out gate", () => {
     // navigation, engine errors, settings. All funnel through the same `track`.
     trackAppLaunched({
       capture_source: "Mixed",
-      model_size: "Small",
       dictation_enabled: 1,
       dictation_slot_count: 2,
       theme: "dark",

@@ -5,10 +5,7 @@ import {
   buildFolderProfiles,
   type FolderSuggestion,
 } from "@/lib/auto-tag";
-import { commands } from "@/lib/tauri";
 import { isVisibleSegment } from "@/lib/ai";
-import { listFolders, listTags } from "@/lib/db";
-import { buildVocabularyHints } from "@/lib/transcription";
 
 export function useAutoTag(sessionId: string | null, isRecording: boolean) {
   const folders = useAppStore((s) => s.folders);
@@ -88,13 +85,6 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
     });
   }, [activeSessionSegments, isRecording]);
 
-  const refreshVocabularyHints = useCallback(async () => {
-    const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
-    if (updatedHints) {
-      commands.updateVocabularyHints(updatedHints).catch(() => {});
-    }
-  }, []);
-
   const acceptSuggestion = useCallback(
     async (suggestion: FolderSuggestion) => {
       if (!sessionId) return;
@@ -102,9 +92,8 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
       trackerRef.current?.accept(suggestion.id);
       setSuggestions([]);
       await addSessionToFolder(sessionId, suggestion.id);
-      await refreshVocabularyHints();
     },
-    [sessionId, addSessionToFolder, refreshVocabularyHints],
+    [sessionId, addSessionToFolder],
   );
 
   const applyOverride = useCallback(
@@ -114,9 +103,8 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
       trackerRef.current?.complete();
       setSuggestions([]);
       await addSessionToFolder(sessionId, folderId);
-      await refreshVocabularyHints();
     },
-    [sessionId, addSessionToFolder, refreshVocabularyHints],
+    [sessionId, addSessionToFolder],
   );
 
   const dismissSuggestion = useCallback((suggestion: FolderSuggestion) => {

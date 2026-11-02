@@ -130,34 +130,33 @@ async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
 async audioFilesExist(paths: string[]) : Promise<boolean[]> {
     return await TAURI_INVOKE("audio_files_exist", { paths });
 },
-async getAvailableModels() : Promise<Result<ModelInfoDto[], CommandError>> {
+/**
+ * Lists model files left behind by earlier releases, with their sizes, so
+ * Settings can offer to remove them. Nothing is deleted without the user.
+ */
+async listLegacyModelFiles() : Promise<Result<LegacyModelFileDto[], CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_available_models") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async downloadModel(size: ModelSizeDto) : Promise<Result<string, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("download_model", { size }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_model", { size }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_legacy_model_files") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Spawn the sidecar with the requested engine. Whisper requires
- * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
- * enable Sortformer diarization.
+ * Deletes the named legacy model files. Names that aren't legacy model
+ * files are refused.
+ */
+async deleteLegacyModelFiles(names: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_legacy_model_files", { names }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Spawn the sidecar with the requested engine. Parakeet requires
+ * `parakeet_variant` and may optionally enable Sortformer diarization.
  *
  * Re-init semantics:
  * - If the engine is uninitialized, build the client + scheduler.
@@ -168,9 +167,9 @@ async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
  * an explicit error directing the caller to `shutdown_transcription_client`
  * first. Engine swap is an explicit two-step operation; no implicit drain.
  */
-async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
+async initTranscriptionClient(engine: EngineKindDto, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("init_transcription_client", { engine, whisperModel, parakeetVariant, enableDiarization }) };
+    return { status: "ok", data: await TAURI_INVOKE("init_transcription_client", { engine, parakeetVariant, enableDiarization }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -202,8 +201,7 @@ async getTranscriptionStatus() : Promise<Result<TranscriptionStatusDto, CommandE
 }
 },
 /**
- * Returns the static engine catalogue (Whisper + Parakeet capability + language lists).
- * The frontend uses this to drive the cascading engine → model → language UI.
+ * Returns the static engine catalogue (capabilities + language lists).
  */
 async getEngineCatalogue() : Promise<Result<EngineDescriptorDto[], CommandError>> {
     try {
@@ -299,14 +297,6 @@ async stopLiveTranscription(kind: LiveSourceKind | null) : Promise<Result<null, 
 async getLiveTranscriptionStatus(kind: LiveSourceKind | null) : Promise<Result<LiveTranscriptionStatus, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_live_transcription_status", { kind }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async updateVocabularyHints(hints: string) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_vocabulary_hints", { hints }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -956,13 +946,14 @@ export type DeviceRosterEntryDto = { fingerprint: string; isSelf: boolean; pendi
 platform: string | null }
 export type DeviceTypeDto = "Input" | "Output"
 /**
- * Engine capabilities + supported languages for the cascading UI in Settings.
+ * Engine capabilities + supported languages for Settings.
  */
-export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; languages: string[]; supports_diarization: boolean; supports_initial_prompt: boolean }
+export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; languages: string[]; supports_diarization: boolean }
 /**
- * Which transcription engine the frontend has selected.
+ * Which transcription engine the frontend has selected. Parakeet is the
+ * only engine (ADR 0005).
  */
-export type EngineKindDto = "Whisper" | "Parakeet"
+export type EngineKindDto = "Parakeet"
 /**
  * Level passed by the frontend logger. Mirrors `tracing::Level` so the
  * in-process subscriber can route the event identically to a native call.
@@ -971,6 +962,11 @@ export type EngineKindDto = "Whisper" | "Parakeet"
 export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * A model file left behind by an earlier release (today: Whisper GGML
+ * weights and the GGML Silero VAD file) that no current model uses.
+ */
+export type LegacyModelFileDto = { name: string; bytes: number }
 /**
  * Routing identity of a live-transcription runtime. `Session` is the
  * long-running recording flow that writes session audio parts; `Dictation`
@@ -988,14 +984,6 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type LiveSourceKind = "session" | "dictation"
 export type LiveTranscriptionConfig = {
 /**
- * Milliseconds of continuous silence before triggering a chunk. Default: 800.
- */
-silence_duration_ms: number;
-/**
- * Force a chunk after this many seconds of continuous speech. Default: 30.
- */
-max_chunk_seconds: number;
-/**
  * Seconds of buffer lookback at session start (backfill). Default: 0.
  */
 backfill_seconds: number;
@@ -1009,18 +997,10 @@ source: CaptureSourceDto;
  */
 mix_config: MixConfigDto | null;
 /**
- * Whisper language.
+ * Requested language, forwarded to the engine. Parakeet auto-detects
+ * and ignores it.
  */
 language: string | null;
-/**
- * Max characters of prior transcript to feed as Whisper prompt context. Default: 350.
- */
-prompt_context_chars: number | null;
-/**
- * Seconds of all-source silence before clearing prompt context to prevent
- * hallucination from stale context. Default: 5.0. Set to 0 to disable.
- */
-prompt_decay_silence_seconds: number | null;
 /**
  * Session ID for streaming session-audio recording. If set, the loop
  * streams a new audio part to disk during the session and emits
@@ -1062,16 +1042,9 @@ audio_export_format: AudioExportFormatDto | null;
 mp3_bitrate: number | null;
 /**
  * Request speaker diarization on every transcribed chunk. Honored only
- * when the active engine is Parakeet *and* the sidecar was spawned with
- * a Sortformer model path. Whisper sessions ignore this flag.
+ * when the sidecar was spawned with a Sortformer model path.
  */
 diarization?: boolean;
-/**
- * Comma-separated vocabulary hints (folder/tag names) prepended to the
- * Whisper initial_prompt to improve recognition of proper nouns. Ignored
- * for Parakeet sessions (the TDT decoder has no text-prompt input).
- */
-vocabulary_hints: string | null;
 /**
  * When set, this run is a resume of an existing Session. The new
  * recording becomes a fresh audio part appended after the existing parts;
@@ -1125,8 +1098,6 @@ export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
  */
 export type LoginBeginResultDto = { saltMismatch: boolean }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
-export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
-export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type ParakeetVariantDto = "TdtV3" |
 /**

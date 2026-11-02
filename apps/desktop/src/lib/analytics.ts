@@ -60,7 +60,6 @@ function scrubProps(props: Props): Props {
 // App lifecycle
 export function trackAppLaunched(props: {
   capture_source: string;
-  model_size: string;
   dictation_enabled: number;
   dictation_slot_count: number;
   theme: string;
@@ -205,21 +204,6 @@ export function trackShortcutUsed(props: { shortcut_id: string }): void {
 }
 
 // Model & Engine
-export function trackModelDownloaded(props: { model_size: string }): void {
-  track("model_downloaded", props);
-}
-
-export function trackModelDeleted(props: { model_size: string }): void {
-  track("model_deleted", props);
-}
-
-export function trackModelSwitched(props: {
-  model_size: string;
-  from_size: string;
-}): void {
-  track("model_switched", props);
-}
-
 export function trackEngineError(props: {
   error: string;
   phase: string;

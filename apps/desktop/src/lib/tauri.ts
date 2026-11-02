@@ -15,8 +15,8 @@ export type TranscriptSegmentDto = {
   end_ms: number;
   text: string;
   confidence: number;
-  /** Populated when the active engine is Parakeet *and* diarization was
-   *  requested for the originating transcribe call. `null` for Whisper. */
+  /** Populated when diarization was requested for the originating
+   *  transcribe call; otherwise `null`. */
   speaker_id: number | null;
 };
 

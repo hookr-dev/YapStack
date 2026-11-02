@@ -11,7 +11,7 @@ import {
   tauriCommandsMock,
 } from "@/test/tauri-mocks";
 import { useAppStore } from "@/stores/appStore";
-import type { EngineDescriptorDto, EngineKindDto } from "@/lib/types";
+import type { EngineDescriptorDto } from "@/lib/types";
 import { TranscriptionTab } from "./TranscriptionTab";
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
@@ -22,39 +22,28 @@ vi.mock("@tauri-apps/api/webviewWindow", () => tauriWebviewWindowMock());
 vi.mock("@tauri-apps/plugin-sql", () => tauriSqlMock());
 vi.mock("@/lib/tauri", () => tauriCommandsMock());
 
-// Mirror of the Rust CATALOGUE capability flags that matter here: Whisper
-// seeds an initial prompt, Parakeet does not.
-const WHISPER: EngineDescriptorDto = {
-  kind: "Whisper",
-  display_name: "Whisper",
-  languages: ["en"],
-  supports_diarization: false,
-  supports_initial_prompt: true,
-};
-
+// Mirror of the Rust CATALOGUE: Parakeet is the only engine (ADR 0005).
 const PARAKEET: EngineDescriptorDto = {
   kind: "Parakeet",
   display_name: "Parakeet",
-  languages: ["en"],
+  languages: ["en", "de", "fr"],
   supports_diarization: true,
-  supports_initial_prompt: false,
 };
 
-function setupEngine(selectedEngine: EngineKindDto) {
+function setup(
+  overrides: Partial<ReturnType<typeof useAppStore.getState>> = {},
+  language = "en",
+) {
   useAppStore.setState({
-    engineCatalogue: [WHISPER, PARAKEET],
-    settings: {
-      ...useAppStore.getState().settings,
-      selectedEngine,
-    },
+    engineCatalogue: [PARAKEET],
+    enginePhase: "ready",
+    engineError: null,
+    legacyModelFiles: [],
+    refreshLegacyModelFiles: vi.fn().mockResolvedValue(undefined),
+    settings: { ...useAppStore.getState().settings, language },
     updateSettings: vi.fn(),
+    ...overrides,
   });
-}
-
-// Advanced settings live inside a Collapsible that is collapsed by default,
-// so its content is not mounted until the trigger is clicked.
-async function openAdvanced() {
-  await userEvent.click(screen.getByText("Advanced"));
 }
 
 beforeEach(() => {
@@ -65,64 +54,89 @@ afterEach(() => {
   cleanup();
 });
 
-describe("TranscriptionTab — Advanced capability gating", () => {
-  it("shows Prompt Context and Prompt Decay when the engine supports an initial prompt (Whisper)", async () => {
-    setupEngine("Whisper");
+describe("TranscriptionTab — Parakeet only", () => {
+  it("shows Parakeet as a static engine line with no engine picker or Whisper sliders", () => {
+    setup();
     render(<TranscriptionTab />);
-    await openAdvanced();
 
-    expect(screen.getByText("Prompt Context")).toBeInTheDocument();
-    expect(screen.getByText("Prompt Decay")).toBeInTheDocument();
+    expect(screen.getByText("Parakeet TDT v3")).toBeInTheDocument();
+    expect(screen.queryByText("Whisper")).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    for (const gone of [
+      "Advanced",
+      "Max Chunk Duration",
+      "Silence Pause",
+      "Prompt Context",
+      "Prompt Decay",
+    ]) {
+      expect(screen.queryByText(gone)).not.toBeInTheDocument();
+    }
   });
 
-  it("hides Prompt Context and Prompt Decay when the engine has no initial prompt (Parakeet)", async () => {
-    setupEngine("Parakeet");
+  it("lists the auto-detected languages read-only", async () => {
+    setup();
     render(<TranscriptionTab />);
-    await openAdvanced();
 
-    expect(screen.queryByText("Prompt Context")).not.toBeInTheDocument();
-    expect(screen.queryByText("Prompt Decay")).not.toBeInTheDocument();
+    await userEvent.click(
+      screen.getByText("Auto-detected: 3 European languages"),
+    );
+    expect(screen.getByText("English, French, German")).toBeInTheDocument();
   });
 
-  it("keeps the engine-agnostic Max Chunk and Silence Pause rows for both engines", async () => {
-    setupEngine("Whisper");
-    render(<TranscriptionTab />);
-    await openAdvanced();
-    expect(screen.getByText("Max Chunk Duration")).toBeInTheDocument();
-    expect(screen.getByText("Silence Pause")).toBeInTheDocument();
-    cleanup();
-
-    setupEngine("Parakeet");
-    render(<TranscriptionTab />);
-    await openAdvanced();
-    expect(screen.getByText("Max Chunk Duration")).toBeInTheDocument();
-    expect(screen.getByText("Silence Pause")).toBeInTheDocument();
-  });
-
-  it("does not clobber persisted prompt settings when the active engine hides them", async () => {
-    setupEngine("Parakeet");
+  it("shows a notice for a persisted language Parakeet doesn't support, without rewriting it", () => {
     const updateSettings = vi.fn();
-    useAppStore.setState({
-      settings: {
-        ...useAppStore.getState().settings,
-        promptContextChars: 350,
-        promptDecaySilenceSeconds: 5,
-      },
-      updateSettings,
-    });
-
+    setup({ updateSettings }, "ja");
     render(<TranscriptionTab />);
-    await openAdvanced();
 
-    // Hiding is UI-only: no write to the prompt settings on render.
-    const touchedPrompt = updateSettings.mock.calls.some(([patch]) => {
-      const p = patch as Record<string, unknown>;
-      return (
-        "promptContextChars" in p || "promptDecaySilenceSeconds" in p
-      );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Japanese isn't supported yet.",
+    );
+    expect(updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("shows no language notice for a supported language", () => {
+    setup({}, "de");
+    render(<TranscriptionTab />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("offers to remove old Whisper models with their total size and removes them on click", async () => {
+    const deleteLegacyModelFiles = vi.fn().mockResolvedValue(undefined);
+    setup({
+      legacyModelFiles: [
+        { name: "ggml-small.bin", bytes: 466_000_000 },
+        { name: "ggml-silero-v6.2.0.bin", bytes: 885_000 },
+      ],
+      deleteLegacyModelFiles,
     });
-    expect(touchedPrompt).toBe(false);
-    expect(useAppStore.getState().settings.promptContextChars).toBe(350);
-    expect(useAppStore.getState().settings.promptDecaySilenceSeconds).toBe(5);
+    render(<TranscriptionTab />);
+
+    expect(screen.getByText(/Remove old Whisper models \(/)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Remove old Whisper models" }),
+    );
+    expect(deleteLegacyModelFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the old-models row when nothing is left on disk", () => {
+    setup();
+    render(<TranscriptionTab />);
+    expect(
+      screen.queryByText(/Remove old Whisper models/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the engine error with a Retry that re-runs setup", async () => {
+    const autoSetup = vi.fn().mockResolvedValue(undefined);
+    setup({
+      enginePhase: "error",
+      engineError: "network unreachable",
+      autoSetup,
+    });
+    render(<TranscriptionTab />);
+
+    expect(screen.getByText("network unreachable")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    expect(autoSetup).toHaveBeenCalledTimes(1);
   });
 });
