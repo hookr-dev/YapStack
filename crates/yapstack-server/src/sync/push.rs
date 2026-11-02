@@ -8,6 +8,9 @@
 //! HOLES when a transaction rolls back — a reader using a snapshot cursor then silently
 //! skips a hole that later fills, losing data. The counter row fixes this:
 //!
+//! 0. Lock the tenant's sync capability floor row `FOR SHARE` and refuse a batch whose
+//!    declared level (`X-YapStack-Batch-Capability`) is above it (ADR 0006 §5.4). Always
+//!    taken BEFORE `tenant_seq`, the one lock order shared with the floor raise.
 //! 1. Bootstrap the tenant's `tenant_seq` row (idempotent).
 //! 2. `SELECT next_seq ... FOR UPDATE` — this ROW LOCK is the per-tenant push
 //!    serialization point; it is held until COMMIT, so concurrent pushers for the same
@@ -25,22 +28,27 @@
 use std::collections::HashMap;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use uuid::Uuid;
-use yapstack_common::sync::{PushAck, PushRequest, PushResponse, MAX_PUSH_BYTES, MAX_PUSH_CHANGES};
+use yapstack_common::sync::{
+    PushAck, PushRequest, PushResponse, BATCH_CAPABILITY_HEADER, MAX_PUSH_BYTES, MAX_PUSH_CHANGES,
+};
 
 use crate::choke;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::{AuthTenant, ClientIp};
 use crate::state::AppState;
+use crate::sync::capability;
 
 pub async fn push(
     State(st): State<AppState>,
     auth: AuthTenant,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Json(req): Json<PushRequest>,
 ) -> Result<Json<PushResponse>, AppError> {
     // Guardrail: per-(tenant, ip) rate limit (SYNC_SPEC §9.4).
@@ -57,6 +65,7 @@ pub async fn push(
     if req.changes.is_empty() {
         return Ok(Json(PushResponse::default()));
     }
+    let batch_level = capability::header_level(&headers, BATCH_CAPABILITY_HEADER)?;
 
     // Decode ciphertext up front (opaque bytea; never inspected). Enforce the byte cap.
     let mut decoded: Vec<Vec<u8>> = Vec::with_capacity(req.changes.len());
@@ -85,6 +94,14 @@ pub async fn push(
     crate::devices::require_active_caller(&mut tx, auth.tenant_id, auth.client_id).await?;
     // NOTE (SYNC_SPEC §15.L, follow-on): per-change `client_id` is NOT yet bound to the
     // caller — an active device can push changes attributed to another in-tenant device.
+
+    // (0) The capability floor, FOR SHARE, before tenant_seq. The client's persisted copy of
+    // the floor never authorizes a push: a restored relay can sit below it.
+    let levels =
+        capability::lock_floor(&mut tx, auth.tenant_id, capability::FloorLock::Share).await?;
+    if batch_level > levels.required_sync_capability {
+        return Err(AppError::CapabilityFloor(levels));
+    }
 
     // (1) Bootstrap + (2) acquire the per-tenant push lock (held until commit).
     sqlx::query("INSERT INTO tenant_seq (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")

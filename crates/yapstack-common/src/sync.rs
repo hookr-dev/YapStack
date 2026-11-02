@@ -82,6 +82,70 @@ pub struct PullResponse {
     pub changes: Vec<PulledChange>,
     pub next_seq: i64,
     pub has_more: bool,
+    /// The workspace floor at the time of this read (ADR 0006 §5.7). `0` from a relay
+    /// that predates the capability gate.
+    #[serde(default)]
+    pub required_sync_capability: i32,
+    /// The highest level a refused raise has asked for. A device below it is nudged to
+    /// update ("Another device needs you to update YapStack").
+    #[serde(default)]
+    pub requested_sync_capability: i32,
+}
+
+// ------------------------------------------------------- sync capability (ADR 0006 §5)
+
+/// Request header carrying the client's sync capability level on every pull and on the
+/// snapshot routes. An absent header is level 0 (an older build).
+pub const SYNC_CAPABILITY_HEADER: &str = "x-yapstack-sync-capability";
+/// Request header on `POST /sync/push`: the highest capability level among the batch's
+/// entries. An absent header is level 0. The relay refuses a batch above its floor.
+pub const BATCH_CAPABILITY_HEADER: &str = "x-yapstack-batch-capability";
+/// A device whose last pull is older than this doesn't block a floor raise.
+pub const CAPABILITY_WINDOW_DAYS: i32 = 30;
+
+/// The workspace's two capability levels (both only ever rise).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SyncCapabilityLevels {
+    pub required_sync_capability: i32,
+    pub requested_sync_capability: i32,
+}
+
+/// `PUT /sync/capability` body: raise the workspace floor to at least this level.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaiseSyncCapabilityRequest {
+    pub required_sync_capability: i32,
+}
+
+/// One device that keeps a raise from succeeding: seen within the window, not revoked,
+/// and reporting a lower level. Enough for the user to recognise (and revoke) it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityBlocker {
+    pub client_id: Uuid,
+    pub label: String,
+    pub platform: String,
+    pub sync_capability: i32,
+    /// RFC 3339 time of the device's last recorded pull.
+    pub capability_seen_at: String,
+}
+
+/// Body of the 409 `sync_capability_blocked` refusal of `PUT /sync/capability`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCapabilityBlocked {
+    pub code: String,
+    pub message: String,
+    pub required_sync_capability: i32,
+    pub requested_sync_capability: i32,
+    pub blockers: Vec<CapabilityBlocker>,
+}
+
+/// Body of a capability refusal: 426 `update_required` (pull/snapshot below the floor)
+/// or 409 `sync_capability_floor` (a push batch above the floor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCapabilityRefusal {
+    pub code: String,
+    pub message: String,
+    pub required_sync_capability: i32,
+    pub requested_sync_capability: i32,
 }
 
 // -------------------------------------------------------- completeness (§7b, A3)

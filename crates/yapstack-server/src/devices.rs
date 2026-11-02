@@ -47,6 +47,8 @@ struct DeviceRow {
     platform: String,
     status: String,
     added_at: chrono::DateTime<chrono::Utc>,
+    sync_capability: i32,
+    capability_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `GET /devices` — the account's device index (pending + active) for the approving
@@ -58,7 +60,8 @@ pub async fn list(
 ) -> Result<Json<DevicesResponse>, AppError> {
     let mut tx = db::begin_tenant_tx(&st.pool, auth.tenant_id).await?;
     let rows: Vec<DeviceRow> = sqlx::query_as(
-        "SELECT client_id, ed25519_pub, label, platform, status, added_at \
+        "SELECT client_id, ed25519_pub, label, platform, status, added_at, \
+                sync_capability, capability_seen_at \
          FROM devices WHERE workspace_id = $1 ORDER BY added_at",
     )
     .bind(auth.tenant_id)
@@ -75,6 +78,8 @@ pub async fn list(
             platform: r.platform,
             status: r.status,
             added_at: r.added_at.to_rfc3339(),
+            sync_capability: r.sync_capability,
+            capability_seen_at: r.capability_seen_at.map(|t| t.to_rfc3339()),
         })
         .collect();
     Ok(Json(DevicesResponse { devices }))

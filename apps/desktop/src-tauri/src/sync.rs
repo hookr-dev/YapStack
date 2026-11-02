@@ -7158,6 +7158,8 @@ mod tests {
             platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         };
 
         let entries = build_roster_membership(&verified_prev, &[], &target).unwrap();
@@ -7179,6 +7181,8 @@ mod tests {
                 platform: String::new(),
                 status: "active".into(),
                 added_at: "2026-01-01T00:00:00Z".into(),
+                sync_capability: 0,
+                capability_seen_at: None,
             },
         )
         .unwrap();
@@ -7223,6 +7227,8 @@ mod tests {
             platform: String::new(),
             status: "pending".into(),
             added_at: "2026-02-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         };
         // Relay reports self with a SUBSTITUTED key.
         let get_devices = vec![DeviceInfo {
@@ -7232,6 +7238,8 @@ mod tests {
             platform: String::new(),
             status: "active".into(),
             added_at: "2026-01-01T00:00:00Z".into(),
+            sync_capability: 0,
+            capability_seen_at: None,
         }];
         let err = build_roster_membership(&verified_prev, &get_devices, &target).unwrap_err();
         assert!(err.contains("different ed25519_pub"), "got: {err}");
