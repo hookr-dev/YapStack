@@ -9,7 +9,7 @@ Canonical instruction file for AI coding agents working on YapStack. Read by **a
 If you have one question, the answer is probably here. If not, follow the doc router below.
 
 - **Goal**: real-time on-device audio capture + transcription on macOS and Windows.
-- **Engines**: Whisper (Metal, broad language) and Parakeet TDT v3 (NVIDIA, faster on Apple Silicon via WebGPU + int8). Pick at runtime.
+- **Engine**: Parakeet TDT v3 (NVIDIA, 25 European languages, WebGPU on macOS and Windows with CPU fallback). Whisper was removed per ADR 0005.
 - **Stack**: Tauri v2 (Rust backend) + React 19/TypeScript frontend, SQLite via a repo-owned rusqlite command backend, sidecar binary for inference IPC over JSON-line stdin/stdout.
 - **Verification**: `pnpm check` is the local gate. Run it before declaring work done. CI also runs Rust checks on Windows, which a Mac can't reproduce; see [Keeping CI green](#keeping-ci-green).
 - **License**: AGPL-3.0. New code stays open under the same license.
@@ -53,11 +53,10 @@ pnpm lint                                  # cargo fmt + clippy + ESLint
 pnpm typecheck                             # tsc
 
 # Feature-flag transcription sidecar builds
-cargo build -p yapstack-transcription-sidecar --features whisper                                # whisper-rs (needs cmake)
 cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
 cargo build -p yapstack-transcription-sidecar --features parakeet,coreml                        # + ORT-CoreML EP
 cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP
-cargo build -p yapstack-transcription-sidecar --features whisper,parakeet,metal,coreml,webgpu   # full Apple
+cargo build -p yapstack-transcription-sidecar --features parakeet,coreml,webgpu                 # full Apple
 
 # Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
 ./scripts/build-sidecars.sh
@@ -94,7 +93,7 @@ Agent should respect these without being asked.
 - **Database schema migrations** (`apps/desktop/src-tauri/src/db.rs` versioned migrations, frontend `getDb()` runtime patches). Schema bumps require an [ADR](docs/adr/) and a migration plan.
 - **Sidecar IPC protocol changes** (`crates/yapstack-common/src/types.rs` `SidecarRequest`/`SidecarResponse`). Forward/backward compatibility matters across mismatched sidecar/host versions.
 - **Tauri command surface changes** (add/remove/rename in `apps/desktop/src-tauri/src/commands/`). These regenerate TS bindings via specta.
-- **Dependency upgrades** beyond patch level. Especially `tauri`, `whisper-rs`, `parakeet-rs`, `ort`, `react`.
+- **Dependency upgrades** beyond patch level. Especially `tauri`, `parakeet-rs`, `ort`, `react`.
 - **Branch-protection or repo-settings changes** via `gh api`.
 - **Force-push** or any operation that rewrites published history.
 - **Public-facing copy** in README, CHANGELOG release entries, in-app onboarding.
@@ -168,7 +167,7 @@ Run through this before declaring a task done.
 
 - **macOS Apple Silicon** is the primary target. Code must work there.
 - **Intel Mac** is best-effort: don't break it, don't optimize for it.
-- **Windows (x64)** is supported: CI runs clippy and tests on Windows, and releases ship a Windows installer. Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Whisper stays CPU on Windows. Don't delete platform-specific branches without an ADR.
+- **Windows (x64)** is supported: CI runs clippy and tests on Windows, and releases ship a Windows installer. Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Don't delete platform-specific branches without an ADR.
 - **Linux** is not a target yet (the relay server is the exception: it is deployed on Linux).
 - **Tauri secret signing**: the `tauri.conf.json` `pubkey` is the **public** half of an Ed25519 minisign keypair. The private key lives in GitHub Actions Secrets. Do not regenerate without user direction — rotation invalidates auto-update for every existing install.
 

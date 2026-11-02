@@ -5,11 +5,9 @@
 - Rust, pinned in `rust-toolchain.toml` (rustup installs the pinned version automatically). The `sync` feature also needs `nightly-2023-10-05` for the vendored cr-sqlite bundle: `rustup toolchain install nightly-2023-10-05`.
 - Node.js 24 (CI uses 24; the frontend tests need `node:sqlite`)
 - pnpm
-- cmake (only needed for `--features whisper`)
 
 ### macOS-specific
 - Xcode Command Line Tools (provides clang/clang++)
-- `brew install cmake` (for whisper feature)
 
 ## Setup
 
@@ -69,31 +67,27 @@ pnpm check
 
 ### yapstack-transcription-sidecar
 ```bash
-# Single engines
-cargo build -p yapstack-transcription-sidecar --features whisper                # Whisper only (requires cmake)
-cargo build -p yapstack-transcription-sidecar --features parakeet               # Parakeet only (no cmake needed; pulls ort + parakeet-rs)
+# Engine
+cargo build -p yapstack-transcription-sidecar --features parakeet               # Parakeet (pulls ort + parakeet-rs)
 
 # Add accelerators
-cargo build -p yapstack-transcription-sidecar --features whisper,metal          # Whisper + Metal
 cargo build -p yapstack-transcription-sidecar --features parakeet,coreml        # Parakeet + ORT-CoreML EP (Apple)
-cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on Windows)
 
 # Standard apple build (what scripts/build-transcription-sidecar.sh produces on macOS)
-cargo build -p yapstack-transcription-sidecar --features whisper,parakeet,metal,coreml,webgpu
+cargo build -p yapstack-transcription-sidecar --features parakeet,coreml,webgpu
 
 # Default features
-cargo build -p yapstack-transcription-sidecar                                   # = whisper + parakeet
+cargo build -p yapstack-transcription-sidecar                                   # = parakeet
 ```
 
 | Feature | Purpose |
 |---------|---------|
-| `whisper` | Whisper transcription via whisper-rs. Requires cmake. Without it, the sidecar still compiles but every `--engine whisper` request returns "engine 'whisper' not compiled in this build". |
-| `metal` | Metal GPU acceleration for whisper-rs (Apple). |
 | `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
 | `coreml` | Adds the ORT-CoreML execution provider for Parakeet on Apple. Strict superset of `parakeet`. The Parakeet backend's "Auto" policy will skip CoreML at load time if the model dir contains external `.onnx.data` files (known ORT bug); set `YAPSTACK_PARAKEET_ACCEL=coreml` to force-attempt. |
-| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows). Compiled into both the macOS and Windows sidecars, and selected by `Auto` on both since Gate C passed (ADR 0004); EP-init failure falls back to CPU with an honest `accel` label. Whisper stays CPU on Windows. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. |
+| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows). Compiled into both the macOS and Windows sidecars, and selected by `Auto` on both since Gate C passed (ADR 0004); EP-init failure falls back to CPU with an honest `accel` label. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. |
 
-If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`. The dispatcher in `main.rs` is engine-agnostic and unconditional.
+Parakeet is the only engine (ADR 0005). A `--no-default-features` build has no engine compiled in, and every IPC request returns `no transcription engine compiled in`. The sidecar defaults to `--engine parakeet`; an unknown `--engine` value is a startup error (exit code 2). The dispatcher in `main.rs` is engine-agnostic.
 
 ### Runtime env vars (sidecar)
 
@@ -114,7 +108,7 @@ The sidecar is a standalone binary that must be built separately and placed in `
 ./scripts/build-transcription-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-This builds with `--release --features whisper` and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
+This builds with `--release` and the per-target features (`parakeet,coreml,webgpu` on Apple, `parakeet,webgpu` on Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
 
 The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 
@@ -305,10 +299,11 @@ Without `S3_ENDPOINT`, the two object-store tests (`gc_deletes_object_and_row_li
 
 ## Models Directory
 
-Whisper models are stored in the app's data directory under `models/`:
+Models are stored in the app's data directory under `models/`:
 - macOS: `~/Library/Application Support/dev.yapstack.app/models/`
-- Whisper models: `ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin` — downloaded from `huggingface.co/ggerganov/whisper.cpp`
-- VAD model: `ggml-silero-v6.2.0.bin` (~885KB) — auto-downloaded on the first `init_transcription_client` call (Whisper engine path) from `huggingface.co/ggml-org/whisper-vad`. Used by whisper.cpp for voice activity detection preprocessing.
+- Parakeet: one subdirectory per variant (`parakeet-tdt-v3/`, `parakeet-tdt-v3-int8/`) holding the ONNX bundle.
+- Sortformer: a single ONNX file, downloaded on first diarization use.
+- Legacy files: earlier releases left Whisper GGML weights (`ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin`) and the GGML Silero VAD file (`ggml-silero-v6.2.0.bin`) here. Nothing uses them now and they are never deleted automatically; `list_legacy_model_files` / `delete_legacy_model_files` let the user remove them.
 
 ## Temp File Cleanup
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a sidecar process that supports two engines as first-class peers: **Whisper** (whisper-rs, 99 languages) and **NVIDIA Parakeet TDT v3** (parakeet-rs + ONNX Runtime, 25 European languages, optional Sortformer speaker diarization). The user picks the engine in Settings; the sidecar is spawned with `--engine whisper|parakeet` and dispatches IPC requests through a `TranscriptionBackend` trait so adding a third engine is one feature flag plus one impl. Sessions and segments are persisted to SQLite through a repo-owned command layer (`db_service`, single writer + reader pool); when the optional `sync` feature is enabled the same database is CRDT-tracked (cr-sqlite) and synchronized end-to-end-encrypted through a self-hosted blind relay — see `CRYPTO_SPEC.md` for the cryptographic design and `self-hosting.md` for running the relay.
+YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a sidecar process running **NVIDIA Parakeet TDT v3** (parakeet-rs + ONNX Runtime, 25 European languages, optional Sortformer speaker diarization). Parakeet is the only engine (Whisper was removed per ADR 0005). The sidecar is spawned with `--engine parakeet` and dispatches IPC requests through a `TranscriptionBackend` trait, so adding another engine is one feature flag plus one impl. Sessions and segments are persisted to SQLite through a repo-owned command layer (`db_service`, single writer + reader pool); when the optional `sync` feature is enabled the same database is CRDT-tracked (cr-sqlite) and synchronized end-to-end-encrypted through a self-hosted blind relay — see `CRYPTO_SPEC.md` for the cryptographic design and `self-hosting.md` for running the relay.
 
 ## Workspace Layout
 
@@ -13,7 +13,7 @@ yapstack/
 │   ├── yapstack-common/           # Shared types, config, IPC protocol
 │   ├── yapstack-audio/            # Audio capture, ring buffers, mixing, WAV export
 │   ├── yapstack-transcription/    # Model management, sidecar client
-│   ├── yapstack-transcription-sidecar/  # Standalone Whisper/Parakeet inference binary
+│   ├── yapstack-transcription-sidecar/  # Standalone Parakeet inference binary
 │   ├── yapstack-crypto/           # E2E primitives: AEAD envelopes, KDFs, roster signing, KATs
 │   ├── yapstack-sync/             # Sync engine: CRDT capture/merge, outbox, audio blobs, transport
 │   ├── yapstack-server/           # Self-hostable blind relay (axum + Postgres + MinIO)
@@ -60,7 +60,8 @@ Shared types used across all crates. No business logic.
 - `audio.rs` — `deinterleave_to_mono()`, `resample()` (rubato sinc, no-op when from_rate == to_rate). Used by `yapstack-audio` internally, `live_transcription.rs` directly, and the Parakeet/Sortformer backends in `yapstack-transcription-sidecar`.
 - `config.rs` — `AppConfig`, `AudioConfig` (only `capture_history_seconds`), `TranscriptionConfig` with serde
 - `types.rs` — Domain types (`CaptureState`, `CaptureSource`, `PermissionStatus`, `EngineKind`, etc.). `TranscriptSegment` carries an optional `speaker_id` for Parakeet+Sortformer output. IPC protocol (`SidecarRequest`, `SidecarResponse`) is engine-agnostic; `Transcribe` carries an optional `diarization: bool`.
-- `engines.rs` — Static `engine_catalogue()` exposing `EngineDescriptor { kind, display_name, languages, supports_diarization, supports_initial_prompt }` per engine. Single source of truth for engine capabilities + supported languages, consumed by both backend validation and the frontend cascading dropdowns (via the `get_engine_catalogue` Tauri command).
+- `engines.rs` — Static `engine_catalogue()` exposing `EngineDescriptor { kind, display_name, languages, supports_diarization }` per engine (one entry today: Parakeet). Single source of truth for engine capabilities + supported languages, consumed by both backend validation and the frontend (via the `get_engine_catalogue` Tauri command).
+- `hallucination.rs` — Two-tier filler/outro pattern tables: `is_always_reject(text)` (canned outros, dropped at any confidence) and `is_marginal_reject(text)` (short fillers, dropped only at low confidence by the caller).
 
 ### yapstack-audio
 All audio capture and processing. Core of the application.
@@ -75,28 +76,22 @@ All audio capture and processing. Core of the application.
 - `error.rs` — `AudioError` enum with `From` impls for cpal and hound errors
 
 ### yapstack-transcription
-Model management and sidecar client. No whisper-rs / parakeet-rs dependencies — those live entirely in the sidecar.
-- `model.rs` — `ModelManager` manages three model families with HuggingFace download + streaming SHA-256 verification:
-  - **Whisper** (single ggml file): `ModelSize { Tiny, Base, Small, Medium }`, `download`, `verify_checksum`, `delete`, `list_all`.
-  - **Whisper VAD** (Silero, ~885KB, auto-downloaded): `vad_model_path`, `download_vad_model`, `ensure_vad_model`.
+Model management and sidecar client. No parakeet-rs / ort dependencies — those live entirely in the sidecar.
+- `model.rs` — `ModelManager` manages two model families with HuggingFace download + streaming SHA-256 verification, plus legacy-file cleanup:
   - **Parakeet** (multi-file ONNX bundle in `models_dir/parakeet-<variant>/`): `ParakeetVariant::TdtV3`, `parakeet_model_dir`, `parakeet_is_available` (checks all required files), `download_parakeet` (loops over the variant's `files()` list with per-file SHA verify), `delete_parakeet`, `ensure_parakeet`.
   - **Sortformer** (single ONNX file, ~50MB): `SortformerVariant::V2_1`, `sortformer_model_path`, `download_sortformer`, `ensure_sortformer`.
-- `client.rs` — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `vad_model_path?` (Whisper-only), `sortformer_model_path?` (Parakeet-only), and `coreml_cache_dir?` (Parakeet-only). `transcribe_with(audio, language, prompt, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`.
+  - **Legacy files** (Whisper GGML weights `ggml-{tiny,base,small,medium}.bin` and the GGML Silero VAD `ggml-silero-v6.2.0.bin` left by earlier releases): `list_legacy_model_files` returns `LegacyModelFile { name, bytes }` for those present; `delete_legacy_model_files(&[String])` refuses any name outside that fixed list. Never deleted without the user.
+- `client.rs` — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `sortformer_model_path?`, and `coreml_cache_dir?`. `transcribe_with(audio, language, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`.
 - `error.rs` — `TranscriptionError` with variants for download, sidecar, timeout, IO, HTTP
 
 ### yapstack-transcription-sidecar
 Standalone binary. Reads JSON-line requests from stdin, writes responses to stdout. Logging goes to stderr.
 
-**CLI**: `yapstack-transcription-sidecar [--engine whisper|parakeet] [--model PATH] [--vad-model PATH] [--sortformer-model PATH] [--coreml-cache-dir PATH]`
+**CLI**: `yapstack-transcription-sidecar [--engine parakeet] [--model PATH] [--sortformer-model PATH] [--coreml-cache-dir PATH]`. `--engine` defaults to `parakeet`; any other value is a startup error (exit code 2).
 
-**Architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. Concrete impls in `engines/whisper.rs` (whisper-rs + flash attention + Silero VAD) and `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait. When the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`.
+**Architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection). `main.rs` is a thin IPC dispatcher that builds the backend at startup and forwards every request through the trait. A `--no-default-features` build has no engine, and every IPC request returns `no transcription engine compiled in`.
 
-**Whisper backend (`engines/whisper.rs`)**: Loads whisper-rs model with flash attention, converts audio to 16kHz mono (stereo→mono averaging + sinc interpolation resampling via rubato), transcribes WAV files with optional `initial_prompt` for context continuity, filters hallucination segments via `should_include_segment()`.
-- Whisper params: `greedy(best_of=1)`, `no_context(true)`, `logprob_thold(-1.0)`, `max_tokens(100/200)`, `suppress_blank(true)`, `suppress_nst(true)`, `temperature_inc(0.2)`, `no_speech_thold(0.45)`, `single_segment(adaptive)`
-- **Silero VAD**: Optional `--vad-model` arg enables voice activity detection as whisper.cpp preprocessing (threshold 0.5, min_speech 250ms, min_silence 100ms, pad 30ms). Skips non-speech audio before decoding, reducing hallucinations.
-- Hallucination filtering: drops empty text, special tokens (`[BLANK_AUDIO]`, `[MUSIC]`), low-confidence segments (< 0.4), excessive word/phrase repetition (3+ consecutive identical words with punctuation-normalized detection via `normalize_for_repetition()`), and 47 known filler/hallucination patterns ("thank you", "thanks for watching", "yeah", "um", "so", etc.) at marginal confidence (< 0.6).
-
-**Parakeet backend (`engines/parakeet.rs`)**: Loads `ParakeetTDT::from_pretrained(model_dir, exec_config)` from a directory containing `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`. Resamples audio to 16 kHz mono via `yapstack_common::audio::resample` before calling `transcribe_samples` (parakeet-rs 0.3.5 rejects other rates despite its docs). Token-level timestamps grouped into segments at 0.5 s silence gaps + 12 s soft cap. Same `should_include_segment` post-filter as Whisper (mostly a no-op for Parakeet which doesn't hallucinate the same patterns).
+**Parakeet backend (`engines/parakeet.rs`)**: Loads `ParakeetTDT::from_pretrained(model_dir, exec_config)` from a directory containing `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`. Resamples audio to 16 kHz mono via `yapstack_common::audio::resample` before calling `transcribe_samples` (parakeet-rs 0.3.5 rejects other rates despite its docs). Token-level timestamps grouped into segments at 0.5 s silence gaps + 12 s soft cap. Segments pass through `should_include_segment(text, confidence)`: drops empty / bracketed-token text, low-confidence repetition loops (< 0.7), anything below 0.4, `is_always_reject` matches, and `is_marginal_reject` matches below 0.6.
 - **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` env var. `auto` uses CoreML when compiled in *and* the model dir contains no external `.onnx.data` files (TDT v3 *does* — so Auto falls through to CPU on this model). Per-load CPU fallback at the backend level catches CoreML/WebGPU load failures and degrades silently — the sidecar never returns "no model loaded".
 - **Sortformer post-pass** (when `Transcribe.diarization=true` and the sidecar was spawned with `--sortformer-model`): runs Sortformer on the same resampled 16 kHz audio, returns `Vec<SpeakerSegment>` with sample-range + `speaker_id`. `assign_speakers()` maps speaker ranges onto produced transcript segments by maximum-overlap (samples → ms → segment range overlap) and populates `TranscriptSegment.speaker_id`. Sortformer model is loaded lazily on first diarization request to avoid the cost when diarization is off.
 
@@ -106,7 +101,7 @@ Tauri commands layer. Thin wrappers that convert between domain types and DTOs (
 - `commands/audio.rs` — Device listing, capture start/stop, capture status, buffer info, `peek_capture_energy` (RMS readout used by the recording beacon). `MixConfigDto::sanitized()` validates gain values at the command boundary.
 - `commands/capture.rs` — Audio cleanup commands only (`delete_audio_files` for per-part cleanup, `delete_session_wav` for legacy session-glob cleanup). Session lifecycle and audio finalization are owned by `commands/live_transcription.rs`.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
-- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Clones an `Arc<TranscriptionScheduler>` from app-level state at session start; the scheduler outlives every session. Each runtime carries a `LiveSourceKind` (`Session` or `Dictation`) that's threaded onto every emitted event so the frontend routes by source kind, not by string-matching session ids. Two-slot runtime state (`session`, `dictation`) with `Idle | Starting | Running | Stopping` lifecycle so the same kind can't double-start during finalization. Streams session WAV incrementally via `SessionWavWriter`.
+- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Clones an `Arc<TranscriptionScheduler>` from app-level state at session start; the scheduler outlives every session. Each runtime carries a `LiveSourceKind` (`Session` or `Dictation`) that's threaded onto every emitted event so the frontend routes by source kind, not by string-matching session ids. Two-slot runtime state (`session`, `dictation`) with `Idle | Starting | Running | Stopping` lifecycle so the same kind can't double-start during finalization. Streams session WAV incrementally via `SessionWavWriter`.
 - `commands/transcription_scheduler.rs` — Long-lived single-worker priority queue in front of the sidecar lane (`FinalFlush > Dictation > Live (mic/system round-robin) > Backfill`, backfill gated while *any* producer bit in `{LiveMic, LiveSystem, Dictation}` is set). Constructed once at engine init and shared by every live runtime. Sole caller of `TranscriptionClient::transcribe_with`, which makes sidecar respawn race-free. `submit()` returns `Result<Receiver, SchedulerError>` and rejects with `Shutdown` once terminal so racing `Arc<Scheduler>` clones can't enqueue into a dead worker. See "Transcription Scheduler" below.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
 - `commands/system_volume.rs` — `apply_volume_duck`, `restore_volume`. Generic system-output volume control wrapping the `system_volume` mechanism module. Policy of *when* to duck lives in callers (currently dictation only); the commands themselves know nothing about dictation.
@@ -159,24 +154,17 @@ its own session id.
 
 ### Transcription
 ```
-Frontend: init_transcription_client(engine, whisper_model?, parakeet_variant?, enable_diarization)
+Frontend: init_transcription_client(engine, parakeet_variant?, enable_diarization)
     → Validates the engine's selected model is on disk; returns NotFound if not
     → For Parakeet+diarization, also ensure_sortformer() (auto-downloads ~50MB Sortformer ONNX)
-    → For Whisper, ensure_vad_model() (auto-downloads ~885KB Silero ONNX)
-    → Resolves CoreML cache dir under $APP_DATA_DIR/cache/coreml/ (Parakeet only)
-    → spawns yapstack-transcription-sidecar with: --engine, --model, [--vad-model | --sortformer-model + --coreml-cache-dir]
+    → Resolves CoreML cache dir under $APP_DATA_DIR/cache/coreml/
+    → spawns yapstack-transcription-sidecar with: --engine, --model, [--sortformer-model] [--coreml-cache-dir]
     → JSON-line IPC over stdin/stdout
 
 Live transcription loop (one chunk):
-    → TranscriptionClient.transcribe_with(audio_path, language, prompt, diarization)
+    → TranscriptionClient.transcribe_with(audio_path, language, diarization)
     → sends {"type":"transcribe", ..., diarization} to sidecar stdin
     → sidecar dispatches via TranscriptionBackend trait:
-
-      Whisper backend:
-        → loads WAV (any sample rate / channel count)
-        → converts to mono (averaging channels) + resamples to 16kHz (sinc via rubato) if needed
-        → runs whisper inference with optional initial_prompt
-        → segments[*].speaker_id = None
 
       Parakeet backend:
         → loads WAV at native rate
@@ -185,7 +173,6 @@ Live transcription loop (one chunk):
         → groups word-level tokens into segments at silence gaps
         → if diarization=true: also runs Sortformer on the same audio,
           assigns speaker_id by max-overlap onto produced segments
-        → drops opts.initial_prompt silently (TDT decoder has no prompt input)
 
     → returns {"type":"transcription", text, segments[* speaker_id], duration_ms}
     → TranscriptionResult { text, segments, duration_ms }
@@ -225,8 +212,8 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
         6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
            chunk 1, etc.), and *await each chunk's scheduler response*
-           before submitting the next. Per-chunk prompt context and
-           in-order segment emission both depend on this serial wait, so
+           before submitting the next. In-order segment emission
+           depends on this serial wait, so
            the submitter is what's actually doing the draining. The
            scheduler still admits Backfill jobs only when it has no
            FinalFlush/Live work queued and the live loop reports idle.
@@ -242,9 +229,9 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            the last-resort escape hatch for a wedged submitter.
 
     Track 2 — Live VAD loop (runs concurrently; per-call diarization gated on
-              ctx.config.diarization, initial_prompt gated on
-              ctx.engine_profile.uses_initial_prompt):
-        1. Poll every tuning.poll_interval (Whisper 300ms; Parakeet 100ms)
+              ctx.config.diarization; fixed Parakeet profile: 500 ms silence,
+              10 s max chunk, 100 ms poll, 250 ms pre-roll):
+        1. Poll every tuning.poll_interval (100 ms)
         2. Single lock: per-source extract_source_audio() for Silero +
            extract_since() for WAV flush. Raw mono samples, not RMS.
         3. Outside the lock:
@@ -299,10 +286,7 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            calls `scheduler.shutdown_client()` to drain the worker and
            tear down the inner TranscriptionClient.
     → Per-source VAD: SourceVadState tracks mic/system independently
-    → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
-    → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
-      all-source silence. Prevents stale context from causing hallucination after long pauses.
-      Backfill seeding is one-shot (prompt_seeded_from_backfill guard prevents re-seeding after decay).
+    → Per-source accumulated_text (capped at 1000 chars) feeds LiveSegmentEvent.accumulated_text; no text prompt is sent to the engine
     → Stopped via oneshot channel from stop_live_transcription()
 ```
 
@@ -380,7 +364,7 @@ affected. The `JobOrigin::Dictation` priority tier puts dictation chunks
 ahead of session live chunks in the scheduler queue.
 
 **Job submission API.** `scheduler.submit(JobRequest { origin, source,
-wav_path, language, initial_prompt, diarization })` returns a
+wav_path, language, diarization })` returns a
 `oneshot::Receiver<JobOutcome>`. `JobOutcome` carries the
 `TranscriptionResult` (or a `SchedulerError`) and the worker's `wall_ms`
 for pressure telemetry.
@@ -424,7 +408,7 @@ Two coordinated paths recover from a Stream that's gone bad: a *symptom-based* i
 ### Backend (Rust)
 Five `Arc<Mutex<T>>` (or `Arc<T>`) states managed by Tauri:
 - `AudioManagerState` — audio capture lifecycle, ring buffers, sessions
-- `ModelManagerState` — model download/delete/list (Whisper + Parakeet + Sortformer)
+- `ModelManagerState` — model download/delete (Parakeet + Sortformer) and legacy model file list/delete
 - `TranscriptionSchedulerState` — `Arc<Mutex<Option<InitializedEngine>>>`, the single source of truth for engine initialization. The scheduler owns the `Arc<TranscriptionClient>` for its full lifetime as the sole `transcribe_with` caller; both the session and dictation runtimes clone `Arc<TranscriptionScheduler>` from here. `init_transcription_client` is idempotent on a matching engine config; engine swap is an explicit two-step (`shutdown_transcription_client` first, then re-init).
 - `LiveTranscriptionState` — `Arc<Mutex<LiveTranscriptionSlots>>` with `session` and `dictation` slots, each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. Same-kind double-start is rejected even during finalization.
 - `DictationOwnsMicState` — `Arc<DictationOwnsMic>` (mutex-protected window list). Records the open dictation window's start position and a list of closed `[start, end)` windows. Drives session mic suspension, WAV muting, and dictation-runtime cursor initialization.
@@ -959,8 +943,8 @@ The `AudioRingBuffer` is the performance-critical component:
 JSON-line protocol over stdin/stdout. Each message is a single JSON object followed by `\n`.
 
 **Requests** (tagged union via `#[serde(tag = "type")]`):
-- `{"type":"transcribe", "id": 1, "audio_path": "/path/to/file.wav", "language": "en", "initial_prompt": "prior context..."}`
-- `{"type":"load_model", "id": 2, "model_path": "/path/to/ggml-small.bin"}`
+- `{"type":"transcribe", "id": 1, "audio_path": "/path/to/file.wav", "language": "en", "diarization": false}`
+- `{"type":"load_model", "id": 2, "model_path": "/path/to/models/parakeet-tdt-v3-int8"}`
 - `{"type":"shutdown"}`
 
 **Responses**:
@@ -975,7 +959,7 @@ JSON-line protocol over stdin/stdout. Each message is a single JSON object follo
 |---------|-------|---------------------|-------|
 | Microphone capture | cpal (CoreAudio) | cpal (WASAPI) | cpal (ALSA) |
 | System audio capture | cpal loopback (always available) | cpal loopback (WASAPI) | Unavailable |
-| Whisper transcription | whisper.cpp (Metal) | whisper.cpp | whisper.cpp |
+| Parakeet transcription | parakeet-rs + ORT (CoreML / WebGPU / CPU) | parakeet-rs + ORT (WebGPU / CPU) | parakeet-rs + ORT (CPU) |
 | Entitlements | audio-input, screen-capture | N/A | N/A |
 
 ### Windows WASAPI notes
@@ -1018,11 +1002,11 @@ comments now cite `SYNC_SPEC` / `CRYPTO_SPEC` sections directly.
 
 ## Key Design Decisions
 
-1. **Sidecar process for Whisper** — Isolates heavy native dependency (whisper.cpp/cmake) from the main app binary. Crash isolation. Can be updated independently.
+1. **Sidecar process for inference** — Isolates the heavy native ML runtime (parakeet-rs + ONNX Runtime) from the main app binary. Crash isolation. Can be updated independently.
 2. **Lock-free ring buffer** — Audio callbacks cannot block. SPSC with atomics avoids mutex contention.
 3. **DTO layer in Tauri commands** — Domain types don't derive `specta::Type`. DTOs add the TypeScript generation derive and convert via `From` impls.
-4. **Feature flags for optional native deps** — `whisper` and `metal` on yapstack-transcription-sidecar keep the default build lightweight. System audio is always compiled in via cpal loopback (no feature flag).
-5. **16-bit PCM WAV export** — WAV files are written at the configured capture source's output rate (mic for `MicOnly`, system for `SystemOnly`, mic-rate mixed output for `Mixed` when mic is present). The sidecar resamples to 16kHz mono before Whisper inference. 16-bit quantization is sufficient (-96 dB noise floor).
+4. **Feature flags for optional native deps** — `coreml` and `webgpu` on yapstack-transcription-sidecar are opt-in on top of the default `parakeet` feature. System audio is always compiled in via cpal loopback (no feature flag).
+5. **16-bit PCM WAV export** — WAV files are written at the configured capture source's output rate (mic for `MicOnly`, system for `SystemOnly`, mic-rate mixed output for `Mixed` when mic is present). The sidecar resamples to 16kHz mono before inference. 16-bit quantization is sufficient (-96 dB noise floor).
 6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start and stop. `SessionWavWriter` streams audio incrementally to disk every poll, and stop-time tails are flushed with `snapshot_range()` so post-stop samples never enter the finalized part.
 7. **Custom URI scheme for audio** — `audio-stream://` protocol serves session audio (WAV or MP3) from any allow-listed directory with range request support, avoiding cross-origin issues with the default asset protocol during development.
 8. **`session_audio_parts` is the durable source of truth for session audio** — Each session has zero or more part rows (`part_index = 0, 1, 2…`); when `LiveTranscriptionConfig.persist_audio_part` is true (default for actual sessions) the row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event can't lose the file. Dictation flips the flag off — its synthetic per-utterance id has no `sessions.id` row, so the path goes onto `dictation_history` instead and the parts table only ever holds rows that round-trip to a real session. Resuming a session appends a new part rather than overwriting; the FE concatenates parts at playback time. `audio_save_locations` tracks every directory the app has ever written into so reconciliation on next startup can recover orphans even if the row insert was missed.
