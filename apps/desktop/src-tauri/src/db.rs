@@ -19,11 +19,12 @@ pub enum MigrationKind {
     /// Ordinary SQL. On a CRR DB a single `ALTER TABLE <sync_table>` is routed
     /// through `crsql_alter`; anything else that names a sync table is refused.
     Plain,
-    /// Only `CREATE [UNIQUE] INDEX IF NOT EXISTS … ON <table>` statements. An index
-    /// changes no rows, columns or clocks, so it is applied plainly even on a CRR
-    /// sync table and leaves cr-sqlite's triggers alone. A UNIQUE index whose key
-    /// is not exactly the table's PRIMARY KEY is refused (cr-sqlite can't merge
-    /// under it; uniqueness is app-layer).
+    /// Only `CREATE INDEX IF NOT EXISTS … ON <sync_table>(…)` statements, plus
+    /// `DROP INDEX IF EXISTS <name>` when the same migration re-creates `<name>`. An
+    /// index changes no rows, columns or clocks, so it is applied plainly even on a
+    /// CRR sync table and leaves cr-sqlite's triggers alone. Every UNIQUE index is
+    /// refused: cr-sqlite rejects any that doesn't come from the PRIMARY KEY, and
+    /// uniqueness on a synced table is app-layer.
     SyncIndex,
 }
 
@@ -1097,6 +1098,13 @@ pub fn migrations() -> Vec<Migration> {
             // exactly as v1–v15 leave it on a fresh DB (`idx_chat_messages_session` in
             // its v8 shape). `IF NOT EXISTS` makes it a no-op on a DB that still has
             // them (every non-synced DB, and any DB cut over after this release).
+            // `IF NOT EXISTS` matches on the name only, so the two indexes whose shape
+            // has history are dropped and re-created instead:
+            //   * `idx_chat_messages_session` was `(session_id, created_at)` in v7;
+            //   * `idx_tags_name` gets an explicit `COLLATE NOCASE`. Cutover drops the
+            //     column's NOCASE, and `getTagByName` (lib/db.ts) asks `= ? COLLATE
+            //     NOCASE`, so only an explicitly NOCASE index serves it on a synced DB.
+            //     Cutover replays this SQL verbatim, so the collation survives it.
             // Invariant I-NT2: a fresh non-CRR DB and a cut-over DB end with the
             // same index set. Keep this list in step with any new synced-table index.
             sql: r#"
@@ -1109,12 +1117,14 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(note_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_context ON chat_messages(context_key, created_at ASC);
+            DROP INDEX IF EXISTS idx_chat_messages_session;
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_session_folders_folder ON session_folders(folder_id);
             CREATE INDEX IF NOT EXISTS idx_session_folders_session ON session_folders(session_id);
             CREATE INDEX IF NOT EXISTS idx_dictation_history_created ON dictation_history(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_dictation_history_slot ON dictation_history(slot_id);
-            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+            DROP INDEX IF EXISTS idx_tags_name;
+            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id);
             CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(session_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_send ON chat_messages(context_key, send_id, sequence);

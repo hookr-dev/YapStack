@@ -172,21 +172,28 @@ is applied plainly.
 
 - **`Plain`**: a single `ALTER TABLE <sync_table>` is routed through `crsql_alter`;
   any other statement that names a sync table is refused.
-- **`SyncIndex`**: only `CREATE [UNIQUE] INDEX IF NOT EXISTS … ON <sync_table>(…)`,
-  applied plainly (an index touches no rows, columns or clocks, so CRR triggers stay
-  current). A UNIQUE index whose key is not exactly the table's PRIMARY KEY is refused
-  on every database, so a fresh DB never holds an index cutover would drop.
+- **`SyncIndex`**: only `CREATE INDEX IF NOT EXISTS … ON <sync_table>(…)`, plus
+  `DROP INDEX IF EXISTS <name>` when the same migration re-creates `<name>`; no SQL
+  comments. Applied plainly (an index touches no rows, columns or clocks, so CRR
+  triggers stay current). Every UNIQUE index is refused on every database, even one
+  over the PK: the vendored cr-sqlite rejects any UNIQUE index whose origin isn't the
+  PRIMARY KEY, and cutover drops UNIQUE indexes, so a fresh DB never holds one.
 
 **Indexes survive cutover.** The rebuild (`schema::transform_and_crrify`) captures each
 table's declared non-UNIQUE indexes from `sqlite_master` (never `sqlite_autoindex_*`,
 never UNIQUE) and replays them after the RENAME, alongside the app triggers. Builds
 before this dropped every secondary index at cutover; migration v18 (`SyncIndex`)
 re-declares every synced-table secondary index with `IF NOT EXISTS` to restore them on
-those databases (I-NT2). A new index on a synced table is a `SyncIndex` migration.
+those databases (I-NT2). `IF NOT EXISTS` matches on the name only, so v18 drops and
+re-creates the two indexes whose shape has history (`idx_chat_messages_session`, v7's
+two-column shape; `idx_tags_name`, see below). A new index on a synced table is a
+`SyncIndex` migration.
 
-The rebuild does not carry a column `COLLATE` over, so `tags.name` (and with it
-`idx_tags_name`) compares BINARY after cutover rather than NOCASE; the NOCASE rule
-itself is enforced by `uniqueness`.
+The rebuild does not carry a column `COLLATE` over, so after cutover `tags.name`
+compares BINARY rather than NOCASE (open follow-up: tag de-duplication by name becomes
+case-sensitive). v18 declares `idx_tags_name` as `tags(name COLLATE NOCASE)`, so the
+index itself stays NOCASE through cutover and serves `getTagByName`'s explicit
+`COLLATE NOCASE` lookup either way.
 
 #### Column additions that must be CRR-tracked
 
@@ -728,7 +735,7 @@ onboarding completes.
 | I26 | Removing a device revokes its access, requires re-authentication, and re-enrols it pending with no grant; the removed device is told so and refuses to enable (§15.D) | `auth_flow::device_removal_revokes_access_and_requires_reapproval`, `device_removal_reauth_and_revoked_row_edges`, `SyncTab.test.tsx` ("a removed device is told so…") |
 | I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
-| I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses a non-PK UNIQUE (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
+| I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses every UNIQUE index (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
 
 ---
 
