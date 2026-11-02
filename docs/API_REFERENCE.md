@@ -792,6 +792,7 @@ pub struct SyncStatusDto {
 pub enum SyncCapabilityNoticeDto {     // tagged on `kind`, kebab-case
     UpdateRequired, AnotherDeviceNeedsUpdate,
     WaitingForDevices { blockers: Vec<CapabilityBlockerDto { label?, platform?, last_seen, fingerprint? }> },
+    RelayNeedsUpdate,                  // the relay answered 404/405 to PUT /sync/capability: it predates the gate
 }
 pub struct SignupResultDto { recovery_code: String, device_fingerprint: String }
 pub struct LoginBeginResultDto { salt_mismatch: bool }
@@ -829,7 +830,8 @@ pub struct PushRequest { changes: Vec<PushChange> }               // ≤ 1000 ch
 pub struct PushResponse { acks: Vec<PushAck { client_id, client_seq, changeset_seq, deduplicated }>, max_changeset_seq }
 pub struct PullResponse { changes: Vec<PulledChange>, next_seq, has_more, required_sync_capability, requested_sync_capability }
 // Sync capability gate (ADR 0006 §5): request headers X-YapStack-Sync-Capability (pull, snapshot, raise), X-YapStack-Batch-Capability (push) and X-YapStack-Snapshot-Capability (snapshot presign content level); absent = 0
-pub struct RaiseSyncCapabilityRequest { required_sync_capability }          // PUT /sync/capability → SyncCapabilityLevels
+pub struct RaiseSyncCapabilityRequest { required_sync_capability }          // PUT /sync/capability → SyncCapabilityLevels; 404/405 ⇒ SyncError::CapabilityGateMissing (client)
+// Client: SyncTransport::put_snapshot(meta, ciphertext, content_capability) sends the snapshot header; schema::snapshot_content_capability(conn) gives the level
 pub struct SyncCapabilityLevels { required_sync_capability, requested_sync_capability }
 pub struct SyncCapabilityRefusal { code: "update_required" (426) | "sync_capability_floor" (409), message, required_sync_capability, requested_sync_capability }
 pub struct SyncCapabilityBlocked { code: "sync_capability_blocked", message, required_sync_capability, requested_sync_capability, blockers: Vec<CapabilityBlocker { client_id, label, platform, sync_capability, capability_seen_at }> }   // 409 from PUT /sync/capability

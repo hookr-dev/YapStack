@@ -36,7 +36,7 @@ When bumping the release version, edit all of:
 
 Some releases need the relay to understand something first. Deploy the relay (and run its migrations) **before** publishing such a release, including on self-hosted relays.
 
-- The sync capability gate (relay migration `0014`, ADR 0006 §5) must be deployed before the release whose client sends `X-YapStack-Sync-Capability`. A relay without it ignores the header, so nothing breaks, but no device's level is recorded and no floor can be raised.
+- The sync capability gate (relay migration `0014`, ADR 0006 §5) must be deployed before the release whose client sends `X-YapStack-Sync-Capability`. A relay without it ignores the headers, so no device's level is recorded and no floor can be raised. Clients never send it a change above level 0: they need proof the relay enforces the gate first, and its 404/405 on `PUT /sync/capability` holds those changes on the device with "Your sync server needs an update" until the relay is updated (SYNC_SPEC §9.3). Level-0 sync carries on.
 
 ## Cutting a release
 
