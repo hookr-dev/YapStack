@@ -24,6 +24,9 @@ const K_SESSION_SEQ_RECONCILED: &str = "seq_reconciled";
 /// Connection-scoped session marker: the relay enforces the capability gate (O2, see
 /// [`capability_gate_proven`]).
 const K_SESSION_CAPABILITY_GATE_PROVEN: &str = "capability_gate_proven";
+/// Connection-scoped session marker: the unacked outbox levels were re-checked (O1, see
+/// [`outbox_levels_checked`]).
+const K_SESSION_OUTBOX_LEVELS_CHECKED: &str = "outbox_levels_checked";
 
 pub fn ensure_meta_table(conn: &Connection) -> Result<(), SyncError> {
     conn.execute_batch(
@@ -209,6 +212,18 @@ pub fn capability_gate_proven(conn: &Connection) -> Result<bool, SyncError> {
 /// Record that this connection has seen the relay enforce the capability gate.
 pub fn mark_capability_gate_proven(conn: &Connection) -> Result<(), SyncError> {
     set_session_marker(conn, K_SESSION_CAPABILITY_GATE_PROVEN)
+}
+
+/// True once THIS connection has re-checked the levels stored on the unacked outbox entries
+/// against the current table levels (O1, `outbox::restamp_unacked_levels`). Connection-scoped
+/// like [`seq_reconciled`], so an upgrade or a restored outbox is re-checked at the next spawn.
+pub fn outbox_levels_checked(conn: &Connection) -> Result<bool, SyncError> {
+    session_marker(conn, K_SESSION_OUTBOX_LEVELS_CHECKED)
+}
+
+/// Record that this connection has re-checked the outbox levels.
+pub fn mark_outbox_levels_checked(conn: &Connection) -> Result<(), SyncError> {
+    set_session_marker(conn, K_SESSION_OUTBOX_LEVELS_CHECKED)
 }
 
 /// The first wait after a refused floor raise, doubled per further refusal up to

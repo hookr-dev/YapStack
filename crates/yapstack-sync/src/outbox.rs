@@ -1119,8 +1119,57 @@ async fn push_direction<T: SyncTransport + ?Sized>(
     if !state::seq_reconciled(conn)? {
         reconcile_seq_counter(conn, client_id, transport).await?;
     }
+    restamp_unacked_levels(conn, cipher, client_id)?;
     enqueue_local(conn, cipher, client_id, schema_version, engine_version)?;
     push_outbox(conn, client_id, transport).await
+}
+
+/// Raise every unacked entry's stored level to the highest level this build gives the tables
+/// it holds rows for (ADR 0006 §5.4, O1). A stored level is only a floor: an entry captured
+/// by an older build (or restored from a backup of one) can hold rows of a table that build
+/// rated lower. Runs once per drain connection (`state::outbox_levels_checked`), before
+/// anything is pushed, so an upgrade or a restore is re-checked at the next spawn. An entry
+/// that can't be decrypted stops the push (it is never sent at a level it can't be checked
+/// for), and the next cycle tries again.
+fn restamp_unacked_levels(
+    conn: &Connection,
+    cipher: &ChangesetCipher,
+    client_id: uuid::Uuid,
+) -> Result<(), SyncError> {
+    ensure_outbox_table(conn)?;
+    if state::outbox_levels_checked(conn)? {
+        return Ok(());
+    }
+    let entries: Vec<(i64, i32)> = {
+        let mut stmt = conn.prepare(
+            "SELECT client_seq, required_sync_capability FROM _yapstack_outbox \
+             WHERE acked=0 ORDER BY client_seq",
+        )?;
+        let v = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        v
+    };
+    for (seq, stamped) in entries {
+        let blob: Vec<u8> = conn.query_row(
+            "SELECT ciphertext FROM _yapstack_outbox WHERE client_seq=?1",
+            [seq],
+            |r| r.get(0),
+        )?;
+        let rows = Changeset::decode(&cipher.decrypt(client_id, seq, &blob)?)?.rows;
+        let level = rows
+            .iter()
+            .map(|r| crate::schema::table_sync_capability(&r.table))
+            .max()
+            .unwrap_or(0);
+        if level > stamped {
+            conn.execute(
+                "UPDATE _yapstack_outbox SET required_sync_capability=?1 WHERE client_seq=?2",
+                rusqlite::params![level, seq],
+            )?;
+        }
+    }
+    state::mark_outbox_levels_checked(conn)
 }
 
 /// Pull new changesets, decrypt, and merge them IN COMMIT ORDER, advancing the pull
@@ -1642,6 +1691,41 @@ mod tests {
         // (`outbox_level_column_is_added_to_an_older_table`). That is sound: such a build
         // only ever converted the cutover tables, so its entries can't hold a gated row.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_entry_stamped_below_its_tables_level_is_held_at_that_level() {
+        // An older build (before O1) captured `t_new` rows and stamped the entry 0; the
+        // outbox survives an upgrade or a restore. The stamp is a floor, never the truth.
+        let db = post_cutover_db();
+        let me = Uuid::from_u128(1);
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        enqueue_local(db.conn(), &cipher, me, sv, ev).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE _yapstack_outbox SET required_sync_capability = 0",
+                [],
+            )
+            .unwrap();
+        let relay = MockRelay::new();
+        relay.set_capability_blockers(vec![blocker("old laptop")]);
+
+        let report = drain_once(db.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            relay_tables(&relay, &cipher).await,
+            vec!["tags".to_string()],
+            "the mis-stamped t_new entry is held"
+        );
+        assert!(
+            matches!(report.push_error, Some(SyncError::CapabilityBlocked { .. })),
+            "got {:?}",
+            report.push_error
+        );
+        assert_eq!(outbox_levels(db.conn()), vec![0, 1], "re-stamped in place");
     }
 
     #[tokio::test(flavor = "current_thread")]
