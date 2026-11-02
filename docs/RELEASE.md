@@ -32,6 +32,12 @@ When bumping the release version, edit all of:
 
 `apps/desktop/package.json` carries an unrelated `"version"` field that does **not** track release versions. Do not touch it as part of a release cut.
 
+## Relay before release
+
+Some releases need the relay to understand something first. Deploy the relay (and run its migrations) **before** publishing such a release, including on self-hosted relays.
+
+- The sync capability gate (relay migration `0014`, ADR 0006 §5) must be deployed before the release whose client sends `X-YapStack-Sync-Capability`. A relay without it ignores the header, so nothing breaks, but no device's level is recorded and no floor can be raised.
+
 ## Cutting a release
 
 This is the path used for every release the project has shipped so far. PR title convention is `chore: prepare vX.Y.Z` (see commits `8891757`, `e302676`, `709ceee`, `5205d8a` for prior cuts).
@@ -69,6 +75,10 @@ This is the path used for every release the project has shipped so far. PR title
     - Sanity-check that `latest.json`'s `version` matches the tag and the URL points at the uploaded `.app.tar.gz`.
     - Download the DMG, install it on a clean macOS Apple Silicon machine, and exercise the golden path (start a session, dictation, system audio capture, verify auto-update points at the new version).
 11. **Publish the draft.** From the GitHub Releases UI, uncheck "Set as a pre-release" only if this is a stable (non-alpha/beta/rc) release; otherwise leave it as a pre-release. Click **Publish release**. Existing installs running the auto-updater will pick up `latest.json` on their next check.
+
+## Releases that add a synced table
+
+A peer that receives rows for a synced table it doesn't have yet must hold them in its schema quarantine, not stop syncing (ADR 0006 §4, SYNC_SPEC §6.4). Builds before that tolerance existed stall their pull on such a row. So **no release may introduce a new synced table (a `SYNC_TABLES` entry) unless the previous release already contained the table-readiness quarantine.** Adding one also needs the peer capability gate in ADR 0006 §5.
 
 ## Verification before publish
 

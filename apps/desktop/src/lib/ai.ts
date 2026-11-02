@@ -10,6 +10,11 @@ import type { DbSegment } from "./db";
 import type { DbDictationHistory } from "./db";
 import type { ToolCallResult } from "./ai-tools";
 import type { FolderTreeNode } from "./folder-tree";
+import {
+  resolveSpeakerLabel,
+  type SessionSpeakers,
+  type SpeakerSegment,
+} from "./speakers";
 
 // ----- ChatContext -----
 
@@ -249,34 +254,17 @@ export function shouldAutoRefreshModels(params: {
 // ----- Context Assembly -----
 
 /**
- * Speaker label for a segment in transcript text rendered for the LLM.
- *
- * The convention is the same everywhere a segment is shown to the model
- * (single-session transcript context, `get_session_context` tool output,
- * `search_sessions` snippets). The model relies on this label — without
- * it, statements from other speakers look indistinguishable from things
- * the user said.
- *
- *  - `Mic`  → "You" (the human running the app, captured via microphone).
- *  - `System` with `speaker_id` set → custom name from `speakerNames` if
- *    present, else `Speaker N` (1-indexed for human-friendly numbering).
- *    System audio is everyone else: people on a video call, podcast
- *    audio, etc.
- *  - `System` without diarization → "Other" (we know it isn't the user
- *    but we have no further identification).
- *
- * Returning a flat string (not optional) means callers can always wrap
- * it in `(...)` without conditional formatting.
+ * Speaker label for a segment in transcript text rendered for the LLM: the
+ * `"model"` audience of `resolveSpeakerLabel`. Every path that shows a
+ * segment to the model (transcript context, `get_session_context`,
+ * `search_sessions` snippets) goes through here, so the label convention in
+ * `SPEAKER_INSTRUCTION` holds everywhere.
  */
 export function formatSegmentSpeaker(
-  seg: DbSegment,
-  speakerNames?: Record<number, string>,
+  seg: SpeakerSegment,
+  speakers?: SessionSpeakers,
 ): string {
-  if (seg.source === "Mic") return "You";
-  if (seg.speaker_id != null) {
-    return speakerNames?.[seg.speaker_id] ?? `Speaker ${seg.speaker_id + 1}`;
-  }
-  return "Other";
+  return resolveSpeakerLabel(seg, speakers, "model");
 }
 
 /**
@@ -294,7 +282,7 @@ export function isVisibleSegment(seg: DbSegment): boolean {
 
 export function assembleTranscriptContext(
   segments: DbSegment[],
-  speakerNames?: Record<number, string>,
+  speakers?: SessionSpeakers,
 ): string {
   return segments
     .filter(isVisibleSegment)
@@ -302,7 +290,7 @@ export function assembleTranscriptContext(
       const mins = Math.floor(s.audio_offset_seconds / 60);
       const secs = Math.floor(s.audio_offset_seconds % 60);
       const ts = `${mins}:${secs.toString().padStart(2, "0")}`;
-      const label = formatSegmentSpeaker(s, speakerNames);
+      const label = formatSegmentSpeaker(s, speakers);
       return `[seg:${s.id} ${ts}] (${label}) ${s.text}`;
     })
     .join("\n");

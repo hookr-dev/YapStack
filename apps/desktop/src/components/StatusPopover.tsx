@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/tabs";
 import { LogsPanel } from "@/components/LogsPanel";
 import { formatBytes, formatElapsed, SOURCE_LABELS_FULL } from "@/lib/utils";
+import { accelDisplayLabel } from "@/lib/accel";
 import { commands } from "@/lib/tauri";
 import type {
   LiveTranscriptionStatus,
@@ -307,6 +308,10 @@ export function StatusPopover() {
       }${
         loadedEngineInfo?.accel
           ? `   Accel: ${loadedEngineInfo.accel}${
+              loadedEngineInfo.accelFallback
+                ? ` [fallback: ${loadedEngineInfo.accelFallback}]`
+                : ""
+            }${loadedEngineInfo.accelPartial ? " [partial]" : ""}${
               loadedEngineInfo.modelDir
                 ? ` (${loadedEngineInfo.modelDir
                     .split(/[/\\]/)
@@ -419,8 +424,15 @@ export function StatusPopover() {
               {loadedEngineInfo?.accel && (
                 <p className="mt-0.5 text-[10px] text-muted-foreground/80">
                   <span className="text-muted-foreground/50">Accelerator:</span>{" "}
-                  <span className="font-mono uppercase">
-                    {loadedEngineInfo.accel}
+                  <span
+                    className="font-mono"
+                    title={loadedEngineInfo.accelFallback ?? undefined}
+                  >
+                    {accelDisplayLabel(
+                      loadedEngineInfo.accel,
+                      loadedEngineInfo.accelFallback,
+                      loadedEngineInfo.accelPartial,
+                    )}
                   </span>
                   {loadedEngineInfo.modelDir && (
                     <span className="ml-2 text-muted-foreground/50">
