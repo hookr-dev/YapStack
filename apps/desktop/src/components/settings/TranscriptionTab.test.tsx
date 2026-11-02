@@ -126,6 +126,21 @@ describe("TranscriptionTab — Parakeet only", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("disables Retry while setup is running, so a double click retries once", async () => {
+    let finish: () => void = () => {};
+    const autoSetup = vi.fn(
+      () => new Promise<void>((resolve) => (finish = resolve)),
+    );
+    setup({ enginePhase: "error", engineError: "offline", autoSetup });
+    render(<TranscriptionTab />);
+
+    const retry = screen.getByRole("button", { name: /Retry/ });
+    await userEvent.dblClick(retry);
+    expect(autoSetup).toHaveBeenCalledTimes(1);
+    expect(retry).toBeDisabled();
+    finish();
+  });
+
   it("shows the engine error with a Retry that re-runs setup", async () => {
     const autoSetup = vi.fn().mockResolvedValue(undefined);
     setup({

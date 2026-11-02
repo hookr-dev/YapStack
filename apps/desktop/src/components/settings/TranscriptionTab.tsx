@@ -87,6 +87,7 @@ export function TranscriptionTab() {
   const setDiarizationEnabled = useAppStore((s) => s.setDiarizationEnabled);
   const [showLanguages, setShowLanguages] = useState(false);
   const [removingLegacy, setRemovingLegacy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   useEffect(() => {
     refreshLegacyModelFiles().catch(() => {});
@@ -184,8 +185,12 @@ export function TranscriptionTab() {
               size="sm"
               variant="outline"
               className="h-7 shrink-0 text-xs"
+              disabled={retrying}
               onClick={() => {
-                autoSetup().catch(() => {});
+                setRetrying(true);
+                autoSetup()
+                  .catch(() => {})
+                  .finally(() => setRetrying(false));
               }}
             >
               <RotateCw className="mr-1 h-3 w-3" />

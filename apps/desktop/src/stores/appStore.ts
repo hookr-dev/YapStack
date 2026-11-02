@@ -1105,6 +1105,7 @@ function groupBySession<T extends { session_id: string }>(
 let navRequestSeq = 0;
 
 function createAppStore() {
+  let autoSetupInFlight: Promise<void> | null = null;
   return create<AppState>()(
     persist(
       (set, get) => ({
@@ -2240,207 +2241,216 @@ function createAppStore() {
         }
       },
 
-      autoSetup: async () => {
-        // HMR-preserved Zustand store already holds "ready" when the backend
-        // is warm — skip the whole setup path. On fresh app start enginePhase
-        // is "idle", so this falls through to full init. Backend commands are
-        // idempotent (startCapture treats AlreadyRunning as Ok,
-        // init_transcription_client short-circuits on is_some()), so any
-        // duplicate calls are harmless.
-        if (get().enginePhase === "ready") return;
+      autoSetup: () => {
+        // One run at a time: Retry, a remount and the first launch can all
+        // call this while a run is still awaiting its download, and a second
+        // run would start a second download of the same model.
+        if (autoSetupInFlight) return autoSetupInFlight;
+        autoSetupInFlight = (async () => {
+          // HMR-preserved Zustand store already holds "ready" when the backend
+          // is warm — skip the whole setup path. On fresh app start enginePhase
+          // is "idle", so this falls through to full init. Backend commands are
+          // idempotent (startCapture treats AlreadyRunning as Ok,
+          // init_transcription_client short-circuits on is_some()), so any
+          // duplicate calls are harmless.
+          if (get().enginePhase === "ready") return;
 
-        // The webview boots concurrently with the Rust setup hook, so a fast
-        // frontend can invoke commands whose managed state doesn't exist yet
-        // ("state not managed" — observed on the Windows canary). Wait for
-        // the backend's ready flag before the first engine command; the flag
-        // itself is builder-managed, so this poll can never race.
-        await waitForBackendReady();
+          // The webview boots concurrently with the Rust setup hook, so a fast
+          // frontend can invoke commands whose managed state doesn't exist yet
+          // ("state not managed" — observed on the Windows canary). Wait for
+          // the backend's ready flag before the first engine command; the flag
+          // itself is builder-managed, so this poll can never race.
+          await waitForBackendReady();
 
-        const { settings } = get();
+          const { settings } = get();
 
-        // Request Screen Recording TCC up front — on macOS 14.2+ this gates
-        // the Core Audio tap cpal uses for system audio loopback. Fire the
-        // prompt before startCapture so users see it during onboarding instead
-        // of later, silently failing.
-        commands.requestScreenCapturePermission().catch(() => {});
+          // Request Screen Recording TCC up front — on macOS 14.2+ this gates
+          // the Core Audio tap cpal uses for system audio loopback. Fire the
+          // prompt before startCapture so users see it during onboarding instead
+          // of later, silently failing.
+          commands.requestScreenCapturePermission().catch(() => {});
 
-        // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
-        commands
-          .startCapture(
-            settings.selectedMicDeviceId,
-            settings.captureSource,
-            settings.bufferMaxSeconds,
-          )
-          .then((result) => {
-            if (result.status === "error") {
-              commands.getCaptureStatus().then((r) => {
-                if (r.status === "ok") get().setCaptureStatus(r.data);
-              });
+          // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
+          commands
+            .startCapture(
+              settings.selectedMicDeviceId,
+              settings.captureSource,
+              settings.bufferMaxSeconds,
+            )
+            .then((result) => {
+              if (result.status === "error") {
+                commands.getCaptureStatus().then((r) => {
+                  if (r.status === "ok") get().setCaptureStatus(r.data);
+                });
+              }
+            })
+            .catch(() => {});
+
+          // Track 2 — Engine setup
+          try {
+            // Load devices + catalogue in parallel (non-blocking)
+            get()
+              .refreshDevices()
+              .catch((e) => console.error("Failed to refresh devices:", e));
+            get()
+              .loadEngineCatalogue()
+              .catch((e) => console.error("Failed to load catalogue:", e));
+
+            // Variant resolution is driven by the backend's
+            // `recommended_for_host()` (cfg-driven, deterministic per
+            // machine). For the post-update upgrade case — Apple Silicon
+            // users sitting on `TdtV3` because that was the only variant
+            // pre-int8 — we want to download `TdtV3Int8` AND keep the old
+            // bundle as a safety net so an offline launch / dropped
+            // download doesn't strand the user with a working model on
+            // disk that we ignored.
+            //
+            // Order: refresh state first, then decide which variant to
+            // load this launch.
+            await get().refreshParakeetModels();
+            await get().refreshSortformerStatus();
+
+            const recommendedRes =
+              await commands.getRecommendedParakeetVariant();
+            if (recommendedRes.status === "error") {
+              console.error(
+                "getRecommendedParakeetVariant failed; falling back to selected variant:",
+                commandErrorMessage(recommendedRes.error),
+              );
             }
-          })
-          .catch(() => {});
+            const recommended =
+              recommendedRes.status === "ok" ? recommendedRes.data : null;
 
-        // Track 2 — Engine setup
-        try {
-          // Load devices + catalogue in parallel (non-blocking)
-          get()
-            .refreshDevices()
-            .catch((e) => console.error("Failed to refresh devices:", e));
-          get()
-            .loadEngineCatalogue()
-            .catch((e) => console.error("Failed to load catalogue:", e));
-
-          // Variant resolution is driven by the backend's
-          // `recommended_for_host()` (cfg-driven, deterministic per
-          // machine). For the post-update upgrade case — Apple Silicon
-          // users sitting on `TdtV3` because that was the only variant
-          // pre-int8 — we want to download `TdtV3Int8` AND keep the old
-          // bundle as a safety net so an offline launch / dropped
-          // download doesn't strand the user with a working model on
-          // disk that we ignored.
-          //
-          // Order: refresh state first, then decide which variant to
-          // load this launch.
-          await get().refreshParakeetModels();
-          await get().refreshSortformerStatus();
-
-          const recommendedRes =
-            await commands.getRecommendedParakeetVariant();
-          if (recommendedRes.status === "error") {
-            console.error(
-              "getRecommendedParakeetVariant failed; falling back to selected variant:",
-              commandErrorMessage(recommendedRes.error),
+            const downloadedVariants = get().parakeetModels.filter(
+              (m) => m.downloaded,
             );
-          }
-          const recommended =
-            recommendedRes.status === "ok" ? recommendedRes.data : null;
+            const recommendedDownloaded =
+              recommended &&
+              downloadedVariants.some((m) => m.variant === recommended);
+            // Any non-recommended variant that's already on disk — the
+            // user's "previous bundle" if we're mid-upgrade. Used as the
+            // fallback target when a recommended-variant download fails.
+            const legacyFallback =
+              downloadedVariants.find((m) => m.variant !== recommended)
+                ?.variant ?? null;
 
-          const downloadedVariants = get().parakeetModels.filter(
-            (m) => m.downloaded,
-          );
-          const recommendedDownloaded =
-            recommended &&
-            downloadedVariants.some((m) => m.variant === recommended);
-          // Any non-recommended variant that's already on disk — the
-          // user's "previous bundle" if we're mid-upgrade. Used as the
-          // fallback target when a recommended-variant download fails.
-          const legacyFallback =
-            downloadedVariants.find((m) => m.variant !== recommended)
-              ?.variant ?? null;
+            let variant = settings.selectedParakeetVariant;
 
-          let variant = settings.selectedParakeetVariant;
-
-          if (recommendedDownloaded) {
-            // Recommended is already on disk. Use it directly.
-            variant = recommended!;
-          } else if (recommended) {
-            // Need to download the recommended variant. If the user
-            // already has another variant downloaded (the upgrade
-            // case), surface a one-time toast so they know why a
-            // fresh download is happening right after the app update.
-            if (settings.whisperRemovedNotice) {
-              const size = get().parakeetModels.find(
-                (m) => m.variant === recommended,
-              )?.approximate_size_bytes;
-              toast.info(
-                size
-                  ? `Whisper has been removed. YapStack now uses Parakeet; downloading it once (${formatBytes(size)})…`
-                  : "Whisper has been removed. YapStack now uses Parakeet; downloading it once…",
-                {
-                  id: "parakeet-variant-upgrade",
-                  duration: 10000,
-                },
-              );
-            } else if (legacyFallback) {
-              toast.info(
-                "Upgrading Parakeet to the optimized model for your Mac. Downloading…",
-                {
-                  id: "parakeet-variant-upgrade",
-                  duration: 10000,
-                },
-              );
-            }
-            set({ enginePhase: "downloading", modelDownloadProgress: 0 });
-            const dl = await commands.downloadParakeetModel(recommended);
-            set({ modelDownloadProgress: null });
-
-            if (dl.status === "error") {
-              if (legacyFallback) {
-                // Keep the user working on the bundle they already
-                // have. Surface a warning so they know the upgrade
-                // didn't take and can retry next launch.
-                toast.warning(
-                  "Couldn't download the optimized Parakeet model. Continuing with the existing bundle.",
+            if (recommendedDownloaded) {
+              // Recommended is already on disk. Use it directly.
+              variant = recommended!;
+            } else if (recommended) {
+              // Need to download the recommended variant. If the user
+              // already has another variant downloaded (the upgrade
+              // case), surface a one-time toast so they know why a
+              // fresh download is happening right after the app update.
+              if (settings.whisperRemovedNotice) {
+                const size = get().parakeetModels.find(
+                  (m) => m.variant === recommended,
+                )?.approximate_size_bytes;
+                toast.info(
+                  size
+                    ? `Whisper has been removed. YapStack now uses Parakeet; downloading it once (${formatBytes(size)})…`
+                    : "Whisper has been removed. YapStack now uses Parakeet; downloading it once…",
                   {
                     id: "parakeet-variant-upgrade",
-                    duration: 8000,
+                    duration: 10000,
                   },
                 );
-                variant = legacyFallback;
-              } else {
-                // No fallback on disk → first-install error path.
-                trackEngineError({
-                  error: commandErrorMessage(dl.error),
-                  phase: "downloading",
-                });
-                set({
-                  enginePhase: "error",
-                  engineError: commandErrorMessage(dl.error),
-                });
-                return;
+              } else if (legacyFallback) {
+                toast.info(
+                  "Upgrading Parakeet to the optimized model for your Mac. Downloading…",
+                  {
+                    id: "parakeet-variant-upgrade",
+                    duration: 10000,
+                  },
+                );
               }
-            } else {
-              await get().refreshParakeetModels();
-              variant = recommended;
+              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              const dl = await commands.downloadParakeetModel(recommended);
+              set({ modelDownloadProgress: null });
+
+              if (dl.status === "error") {
+                if (legacyFallback) {
+                  // Keep the user working on the bundle they already
+                  // have. Surface a warning so they know the upgrade
+                  // didn't take and can retry next launch.
+                  toast.warning(
+                    "Couldn't download the optimized Parakeet model. Continuing with the existing bundle.",
+                    {
+                      id: "parakeet-variant-upgrade",
+                      duration: 8000,
+                    },
+                  );
+                  variant = legacyFallback;
+                } else {
+                  // No fallback on disk → first-install error path.
+                  trackEngineError({
+                    error: commandErrorMessage(dl.error),
+                    phase: "downloading",
+                  });
+                  set({
+                    enginePhase: "error",
+                    engineError: commandErrorMessage(dl.error),
+                  });
+                  return;
+                }
+              } else {
+                await get().refreshParakeetModels();
+                variant = recommended;
+              }
             }
-          }
 
-          // Persist whichever variant we ended up using so StatusPopover,
-          // pressure-event tagging, and the next autoSetup pass all see
-          // a coherent view.
-          if (variant !== settings.selectedParakeetVariant) {
-            get().updateSettings({ selectedParakeetVariant: variant });
-          }
-
-          // Sortformer download is lazy — only when diarization is on.
-          if (
-            settings.diarizationEnabled &&
-            !get().sortformerStatus?.downloaded
-          ) {
-            set({ modelDownloadProgress: 0 });
-            const dl = await commands.downloadSortformerModel("V2_1");
-            if (dl.status === "error") {
-              console.error(
-                "sortformer download failed; continuing without diarization:",
-                commandErrorMessage(dl.error),
-              );
+            // Persist whichever variant we ended up using so StatusPopover,
+            // pressure-event tagging, and the next autoSetup pass all see
+            // a coherent view.
+            if (variant !== settings.selectedParakeetVariant) {
+              get().updateSettings({ selectedParakeetVariant: variant });
             }
-            set({ modelDownloadProgress: null });
-            await get().refreshSortformerStatus();
-          }
 
-          set({ enginePhase: "initializing" });
-          const initResult = await commands.initTranscriptionClient(
-            "Parakeet",
-            variant,
-            settings.diarizationEnabled,
-          );
-          if (initResult.status === "error") {
-            trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
-            set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
-            return;
+            // Sortformer download is lazy — only when diarization is on.
+            if (
+              settings.diarizationEnabled &&
+              !get().sortformerStatus?.downloaded
+            ) {
+              set({ modelDownloadProgress: 0 });
+              const dl = await commands.downloadSortformerModel("V2_1");
+              if (dl.status === "error") {
+                console.error(
+                  "sortformer download failed; continuing without diarization:",
+                  commandErrorMessage(dl.error),
+                );
+              }
+              set({ modelDownloadProgress: null });
+              await get().refreshSortformerStatus();
+            }
+
+            set({ enginePhase: "initializing" });
+            const initResult = await commands.initTranscriptionClient(
+              "Parakeet",
+              variant,
+              settings.diarizationEnabled,
+            );
+            if (initResult.status === "error") {
+              trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
+              set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
+              return;
+            }
+            set({ enginePhase: "ready", engineError: null });
+            if (settings.whisperRemovedNotice) {
+              get().updateSettings({ whisperRemovedNotice: false });
+            }
+          } catch (e) {
+            // console.error routes through the frontend log bridge, so the
+            // failure lands in the unified log file — engine setup errors on
+            // a user's machine must be diagnosable from logs alone.
+            console.error("engine autoSetup failed:", e);
+            set({ enginePhase: "error", engineError: String(e) });
           }
-          set({ enginePhase: "ready", engineError: null });
-          if (settings.whisperRemovedNotice) {
-            get().updateSettings({ whisperRemovedNotice: false });
-          }
-        } catch (e) {
-          // console.error routes through the frontend log bridge, so the
-          // failure lands in the unified log file — engine setup errors on
-          // a user's machine must be diagnosable from logs alone.
-          console.error("engine autoSetup failed:", e);
-          set({ enginePhase: "error", engineError: String(e) });
-        }
+        })().finally(() => {
+          autoSetupInFlight = null;
+        });
+        return autoSetupInFlight;
       },
 
       loadEngineCatalogue: async () => {

@@ -117,6 +117,21 @@ describe("Whisper user upgrading to the Parakeet-only build", () => {
     expect(commands.initTranscriptionClient).not.toHaveBeenCalled();
   });
 
+  it("a second autoSetup while the first is still running starts no second download", async () => {
+    seedPersisted(31);
+    const { useAppStore, commands } = await launch();
+
+    // Retry double-clicked from the error state: both calls start before
+    // the first download resolves.
+    await Promise.all([
+      useAppStore.getState().autoSetup(),
+      useAppStore.getState().autoSetup(),
+    ]);
+
+    expect(commands.downloadParakeetModel).toHaveBeenCalledTimes(1);
+    expect(commands.initTranscriptionClient).toHaveBeenCalledTimes(1);
+  });
+
   it("merge coerces a Whisper engine even when the persisted version is already current", async () => {
     // Persist-version skew: a v32 blob that still says Whisper must never
     // reach the backend, which no longer accepts that engine.
