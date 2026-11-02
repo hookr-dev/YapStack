@@ -13,7 +13,8 @@ pub struct Migration {
     /// Every schema object this migration creates, or empty: each table with each
     /// of its columns, each index, trigger and virtual table. A test checks the
     /// list equals what the migration really creates. When the migration can't be
-    /// applied and all of them are already present (on a CRR DB, a synced table must
+    /// applied and all of them are already present with the definitions a fresh
+    /// install of the migration list gives them (on a CRR DB, a synced table must
     /// also be a CRR with current triggers), the runner records it as applied
     /// instead of failing it on every boot. Declare them only for a migration whose
     /// schema can land out of band (a runtime schema patch, cutover) and whose data
@@ -21,20 +22,21 @@ pub struct Migration {
     pub schema_effects: &'static [SchemaObject],
 }
 
-/// A schema object a [`Migration`] creates, probed in `sqlite_master` (or
-/// `pragma_table_info` for a column).
+/// A schema object a [`Migration`] creates. The runner compares it with the same
+/// object in a fresh-install reference schema (`db_service::schema_effects_present`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaObject {
-    /// An ordinary table, by name. Declare its columns separately.
+    /// An ordinary table: same column names and types. Declare its columns too.
     Table(&'static str),
-    /// A column: `(table, column)`.
+    /// A column `(table, column)`: same declared type.
     Column(&'static str, &'static str),
+    /// Same normalized `CREATE INDEX` statement.
     Index(&'static str),
+    /// Same normalized `CREATE TRIGGER` statement, body included.
     Trigger(&'static str),
-    /// A virtual table: `(name, its CREATE statement)`, matched on the whole
-    /// statement (columns and options) up to spelling, since an FTS table's
-    /// options decide what it stores.
-    VirtualTable(&'static str, &'static str),
+    /// Same normalized `CREATE VIRTUAL TABLE` statement (an FTS table's options
+    /// decide what it stores).
+    VirtualTable(&'static str),
 }
 
 /// How [`crate::db_service::run_migrations`] treats a migration on a cr-sqlite
@@ -1007,29 +1009,10 @@ pub fn migrations() -> Vec<Migration> {
             // db.ts `ensureRuntimeSchema` creates the same tables, backfill and
             // triggers.
             schema_effects: &[
-                SchemaObject::VirtualTable(
-                    "segments_fts",
-                    "CREATE VIRTUAL TABLE segments_fts USING fts5(segment_id UNINDEXED, \
-                     session_id UNINDEXED, text, \
-                     tokenize = 'porter unicode61 remove_diacritics 2')",
-                ),
-                SchemaObject::VirtualTable(
-                    "notes_fts",
-                    "CREATE VIRTUAL TABLE notes_fts USING fts5(note_id UNINDEXED, \
-                     session_id UNINDEXED, content, \
-                     tokenize = 'porter unicode61 remove_diacritics 2')",
-                ),
-                SchemaObject::VirtualTable(
-                    "sessions_fts",
-                    "CREATE VIRTUAL TABLE sessions_fts USING fts5(session_id UNINDEXED, \
-                     title, tokenize = 'porter unicode61 remove_diacritics 2')",
-                ),
-                SchemaObject::VirtualTable(
-                    "dictations_fts",
-                    "CREATE VIRTUAL TABLE dictations_fts USING fts5(dictation_id UNINDEXED, \
-                     output_text, input_text, \
-                     tokenize = 'porter unicode61 remove_diacritics 2')",
-                ),
+                SchemaObject::VirtualTable("segments_fts"),
+                SchemaObject::VirtualTable("notes_fts"),
+                SchemaObject::VirtualTable("sessions_fts"),
+                SchemaObject::VirtualTable("dictations_fts"),
                 SchemaObject::Trigger("segments_ai"),
                 SchemaObject::Trigger("segments_ad"),
                 SchemaObject::Trigger("segments_au"),

@@ -522,22 +522,23 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
     run_migrations_list(conn, &crate::db::migrations())
 }
 
+/// The tauri-plugin-sql (sqlx) bookkeeping table, created if missing.
+const SQLX_MIGRATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN NOT NULL,
+    checksum BLOB NOT NULL,
+    execution_time BIGINT NOT NULL
+);";
+
 /// Migration runner over an explicit list (so tests can drive the CRR-wrap path
 /// with a synthetic migration). See [`run_migrations`].
 pub fn run_migrations_list(
     conn: &Connection,
     migrations: &[crate::db::Migration],
 ) -> rusqlite::Result<Vec<i64>> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-            version BIGINT PRIMARY KEY,
-            description TEXT NOT NULL,
-            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            success BOOLEAN NOT NULL,
-            checksum BLOB NOT NULL,
-            execution_time BIGINT NOT NULL
-        );",
-    )?;
+    conn.execute_batch(SQLX_MIGRATIONS_DDL)?;
 
     let applied: std::collections::HashSet<i64> = {
         let mut stmt = conn.prepare("SELECT version FROM _sqlx_migrations")?;
@@ -546,6 +547,7 @@ pub fn run_migrations_list(
     };
 
     let mut newly_applied = Vec::new();
+    let mut reference = None;
     for m in migrations {
         if applied.contains(&m.version) {
             continue;
@@ -553,7 +555,7 @@ pub fn run_migrations_list(
         match apply_migration(conn, m) {
             Ok(()) => newly_applied.push(m.version),
             Err(e) => {
-                if record_if_schema_present(conn, m) {
+                if record_if_schema_present(conn, m, migrations, &mut reference) {
                     tracing::info!(
                         "migration v{} ({}) could not apply ({e}), but every object it \
                          creates is already present; recorded it as applied",
@@ -576,21 +578,80 @@ pub fn run_migrations_list(
 
 /// For a migration that couldn't apply: record it when its declared
 /// [`crate::db::Migration::schema_effects`] are all present already (put there out
-/// of band), so it isn't retried and failed on every boot. False when it declares
-/// none, any is missing, or the probe or bookkeeping insert errors, leaving the
-/// migration unrecorded.
-fn record_if_schema_present(conn: &Connection, m: &crate::db::Migration) -> bool {
-    !m.schema_effects.is_empty()
-        && schema_effects_present(conn, m.schema_effects).unwrap_or(false)
+/// of band) with the definitions `migrations` gives them, so it isn't retried and
+/// failed on every boot. False when it declares none, any differs, or the probe or
+/// bookkeeping insert errors, leaving the migration unrecorded. `reference` holds
+/// the fresh-install schema, built on first use and shared across one run.
+fn record_if_schema_present(
+    conn: &Connection,
+    m: &crate::db::Migration,
+    migrations: &[crate::db::Migration],
+    reference: &mut Option<Connection>,
+) -> bool {
+    if m.schema_effects.is_empty() {
+        return false;
+    }
+    if reference.is_none() {
+        match reference_schema(migrations) {
+            Ok(r) => *reference = Some(r),
+            Err(e) => {
+                tracing::warn!("building the reference schema failed: {e}");
+                return false;
+            }
+        }
+    }
+    let Some(reference) = reference.as_ref() else {
+        return false;
+    };
+    schema_effects_present(conn, reference, m.schema_effects).unwrap_or(false)
         && record_migration(conn, m, 0).is_ok()
 }
 
-/// True when every declared object is present in its declared shape: each table
-/// and each declared column of it, each index and trigger by name, and each
-/// virtual table by its whole normalized `CREATE` statement (an FTS table's
-/// options decide what it stores). Constraints such as `UNIQUE` aren't checked:
-/// cutover strips every non-PK UNIQUE from a synced table, so a correct CRR DB
-/// wouldn't have it.
+/// The schema `migrations` produce on a fresh install: an in-memory, non-CRR DB
+/// with each one applied plainly. A migration that fails there is skipped, so its
+/// objects are absent and can't match. Applied directly, not through
+/// [`run_migrations_list`], so a failure here never builds another reference.
+fn reference_schema(migrations: &[crate::db::Migration]) -> rusqlite::Result<Connection> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SQLX_MIGRATIONS_DDL)?;
+    for m in migrations {
+        let _ = apply_migration(&reference, m);
+    }
+    Ok(reference)
+}
+
+/// `sql` of a `sqlite_master` row: `None` when absent, `Some(None)` when it has no
+/// SQL (an autoindex).
+fn master_sql(conn: &Connection, ty: &str, name: &str) -> rusqlite::Result<Option<Option<String>>> {
+    conn.prepare("SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2")?
+        .query_row([ty, name], |r| r.get::<_, Option<String>>(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })
+}
+
+/// `(name, declared type)` of each column of `table`, sorted by name.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut cols: Vec<(String, String)> = conn
+        .prepare("SELECT name, upper(type) FROM pragma_table_info(?1)")?
+        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    cols.sort();
+    Ok(cols)
+}
+
+/// True when every declared object in `conn` has the definition it has in
+/// `reference` (the fresh-install schema, see [`reference_schema`]):
+///   * a table has the same columns (names and declared types), and a column the
+///     same declared type. Table SQL itself isn't compared: cutover rewrites it.
+///   * an index, trigger or virtual table has the same normalized `CREATE`
+///     statement ([`normalized_sql`]). Cutover replays non-UNIQUE indexes and app
+///     triggers verbatim, so a CRR DB still matches.
+///
+/// Table constraints such as `UNIQUE` aren't compared: cutover strips every
+/// non-PK UNIQUE from a synced table, so a correct CRR DB wouldn't have them.
 ///
 /// On a CRR-prepared DB, a synced table (or the table of a declared column) must
 /// also be a CRR whose crsql triggers match its current columns: a plain table
@@ -600,39 +661,40 @@ fn record_if_schema_present(conn: &Connection, m: &crate::db::Migration) -> bool
 /// it never records on a CRR DB.
 fn schema_effects_present(
     conn: &Connection,
+    reference: &Connection,
     effects: &[crate::db::SchemaObject],
 ) -> rusqlite::Result<bool> {
     use crate::db::SchemaObject;
     // Plain sqlite_master probes rather than yapstack_sync::schema's `table_exists` /
     // `is_crr` / `column_exists`: those exist only with the `sync` feature and
     // return SyncError, and this runs in every build.
-    let master_sql = |ty: &str, name: &str| -> rusqlite::Result<Option<Option<String>>> {
-        conn.prepare("SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2")?
-            .query_row([ty, name], |r| r.get::<_, Option<String>>(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })
+    let named =
+        |ty: &str, name: &str| Ok::<_, rusqlite::Error>(master_sql(conn, ty, name)?.is_some());
+    let same_sql = |ty: &str, name: &str| -> rusqlite::Result<bool> {
+        let live = master_sql(conn, ty, name)?.flatten();
+        let want = master_sql(reference, ty, name)?.flatten();
+        Ok(matches!((live, want), (Some(l), Some(w)) if normalized_sql(&l) == normalized_sql(&w)))
     };
-    let named = |ty: &str, name: &str| Ok::<_, rusqlite::Error>(master_sql(ty, name)?.is_some());
+    let column_type = |c: &Connection, t: &str, col: &str| -> rusqlite::Result<Option<String>> {
+        Ok(table_columns(c, t)?
+            .into_iter()
+            .find(|(n, _)| n == col)
+            .map(|(_, ty)| ty))
+    };
     let crr_prepared = named("table", "sessions__crsql_clock")?;
     for effect in effects {
         let (present, table) = match *effect {
-            SchemaObject::Table(t) => (named("table", t)?, Some(t)),
-            SchemaObject::Column(t, c) => (
-                conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
-                    .exists([t, c])?,
-                Some(t),
-            ),
-            SchemaObject::Index(i) => (named("index", i)?, None),
-            SchemaObject::Trigger(t) => (named("trigger", t)?, None),
-            SchemaObject::VirtualTable(t, create) => (
-                master_sql("table", t)?
-                    .flatten()
-                    .is_some_and(|sql| normalized_sql(&sql) == normalized_sql(create)),
-                Some(t),
-            ),
+            SchemaObject::Table(t) => {
+                let want = table_columns(reference, t)?;
+                (!want.is_empty() && table_columns(conn, t)? == want, Some(t))
+            }
+            SchemaObject::Column(t, c) => {
+                let want = column_type(reference, t, c)?;
+                (want.is_some() && column_type(conn, t, c)? == want, Some(t))
+            }
+            SchemaObject::Index(i) => (same_sql("index", i)?, None),
+            SchemaObject::Trigger(t) => (same_sql("trigger", t)?, None),
+            SchemaObject::VirtualTable(t) => (same_sql("table", t)?, Some(t)),
         };
         if !present {
             return Ok(false);
@@ -655,18 +717,48 @@ fn schema_effects_present(
     Ok(true)
 }
 
-/// A `CREATE` statement in a comparable form: lower-cased, `IF NOT EXISTS` and a
-/// trailing `;` dropped, whitespace collapsed and removed around punctuation. Two
-/// statements that differ only in spelling compare equal; any change to a name,
-/// column or option does not.
+/// A `CREATE` statement in a comparable form. Outside quotes (`'…'`, `"…"`, `` `…` ``,
+/// `[…]`) it is lower-cased, whitespace is collapsed and dropped next to
+/// punctuation, and a leading `IF NOT EXISTS` and a trailing `;` are removed.
+/// Quoted text is kept exactly, since a tokenizer option or a quoted identifier
+/// means something different in another case or spacing. Two statements that
+/// differ only in spelling compare equal; any change to a name, column, option or
+/// body does not.
 fn normalized_sql(sql: &str) -> String {
-    let lower = sql.trim().trim_end_matches(';').to_ascii_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    let mut out = words.join(" ").replacen(" if not exists", "", 1);
-    for p in ["(", ")", ",", "="] {
-        out = out
-            .replace(&format!(" {p}"), p)
-            .replace(&format!("{p} "), p);
+    let is_punct = |c: char| matches!(c, '(' | ')' | ',' | '=' | ';');
+    let mut out = String::with_capacity(sql.len());
+    let mut close: Option<char> = None;
+    let mut pending_space = false;
+    for c in sql.trim().chars() {
+        if let Some(q) = close {
+            out.push(c);
+            if c == q {
+                close = None;
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() && !is_punct(c) && !out.ends_with(is_punct) {
+            out.push(' ');
+        }
+        pending_space = false;
+        close = match c {
+            '\'' | '"' | '`' => Some(c),
+            '[' => Some(']'),
+            _ => None,
+        };
+        out.push(c.to_ascii_lowercase());
+    }
+    while out.ends_with(';') {
+        out.pop();
+    }
+    // Only the statement head can hold `IF NOT EXISTS` (before any quote or paren).
+    let head_end = out.find(['(', '\'', '"', '`', '[']).unwrap_or(out.len());
+    if let Some(i) = out[..head_end].find(" if not exists ") {
+        out.replace_range(i..i + " if not exists".len(), "");
     }
     out
 }
@@ -2287,6 +2379,21 @@ mod tests {
             (12, "DROP TRIGGER notes_au;"),
             (14, "ALTER TABLE chat_messages DROP COLUMN status;"),
             (14, "DROP INDEX idx_chat_messages_send;"),
+            // Same names, other definitions.
+            (
+                12,
+                "DROP TRIGGER notes_au; \
+                 CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN SELECT 1; END;",
+            ),
+            (
+                14,
+                "DROP INDEX idx_chat_messages_send; \
+                 CREATE UNIQUE INDEX idx_chat_messages_send ON chat_messages(context_key);",
+            ),
+            (
+                11,
+                "DROP INDEX idx_tags_name; CREATE INDEX idx_tags_name ON tags(color);",
+            ),
         ];
         let mut wrongly_recorded = Vec::new();
         for (v, damage) in cases {
@@ -2302,10 +2409,48 @@ mod tests {
         assert!(wrongly_recorded.is_empty(), "{wrongly_recorded:#?}");
     }
 
-    /// Every object in a sqlite_master/table_info snapshot, rendered the way
-    /// [`render_effect`] renders a declaration. FTS shadow tables (and the
-    /// bookkeeping table) are left out: they're the virtual table's internals.
-    fn schema_snapshot(conn: &Connection) -> std::collections::BTreeSet<String> {
+    /// Spelling outside quotes doesn't matter; anything inside quotes does.
+    #[test]
+    fn normalized_sql_keeps_quoted_text_exact() {
+        assert_eq!(
+            normalized_sql(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(a UNINDEXED,\n  b, \
+                 tokenize = 'porter unicode61');"
+            ),
+            normalized_sql(
+                "create virtual table t using fts5 ( a unindexed , b,tokenize='porter unicode61' )"
+            ),
+        );
+        for (a, b) in [
+            (
+                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = \"unicode61 separators 'A'\")",
+                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = \"unicode61 separators 'a'\")",
+            ),
+            (
+                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = 'porter  unicode61')",
+                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = 'porter unicode61')",
+            ),
+            (
+                "CREATE INDEX i ON t(\"Col\")",
+                "CREATE INDEX i ON t(\"col\")",
+            ),
+            ("CREATE INDEX i ON t([Col])", "CREATE INDEX i ON t([col])"),
+            ("CREATE INDEX i ON t(`Col`)", "CREATE INDEX i ON t(`col`)"),
+            (
+                "CREATE INDEX i ON t(a) WHERE b = 'X'",
+                "CREATE INDEX i ON t(a) WHERE b = 'x'",
+            ),
+        ] {
+            assert_ne!(normalized_sql(a), normalized_sql(b), "{a} vs {b}");
+        }
+    }
+
+    /// Every object in a sqlite_master/table_info snapshot, keyed the way
+    /// [`render_effect`] keys a declaration, mapped to its definition: normalized
+    /// SQL for an index, trigger or virtual table, the declared type for a column.
+    /// FTS shadow tables (and the bookkeeping table) are left out: they're the
+    /// virtual table's internals.
+    fn schema_snapshot(conn: &Connection) -> std::collections::BTreeMap<String, String> {
         let rows: Vec<(String, String, Option<String>)> = conn
             .prepare(
                 "SELECT type, name, sql FROM sqlite_master \
@@ -2325,43 +2470,32 @@ mod tests {
             .filter(|(_, _, sql)| is_virtual(sql))
             .map(|(_, n, _)| n.as_str())
             .collect();
-        let mut out = std::collections::BTreeSet::new();
+        let mut out = std::collections::BTreeMap::new();
         for (ty, name, sql) in &rows {
             if virtuals.iter().any(|v| name.starts_with(&format!("{v}_"))) {
                 continue;
             }
+            let norm = || normalized_sql(sql.as_deref().unwrap());
             match ty.as_str() {
                 "table" if is_virtual(sql) => {
-                    out.insert(format!(
-                        "virtual:{name}:{}",
-                        normalized_sql(sql.as_deref().unwrap())
-                    ));
+                    out.insert(format!("virtual:{name}"), norm());
                 }
                 "table" => {
-                    out.insert(format!("table:{name}"));
-                    for c in table_columns_for_test(conn, name) {
-                        out.insert(format!("column:{name}.{c}"));
+                    out.insert(format!("table:{name}"), String::new());
+                    for (c, ty) in table_columns(conn, name).unwrap() {
+                        out.insert(format!("column:{name}.{c}"), ty);
                     }
                 }
                 "index" if sql.is_some() => {
-                    out.insert(format!("index:{name}"));
+                    out.insert(format!("index:{name}"), norm());
                 }
                 "trigger" => {
-                    out.insert(format!("trigger:{name}"));
+                    out.insert(format!("trigger:{name}"), norm());
                 }
                 _ => {}
             }
         }
         out
-    }
-
-    fn table_columns_for_test(conn: &Connection, t: &str) -> Vec<String> {
-        conn.prepare("SELECT name FROM pragma_table_info(?1)")
-            .unwrap()
-            .query_map([t], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(|x| x.unwrap())
-            .collect()
     }
 
     fn render_effect(e: &crate::db::SchemaObject) -> String {
@@ -2371,14 +2505,15 @@ mod tests {
             SchemaObject::Column(t, c) => format!("column:{t}.{c}"),
             SchemaObject::Index(i) => format!("index:{i}"),
             SchemaObject::Trigger(t) => format!("trigger:{t}"),
-            SchemaObject::VirtualTable(t, sql) => format!("virtual:{t}:{}", normalized_sql(sql)),
+            SchemaObject::VirtualTable(t) => format!("virtual:{t}"),
         }
     }
 
     /// The declared effects are exactly what the migration creates, found
-    /// independently of the declaration: snapshot the schema before and after
-    /// applying it to a DB at the previous version, and the difference must equal
-    /// the declared set (nothing missing, nothing extra, nothing removed).
+    /// independently of the declaration: snapshot the schema (definitions
+    /// included) before and after applying it to a DB at the previous version. The
+    /// new objects must equal the declared set, and no existing object may be
+    /// removed or redefined (which a name-only list couldn't declare).
     #[test]
     fn declared_schema_effects_equal_what_each_migration_creates() {
         let mut checked = 0;
@@ -2394,9 +2529,14 @@ mod tests {
                 m.schema_effects.iter().map(render_effect).collect();
             assert_eq!(run_migrations_list(&conn, &[m]).unwrap(), vec![v]);
             let after = schema_snapshot(&conn);
-            let created: std::collections::BTreeSet<String> =
-                after.difference(&before).cloned().collect();
-            assert!(before.is_subset(&after), "v{v} removed objects");
+            for (key, def) in &before {
+                assert_eq!(after.get(key), Some(def), "v{v} removed or redefined {key}");
+            }
+            let created: std::collections::BTreeSet<String> = after
+                .keys()
+                .filter(|k| !before.contains_key(*k))
+                .cloned()
+                .collect();
             assert_eq!(
                 created, declared,
                 "v{v}: declared effects vs what it creates"
@@ -2404,6 +2544,24 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 4, "v11–v14 declare effects");
+    }
+
+    /// On a fresh install every declared object matches the reference, so a
+    /// migration whose schema came from the chain itself would be recorded.
+    #[test]
+    fn declared_schema_effects_match_the_reference_on_a_fresh_install() {
+        let migrations = crate::db::migrations();
+        let fresh = Connection::open_in_memory().unwrap();
+        run_migrations_list(&fresh, &migrations).unwrap();
+        let reference = reference_schema(&migrations).unwrap();
+        assert_eq!(schema_snapshot(&fresh), schema_snapshot(&reference));
+        for m in &migrations {
+            assert!(
+                schema_effects_present(&fresh, &reference, m.schema_effects).unwrap(),
+                "v{}",
+                m.version
+            );
+        }
     }
 
     /// The owner's dev DB: CRR-prepared, `_sqlx_migrations` holds 1–10 and 15–18,
