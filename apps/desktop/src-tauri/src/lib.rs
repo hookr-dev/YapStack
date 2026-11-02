@@ -1030,7 +1030,9 @@ pub fn run() {
                     if label == WINDOW_INSIGHT {
                         style = style.resizable();
                     }
-                    panel.set_style_mask(style.into());
+                    if let Err(e) = panel.set_style_mask(style.into()) {
+                        tracing::error!(window = label, "failed to set panel style mask: {e}");
+                    }
                     panel.set_collection_behavior(
                         CollectionBehavior::new()
                             .can_join_all_spaces()

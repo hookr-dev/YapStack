@@ -35,6 +35,7 @@ use rusqlite::Connection;
 
 use crate::transport::SyncTransport;
 use crate::SyncError;
+use yapstack_common::write_turnstile::WriteTurnstile;
 use yapstack_crypto::audio_stream::{open_blob, seal_blob, AudioIdentity};
 
 /// Filename prefix for the encrypted download temp files the fetch path writes (S3). A
@@ -244,7 +245,10 @@ pub fn enqueue(
     session_id: &str,
     priority: i64,
 ) -> Result<bool, SyncError> {
+    // One write turn per attempt (not across the retry backoff sleeps), so the backfill walk's
+    // run of enqueues and the changeset drain's transactions take the lock in arrival order.
     let n = with_busy_retry("enqueue", || {
+        let _turn = WriteTurnstile::process().acquire();
         Ok(conn.execute(
             "INSERT OR IGNORE INTO _yapstack_audio_upload_queue \
              (part_id, source_path, session_id, priority) VALUES (?1, ?2, ?3, ?4)",
