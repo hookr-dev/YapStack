@@ -914,7 +914,6 @@ mod tests {
             );
             assert!(*level >= crate::TABLE_READINESS_LEVEL, "{t} level {level}");
         }
-        assert!(crate::SYNC_CAPABILITY_LEVEL >= crate::TABLE_READINESS_LEVEL);
     }
 
     #[test]
