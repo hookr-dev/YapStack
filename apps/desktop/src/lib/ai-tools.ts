@@ -30,8 +30,11 @@ import {
   isVisibleSegment,
 } from "./ai";
 import { formatTime, stripHtml } from "./utils";
+import { createSegmentIndex } from "./citations/resolve";
+import { convertCitationsInHtml } from "./citations/html";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
+import { speakersFromNames } from "./speakers";
 
 // --- Core types ---
 
@@ -201,24 +204,20 @@ export interface ToolDefinition {
 
 // --- Citation conversion ---
 
-const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/g;
-
 /**
- * Replace [[seg:ID]] text citations with <span data-segment-ref> HTML nodes
- * that the Tiptap SegmentReference extension can render as interactive pills.
+ * Replace citation markers in model-authored HTML with the
+ * `<span data-segment-ref>` nodes the Tiptap SegmentReference extension
+ * renders as pills. The result is persisted, so a marker that doesn't resolve
+ * to one of `segments` is kept as an unlabelled pending pill (shown as an
+ * unavailable source) rather than removed, and pending pills already in
+ * `html` are re-resolved. Only visible text outside code is touched (see
+ * `lib/citations/html.ts`).
  */
 export function convertCitationsToSegmentRefs(
   html: string,
   segments: DbSegment[],
 ): string {
-  return html.replace(CITE_REGEX, (_match, segId: string) => {
-    const segment = segments.find((s) => s.id === segId);
-    const ts = segment
-      ? formatTime(Math.max(0, segment.audio_offset_seconds))
-      : segId.slice(0, 8);
-    const offset = segment ? segment.audio_offset_seconds : 0;
-    return `<span data-segment-ref="" data-segment-id="${segId}" data-timestamp="${ts}" data-offset="${offset}">${ts}</span>`;
-  });
+  return convertCitationsInHtml(html, createSegmentIndex(segments));
 }
 
 // --- Registry ---
@@ -1058,18 +1057,13 @@ registerTool({
       if (!inScope(hit.sessionId)) return;
       if (bySessionId.has(hit.sessionId)) return;
       // Prepend the speaker label so the model can tell who said this
-      // before deciding whether to expand the session. The label uses the
-      // same convention as `formatSegmentSpeaker`: Mic -> "You", System
-      // with diarisation -> speaker name, System without -> "Other".
-      // Per-session speaker overrides (`speakerNames`) are applied so a
-      // renamed "Speaker 1 -> Alice" mapping shows through here too.
-      const speakerNames =
-        useAppStore.getState().settings.speakerNames[hit.sessionId];
-      let label: string;
-      if (hit.source === "Mic") label = "You";
-      else if (hit.speakerId != null)
-        label = speakerNames?.[hit.speakerId] ?? `Speaker ${hit.speakerId + 1}`;
-      else label = "Other";
+      // before deciding whether to expand the session.
+      const label = formatSegmentSpeaker(
+        { source: hit.source ?? "System", speaker_id: hit.speakerId },
+        speakersFromNames(
+          useAppStore.getState().settings.speakerNames[hit.sessionId],
+        ),
+      );
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
         title: hit.sessionTitle,
@@ -1259,12 +1253,13 @@ registerTool({
           // that session. Pulled fresh per session because IDs are
           // session-local (the same speaker_id in two sessions is two
           // different people).
-          const speakerNames =
-            useAppStore.getState().settings.speakerNames[sid];
+          const speakers = speakersFromNames(
+            useAppStore.getState().settings.speakerNames[sid],
+          );
           lines.push("**Transcript:**");
           for (const seg of live.slice(0, 200)) {
             const ts = formatTime(Math.max(0, seg.audio_offset_seconds));
-            const label = formatSegmentSpeaker(seg, speakerNames);
+            const label = formatSegmentSpeaker(seg, speakers);
             lines.push(`[seg:${seg.id} ${ts}] (${label}) ${seg.text}`);
             provenance.push({
               type: "segment",
