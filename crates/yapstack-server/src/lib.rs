@@ -79,6 +79,8 @@ pub fn build_router(state: AppState) -> Router {
             post(sync::push::push).layer(DefaultBodyLimit::max(PUSH_BODY_LIMIT)),
         )
         .route("/sync/pull", get(sync::pull::pull))
+        // Raise the workspace sync capability floor (ADR 0006 §5.5).
+        .route("/sync/capability", put(sync::capability::raise))
         .route("/sync/completeness", get(sync::completeness::completeness))
         // SSE wakeup stream (§7a). Client: yapstack_sync::transport::stream_wakeups, driven
         // by the desktop drain's SSE subscriber lane. Hint-only — pull remains the source of

@@ -97,6 +97,12 @@ pub struct TranscriptionEngineLoadedEvent {
     pub engine: EngineKindDto,
     pub accel: Option<String>,
     pub model_dir: Option<String>,
+    /// Why the attempted accelerator failed to load, when `accel` is a
+    /// CPU fallback. `None` when the accelerator loaded or CPU was chosen.
+    pub accel_fallback: Option<String>,
+    /// `accel` is a GPU EP that leaves part of the model's heavy ops on
+    /// the CPU (static placement table in the sidecar).
+    pub accel_partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -960,6 +966,8 @@ pub async fn init_transcription_client(
             engine = engine_kind.as_str(),
             accel = info.accel.as_deref(),
             model_dir = info.model_dir.as_deref(),
+            accel_fallback = info.accel_fallback.as_deref(),
+            accel_partial = info.accel_partial,
             "transcription engine loaded"
         );
         let _ = app_handle.emit(
@@ -968,6 +976,8 @@ pub async fn init_transcription_client(
                 engine: engine_kind.into(),
                 accel: info.accel,
                 model_dir: info.model_dir,
+                accel_fallback: info.accel_fallback,
+                accel_partial: info.accel_partial,
             },
         );
     }

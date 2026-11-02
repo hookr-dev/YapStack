@@ -202,7 +202,7 @@ impl Default for SyncInfoConfig {
     fn default() -> Self {
         Self {
             protocol_version: 2,
-            min_client_version: "1.0.0".to_string(),
+            min_client_version: "1.0.0-alpha.0".to_string(),
             engine_version: "0.16.3".to_string(),
             billing_url: None,
         }
@@ -378,6 +378,17 @@ mod tests {
         assert!(ips.contains(&"::1".parse().unwrap()));
         assert_eq!(cfg.ratelimit.login_per_minute, 3);
         assert_eq!(cfg.ratelimit.signup_per_minute, 2);
+    }
+
+    #[test]
+    fn default_min_client_version_is_a_prerelease_floor() {
+        // ADR 0006 §5.9: clients compare by semver precedence, so a `1.0.0` default would
+        // nag every alpha build. The default floor is the first prerelease instead.
+        let cfg = Config::from_toml_str(
+            "database_url = \"postgres://localhost/y\"\njwt_secret = \"s\"\nserver_pepper = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sync.min_client_version, "1.0.0-alpha.0");
     }
 
     #[test]

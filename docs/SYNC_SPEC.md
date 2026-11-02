@@ -160,11 +160,44 @@ app-layer passes reinstate what was stripped after each converged merge:
 | `_yapstack_sync_meta` | `client_id` (unused in production; the keychain identity wins), `pull_watermark`, `push_watermark`, `client_seq`, `seq_reconciled`, `bound_tenant_id` |
 | `_yapstack_sync_prep` | `schema_version` marker that the live DB has been CRR-prepared |
 | `_yapstack_outbox` | encrypted, chunked local changesets awaiting ack |
-| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for unknown columns, clock intact) |
+| `_yapstack_pending_changes` | schema-gap quarantine (decrypted rows for tables that aren't a CRR here yet, or for unknown columns; clock intact) |
 | `_yapstack_crypto_quarantine` | undecryptable pulled changesets (ciphertext, durable, retryable) |
 | `_yapstack_audio_upload_queue` | audio upload state machine per part |
 
-### 4.3 Column additions that must be CRR-tracked
+### 4.3 Schema evolution on a CRR database
+
+Migrations (`db.rs`) carry a `kind` (ADR 0006 §1). On a CRR database the runner
+(`db_service::apply_migration`) treats them as follows; on a non-CRR database every kind
+is applied plainly.
+
+- **`Plain`**: a single `ALTER TABLE <sync_table>` is routed through `crsql_alter`;
+  any other statement that names a sync table is refused.
+- **`SyncIndex`**: only `CREATE INDEX IF NOT EXISTS … ON <sync_table>(…)`, plus
+  `DROP INDEX IF EXISTS <name>` when the same migration re-creates `<name>`; no SQL
+  comments. Names are bare `idx_[a-z0-9_]+` identifiers (no quotes, no schema prefix,
+  never `__crsql`) and tables bare sync-table names; a DROP target must be absent or a
+  declared, non-UNIQUE index on the table its re-create names. Applied plainly (an index touches no rows, columns or clocks, so CRR
+  triggers stay current). Every UNIQUE index is refused on every database, even one
+  over the PK: the vendored cr-sqlite rejects any UNIQUE index whose origin isn't the
+  PRIMARY KEY, and cutover drops UNIQUE indexes, so a fresh DB never holds one.
+
+**Indexes survive cutover.** The rebuild (`schema::transform_and_crrify`) captures each
+table's declared non-UNIQUE indexes from `sqlite_master` (never `sqlite_autoindex_*`,
+never UNIQUE) and replays them after the RENAME, alongside the app triggers. Builds
+before this dropped every secondary index at cutover; migration v18 (`SyncIndex`)
+re-declares every synced-table secondary index with `IF NOT EXISTS` to restore them on
+those databases (I-NT2). `IF NOT EXISTS` matches on the name only, so v18 drops and
+re-creates the two indexes whose shape has history (`idx_chat_messages_session`, v7's
+two-column shape; `idx_tags_name`, see below). A new index on a synced table is a
+`SyncIndex` migration.
+
+The rebuild does not carry a column `COLLATE` over, so after cutover `tags.name`
+compares BINARY rather than NOCASE (open follow-up: tag de-duplication by name becomes
+case-sensitive). v18 declares `idx_tags_name` as `tags(name COLLATE NOCASE)`, so the
+index itself stays NOCASE through cutover and serves `getTagByName`'s explicit
+`COLLATE NOCASE` lookup either way.
+
+#### Column additions that must be CRR-tracked
 
 `schema::OUT_OF_BAND_ALTERS` lists every column the front end historically added at
 runtime (`segments.speaker_id`, `sessions.recording_device_id`, six `chat_messages`
@@ -415,15 +448,37 @@ including its own echoes (idempotent; this is how a restored database re-acquire
 own history), one transaction per changeset with cooperative yields and a real pause
 every 32 merges so UI writers can take the lock. A changeset that fails to decrypt or
 decode is stored in the crypto quarantine and the watermark **advances past it**
-(§11.3 as amended: durable, surfaced, retryable, never wedging). Unknown-column rows go
-to the schema quarantine and replay after the column lands. The watermark is written
-once per page.
+(§11.3 as amended: durable, surfaced, retryable, never wedging). A row goes to the
+schema quarantine when its table isn't a CRR locally (absent, or present but not yet
+converted), **sentinel rows included**, or when its column is unknown; readiness is
+checked once per table per changeset. Any other failure to apply a row still fails the
+changeset and rides back as `pull_error`. The watermark is written once per page.
+
+Replay runs at the end of every drain cycle. It walks the stash in arrival (`id`) order,
+one row per write transaction, each under the process `WriteTurnstile` taken before
+`BEGIN IMMEDIATE`. A row that is still not ready waits; a ready row that fails rolls back
+alone, stays stashed and is retried next cycle, and every later stashed row for the same
+`(table, pk)` is skipped for that pass, so a column row never lands over a failed delete
+sentinel. A merge also stashes an incoming row behind any stashed row for the same
+`(table, pk)` that is ready here (failed, or not replayed yet), so an older live row can't
+land past a failed delete sentinel and resurrect the row. That barrier is derived from the
+stash inside the merge transaction, so it holds across a crash. Each pass persists its counts in `_yapstack_sync_meta`
+(`replay_waiting`: rows waiting for an app update; `replay_failed`: failed plus held behind
+a failure), read by `quarantine::replay_status`, so they hold across idle cycles and
+restarts. A non-zero `replay_failed` turns an otherwise clean cycle's health to `Failing`
+(a possible corruption signal); waiting rows don't. Lane status has no field for the
+waiting count yet. `crr_migrate`, `cascade_gc` and `enforce_uniqueness` skip a sync table
+this device doesn't have, or hasn't converted, yet, and report how many passes they skipped
+(ADR 0006 §4).
 
 ### 6.5 Maintenance
 
 `cascade_gc` and `enforce_uniqueness` run only on a cycle that merged something **and**
 completed a clean, fully-drained pull (`maintenance_ready`); a merge on a failed pull
-arms a flag consumed by the next clean cycle. Rationale: proven ≠ fresh.
+arms a flag consumed by the next clean cycle. Maintenance also waits while any stashed
+row fails to replay (a newer value may be stuck behind an older one that landed), and
+reruns on an idle cycle once a table it skipped becomes a CRR; a drain starts with one pass
+armed, since that schedule is in memory. Rationale: proven ≠ fresh.
 
 ### 6.6 Health and progress
 
@@ -533,34 +588,36 @@ device. A permanently dead device leaves an interrupted row, reclaimable via the
 | `POST /auth/refresh` | refresh JWT | rotation + reuse detection |
 | `PUT /auth/password` | access JWT of an **active** device; per-(tenant, IP) 120/min; current `auth_key` or a recovery sign-in within 15 min | replaces verifier + password wrap, keeps `salt_enc` (A9) |
 | `POST /auth/recover` | none; per-IP | recovery verifier check; device identity honoured only with a valid proof (A10); enrols the presented device pending with a one-shot, 15-min `recovery_grant_at` (same-account rows only, else 409; none for a revoked row); recovery wrap + roster; tokens bound to the device |
-| `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at) |
+| `GET /devices` | access JWT | device index (client_id, pubkey, label, platform, status, added_at, sync_capability, capability_seen_at) |
 | `GET /devices/roster` | access JWT (pending allowed) | stored signed roster + watermarks |
 | `PUT /devices/roster` | access JWT with `client_id` whose row is **active** (plus the current `auth_key` when `revoked_devices` is non-empty), or pending with a fresh `recovery_grant_at` (then exactly counter+1, same epoch, names itself, promotes nobody else) | counter strictly increases, epoch never decreases, 64-byte signature present; promotes `active_devices`; revokes `revoked_devices` (active callers only, never self); consumes the grant |
-| `POST /sync/push` | access JWT of an active device; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered |
-| `GET /sync/pull?since&limit` | access JWT | dense pages, never gated |
+| `POST /sync/push` | access JWT of an active device; per-(tenant, IP) 120/min | ≤1000 changes, ≤5 MiB raw; dense commit-ordered seqs from `tenant_seq` under `FOR UPDATE`; idempotent; 409 on content-differing reuse; choke-metered; 409 `sync_capability_floor` when `X-YapStack-Batch-Capability` is above the floor (taken `FOR SHARE` before `tenant_seq`) |
+| `GET /sync/pull?since&limit` | access JWT | dense pages, never gated by entitlements; records `X-YapStack-Sync-Capability` (absent = 0) on the caller's device row; 426 `update_required` below the floor; every page carries `required_sync_capability` and `requested_sync_capability` |
+| `PUT /sync/capability` | access JWT of an active device | raise the floor to `required_sync_capability` under the floor row `FOR UPDATE`: 200 with the levels when every non-revoked device seen in 30 days reports at least that level, else 409 `sync_capability_blocked` listing them (and `requested` rises) |
 | `GET /sync/completeness` | access JWT | `max`, `count`, `contiguous`, per-client tails |
 | `GET /sync/stream` | access JWT | SSE `wakeup` events carrying only the seq |
 | `POST /audio/presign?sha256&size&part_id&session_id` | access JWT | dedup + refcount + existence-checked presigned PUT |
 | `GET /audio/part/{part_id}` | access JWT | 302 to a presigned GET, never gated |
-| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller) |
+| `POST /snapshot/presign`, `GET /snapshot` | access JWT (presign: **active** device) | snapshot bootstrap seam (no client caller); same capability read gate as pull; presign refuses content (`X-YapStack-Snapshot-Capability`) above the floor |
 | `PUT /admin/v1/tenants/{id}/limits`, `GET …/usage` | Ed25519-signed control-plane requests | mounted only when `[limits].admin_public_key` is set |
 
 Every device-authored write is gated on the caller's device row: push, audio presign,
 snapshot presign and `PUT /auth/password` through `devices::require_active_caller`
 (active only), and `PUT /devices/roster` through its own gate in `put_roster` (active,
 or pending with a fresh recovery grant — A7; removal additionally re-authenticates).
-Pull, audio GET, the roster GET, completeness and the SSE stream are never gated. An
+Pull, audio GET, the roster GET, completeness and the SSE stream are never gated by
+device status. Pull and the snapshot routes are gated by sync capability instead (§9.3). An
 access token outlives a revocation by at most its 15-minute TTL (reads only; writes are
 refused immediately).
 
-### 9.2 Schema (migrations 0001–0013)
+### 9.2 Schema (migrations 0001–0014)
 
 `workspaces`, `users` (verifier, salts, both wraps, recovery verifier), `workspace_members`,
 `devices` (pubkey, label, platform, `status` pending|active|revoked, one-shot `recovery_grant_at`, single-use `recovered_at`, unused `state`
 active|stale|retired, `last_seen` never updated), `device_roster` (opaque list +
 signature + counter + epoch), `refresh_tokens`, `tenant_limits`, `tenant_usage`,
 `tenant_seq`, `changesets`, `shares` (unused), `login_nonces` (A10, non-RLS), `audio_blobs` (+ `released_at`),
-`audio_objects` keyed by part, `snapshots`, `admin_nonces`.
+`audio_objects` keyed by part, `snapshots`, `admin_nonces`, `tenant_sync_capability`.
 
 Migrations 0010–0013 are the feature slices' additions, all additive: `0010`
 `devices.recovery_grant_at` (A7), `0011` `devices.recovered_at` (A9 waiver), `0012`
@@ -573,6 +630,70 @@ migration. The one-shot `migrate` service runs them as the database owner; the
 takes effect when that owner bypasses RLS (a superuser or a `BYPASSRLS` role — the
 compose default; see the managed-Postgres caveat in `self-hosting.md`). Operator steps
 are in [`self-hosting.md`](self-hosting.md#upgrading).
+
+`0014` (ADR 0006 §5) adds `devices.sync_capability` (`int`, default 0) and
+`devices.capability_seen_at` (`timestamptz`, NULL until the first pull on this relay), and
+creates the RLS'd per-tenant floor row `tenant_sync_capability (workspace_id,
+required_sync_capability, requested_sync_capability)`.
+
+### 9.3 Sync capability gate
+
+ADR 0006 §5 is authoritative. In short: every pull reports the client's capability level
+(`X-YapStack-Sync-Capability`; no header = 0). The relay records it on the caller's device
+row, throttled: the `UPDATE` writes only when the level changed, the stamp is over an hour
+old, or there is no stamp yet. The workspace floor lives in `tenant_sync_capability`,
+bootstrapped `INSERT … ON CONFLICT DO NOTHING` like `tenant_seq`. Lock order is always that
+row first, then `tenant_seq`:
+
+- pull, `GET /snapshot` and `POST /snapshot/presign` lock it `FOR SHARE`, record the
+  header, check the level and read in one transaction. Below the floor they answer 426
+  `update_required` ("Update YapStack to keep syncing"), and the stamp still commits;
+- push locks it `FOR SHARE` and refuses a batch whose `X-YapStack-Batch-Capability` is
+  above the floor the relay holds right then (409 `sync_capability_floor`). A client's
+  cached floor never authorizes a push, so a restored relay at floor 0 refuses again;
+- `POST /snapshot/presign` also declares the snapshot's content level
+  (`X-YapStack-Snapshot-Capability`, absent = 0). Each transaction that records or
+  re-points a snapshot row takes the floor row `FOR SHARE` and refuses content above the
+  floor (409 `sync_capability_floor`). Readers must be at or above the floor, which only
+  rises, so every reader of a recorded snapshot can apply it;
+- `PUT /sync/capability` locks it `FOR UPDATE`, then the caller's own device row
+  `FOR SHARE` (a caller revoked meanwhile is refused with 403), records the caller's
+  header, then re-reads `devices`. Both levels only rise (`GREATEST`). A refused raise records
+  `requested`, which every pull returns so a straggler can be nudged.
+
+Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).
+
+**Client side.** Builds send level 1 (`SYNC_CAPABILITY_LEVEL`) on every pull, snapshot
+request and raise. Each outbox entry stores the highest level among its rows
+(`_yapstack_outbox.required_sync_capability`, local, added by `ensure_outbox_table`; a
+table's level is declared in `GATED_SYNC_TABLES` beside `SYNC_TABLES`, and every cutover
+table is 0). The push planner cuts a batch wherever the level changes, so batches are
+single-level and an ungated prefix still ships. A gated batch carries
+`X-YapStack-Batch-Capability`. On 409 `sync_capability_floor` the drain tries the raise
+and retries once. A refused raise holds the push in `client_seq` order and lane status
+names the blocking devices, offering the roster's Remove; pull carries on. A 426 shows
+"Update YapStack to keep syncing". A device below `requested` sees "Another device needs
+you to update YapStack". The transport classifies capability 409s by body `code`, so they
+never reach the `client_seq`-regression recovery that drops the unacked outbox; only a
+409 whose body is the relay's `conflict` code does, and an unreadable or unrecognised 409
+stays an error that leaves the outbox intact. Lane status shows a capability refusal once,
+in its notice, and still shows the other direction's error.
+
+The client persists the last `required`/`requested` levels the relay returned, per
+workspace id (`_yapstack_sync_meta` key `relay_capability:<workspace>`; an account switch
+starts from nothing). That copy is for UX and the feature gate only (ADR 0006 §5.4,
+§5.6): the nudge survives a restart from it, but it never authorizes a push, which the
+relay checks against the floor it holds right then.
+
+`min_client_version` is compared by semver precedence (`1.0.0-alpha.11 <
+1.0.0-alpha.12 < 1.0.0`). The relay's default is the prerelease floor `1.0.0-alpha.0`,
+so alpha builds aren't nagged. The drain refreshes it from `GET /sync/info` on its first
+cycle, whenever the relay's reachability flips, and otherwise every 15 minutes, on the
+transport's client and without ever waiting on it: the fetch runs on the drain runtime only
+while the drain is already awaiting, so a slow relay can't delay a cycle, the first-cycle
+latch or the stop check. The last-seen value is persisted per workspace
+(`relay_min_client_version:<workspace>`, kept while the relay is unreachable, removed when
+the relay stops publishing one) and the advisory shows in lane status (ADR 0006 §5.9).
 
 ### 9.3 Isolation
 
@@ -658,8 +779,9 @@ onboarding completes.
   changeset AAD; the relay's plaintext copies are untrusted hints. Because the AAD
   binds the **local** versions, any version skew between peers quarantines wholesale
   until the lagging device updates and retries — this is the v1 posture (§14 D9).
-- Relay `min_client_version` is advisory ("update this app"); there is no per-tenant
-  floor and no device staleness lifecycle (§14 D5).
+- Relay `min_client_version` is advisory ("update this app"). The per-tenant floor is
+  the sync capability gate (§9.3, ADR 0006 §5), keyed to the level each device reports,
+  not to its version. There is still no device staleness lifecycle (§14 D5).
 - Relay `protocol_version` is **2** since A10 (the login challenge). The client checks
   only that the field is present (the not-a-relay sentinel); the version itself is
   informational. Compatibility is enforced by behaviour: a client older than A10 signs in
@@ -690,6 +812,7 @@ onboarding completes.
 | I12 | Two devices converge through the relay; random programs converge | `runtime::two_devices_converge_through_relay`, `convergence_proptest` |
 | I13 | Independent UUID libraries merge as a lossless union; shared ancestry is lossy by design | `merge_semantics::*` |
 | I14 | Unknown-column changes quarantine and replay after migration | `remediations::r7_quarantine_replay_across_schema_gap` |
+| I-NT1 | A row for a table that isn't a CRR locally never fails a changeset: it waits in the schema quarantine, the watermark advances, and it replays once the table is a CRR; one failing stashed row never blocks the others | `outbox::tests::wedge_regression_new_table_sentinel`, `quarantine::tests::*`, `remediations::absent_tables_are_tolerated_by_migrate_cascade_and_uniqueness` |
 | I15 | Dedup and cascade never destroy a partially merged or not-yet-merged row | `data_integrity_prove::*` |
 | I16 | A restored DB re-acquires its own history (own echoes merge) | `outbox` restore tests |
 | I17 | Stale CRR triggers are detected and healed without touching sync state | `trigger_arity::*` |
@@ -704,6 +827,7 @@ onboarding completes.
 | I26 | Removing a device revokes its access, requires re-authentication, and re-enrols it pending with no grant; the removed device is told so and refuses to enable (§15.D) | `auth_flow::device_removal_revokes_access_and_requires_reapproval`, `device_removal_reauth_and_revoked_row_edges`, `SyncTab.test.tsx` ("a removed device is told so…") |
 | I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
+| I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses every UNIQUE index (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
 
 ---
 
@@ -752,7 +876,7 @@ points to §15. Nothing in this table is still open.
 | D2 | Decision report §4.2: two Argon2 passes with `salt_auth` and `salt_enc` | One pass + HKDF split (CRYPTO_SPEC §2.3) | CRYPTO_SPEC is authoritative; the report was a draft |
 | D3 | Decision report §7a: SSE events carry `(changeset_seq, ciphertext)` | Wakeup events carry the seq only; pull is the truth | Spec wins (the blind hint is the safer design) |
 | D4 | Decision report §9: `Content-MD5`, multipart > 100 MB, lazy re-hash, `GET /audio/{session_id}` | STREAM envelope, part-id addressing, pinned-length presigned PUT, AEAD tags as verification, no multipart | CRYPTO_SPEC §1.5 + this §7 are authoritative |
-| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns; no floor | Not implemented, documented (§11). Additive-only stays the safety lever; the columns stay (**§15.I**) |
+| D5 | Decision report §6.4–6.5: version handshake, per-tenant schema floor, device `active → stale → retired` | Only an advisory `min_client_version`; `devices.state` and `last_seen` are dead columns. The per-tenant floor exists as the sync capability gate (§9.3, migration 0014) | Version handshake and staleness lifecycle not implemented, documented (§11). Additive-only stays the safety lever; the columns stay (**§15.I**) |
 | D6 | Decision report §8, CRYPTO_SPEC §8–§9: private-link shares and a JS share-viewer | `shares` table on both sides only; no routes, no UI, no JS stack | Not built; deferred. CRYPTO_SPEC §8/§9/§13.6 stay as the future contract |
 | D7 | Decision report §4.6, Phase 3: per-field settings sync, AI keys vault-wrapped | `SETTINGS_SYNC_POLICY`, `projectSyncedSettings`, `stripAiSecrets`, `prepareAiConfigForSync` existed with no caller | **Done (78e0bf3):** `sync-policy.ts`, its test and the AI-wrap helpers deleted; the classification lives in §4.5 |
 | D8 | Decision report Phase 3: default server URL is the hosted relay | `DEFAULT_SYNC_SERVER_URL = ""`; the hosted hostname does not resolve | Self-host only until a hosted relay exists (**§15.G**) |
@@ -773,6 +897,7 @@ points to §15. Nothing in this table is still open.
 | D23 | `lib/sync.ts` `SyncPhase` included `preparing`; `syncConfig.lastChangesetSeq` was persisted; `billingUrl` was a status field | Rust never emitted `preparing`; `lastChangesetSeq` had no writer; `build_status_dto` always set `billing_url: None` and the probe did not read it | **Done (78e0bf3):** removed (the relay's `GET /sync/info` still echoes an operator-configured `billing_url`; no client reads it) |
 | D24 | `SyncError::CryptoSkip` docs: the drain **stops** at an undecryptable changeset | `pull_direction` quarantines and **advances** | **Done (78e0bf3):** removed |
 | D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | Design written up as [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md); **awaiting ratification** (§15.F) |
+| D26 | ADR 0006 §2: the CRR rebuild keeps a table's secondary indexes | `transform_and_crrify` replayed triggers only, so cutover dropped every secondary index (the owner's synced DB kept just the two `lib/db.ts` re-creates); sessions-by-day and segments-by-session became full scans | **Done (FP2a):** indexes captured and replayed at cutover; migration v18 (`SyncIndex`) restores them on databases already cut over (§4.3, I-NT2) |
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
 
 ---

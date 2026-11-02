@@ -93,6 +93,17 @@ pub enum SidecarResponse {
         /// surface "what's running" without re-deriving from FE state.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_dir: Option<String>,
+        /// Why the attempted accelerator failed to load, when `accel` is
+        /// `"cpu"` because of a fallback rather than by choice. Additive:
+        /// older sidecars omit it (deserializes to None) and older hosts
+        /// ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accel_fallback: Option<String>,
+        /// `accel` is a GPU EP that leaves part of the model's heavy ops on
+        /// the CPU (from the sidecar's static placement table). Additive:
+        /// absent means false, and it is only sent when true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accel_partial: bool,
     },
     /// Response to `QueryEngineInfo` — same shape as `ModelLoaded` but
     /// fired in response to an explicit query, not a load. `accel`/
@@ -104,6 +115,12 @@ pub enum SidecarResponse {
         accel: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_dir: Option<String>,
+        /// See `ModelLoaded::accel_fallback`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accel_fallback: Option<String>,
+        /// See `ModelLoaded::accel_partial`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accel_partial: bool,
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
@@ -296,6 +313,73 @@ mod tests {
                 assert_eq!(initial_prompt, None);
                 assert!(!diarization);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_model_loaded_accel_fallback_is_backward_compatible() {
+        // Older sidecar: no accel_fallback key → None.
+        let json = r#"{"type":"model_loaded","id":1,"accel":"cpu","model_dir":"/m"}"#;
+        match serde_json::from_str::<SidecarResponse>(json).unwrap() {
+            SidecarResponse::ModelLoaded {
+                accel_fallback,
+                accel_partial,
+                ..
+            } => {
+                assert_eq!(accel_fallback, None);
+                assert!(!accel_partial);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let json = r#"{"type":"engine_info","id":2,"accel":"cpu"}"#;
+        match serde_json::from_str::<SidecarResponse>(json).unwrap() {
+            SidecarResponse::EngineInfo { accel_fallback, .. } => {
+                assert_eq!(accel_fallback, None)
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // A normal load omits the key, so the wire stays what older hosts saw.
+        let normal = SidecarResponse::ModelLoaded {
+            id: 3,
+            accel: Some("webgpu".into()),
+            model_dir: None,
+            accel_fallback: None,
+            accel_partial: false,
+        };
+        let wire = serde_json::to_string(&normal).unwrap();
+        assert!(!wire.contains("accel_fallback"));
+        assert!(!wire.contains("accel_partial"));
+
+        // A fallback round-trips its reason.
+        let fallback = SidecarResponse::EngineInfo {
+            id: 4,
+            accel: Some("cpu".into()),
+            model_dir: None,
+            accel_fallback: Some("webgpu failed to load: no adapter".into()),
+            accel_partial: false,
+        };
+        let json = serde_json::to_string(&fallback).unwrap();
+        match serde_json::from_str::<SidecarResponse>(&json).unwrap() {
+            SidecarResponse::EngineInfo { accel_fallback, .. } => assert_eq!(
+                accel_fallback.as_deref(),
+                Some("webgpu failed to load: no adapter")
+            ),
+            _ => panic!("wrong variant"),
+        }
+
+        // A partial GPU load round-trips its flag.
+        let partial = SidecarResponse::ModelLoaded {
+            id: 5,
+            accel: Some("webgpu".into()),
+            model_dir: None,
+            accel_fallback: None,
+            accel_partial: true,
+        };
+        let json = serde_json::to_string(&partial).unwrap();
+        match serde_json::from_str::<SidecarResponse>(&json).unwrap() {
+            SidecarResponse::ModelLoaded { accel_partial, .. } => assert!(accel_partial),
             _ => panic!("wrong variant"),
         }
     }
