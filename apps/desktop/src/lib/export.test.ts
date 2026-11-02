@@ -12,8 +12,10 @@ function seg(
   source: DbSegment["source"],
   text: string,
   audio_offset_seconds: number,
+  speaker_id: number | null = null,
 ): DbSegment {
   return {
+    speaker_id,
     id: `${source}-${audio_offset_seconds}`,
     session_id: "s1",
     source,
@@ -49,6 +51,30 @@ describe("formatTimestamp", () => {
 });
 
 describe("segmentsToAttributedMarkdown", () => {
+  it("starts a new turn when the speaker changes within one channel", () => {
+    const md = segmentsToAttributedMarkdown([
+      seg("Mic", "I'll own the budget.", 0, 0),
+      seg("Mic", "No, I will.", 4, 1),
+      seg("Mic", "Fine.", 8, 0),
+    ]);
+    expect(md).toBe(
+      "**Speaker 1:** I'll own the budget.\n\n**Speaker 2:** No, I will.\n\n**Speaker 1:** Fine.",
+    );
+  });
+
+  it("merges same-speaker clusters and keeps mic and system clusters apart", () => {
+    const md = segmentsToAttributedMarkdown(
+      [
+        seg("Mic", "a", 0, 0),
+        seg("Mic", "b", 1, 0),
+        seg("System", "c", 2, 0),
+        seg("Mic", "d", 3),
+      ],
+      { speakers: { "system:c0": { display_name: "Alice" } } },
+    );
+    expect(md).toBe("**Speaker 1:** a b\n\n**Alice:** c\n\n**Me:** d");
+  });
+
   it("labels Mic as **Me:** and System as **Them:**", () => {
     const md = segmentsToAttributedMarkdown([
       seg("System", "Thanks for hopping on.", 0),

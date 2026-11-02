@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
@@ -42,7 +42,7 @@ jobs:
       CFLAGS: "-march=native"
       CXXFLAGS: "-march=native"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install cmake
         run: brew install cmake
@@ -66,7 +66,7 @@ jobs:
         run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-macos-latest
           key: ${{ steps.xcode.outputs.version }}
@@ -97,7 +97,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Check cmake
         # windows-latest ships cmake in the runner image; the sidecar's
@@ -112,7 +112,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-windows-latest
           # ort-sys downloads its prebuilt binaries here at build-script time;
@@ -160,10 +160,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # 24: db-runtime-schema.test.ts imports node:sqlite, which Node 22's
           # Vite can't resolve as a built-in.
@@ -178,7 +178,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
