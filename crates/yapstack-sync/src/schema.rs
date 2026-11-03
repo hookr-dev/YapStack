@@ -301,15 +301,23 @@ pub fn crr_sync_tables(conn: &Connection) -> Result<Vec<&'static str>, SyncError
 /// Rebuild one table into its CRR-compatible shape (preserving app triggers such as
 /// the FTS sync triggers, and its non-UNIQUE secondary indexes) then `crsql_as_crr` it. Idempotent: a table already
 /// converted is skipped.
+///
+/// Needs `foreign_keys` off (see [`ensure_crr`]). BEGIN IMMEDIATE, and every read inside
+/// it, for the reason `alter_dance` gives: the boot heal runs this on the drain's
+/// connection while the app's writer is live, so the table must not change between
+/// reading its shape and rebuilding it, and a lost read->write upgrade would fail outright.
 fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError> {
-    if is_crr(conn, table)? {
+    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`; the
+    // `DropBehavior::Rollback` default is what unwinds a half-done rebuild.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if is_crr(&tx, table)? {
         return Ok(());
     }
-    if !table_exists(conn, table)? {
+    if !table_exists(&tx, table)? {
         return Err(SyncError::UnknownTable(table.to_string()));
     }
     let triggers: Vec<String> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT sql FROM sqlite_master \
              WHERE type='trigger' AND tbl_name=?1 AND sql IS NOT NULL",
         )?;
@@ -318,17 +326,13 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
             .collect();
         v?
     };
-    let indexes = secondary_index_sql(conn, table)?;
+    let indexes = secondary_index_sql(&tx, table)?;
 
-    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tmp = format!("{table}__crr_rebuild");
     // Derive the rebuild shape from the LIVE table (not a hardcoded list) so the
     // column count/order always matches `SELECT *`, regardless of migration drift
     // such as the runtime-patched `segments.speaker_id` (R8 fresh-install fix).
-    let body = derive_rebuild_body(conn, table)?;
-    // `new_unchecked` because we hold only a `&Connection` here, not `&mut`; the
-    // `DropBehavior::Rollback` default is what unwinds a half-done rebuild.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    let body = derive_rebuild_body(&tx, table)?;
     tx.execute_batch(&format!("CREATE TABLE \"{tmp}\" ({body});"))?;
     tx.execute_batch(&format!("INSERT INTO \"{tmp}\" SELECT * FROM \"{table}\";"))?;
     tx.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
@@ -349,6 +353,43 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
     Ok(())
 }
 
+/// Convert `table` to a CRR (ADR 0006 §1): the CRR rebuild, then `crsql_as_crr`, which
+/// backfills clocks for the rows already there. Idempotent. Any table; the caller decides
+/// which ones sync.
+///
+/// The rebuild needs `foreign_keys` off: dropping the old table would otherwise run its FK
+/// actions (a parent's `ON DELETE CASCADE` would empty its children). The setting is put
+/// back afterwards, failure included, since this runs on long-lived connections (the app's
+/// writer for a `CreateSyncTable` migration, the drain for the boot heal). The pragma is a
+/// no-op inside a transaction, so call this outside one; the rebuild's BEGIN then refuses
+/// a connection that is already in one.
+pub fn ensure_crr(conn: &Connection, table: &str) -> Result<(), SyncError> {
+    let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let res = transform_and_crrify(conn, table);
+    let restored = conn.execute_batch(&format!("PRAGMA foreign_keys={fk};"));
+    res?;
+    restored?;
+    Ok(())
+}
+
+/// [`ensure_crr`] each of `tables` this DB has and hasn't converted yet, in order, stopping
+/// at the first failure. Returns the ones it converted.
+fn crrify_present_tables<'a>(
+    conn: &Connection,
+    tables: &[&'a str],
+) -> Result<Vec<&'a str>, SyncError> {
+    let mut converted = Vec::new();
+    for t in tables {
+        if !table_exists(conn, t)? || is_crr(conn, t)? {
+            continue;
+        }
+        ensure_crr(conn, t)?;
+        converted.push(*t);
+    }
+    Ok(converted)
+}
+
 /// R3 entry point: transform + CRRify every sync table on a (COPY of a) local DB.
 /// NEVER call against the live DB — operate on a `.backup` copy (T001 procedure).
 ///
@@ -356,13 +397,19 @@ fn transform_and_crrify(conn: &Connection, table: &str) -> Result<(), SyncError>
 /// table added after cutover is created and converted by its own migration, and rows for it
 /// that arrive first wait in the quarantine.
 pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
-    for t in SYNC_TABLES {
-        if !table_exists(conn, t)? {
-            continue;
-        }
-        transform_and_crrify(conn, t)?;
+    crrify_present_tables(conn, SYNC_TABLES).map(|_| ())
+}
+
+/// Boot heal (ADR 0006 §3): on a CRR-prepared DB, convert every `SYNC_TABLES` table that
+/// exists but isn't a CRR yet. That is a `CreateSyncTable` migration that stopped between
+/// its CREATE and the conversion, or one recorded where the table couldn't be converted (a
+/// build without sync applies it plainly). Returns the tables it converted. Does nothing on
+/// a DB that isn't CRR-prepared: converting one is cutover's job, on a copy.
+pub fn ensure_sync_tables_crr(conn: &Connection) -> Result<Vec<&'static str>, SyncError> {
+    if crr_sync_tables(conn)?.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    crrify_present_tables(conn, SYNC_TABLES)
 }
 
 /// The `crsql_begin_alter` / `crsql_commit_alter` dance around an OPTIONAL schema
@@ -957,6 +1004,179 @@ mod tests {
             snapshot_content_capability(conn).unwrap(),
             crate::TABLE_READINESS_LEVEL
         );
+    }
+
+    /// A gated table above this build's own level would make every device running it a
+    /// blocker of its own floor raise, forever.
+    #[test]
+    fn no_table_needs_more_than_this_build_reports() {
+        assert!(highest_table_sync_capability() <= crate::SYNC_CAPABILITY_LEVEL);
+    }
+
+    fn foreign_keys_on(conn: &Connection) -> bool {
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 1
+    }
+
+    fn changes_for(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM crsql_changes WHERE \"table\" = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The rebuild turns `foreign_keys` off (dropping a parent would otherwise cascade into
+    /// its children). `ensure_crr` also runs on the app's long-lived writer, so it hands the
+    /// connection back with the setting it had, after a failure too.
+    #[test]
+    fn ensure_crr_restores_foreign_keys() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; \
+             CREATE TABLE parent(id TEXT PRIMARY KEY); \
+             CREATE TABLE child(id TEXT PRIMARY KEY, \
+               parent_id TEXT REFERENCES parent(id) ON DELETE CASCADE); \
+             CREATE TABLE bad(id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO parent VALUES ('p1'); INSERT INTO child VALUES ('c1', 'p1');",
+        )
+        .unwrap();
+        ensure_crr(conn, "parent").unwrap();
+        assert!(foreign_keys_on(conn), "on again after a conversion");
+        assert!(
+            ensure_crr(conn, "bad").is_err(),
+            "a non-TEXT PK can't convert"
+        );
+        assert!(foreign_keys_on(conn), "on again after a failed conversion");
+        let children: i64 = conn
+            .query_row("SELECT count(*) FROM child", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(children, 1, "rebuilding the parent cascaded nothing");
+
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        ensure_crr(conn, "child").unwrap();
+        assert!(
+            !foreign_keys_on(conn),
+            "a connection that had it off keeps it off"
+        );
+    }
+
+    /// Rows written before the conversion get clocks (`crsql_as_crr` backfills them), so
+    /// capture sees them like any other change.
+    #[test]
+    fn ensure_crr_backfills_rows_written_before_conversion_and_capture_sees_them() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE shares(id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, note TEXT); \
+             CREATE INDEX idx_shares_folder ON shares(folder_id); \
+             INSERT INTO shares VALUES ('a', 'f1', 'x'), ('b', 'f2', NULL);",
+        )
+        .unwrap();
+        ensure_crr(conn, "shares").unwrap();
+        assert!(is_crr(conn, "shares").unwrap());
+        assert!(!crr_triggers_are_stale(conn, "shares").unwrap());
+        let pks: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT pk) FROM crsql_changes WHERE \"table\" = 'shares'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pks, 2,
+            "both rows written before the conversion are changes"
+        );
+        assert_eq!(
+            secondary_index_sql(conn, "shares").unwrap().len(),
+            1,
+            "the index survives the rebuild"
+        );
+    }
+
+    #[test]
+    fn ensure_crr_is_idempotent() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO shares VALUES ('a', 'x');",
+        )
+        .unwrap();
+        ensure_crr(conn, "shares").unwrap();
+        let version = |c: &Connection| {
+            c.query_row("SELECT crsql_db_version()", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = (version(conn), changes_for(conn, "shares"));
+        ensure_crr(conn, "shares").unwrap();
+        assert_eq!((version(conn), changes_for(conn, "shares")), before);
+    }
+
+    /// The boot heal never converts anything on a DB that isn't CRR-prepared: cutover does
+    /// that, on a copy.
+    #[test]
+    fn ensure_sync_tables_crr_is_a_no_op_on_a_non_crr_db() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE tags(id TEXT PRIMARY KEY, name TEXT); \
+             CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT);",
+        )
+        .unwrap();
+        assert!(ensure_sync_tables_crr(conn).unwrap().is_empty());
+        assert!(crr_tables(conn).unwrap().is_empty());
+    }
+
+    /// On a CRR DB it converts every present sync table that isn't a CRR yet (a
+    /// `CreateSyncTable` that stopped between its CREATE and the conversion), skips absent
+    /// ones and leaves tables outside `SYNC_TABLES` alone.
+    #[test]
+    fn ensure_sync_tables_crr_converts_present_unconverted_tables() {
+        let db = crate::CrsqlDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; \
+             CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT); \
+             CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT); \
+             CREATE TABLE t_local(id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO shares VALUES ('a', 'x');",
+        )
+        .unwrap();
+        conn.query_row("SELECT crsql_as_crr('tags')", [], |_| Ok(()))
+            .unwrap();
+        assert_eq!(ensure_sync_tables_crr(conn).unwrap(), vec!["shares"]);
+        assert!(is_crr(conn, "shares").unwrap());
+        assert!(!is_crr(conn, "t_local").unwrap());
+        assert!(changes_for(conn, "shares") > 0, "its row was backfilled");
+        assert!(foreign_keys_on(conn));
+        assert!(
+            ensure_sync_tables_crr(conn).unwrap().is_empty(),
+            "idempotent"
+        );
+    }
+
+    /// A write from another connection (the app's writer, while the drain converted the
+    /// table) is captured once the conversion has committed.
+    #[test]
+    fn a_write_from_another_connection_after_conversion_is_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let drain = crate::CrsqlDb::open(&path).unwrap();
+        let writer = crate::CrsqlDb::open(&path).unwrap();
+        drain
+            .conn()
+            .execute_batch("CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT);")
+            .unwrap();
+        ensure_crr(drain.conn(), "shares").unwrap();
+        writer
+            .conn()
+            .execute("INSERT INTO shares VALUES ('w', 'from the writer')", [])
+            .unwrap();
+        assert!(changes_for(drain.conn(), "shares") > 0);
     }
 
     #[test]
