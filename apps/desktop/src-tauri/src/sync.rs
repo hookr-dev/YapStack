@@ -1823,8 +1823,9 @@ fn heal_crr_trigger_arity(conn: &Connection) {
 /// Convert every `SYNC_TABLES` table that exists here but isn't a CRR yet (ADR 0006 §3):
 /// one a `CreateSyncTable` migration created and didn't convert, or one recorded where it
 /// couldn't be converted (a build without sync applies the migration plainly). Rows
-/// written to it in the meantime get clocks and are captured. A table it converts is no
-/// longer a setup failure in lane status.
+/// written to it in the meantime get clocks and are captured. Then every setup failure
+/// whose migration's whole setup is now in place leaves lane status; one still missing an
+/// index stays until a restart reruns its migration.
 ///
 /// Takes the write turn: it rebuilds tables on the drain's connection while the app's
 /// writer is live. NON-FATAL, like [`heal_crr_trigger_arity`]: a failure is logged and the
@@ -1839,18 +1840,14 @@ fn heal_unconverted_sync_tables(
     };
     match converted {
         Ok(tables) if tables.is_empty() => {}
-        Ok(tables) => {
-            tracing::warn!(
-                "sync: converted {} synced table(s) a migration left unconverted: {}",
-                tables.len(),
-                tables.join(", ")
-            );
-            for t in tables {
-                failures.resolve(t);
-            }
-        }
+        Ok(tables) => tracing::warn!(
+            "sync: converted {} synced table(s) a migration left unconverted: {}",
+            tables.len(),
+            tables.join(", ")
+        ),
         Err(e) => tracing::error!("sync: converting unconverted synced tables failed: {e}"),
     }
+    failures.resolve_landed(conn);
 }
 
 fn ensure_prep_table(conn: &Connection) -> rusqlite::Result<()> {
@@ -8775,34 +8772,55 @@ mod tests {
         assert!(n > 0, "post-heal UPDATEs must be captured by crsql_changes");
     }
 
-    /// The same pass on a HEALTHY device (Mac-shaped: cut over at the full 14-column
-    /// shape) heals nothing and leaves sync state — site id, db_version, watermarks —
-    /// untouched, so it can run unconditionally at every boot.
-    /// ADR 0006 §3: a synced table whose migration is recorded but that isn't a CRR (a build
-    /// without sync applied it plainly) is converted by the drain's boot heal while the app's
-    /// writer stays open, its rows written before then become changes, and lane status stops
-    /// reporting it.
-    #[test]
-    fn drain_heal_converts_a_recorded_but_non_crr_sync_table() {
-        let (_dir, path, svc) = cutover_fixture();
+    /// A `CreateSyncTable` of `shares` (the stand-in for a table added after cutover) with
+    /// the given SQL.
+    fn shares_migration(sql: &'static str) -> crate::db::Migration {
+        crate::db::Migration {
+            version: 990,
+            description: "test: create sync table",
+            sql,
+            kind: crate::db::MigrationKind::CreateSyncTable { table: "shares" },
+            schema_effects: &[],
+        }
+    }
+
+    const SHARES_TABLE: &str =
+        "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, note TEXT)";
+
+    /// A cut-over live DB whose `shares` is a plain table with one row, as a `CreateSyncTable`
+    /// migration that never converted it leaves it (`shares` dropped with its CRR machinery,
+    /// then re-created from `create`).
+    fn live_db_with_unconverted_shares(
+        create: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::db_service::DbServiceState,
+    ) {
+        let (dir, path, svc) = cutover_fixture();
         perform_cutover(&path, &svc).expect("cutover → CRR live DB");
-        // Stand-in for a table no build converted: `shares` without its CRR machinery.
         for t in ["shares", "shares__crsql_clock", "shares__crsql_pks"] {
             svc.execute(&format!("DROP TABLE IF EXISTS {t}"), &[])
                 .unwrap();
         }
-        svc.execute(
-            "CREATE TABLE shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, note TEXT)",
-            &[],
-        )
-        .unwrap();
+        svc.execute(create, &[]).unwrap();
         svc.execute(
             "INSERT INTO shares (id, folder_id) VALUES ('sh1', 'f1')",
             &[],
         )
         .unwrap();
+        (dir, path, svc)
+    }
+
+    /// ADR 0006 §3: a synced table whose migration is recorded but that isn't a CRR (a build
+    /// without sync applied it plainly) is converted by the drain's boot heal while the app's
+    /// writer stays open, its rows written before then become changes, and lane status stops
+    /// reporting it once everything the migration declares is in place.
+    #[test]
+    fn drain_heal_converts_a_recorded_but_non_crr_sync_table() {
+        let (_dir, path, svc) = live_db_with_unconverted_shares(SHARES_TABLE);
         let failures = crate::db_service::SyncTableSetupFailures::new();
-        failures.add("shares");
+        failures.add(shares_migration(SHARES_TABLE));
 
         let db = CrsqlDb::open(&path).unwrap();
         let conn = db.conn();
@@ -8837,6 +8855,50 @@ mod tests {
         assert!(failures.tables().is_empty());
     }
 
+    /// The setup notice stays until the migration's whole setup is in place, not just the
+    /// conversion: a heal that converts the table while its index is missing keeps it, and
+    /// so does a table already converted (a run that failed after the conversion, at its
+    /// indexes). Once the index is there too, the next heal clears it.
+    #[test]
+    fn drain_heal_clears_the_setup_notice_only_once_the_migration_s_setup_is_complete() {
+        const WITH_INDEX: &str = "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, \
+             folder_id TEXT NOT NULL, note TEXT); \
+             CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id)";
+        let (_dir, path, svc) = live_db_with_unconverted_shares(SHARES_TABLE);
+        let failures = crate::db_service::SyncTableSetupFailures::new();
+        failures.add(shares_migration(WITH_INDEX));
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(schema::is_crr(conn, "shares").unwrap());
+        assert_eq!(
+            failures.tables(),
+            vec!["shares"],
+            "converted, index missing"
+        );
+        heal_unconverted_sync_tables(conn, &failures);
+        assert_eq!(
+            failures.tables(),
+            vec!["shares"],
+            "a CRR, index still missing"
+        );
+
+        svc.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id)",
+            &[],
+        )
+        .unwrap();
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(
+            failures.tables().is_empty(),
+            "everything it declares is in place"
+        );
+    }
+
+    /// The same pass on a HEALTHY device (Mac-shaped: cut over at the full 14-column
+    /// shape) heals nothing and leaves sync state — site id, db_version, watermarks —
+    /// untouched, so it can run unconditionally at every boot.
     #[test]
     fn boot_heal_is_inert_on_a_healthy_device() {
         let (_dir, path, svc) = migration_chain_fixture(true);

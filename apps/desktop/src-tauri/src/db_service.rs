@@ -542,13 +542,13 @@ const SQLX_MIGRATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
 /// table it converts, and `sync_status` reads it.
 #[derive(Debug, Default)]
 pub struct SyncTableSetupFailures {
-    tables: Mutex<Vec<&'static str>>,
+    migrations: Mutex<Vec<crate::db::Migration>>,
 }
 
 impl SyncTableSetupFailures {
     pub const fn new() -> Self {
         Self {
-            tables: Mutex::new(Vec::new()),
+            migrations: Mutex::new(Vec::new()),
         }
     }
 
@@ -558,31 +558,49 @@ impl SyncTableSetupFailures {
         &PROCESS
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<&'static str>> {
-        self.tables.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<crate::db::Migration>> {
+        self.migrations.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn clear(&self) {
         self.lock().clear();
     }
 
-    pub(crate) fn add(&self, table: &'static str) {
-        let mut tables = self.lock();
-        if !tables.contains(&table) {
-            tables.push(table);
+    /// `m` (a `CreateSyncTable`) didn't finish.
+    pub(crate) fn add(&self, m: crate::db::Migration) {
+        let mut migrations = self.lock();
+        if !migrations.iter().any(|f| f.version == m.version) {
+            migrations.push(m);
         }
     }
 
-    /// `table` is a CRR now (the boot heal converted it).
+    /// Drop each migration whose whole setup is in place in `conn` now (the check a run
+    /// records by, [`create_sync_table_landed`]). Converting the table alone isn't enough:
+    /// its indexes can still be missing, and a run that failed after the conversion leaves
+    /// a CRR the boot heal never touches. An entry whose check errors is kept.
     #[cfg(feature = "sync")]
-    pub fn resolve(&self, table: &str) {
-        self.lock().retain(|t| *t != table);
+    pub fn resolve_landed(&self, conn: &Connection) {
+        self.lock()
+            .retain(|m| !create_sync_table_landed(conn, m).unwrap_or(false));
     }
 
-    /// Read only by sync lane status, which a build without sync doesn't have.
+    /// The tables of the migrations that didn't finish. Read only by sync lane status,
+    /// which a build without sync doesn't have.
     #[cfg(feature = "sync")]
     pub fn tables(&self) -> Vec<String> {
-        self.lock().iter().map(|t| (*t).to_string()).collect()
+        self.lock()
+            .iter()
+            .filter_map(created_sync_table)
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// The table a `CreateSyncTable` migration creates.
+fn created_sync_table(m: &crate::db::Migration) -> Option<&'static str> {
+    match m.kind {
+        crate::db::MigrationKind::CreateSyncTable { table } => Some(table),
+        _ => None,
     }
 }
 
@@ -634,8 +652,8 @@ fn run_migrations_list_with(
                         m.version,
                         m.description
                     );
-                    if let crate::db::MigrationKind::CreateSyncTable { table } = m.kind {
-                        failures.add(table);
+                    if created_sync_table(m).is_some() {
+                        failures.add(*m);
                     }
                 }
             }
@@ -1003,6 +1021,10 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     conn.execute_batch("BEGIN;")?;
     let res = conn
         .execute_batch(m.sql)
+        .and_then(|()| match created_sync_table(m) {
+            Some(_) => ensure_create_sync_table_landed(conn, m),
+            None => Ok(()),
+        })
         .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
     match res {
         Ok(()) => conn.execute_batch("COMMIT;"),
@@ -1013,9 +1035,41 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     }
 }
 
+/// Whether everything a `CreateSyncTable` `m` declares ([`recordable_effects`]) is in
+/// place in `conn`, compared with what `m` alone creates on an empty DB: the table in that
+/// shape, each of its indexes, and on a CRR DB the table as a CRR with current triggers
+/// ([`schema_effects_present`], the check #133's fallback records a failed run by). The
+/// reference is `m` alone because at this point no later migration has run.
+fn create_sync_table_landed(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Result<bool> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(m.sql)?;
+    schema_effects_present(conn, &reference, &recordable_effects(m))
+}
+
+/// The run's last check before it records `m`: a CREATE that matched an existing table of
+/// another shape (`IF NOT EXISTS` matches on the name alone) must not be recorded as done.
+fn ensure_create_sync_table_landed(
+    conn: &Connection,
+    m: &crate::db::Migration,
+) -> rusqlite::Result<()> {
+    if create_sync_table_landed(conn, m)? {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!(
+            "CreateSyncTable migration v{} ({}): what it creates is not in place afterwards \
+             (an existing table or index of the same name differs, or the table isn't a CRR \
+             with current triggers). Not recording it.",
+            m.version, m.description
+        )),
+    ))
+}
+
 /// Apply a validated `CreateSyncTable` migration on a CRR DB: the CREATE, then the
 /// conversion ([`yapstack_sync::schema::ensure_crr`], which puts `foreign_keys` back as
-/// it found it), then the indexes and the bookkeeping row in one transaction. The
+/// it found it), then the indexes, the check that everything it declares landed
+/// ([`ensure_create_sync_table_landed`]) and the bookkeeping row in one transaction. The
 /// migration is recorded last and every step is idempotent, so a run cut short anywhere
 /// leaves it unrecorded and the next run finishes it.
 #[cfg(feature = "sync")]
@@ -1035,6 +1089,7 @@ fn apply_create_sync_table_on_crr(
     let res = indexes
         .iter()
         .try_for_each(|i| conn.execute_batch(i))
+        .and_then(|()| ensure_create_sync_table_landed(conn, m))
         .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
     match res {
         Ok(()) => conn.execute_batch("COMMIT;"),
@@ -1197,7 +1252,9 @@ fn validate_create_sync_table_migration(
 /// (`__crsql`), and `<table>` is bare too. No quotes, no schema prefix, so what is
 /// checked is exactly what SQLite resolves. A DROP target must be absent or a declared,
 /// non-UNIQUE index on the same table its re-create names, so a DROP can never remove a
-/// constraint's autoindex, a UNIQUE index or another table's index.
+/// constraint's autoindex, a UNIQUE index or another table's index. A CREATE's name must
+/// be absent or already an index on the table it names, so `IF NOT EXISTS` can't turn it
+/// into a no-op because another table holds the name.
 ///
 /// Every declared UNIQUE index is refused, even one over exactly the PK: the
 /// vendored cr-sqlite rejects any unique index whose origin isn't `pk`
@@ -1278,6 +1335,31 @@ fn validate_index_statements(
                     }
                 )));
             }
+        }
+    }
+    // After the DROP checks, so a re-created index's DROP is judged first. `IF NOT
+    // EXISTS` matches on the name alone, so a same-named object on another table would
+    // make a CREATE a silent no-op.
+    for st in &stmts {
+        let IndexStmt::Create { name, table, .. } = st else {
+            continue;
+        };
+        let owner: Option<(String, String)> = conn
+            .query_row(
+                "SELECT type, tbl_name FROM sqlite_master WHERE name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        if let Some((ty, tbl)) = owner.filter(|(ty, tbl)| ty != "index" || tbl != table) {
+            return Err(refuse(format!(
+                "`{name}` already names a {ty} on `{tbl}`, so `CREATE INDEX IF NOT EXISTS \
+                 {name} ON {table}` would create nothing"
+            )));
         }
     }
     Ok(())
@@ -2358,6 +2440,8 @@ mod tests {
             sync_index(993, "DROP INDEX IF EXISTS idx_sessions_created; CREATE INDEX IF NOT EXISTS idx_sessions_created ON segments(created_at)"),
             // A DROP target that is a UNIQUE index (created below).
             sync_index(994, "DROP INDEX IF EXISTS idx_u_existing; CREATE INDEX IF NOT EXISTS idx_u_existing ON tags(color)"),
+            // A name another table's index has: `IF NOT EXISTS` would make it a no-op.
+            sync_index(995, "CREATE INDEX IF NOT EXISTS idx_sessions_created ON segments(created_at)"),
         ];
         conn.execute_batch("CREATE UNIQUE INDEX idx_u_existing ON tags(color);")
             .unwrap();
@@ -3332,6 +3416,66 @@ mod tests {
                  CREATE INDEX IF NOT EXISTS idx_x ON shares (folder_id) WHERE v IS NOT NULL",
             );
             apply_migration(conn, &ok).expect(ok.sql);
+        }
+    }
+
+    /// A never-synced DB and a CRR DB without `shares`, each opened like the app's writer.
+    #[cfg(feature = "sync")]
+    fn plain_and_crr_dbs_without_shares() -> [(tempfile::TempDir, ManagedConn); 2] {
+        let (dir, path) = temp_db();
+        let plain = open_managed(&path).unwrap();
+        run_migrations(plain.conn()).unwrap();
+        plain.conn().execute_batch("DROP TABLE shares;").unwrap();
+        [(dir, plain), crr_db_without_shares()]
+    }
+
+    /// `IF NOT EXISTS` matches on the name alone: an index of the same name on another table
+    /// would turn the migration's CREATE INDEX into a no-op and leave its table without the
+    /// index, recorded as done. The name is refused instead, before any DDL.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_refuses_an_index_name_another_table_has() {
+        for (_dir, conn) in &plain_and_crr_dbs_without_shares() {
+            let conn = conn.conn();
+            conn.execute_batch("CREATE INDEX idx_shares_folder ON folders(name);")
+                .unwrap();
+            let failures = SyncTableSetupFailures::new();
+            let m = create_sync_table(990, "shares", SHARES_SQL);
+            let err = apply_migration(conn, &m).expect_err("a name another table has");
+            assert!(err.to_string().contains("Refusing to apply"), "{err}");
+            assert!(
+                !table_exists_for_test(conn, "shares"),
+                "refused before any DDL"
+            );
+            assert!(run_migrations_list_with(conn, &[m], &failures)
+                .unwrap()
+                .is_empty());
+            assert!(!recorded_versions(conn).contains(&990));
+            assert_eq!(failures.tables(), vec!["shares"]);
+        }
+    }
+
+    /// `CREATE TABLE IF NOT EXISTS` keeps a table of the same name whatever its shape, so a
+    /// leftover `shares` missing a column would be converted and recorded as done. The run
+    /// checks what it declares landed (the same check a failed run is recorded by) before
+    /// it records, and reports it otherwise.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_records_only_once_what_it_declares_landed() {
+        for (_dir, conn) in &plain_and_crr_dbs_without_shares() {
+            let conn = conn.conn();
+            conn.execute_batch(
+                "CREATE TABLE shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL);",
+            )
+            .unwrap();
+            let failures = SyncTableSetupFailures::new();
+            let m = create_sync_table(990, "shares", SHARES_SQL);
+            assert!(run_migrations_list_with(conn, &[m], &failures)
+                .unwrap()
+                .is_empty());
+            assert!(!recorded_versions(conn).contains(&990));
+            assert_eq!(failures.tables(), vec!["shares"]);
+            assert!(foreign_keys_on(conn));
         }
     }
 

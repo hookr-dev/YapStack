@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 /// which preserves continuity with the plugin's `_sqlx_migrations` bookkeeping.
 /// All migrations are `Up`; `kind` says how the runner may apply them on a CRR DB
 /// (ADR 0006 §1).
+#[derive(Clone, Copy, Debug)]
 pub struct Migration {
     pub version: i64,
     pub description: &'static str,
