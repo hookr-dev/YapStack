@@ -62,6 +62,24 @@ pub fn table_sync_capability(table: &str) -> i32 {
         .map_or(crate::TABLE_READINESS_LEVEL, |(_, level)| *level)
 }
 
+/// The highest level any table can need in this build: what an entry whose rows can't be
+/// read is held at, so it never goes out below the level of whatever it carries.
+#[must_use]
+pub fn highest_table_sync_capability() -> i32 {
+    GATED_SYNC_TABLES
+        .iter()
+        .map(|(_, level)| *level)
+        .fold(crate::TABLE_READINESS_LEVEL, i32::max)
+}
+
+/// True when some CRR table here is outside the cutover set, i.e. when an outbox entry could
+/// hold rows above level 0.
+pub fn has_post_cutover_crr_table(conn: &Connection) -> Result<bool, SyncError> {
+    Ok(crr_tables(conn)?
+        .iter()
+        .any(|t| !SYNC_TABLES[..CUTOVER_SYNC_TABLE_COUNT].contains(&t.as_str())))
+}
+
 /// One column's metadata as reported by `PRAGMA table_info`, in declared (`cid`)
 /// order. This is the authoritative, drift-proof shape of the LIVE table.
 struct ColInfo {

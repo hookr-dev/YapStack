@@ -202,9 +202,10 @@ pub fn ensure_outbox_table(conn: &Connection) -> Result<(), SyncError> {
             changeset_seq INTEGER, \
             created_at TEXT NOT NULL DEFAULT (datetime('now')));",
     )?;
-    // ADR 0006 §5.4: the highest sync capability level among the entry's rows. Added
-    // idempotently; entries captured by older builds can't hold rows for gated tables, so
-    // the default 0 is correct for them.
+    // ADR 0006 §5.4: the highest sync capability level among the entry's rows, added
+    // idempotently. An entry from a build that predates the column reads 0, and an older
+    // build may have rated a table lower than this one does, so the stored level is only a
+    // floor: `restamp_unacked_levels` re-checks it before anything is pushed.
     let has_level: bool = conn.query_row(
         "SELECT count(*) > 0 FROM pragma_table_info('_yapstack_outbox') \
          WHERE name = 'required_sync_capability'",
@@ -1175,9 +1176,17 @@ async fn push_direction<T: SyncTransport + ?Sized>(
 /// it holds rows for (ADR 0006 §5.4, O1). A stored level is only a floor: an entry captured
 /// by an older build (or restored from a backup of one) can hold rows of a table that build
 /// rated lower. Runs once per drain connection (`state::outbox_levels_checked`), before
-/// anything is pushed, so an upgrade or a restore is re-checked at the next spawn. An entry
-/// that can't be decrypted stops the push (it is never sent at a level it can't be checked
-/// for), and the next cycle tries again.
+/// anything is pushed, so an upgrade or a restore is re-checked at the next spawn.
+///
+/// Each entry is read under the schema/engine versions it was captured with (they are bound
+/// into its AAD), so a version bump doesn't make it unreadable. An entry that still can't be
+/// read (a client_id re-minted on the same account, a wrong key epoch) can't be checked, so it
+/// is held at [`crate::schema::highest_table_sync_capability`]: it never goes out below the
+/// level of whatever it carries, it doesn't stop the entries ahead of it, and once the floor
+/// reaches that level it ships as before (peers quarantine what they can't read).
+///
+/// Nothing to do while every CRR table is a cutover table (no entry can hold a gated row), and
+/// an entry already stamped at the highest level is skipped.
 fn restamp_unacked_levels(
     conn: &Connection,
     cipher: &ChangesetCipher,
@@ -1187,34 +1196,60 @@ fn restamp_unacked_levels(
     if state::outbox_levels_checked(conn)? {
         return Ok(());
     }
-    let entries: Vec<(i64, i32)> = {
+    if !crate::schema::has_post_cutover_crr_table(conn)? {
+        return state::mark_outbox_levels_checked(conn);
+    }
+    let highest = crate::schema::highest_table_sync_capability();
+    let entries: Vec<(i64, i32, i32, i32)> = {
         let mut stmt = conn.prepare(
-            "SELECT client_seq, required_sync_capability FROM _yapstack_outbox \
-             WHERE acked=0 ORDER BY client_seq",
+            "SELECT client_seq, required_sync_capability, schema_version, engine_version \
+             FROM _yapstack_outbox \
+             WHERE acked=0 AND required_sync_capability < ?1 ORDER BY client_seq",
         )?;
         let v = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([highest], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         v
     };
-    for (seq, stamped) in entries {
+    let mut unreadable = 0usize;
+    for (seq, stamped, sv, ev) in entries {
         let blob: Vec<u8> = conn.query_row(
             "SELECT ciphertext FROM _yapstack_outbox WHERE client_seq=?1",
             [seq],
             |r| r.get(0),
         )?;
-        let rows = Changeset::decode(&cipher.decrypt(client_id, seq, &blob)?)?.rows;
-        let level = rows
-            .iter()
-            .map(|r| crate::schema::table_sync_capability(&r.table))
-            .max()
-            .unwrap_or(0);
+        let level = match cipher
+            .with_versions(sv as u32, ev as u32)
+            .decrypt(client_id, seq, &blob)
+            .and_then(|pt| Changeset::decode(&pt))
+        {
+            Ok(cs) => cs
+                .rows
+                .iter()
+                .map(|r| crate::schema::table_sync_capability(&r.table))
+                .max()
+                .unwrap_or(0),
+            Err(_) => {
+                unreadable += 1;
+                highest
+            }
+        };
         if level > stamped {
             conn.execute(
                 "UPDATE _yapstack_outbox SET required_sync_capability=?1 WHERE client_seq=?2",
                 rusqlite::params![level, seq],
             )?;
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            target: "yapstack::sync",
+            unreadable_entries = unreadable,
+            held_at_level = highest,
+            "outbox entries this build can't read were held at the highest sync capability level"
+        );
     }
     state::mark_outbox_levels_checked(conn)
 }
@@ -1774,6 +1809,95 @@ mod tests {
             report.push_error
         );
         assert_eq!(outbox_levels(db.conn()), vec![0, 1], "re-stamped in place");
+    }
+
+    #[test]
+    fn restamp_reads_an_entry_under_the_versions_it_was_captured_with() {
+        // An entry captured before a SYNC_SCHEMA_VERSION / engine bump is bound to the old
+        // versions in its AAD; the re-check must still read it, not fall back.
+        let db = post_cutover_db();
+        let me = Uuid::from_u128(1);
+        enqueue_local(db.conn(), &f1_cipher(), me, 1, 16_003).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE _yapstack_outbox SET required_sync_capability = 0",
+                [],
+            )
+            .unwrap();
+        let bumped = ChangesetCipher::new(F1_VAULT, 0, F1_TENANT, 2, 17_000);
+        restamp_unacked_levels(db.conn(), &bumped, me).unwrap();
+        assert_eq!(
+            outbox_levels(db.conn()),
+            vec![0, 1],
+            "decrypted, so the tags entry keeps 0 and t_new gets its level"
+        );
+    }
+
+    #[test]
+    fn restamp_reads_nothing_while_only_cutover_tables_are_crrs() {
+        // No CRR table outside the cutover set: no entry can hold a gated row, so the backlog
+        // isn't decrypted at all (an unreadable entry keeps its 0).
+        let conn = outbox_with_levels(&[(1, 0)]);
+        restamp_unacked_levels(&conn, &f1_cipher(), Uuid::from_u128(1)).unwrap();
+        assert_eq!(outbox_levels(&conn), vec![0]);
+        assert!(state::outbox_levels_checked(&conn).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreadable_entry_is_held_at_the_highest_level_instead_of_wedging_the_push() {
+        // An entry this build can't decrypt (a re-minted client_id, a wrong key epoch) can't
+        // be checked, so it is held at the highest level any table can need. It never wedges
+        // the entries ahead of it, never reaches a floor-0 relay, and ships (opaque, for
+        // peers to quarantine as before) once the floor reaches that level.
+        let db = post_cutover_db();
+        let me = Uuid::from_u128(1);
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        enqueue_local(db.conn(), &cipher, me, sv, ev).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO _yapstack_outbox (client_seq, ciphertext, schema_version, \
+                 engine_version, acked, required_sync_capability) \
+                 VALUES (100, x'00112233', 1, 16003, 0, 0)",
+                [],
+            )
+            .unwrap();
+        state::set_client_seq(db.conn(), 100).unwrap();
+        let relay = MockRelay::new();
+        relay.set_capability_blockers(vec![blocker("old laptop")]);
+
+        let report = drain_once(db.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+        assert!(
+            matches!(report.push_error, Some(SyncError::CapabilityBlocked { .. })),
+            "got {:?}",
+            report.push_error
+        );
+        let held: i32 = db
+            .conn()
+            .query_row(
+                "SELECT required_sync_capability FROM _yapstack_outbox WHERE client_seq = 100",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, crate::schema::highest_table_sync_capability());
+        assert!(
+            !relay.stored_pairs().contains(&(me, 100)),
+            "never sent below its level"
+        );
+        assert!(
+            !relay.stored_pairs().is_empty(),
+            "the entries ahead shipped"
+        );
+
+        relay.set_capability_blockers(Vec::new());
+        state::clear_raise_backoff(db.conn()).unwrap();
+        drain_once(db.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+        assert!(relay.stored_pairs().contains(&(me, 100)));
     }
 
     #[tokio::test(flavor = "current_thread")]
