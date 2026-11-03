@@ -110,17 +110,6 @@ impl ChangesetCipher {
         }
     }
 
-    /// The same account context bound to other schema/engine versions, to read an entry that
-    /// was sealed under the versions it was captured with (they are in its AAD).
-    #[must_use]
-    pub fn with_versions(&self, schema_version: u32, engine_version: u32) -> Self {
-        Self {
-            schema_version,
-            engine_version,
-            ..self.clone()
-        }
-    }
-
     fn changeset_aad(&self, client_id: Uuid, client_seq: i64) -> Vec<u8> {
         lp(&[
             &[VERSION],

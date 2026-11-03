@@ -24,9 +24,6 @@ const K_SESSION_SEQ_RECONCILED: &str = "seq_reconciled";
 /// Connection-scoped session marker: the relay enforces the capability gate (O2, see
 /// [`capability_gate_proven`]).
 const K_SESSION_CAPABILITY_GATE_PROVEN: &str = "capability_gate_proven";
-/// Connection-scoped session marker: the unacked outbox levels were re-checked (O1, see
-/// [`outbox_levels_checked`]).
-const K_SESSION_OUTBOX_LEVELS_CHECKED: &str = "outbox_levels_checked";
 
 pub fn ensure_meta_table(conn: &Connection) -> Result<(), SyncError> {
     conn.execute_batch(
@@ -205,7 +202,7 @@ pub fn clear_seq_reconciled(conn: &Connection) -> Result<(), SyncError> {
 ///
 /// Connection-scoped like [`seq_reconciled`], so every drain spawn (app launch, re-login, an
 /// account switch) proves it again against the relay it is talking to now. It is also dropped
-/// when the relay was unreachable or its event stream ended ([`forget_capability_gate`]).
+/// when the relay was unreachable ([`forget_capability_gate`]).
 pub fn capability_gate_proven(conn: &Connection) -> Result<bool, SyncError> {
     session_marker(conn, K_SESSION_CAPABILITY_GATE_PROVEN)
 }
@@ -213,18 +210,6 @@ pub fn capability_gate_proven(conn: &Connection) -> Result<bool, SyncError> {
 /// Record that this connection has seen the relay enforce the capability gate.
 pub fn mark_capability_gate_proven(conn: &Connection) -> Result<(), SyncError> {
     set_session_marker(conn, K_SESSION_CAPABILITY_GATE_PROVEN)
-}
-
-/// True once THIS connection has re-checked the levels stored on the unacked outbox entries
-/// against the current table levels (O1, `outbox::restamp_unacked_levels`). Connection-scoped
-/// like [`seq_reconciled`], so an upgrade or a restored outbox is re-checked at the next spawn.
-pub fn outbox_levels_checked(conn: &Connection) -> Result<bool, SyncError> {
-    session_marker(conn, K_SESSION_OUTBOX_LEVELS_CHECKED)
-}
-
-/// Record that this connection has re-checked the outbox levels.
-pub fn mark_outbox_levels_checked(conn: &Connection) -> Result<(), SyncError> {
-    set_session_marker(conn, K_SESSION_OUTBOX_LEVELS_CHECKED)
 }
 
 /// The first wait after a refused floor raise, doubled per further refusal up to
@@ -406,8 +391,8 @@ pub fn note_relay_capability(
 }
 
 /// Forget what this connection learned about the relay's gate: the proof, and a cached "no
-/// gate" refusal. For when the relay may have been replaced at the same address (an
-/// unreachable relay, a dropped event stream): the next gated batch proves the gate again.
+/// gate" refusal. For when the relay may have been replaced at the same address (it was
+/// unreachable, e.g. restarting for an upgrade): the next gated batch proves the gate again.
 /// A cached blocker refusal is kept; its own signals end it.
 pub fn forget_capability_gate(conn: &Connection) -> Result<(), SyncError> {
     ensure_session_table(conn)?;

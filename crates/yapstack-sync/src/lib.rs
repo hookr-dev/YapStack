@@ -156,10 +156,4 @@ impl SyncError {
     pub fn is_network(&self) -> bool {
         matches!(self, SyncError::Network(_))
     }
-
-    /// True for an HTTP 5xx from the relay or a proxy in front of it.
-    #[must_use]
-    pub fn is_server_error(&self) -> bool {
-        matches!(self, SyncError::Http(e) if e.status().is_some_and(|s| s.is_server_error()))
-    }
 }

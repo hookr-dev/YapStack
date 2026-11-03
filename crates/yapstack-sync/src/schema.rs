@@ -62,22 +62,13 @@ pub fn table_sync_capability(table: &str) -> i32 {
         .map_or(crate::TABLE_READINESS_LEVEL, |(_, level)| *level)
 }
 
-/// The highest level any table can need in this build: what an entry whose rows can't be
-/// read is held at, so it never goes out below the level of whatever it carries.
+/// The highest level any table can need in this build.
 #[must_use]
 pub fn highest_table_sync_capability() -> i32 {
     GATED_SYNC_TABLES
         .iter()
         .map(|(_, level)| *level)
         .fold(crate::TABLE_READINESS_LEVEL, i32::max)
-}
-
-/// True when some CRR table here is outside the cutover set, i.e. when an outbox entry could
-/// hold rows above level 0.
-pub fn has_post_cutover_crr_table(conn: &Connection) -> Result<bool, SyncError> {
-    Ok(crr_tables(conn)?
-        .iter()
-        .any(|t| !SYNC_TABLES[..CUTOVER_SYNC_TABLE_COUNT].contains(&t.as_str())))
 }
 
 /// One column's metadata as reported by `PRAGMA table_info`, in declared (`cid`)
@@ -541,18 +532,6 @@ pub fn crr_tables(conn: &Connection) -> Result<Vec<String>, SyncError> {
     Ok(out)
 }
 
-/// The level a snapshot of this database must declare (ADR 0006 §5.5): the highest
-/// [`table_sync_capability`] among its CRR tables. A table counts even with no rows: its
-/// clock table can still carry tombstones, and the schema itself is content a reader below
-/// the level can't hold, so this fails closed.
-pub fn snapshot_content_capability(conn: &Connection) -> Result<i32, SyncError> {
-    Ok(crr_tables(conn)?
-        .iter()
-        .map(|t| table_sync_capability(t))
-        .max()
-        .unwrap_or(0))
-}
-
 /// Of the three triggers cr-sqlite generates per CRR table (`triggers.rs:12-20`), the two
 /// whose existence nothing else proves. ALL three must still exist: `is_crr` here probes
 /// the clock table, and cr-sqlite's own `is_crr` probes only `__crsql_itrig`
@@ -1008,35 +987,6 @@ mod tests {
             );
             assert!(*level >= crate::TABLE_READINESS_LEVEL, "{t} level {level}");
         }
-    }
-
-    #[test]
-    fn snapshot_content_level_counts_every_crr_table_even_when_empty() {
-        let db = crate::CrsqlDb::open_in_memory().unwrap();
-        let conn = db.conn();
-        conn.execute_batch(
-            "CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT); \
-             CREATE TABLE t_new(id TEXT NOT NULL PRIMARY KEY, v TEXT); \
-             CREATE TABLE t_local(id TEXT NOT NULL PRIMARY KEY, v TEXT); \
-             INSERT INTO tags VALUES ('g1', 'work'); \
-             INSERT INTO t_local VALUES ('l1', 'never synced');",
-        )
-        .unwrap();
-        conn.query_row("SELECT crsql_as_crr('tags')", [], |_| Ok(()))
-            .unwrap();
-        assert_eq!(
-            snapshot_content_capability(conn).unwrap(),
-            0,
-            "a cutover CRR table and a populated non-CRR table add nothing"
-        );
-        // Fail closed: an empty post-cutover CRR table (its rows deleted, tombstones in its
-        // clock table) still counts.
-        conn.query_row("SELECT crsql_as_crr('t_new')", [], |_| Ok(()))
-            .unwrap();
-        assert_eq!(
-            snapshot_content_capability(conn).unwrap(),
-            crate::TABLE_READINESS_LEVEL
-        );
     }
 
     /// A gated table above this build's own level would make every device running it a
