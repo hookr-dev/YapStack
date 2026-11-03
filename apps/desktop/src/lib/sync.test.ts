@@ -744,7 +744,8 @@ describe("syncCapabilityFloorReached", () => {
     // [what, status, level, enabled]
     ["level 0 is never gated", status(floor(0)), 0, true],
     ["a negative level is never gated", status({}), -1, true],
-    ["no status (sync unavailable): not syncing", null, 1, true],
+    ["no status yet (before the first poll) fails closed", null, 1, false],
+    ["no status yet, level 0", null, 0, true],
     ["sync off writes freely", status({ syncEnabled: false, ...floor(0) }), 1, true],
     ["floor below the level", status(floor(0)), 1, false],
     ["floor at the level", status(floor(1)), 1, true],
