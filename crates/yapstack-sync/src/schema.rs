@@ -432,9 +432,9 @@ pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
 }
 
 /// Boot heal (ADR 0006 §3): on a CRR-prepared DB, convert every `SYNC_TABLES` table that
-/// exists but isn't a CRR yet. That is a `CreateSyncTable` migration that stopped between
-/// its CREATE and the conversion, or one recorded where the table couldn't be converted (a
-/// build without sync applies it plainly). Returns the tables it converted. A table that
+/// exists but isn't a CRR yet: a backstop for a `CreateSyncTable` that stopped or failed
+/// between its CREATE and the conversion (the migration's own rerun at the next launch
+/// normally finishes it first). Returns the tables it converted. A table that
 /// fails doesn't stop the others; the first failure is returned after them, naming what
 /// was converted (cutover, `crr_migrate`, stops instead). Does nothing on
 /// a DB that isn't CRR-prepared: converting one is cutover's job, on a copy.

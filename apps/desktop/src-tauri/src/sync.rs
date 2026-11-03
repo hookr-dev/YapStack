@@ -1821,8 +1821,9 @@ fn heal_crr_trigger_arity(conn: &Connection) {
 }
 
 /// Convert every `SYNC_TABLES` table that exists here but isn't a CRR yet (ADR 0006 §3):
-/// one a `CreateSyncTable` migration created and didn't convert, or one recorded where it
-/// couldn't be converted (a build without sync applies the migration plainly). Rows
+/// one a `CreateSyncTable` migration created but didn't convert, when the migration's own
+/// rerun at launch didn't finish it either (a backstop: a run can stop or fail between the
+/// CREATE and the conversion). Rows
 /// written to it in the meantime get clocks and are captured. Then every setup failure
 /// whose migration's whole setup is now in place leaves lane status; one still missing an
 /// index stays until a restart reruns its migration.
@@ -8851,8 +8852,8 @@ mod tests {
         (dir, path, svc)
     }
 
-    /// ADR 0006 §3: a synced table whose migration is recorded but that isn't a CRR (a build
-    /// without sync applied it plainly) is converted by the drain's boot heal while the app's
+    /// ADR 0006 §3: a synced table its migration created but didn't convert (the run stopped
+    /// between the CREATE and the conversion) is converted by the drain's boot heal while the app's
     /// writer stays open, its rows written before then become changes, and lane status stops
     /// reporting it once everything the migration declares is in place.
     #[test]

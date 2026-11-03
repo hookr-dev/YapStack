@@ -220,8 +220,11 @@ is applied plainly.
     table wait in the schema quarantine meanwhile (I-NT1).
   - **Boot heal.** At drain start, before the column heals below and under the write
     turnstile, `schema::ensure_sync_tables_crr` converts any `SYNC_TABLES` table that
-    exists but isn't a CRR (a run that stopped between CREATE and conversion, or a
-    migration a build without sync applied plainly). It does nothing on a non-CRR
+    exists but isn't a CRR: a backstop for a run that stopped or failed between CREATE
+    and conversion, which the migration's own rerun at launch normally finishes first. A
+    build without sync never records a `CreateSyncTable` on a CRR database (its landed
+    check can't confirm the CRR triggers), so it can't leave one recorded but unconverted.
+    It does nothing on a non-CRR
     database, and a table that fails doesn't stop the others (cutover stops instead).
     Then each reported migration whose landed check now passes leaves the report; one
     whose indexes are still missing stays until a restart reruns it, so the notice never
@@ -568,9 +571,11 @@ sync setup didn't finish") and `relayCapability` (`{ required, requested }` as t
 last returned them; a drain spawn publishes its workspace's persisted copy in the same
 step as its reset, so a respawn shows no gap; `null` while no drain runs, cleared on
 sign-out and sync off). `relayCapability` feeds only the UX gate
-`syncCapabilityFloorReached(status, level)` in `lib/sync.ts`: true for level ≤ 0 or a
-device that isn't syncing, false while no status has arrived, otherwise `required ≥
-level` (unknown counts as 0); it never reads the roster and never authorizes a push. A
+`syncCapabilityFloorReached(status, configSyncEnabled, level)` in `lib/sync.ts`: true for
+level ≤ 0 or a device that isn't syncing (from `status`, or from `syncConfig.syncEnabled`
+before the first status, since a device that never turned sync on is never polled);
+false for a syncing device until a status arrives; otherwise `required ≥ level` (unknown
+counts as 0); it never reads the roster and never authorizes a push. A
 feature also stays off while its own table is in `syncTableSetupFailures`. Field-level shapes are in
 [`API_REFERENCE.md`](API_REFERENCE.md#sync-yapstack-desktop-yapstack-common).
 
@@ -946,7 +951,7 @@ onboarding completes.
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
 | I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses every UNIQUE index (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
 | I29 | A row of a post-cutover table never reaches a relay whose floor is below its level: an unlisted table is level 1, a stored entry level is re-checked before push, capture and push never mix levels, nothing above 0 (batch or snapshot) is sent before this connection has proof the relay enforces the gate, and a cached refusal only withholds (§9.3) | `schema::a_table_outside_the_cutover_set_needs_at_least_table_readiness`, `snapshot_content_level_counts_every_crr_table_even_when_empty`, `outbox::never_synced_device_holds_rows_of_a_post_cutover_table_until_the_floor_rises`, `an_entry_stamped_below_its_tables_level_is_held_at_that_level`, `restamp_reads_an_entry_under_the_versions_it_was_captured_with`, `an_unreadable_entry_is_held_at_the_highest_level_instead_of_wedging_the_push`, `an_accepted_raise_that_leaves_the_floor_below_proves_nothing`, `an_unreachable_relay_forgets_the_gate_proof`, `a_gated_snapshot_needs_the_same_proof_as_a_gated_push`, `captured_levels_cut_batches_and_the_ungated_prefix_acks`, `a_relay_without_the_capability_gate_never_receives_a_gated_batch`, `the_gate_proof_is_per_connection_so_a_respawn_proves_it_again`, `a_blocked_raise_backs_off_until_the_relay_or_the_roster_changes`, `the_backoff_runs_from_when_the_refusal_arrived`, `a_pull_showing_the_floor_raised_ends_the_backoff`, `a_persisted_floor_never_authorizes_a_gated_push`, `restored_outbox_keeps_entry_levels_and_stays_held`, `restored_relay_below_the_old_floor_refuses_again`, `transport::put_snapshot_declares_the_content_level_and_is_refused_above_the_floor`, `sync.rs` `account_switch_recaptures_gated_rows_at_their_level_and_starts_the_floor_from_nothing` |
-| I30 | A `CreateSyncTable` migration is recorded only once everything it declares landed (its table in shape, each of its indexes, and on a CRR DB the table as a CRR with current triggers), whether it applied or failed; a run cut short reruns, one that isn't recorded is reported in lane status until that same check passes, the drain heal converts a recorded-but-unconverted table, and converting never leaves `foreign_keys` changed (§4.3) | `db_service` tests `create_sync_table_*` (incl. `…refuses_an_index_name_another_table_has`, `…records_only_once_what_it_declares_landed`), `a_failed_create_sync_table_*`, `every_create_sync_table_migration_is_crr_compatible`; `schema::ensure_crr_*`, `ensure_sync_tables_crr_*`; `sync.rs` `drain_heal_*`, `drain_connection_prep_converts_unconverted_sync_tables`; `SyncTab.test.tsx` ("a synced table whose setup didn't finish…"). Run in CI by "Rust sync feature (macos-latest)" |
+| I30 | A `CreateSyncTable` migration is recorded only once everything it declares landed (its table in shape, each of its indexes, and on a CRR DB the table as a CRR with current triggers), whether it applied or failed; a run cut short reruns, one that isn't recorded is reported in lane status until that same check passes, the drain heal converts a table a run created but didn't convert, and converting never leaves `foreign_keys` changed (§4.3) | `db_service` tests `create_sync_table_*` (incl. `…refuses_an_index_name_another_table_has`, `…records_only_once_what_it_declares_landed`), `a_failed_create_sync_table_*`, `every_create_sync_table_migration_is_crr_compatible`; `schema::ensure_crr_*`, `ensure_sync_tables_crr_*`; `sync.rs` `drain_heal_*`, `drain_connection_prep_converts_unconverted_sync_tables`; `SyncTab.test.tsx` ("a synced table whose setup didn't finish…"). Run in CI by "Rust sync feature (macos-latest)" |
 
 ---
 
@@ -1020,7 +1025,7 @@ points to §15. Nothing in this table is still open.
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
 | D27 | ADR 0006 §5.4: a missing batch header means 0, "which covers older builds"; entries captured by older builds can't hold rows for new tables | A relay that predates the gate ignores the header and stores any batch; capture is unfiltered, so a build that doesn't list a later table stamped its rows 0 | **Done (FP2b-1):** owner rulings O1–O3 (2026-11-02). Unlisted post-cutover tables are level 1; no gated batch is sent before the relay proves it enforces the gate (404/405 on the raise holds the push); refused raises and a missing gate back off; stored entry levels are re-checked before push, so an outbox captured by an older build (upgrade or restore) is held at its tables' levels, and an entry that can't be read is held at the highest level rather than stopping the push (§9.3, I29). A release tagged from main between #119 and #134 (FP2b-1) has the gate but not O1 or the re-check: it stamps unlisted post-cutover tables 0 and trusts stored levels, so it must not ship once a post-cutover table exists. Not covered: a downgrade to a build that predates the outbox level column pushes queued entries without the header; no client-side check can reach such a build |
 | D28 | ADR 0006 §1: `SyncIndex` statements are `CREATE [UNIQUE] INDEX …` and only "a non-PK `UNIQUE` index on a CRR table is refused"; `CreateSyncTable` is described without a UNIQUE rule | Every UNIQUE index is refused on every DB, PK included (FP2a), and `CreateSyncTable` refuses `UNIQUE` anywhere in its SQL, column and table constraints included | **Done (FP2a, FP2b-2):** owner ruling 2026-11-02, the code wins: the rebuild strips UNIQUE, so a never-synced DB would enforce what a synced one can't (§4.3). The ADR is unchanged (append-only) |
-| D29 | ADR 0006 §1: "A failed `CreateSyncTable` is recorded and shown in sync lane status" | A failed run is reported in lane status (`syncTableSetupFailures`) but not recorded in `_sqlx_migrations`, unless what it creates is already present (#133), so the next launch retries it | **Done (FP2b-2):** recording a failed run would stop the retry and hide the failure; the drain heal backstops a recorded-but-unconverted table (§4.3, I30) |
+| D29 | ADR 0006 §1: "A failed `CreateSyncTable` is recorded and shown in sync lane status" | A failed run is reported in lane status (`syncTableSetupFailures`) but not recorded in `_sqlx_migrations`, unless what it creates is already present (#133), so the next launch retries it | **Done (FP2b-2):** recording a failed run would stop the retry and hide the failure; the drain heal backstops a table a run created but didn't convert (§4.3, I30) |
 
 ---
 
