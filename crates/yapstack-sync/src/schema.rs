@@ -121,7 +121,7 @@ fn type_is_text(ty: &str) -> bool {
 /// A non-null, type-valid synthetic default for a NOT-NULL column the live schema
 /// left without one — required so `is_table_compatible` accepts the CRR and so a
 /// merge that inserts a partial row does not violate NOT NULL.
-fn synthetic_default(ty: &str) -> &'static str {
+pub fn synthetic_default(ty: &str) -> &'static str {
     let u = ty.to_ascii_uppercase();
     if u.contains("INT")
         || u.contains("REAL")
