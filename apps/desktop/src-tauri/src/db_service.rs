@@ -574,14 +574,13 @@ impl SyncTableSetupFailures {
         }
     }
 
-    /// Drop each migration whose whole setup is in place in `conn` now (the check a run
-    /// records by, [`create_sync_table_landed`]). Converting the table alone isn't enough:
-    /// its indexes can still be missing, and a run that failed after the conversion leaves
-    /// a CRR the boot heal never touches. An entry whose check errors is kept.
+    /// Drop each migration whose table and indexes are in place in `conn` now, the table a
+    /// CRR with current triggers (the check a failed run is recorded by,
+    /// [`schema_effects_present`]). An entry whose check errors is kept.
     #[cfg(feature = "sync")]
     pub fn resolve_landed(&self, conn: &Connection) {
         self.lock()
-            .retain(|m| !create_sync_table_landed(conn, m).unwrap_or(false));
+            .retain(|m| !schema_effects_present(conn, &recordable_effects(m)).unwrap_or(false));
     }
 
     /// The tables of the migrations that didn't finish. Read only by sync lane status,
@@ -825,10 +824,6 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     conn.execute_batch("BEGIN;")?;
     let res = conn
         .execute_batch(m.sql)
-        .and_then(|()| match created_sync_table(m) {
-            Some(_) => ensure_create_sync_table_landed(conn, m),
-            None => Ok(()),
-        })
         .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
     match res {
         Ok(()) => conn.execute_batch("COMMIT;"),
@@ -839,38 +834,9 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     }
 }
 
-/// Whether everything a `CreateSyncTable` `m` declares ([`recordable_effects`]) is in
-/// place in `conn`: the table, each of its indexes, and on a CRR DB the table as a CRR with
-/// current triggers ([`schema_effects_present`], the check #133's fallback records a failed
-/// run by).
-fn create_sync_table_landed(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Result<bool> {
-    schema_effects_present(conn, &recordable_effects(m))
-}
-
-/// The run's last check before it records `m`: a CREATE that matched an existing table of
-/// another shape (`IF NOT EXISTS` matches on the name alone) must not be recorded as done.
-fn ensure_create_sync_table_landed(
-    conn: &Connection,
-    m: &crate::db::Migration,
-) -> rusqlite::Result<()> {
-    if create_sync_table_landed(conn, m)? {
-        return Ok(());
-    }
-    Err(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-        Some(format!(
-            "CreateSyncTable migration v{} ({}): what it creates is not in place afterwards \
-             (an existing table or index of the same name differs, or the table isn't a CRR \
-             with current triggers). Not recording it.",
-            m.version, m.description
-        )),
-    ))
-}
-
 /// Apply a validated `CreateSyncTable` migration on a CRR DB: the CREATE, then the
 /// conversion ([`yapstack_sync::schema::ensure_crr`], which puts `foreign_keys` back as
-/// it found it), then the indexes, the check that everything it declares landed
-/// ([`ensure_create_sync_table_landed`]) and the bookkeeping row in one transaction. The
+/// it found it), then the indexes and the bookkeeping row in one transaction. The
 /// migration is recorded last and every step is idempotent, so a run cut short anywhere
 /// leaves it unrecorded and the next run finishes it.
 #[cfg(feature = "sync")]
@@ -890,7 +856,6 @@ fn apply_create_sync_table_on_crr(
     let res = indexes
         .iter()
         .try_for_each(|i| conn.execute_batch(i))
-        .and_then(|()| ensure_create_sync_table_landed(conn, m))
         .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
     match res {
         Ok(()) => conn.execute_batch("COMMIT;"),

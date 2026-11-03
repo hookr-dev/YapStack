@@ -368,48 +368,21 @@ pub fn ensure_crr(conn: &Connection, table: &str) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// What [`crrify_present_tables`] does when a table fails.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnFailure {
-    Stop,
-    /// Try the rest, then return the first failure.
-    Continue,
-}
-
-/// [`ensure_crr`] each of `tables` this DB has and hasn't converted yet, in order. Returns
-/// the ones it converted, or the first failure; with [`OnFailure::Continue`] the others are
-/// still attempted, and the error names what was converted.
+/// [`ensure_crr`] each of `tables` this DB has and hasn't converted yet, in order, stopping
+/// at the first failure. Returns the ones it converted.
 fn crrify_present_tables<'a>(
     conn: &Connection,
     tables: &[&'a str],
-    on_failure: OnFailure,
 ) -> Result<Vec<&'a str>, SyncError> {
     let mut converted = Vec::new();
-    let mut first_err: Option<SyncError> = None;
     for t in tables {
-        let res = (|| {
-            if !table_exists(conn, t)? || is_crr(conn, t)? {
-                return Ok(false);
-            }
-            ensure_crr(conn, t).map(|()| true)
-        })();
-        match res {
-            Ok(true) => converted.push(*t),
-            Ok(false) => {}
-            Err(e) if on_failure == OnFailure::Stop => return Err(e),
-            Err(e) => {
-                first_err.get_or_insert(SyncError::Migration(format!("`{t}`: {e}")));
-            }
+        if !table_exists(conn, t)? || is_crr(conn, t)? {
+            continue;
         }
+        ensure_crr(conn, t)?;
+        converted.push(*t);
     }
-    match first_err {
-        Some(e) if converted.is_empty() => Err(e),
-        Some(e) => Err(SyncError::Migration(format!(
-            "{e} (converted before failing: {})",
-            converted.join(", ")
-        ))),
-        None => Ok(converted),
-    }
+    Ok(converted)
 }
 
 /// R3 entry point: transform + CRRify every sync table on a (COPY of a) local DB.
@@ -419,21 +392,20 @@ fn crrify_present_tables<'a>(
 /// table added after cutover is created and converted by its own migration, and rows for it
 /// that arrive first wait in the quarantine.
 pub fn crr_migrate(conn: &Connection) -> Result<(), SyncError> {
-    crrify_present_tables(conn, SYNC_TABLES, OnFailure::Stop).map(|_| ())
+    crrify_present_tables(conn, SYNC_TABLES).map(|_| ())
 }
 
 /// Boot heal (ADR 0006 §3): on a CRR-prepared DB, convert every `SYNC_TABLES` table that
 /// exists but isn't a CRR yet: a backstop for a `CreateSyncTable` that stopped or failed
 /// between its CREATE and the conversion (the migration's own rerun at the next launch
-/// normally finishes it first). Returns the tables it converted. A table that
-/// fails doesn't stop the others; the first failure is returned after them, naming what
-/// was converted (cutover, `crr_migrate`, stops instead). Does nothing on
-/// a DB that isn't CRR-prepared: converting one is cutover's job, on a copy.
+/// normally finishes it first). Returns the tables it converted, stopping at the first
+/// failure as cutover does. Does nothing on a DB that isn't CRR-prepared: converting one is
+/// cutover's job, on a copy.
 pub fn ensure_sync_tables_crr(conn: &Connection) -> Result<Vec<&'static str>, SyncError> {
     if crr_sync_tables(conn)?.is_empty() {
         return Ok(Vec::new());
     }
-    crrify_present_tables(conn, SYNC_TABLES, OnFailure::Continue)
+    crrify_present_tables(conn, SYNC_TABLES)
 }
 
 /// The `crsql_begin_alter` / `crsql_commit_alter` dance around an OPTIONAL schema
@@ -1139,43 +1111,6 @@ mod tests {
         assert!(
             ensure_sync_tables_crr(conn).unwrap().is_empty(),
             "idempotent"
-        );
-    }
-
-    /// One table that can't convert doesn't keep the heal from converting the others; the
-    /// failure is still returned, naming what was converted. Cutover (`crr_migrate`) still
-    /// stops at the first failure.
-    #[test]
-    fn ensure_sync_tables_crr_converts_the_others_past_a_failing_table() {
-        let db = crate::CrsqlDb::open_in_memory().unwrap();
-        let conn = db.conn();
-        conn.execute_batch(
-            "CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT); \
-             CREATE TABLE sessions(id INTEGER PRIMARY KEY, v TEXT); \
-             CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT);",
-        )
-        .unwrap();
-        conn.query_row("SELECT crsql_as_crr('tags')", [], |_| Ok(()))
-            .unwrap();
-        let err = ensure_sync_tables_crr(conn).expect_err("`sessions` can't convert");
-        assert!(err.to_string().contains("shares"), "{err}");
-        assert!(
-            is_crr(conn, "shares").unwrap(),
-            "converted past the failure"
-        );
-        assert!(!is_crr(conn, "sessions").unwrap());
-
-        let db = crate::CrsqlDb::open_in_memory().unwrap();
-        let conn = db.conn();
-        conn.execute_batch(
-            "CREATE TABLE sessions(id INTEGER PRIMARY KEY, v TEXT); \
-             CREATE TABLE shares(id TEXT PRIMARY KEY, v TEXT);",
-        )
-        .unwrap();
-        assert!(crr_migrate(conn).is_err());
-        assert!(
-            !is_crr(conn, "shares").unwrap(),
-            "cutover stops at the first failure"
         );
     }
 
