@@ -189,18 +189,25 @@ export interface SyncStatus {
 
 /**
  * ADR 0006 §5.6, the UX-only feature gate: whether a feature that writes a table gated at
- * `level` is enabled. Always for level 0, and on a device that isn't syncing (the push
- * path holds its rows once sync is enabled); off while no status has arrived yet; otherwise
- * on once the floor the relay last returned is at least `level`, an unknown floor counting
- * as 0. It never reads the roster.
+ * `level` is enabled. Always for level 0, and on a device that isn't syncing ("devices that
+ * aren't syncing write freely"; the push path holds their rows once sync is enabled).
+ * Whether it is syncing comes from `status`, or from `configSyncEnabled`
+ * (`syncConfig.syncEnabled`, always loaded) before the first status arrives: a device that
+ * never turned sync on has no status at all. A syncing device is off until a status
+ * arrives, then on once the floor the relay last returned is at least `level`, an unknown
+ * floor counting as 0. It never reads the roster.
  *
  * It looks at the floor only. A feature must also stay off while its own table is in
  * `status.syncTableSetupFailures` (its setup on this device didn't finish).
  */
-export function syncCapabilityFloorReached(status: SyncStatus | null, level: number): boolean {
+export function syncCapabilityFloorReached(
+  status: SyncStatus | null,
+  configSyncEnabled: boolean,
+  level: number,
+): boolean {
   if (level <= 0) return true;
+  if (!(status ? status.syncEnabled : configSyncEnabled)) return true;
   if (!status) return false;
-  if (!status.syncEnabled) return true;
   return (status.relayCapability?.required ?? 0) >= level;
 }
 

@@ -741,26 +741,29 @@ describe("syncCapabilityFloorReached", () => {
   const floor = (required: number) => ({ relayCapability: { required, requested: required } });
 
   it.each([
-    // [what, status, level, enabled]
-    ["level 0 is never gated", status(floor(0)), 0, true],
-    ["a negative level is never gated", status({}), -1, true],
-    ["no status yet (before the first poll) fails closed", null, 1, false],
-    ["no status yet, level 0", null, 0, true],
-    ["sync off writes freely", status({ syncEnabled: false, ...floor(0) }), 1, true],
-    ["floor below the level", status(floor(0)), 1, false],
-    ["floor at the level", status(floor(1)), 1, true],
-    ["floor above the level", status(floor(2)), 1, true],
-    ["floor one short", status(floor(1)), 2, false],
-    ["unknown floor (null) counts as 0", status({ relayCapability: null }), 1, false],
-    ["unknown floor (older snapshot) counts as 0", status({}), 1, false],
+    // [what, status, syncConfig.syncEnabled, level, enabled]
+    ["level 0 is never gated", status(floor(0)), true, 0, true],
+    ["a negative level is never gated", status({}), true, -1, true],
+    ["no status yet, sync never turned on: writes freely", null, false, 1, true],
+    ["no status yet, sync on: off until the first poll", null, true, 1, false],
+    ["no status yet, level 0", null, true, 0, true],
+    ["sync off writes freely", status({ syncEnabled: false, ...floor(0) }), true, 1, true],
+    ["the status wins over the config", status(floor(0)), false, 1, false],
+    ["floor below the level", status(floor(0)), true, 1, false],
+    ["floor at the level", status(floor(1)), true, 1, true],
+    ["floor above the level", status(floor(2)), true, 1, true],
+    ["floor one short", status(floor(1)), true, 2, false],
+    ["unknown floor (null) counts as 0", status({ relayCapability: null }), true, 1, false],
+    ["unknown floor (older snapshot) counts as 0", status({}), true, 1, false],
     [
       "requested alone never enables",
       status({ relayCapability: { required: 0, requested: 5 } }),
+      true,
       1,
       false,
     ],
-  ] as const)("%s", (_what, s, level, enabled) => {
-    expect(syncCapabilityFloorReached(s, level)).toBe(enabled);
+  ] as const)("%s", (_what, s, configEnabled, level, enabled) => {
+    expect(syncCapabilityFloorReached(s, configEnabled, level)).toBe(enabled);
   });
 
   it("never reads the roster", () => {
@@ -771,7 +774,7 @@ describe("syncCapabilityFloorReached", () => {
       label: "Old laptop",
       platform: "windows",
     };
-    expect(syncCapabilityFloorReached(status({ roster: [peer], ...floor(1) }), 1)).toBe(true);
-    expect(syncCapabilityFloorReached(status({ roster: [], ...floor(0) }), 1)).toBe(false);
+    expect(syncCapabilityFloorReached(status({ roster: [peer], ...floor(1) }), true, 1)).toBe(true);
+    expect(syncCapabilityFloorReached(status({ roster: [], ...floor(0) }), true, 1)).toBe(false);
   });
 });
