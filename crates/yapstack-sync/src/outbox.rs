@@ -895,23 +895,34 @@ async fn raise_floor<T: SyncTransport + ?Sized>(
     Err(refusal.into_error())
 }
 
-/// Publish a snapshot whose rows need capability `content_level` (ADR 0006 §5.5), under the
-/// same rule as a gated push batch: above level 0 it needs proof this connection's relay
-/// enforces the gate, since one that predates it would presign the snapshot without checking
-/// the declared level. The seed path that will call this has no caller yet.
+/// Publish a snapshot of the database on `conn` (ADR 0006 §5.5) under the same rule as a gated
+/// push batch. Its content level is derived here from `conn`
+/// ([`crate::schema::snapshot_content_capability`]), never taken from the caller. Above level 0
+/// it needs proof the relay enforces the gate, since one that predates it would presign the
+/// snapshot without checking the declared level, and a floor refusal raises and retries once.
+///
+/// Must run on the drain's connection: the proof and the raise backoff are kept on it, and
+/// `conn` must be the database `ciphertext` was taken from. The seed path that will call this
+/// has no caller yet.
 pub async fn put_snapshot_gated<T: SyncTransport + ?Sized>(
     conn: &Connection,
     transport: &T,
     meta: crate::snapshot::SnapshotMeta,
     ciphertext: &[u8],
-    content_level: i32,
 ) -> Result<(), SyncError> {
-    if content_level > 0 {
-        require_capability_gate(conn, transport, content_level, &unix_now_ms).await?;
+    let level = crate::schema::snapshot_content_capability(conn)?;
+    if level == 0 {
+        return transport.put_snapshot(meta, ciphertext, 0).await;
     }
-    transport
-        .put_snapshot(meta, ciphertext, content_level)
-        .await
+    require_capability_gate(conn, transport, level, &unix_now_ms).await?;
+    match transport.put_snapshot(meta, ciphertext, level).await {
+        Err(SyncError::CapabilityFloor { .. }) => {
+            state::mark_capability_gate_proven(conn)?;
+            raise_floor(conn, transport, level, &unix_now_ms).await?;
+            transport.put_snapshot(meta, ciphertext, level).await
+        }
+        other => other,
+    }
 }
 
 /// One full drain cycle: enqueue local writes, push, pull+decrypt+merge, replay.
@@ -991,14 +1002,15 @@ pub async fn drain_once_with_progress<T: SyncTransport + ?Sized>(
         report.pull_error = Some(e);
     }
     // O2/O3: a 426 proves the relay enforces the capability gate; an unreachable relay may
-    // come back as a different one at the same address, so the proof is dropped; and the
-    // relay's levels can end a raise backoff.
+    // come back as a different one at the same address (a 5xx is how a swap behind a proxy
+    // shows), so the proof is dropped; and the relay's levels can end a raise backoff.
     if matches!(report.pull_error, Some(SyncError::UpdateRequired { .. })) {
         state::mark_capability_gate_proven(conn)?;
     }
     if [&report.push_error, &report.pull_error]
-        .iter()
-        .any(|e| e.as_ref().is_some_and(SyncError::is_network))
+        .into_iter()
+        .flatten()
+        .any(|e| e.is_network() || e.is_server_error())
     {
         state::forget_capability_gate(conn)?;
     }
@@ -2089,6 +2101,67 @@ mod tests {
         push_at(&conn, me, &relay, t + 5 * S).await.unwrap();
         assert_eq!(relay.inner.stored_pairs(), vec![(me, 1)]);
         assert_eq!(relay.inner.capability_state().0, 1);
+
+        // Refused at level 2: the floor moving 0 → 1 stays below the refused level, yet a
+        // changed `required` still starts over.
+        let conn = outbox_with_levels(&[(1, 2)]);
+        let relay = recording_relay();
+        relay
+            .inner
+            .set_capability_blockers(vec![blocker("old laptop")]);
+        let raises = || relay.inner.capability_state().2;
+        assert!(push_at(&conn, me, &relay, t).await.is_err());
+        state::note_relay_capability(&conn, levels(0, 2)).unwrap();
+        assert!(push_at(&conn, me, &relay, t + S).await.is_err());
+        assert_eq!(raises(), 1, "unchanged levels keep the backoff");
+        state::note_relay_capability(&conn, levels(1, 2)).unwrap();
+        assert!(push_at(&conn, me, &relay, t + 2 * S).await.is_err());
+        assert_eq!(raises(), 2, "a changed required level starts over");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cycle_that_pulls_peer_changes_keeps_the_backoff() {
+        // O3 as amended: activity on the relay (what an SSE wake signals) resets nothing. A
+        // cycle that merges a peer's changes, with the relay's levels unchanged, still holds.
+        let a = CrsqlDb::open_in_memory().unwrap();
+        let b = post_cutover_db();
+        a.conn()
+            .execute_batch(
+                "CREATE TABLE tags(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL DEFAULT ''); \
+                 SELECT crsql_as_crr('tags');",
+            )
+            .unwrap();
+        let relay = MockRelay::new();
+        relay.set_capability_blockers(vec![blocker("old laptop")]);
+        let cipher = f1_cipher();
+        let (sv, ev) = (SYNC_SCHEMA_VERSION as i32, CRSQLITE_ENGINE_VERSION as i32);
+        let me = Uuid::from_u128(1);
+
+        let first = drain_once(b.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.push_error,
+            Some(SyncError::CapabilityBlocked { .. })
+        ));
+        a.conn()
+            .execute("INSERT INTO tags(id, name) VALUES ('g9', 'peer')", [])
+            .unwrap();
+        let ca = state::client_id(a.conn()).unwrap();
+        drain_once(a.conn(), &cipher, &relay, ca, sv, ev)
+            .await
+            .unwrap();
+        let raised = relay.capability_state().2;
+
+        let woken = drain_once(b.conn(), &cipher, &relay, me, sv, ev)
+            .await
+            .unwrap();
+        assert!(woken.applied > 0, "the cycle merged the peer's change");
+        assert!(matches!(
+            woken.push_error,
+            Some(SyncError::CapabilityBlocked { .. })
+        ));
+        assert_eq!(relay.capability_state().2, raised, "no new raise");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2223,9 +2296,10 @@ mod tests {
             generation: 1,
             baseline_seq: 0,
         };
-        let conn = Connection::open_in_memory().unwrap();
+        // The level comes from the database being published, not from the caller.
+        let gated_db = post_cutover_db();
         let older = MockRelay::new().without_capability_gate();
-        let err = put_snapshot_gated(&conn, &older, meta, b"ct", 1)
+        let err = put_snapshot_gated(gated_db.conn(), &older, meta, b"ct")
             .await
             .unwrap_err();
         assert!(
@@ -2233,18 +2307,30 @@ mod tests {
             "got {err:?}"
         );
         assert!(older.get_snapshot().await.unwrap().is_none());
-        put_snapshot_gated(&conn, &older, meta, b"ct", 0)
+        let cutover_only = Connection::open_in_memory().unwrap();
+        put_snapshot_gated(&cutover_only, &older, meta, b"ct")
             .await
             .unwrap();
         assert!(older.get_snapshot().await.unwrap().is_some());
         assert_eq!(older.capability_state().2, 1, "level 0 needs no raise");
 
         let gated = MockRelay::new();
-        let fresh = Connection::open_in_memory().unwrap();
-        put_snapshot_gated(&fresh, &gated, meta, b"ct", 1)
+        let fresh = post_cutover_db();
+        put_snapshot_gated(fresh.conn(), &gated, meta, b"ct")
             .await
             .unwrap();
         assert_eq!(gated.capability_state().0, 1, "raised, then published");
+
+        // A proven connection whose relay was restored to floor 0: the presign's floor 409
+        // raises and retries once, like a push batch.
+        let restored = MockRelay::new();
+        let proven = post_cutover_db();
+        state::mark_capability_gate_proven(proven.conn()).unwrap();
+        put_snapshot_gated(proven.conn(), &restored, meta, b"ct")
+            .await
+            .unwrap();
+        assert_eq!(restored.capability_state(), (1, 0, 1));
+        assert!(restored.get_snapshot().await.unwrap().is_some());
     }
 
     #[test]

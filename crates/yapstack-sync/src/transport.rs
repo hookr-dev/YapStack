@@ -433,7 +433,8 @@ impl SyncTransport for HttpTransport {
                 baseline_seq: meta.baseline_seq,
             })
             .send()
-            .await?;
+            .await
+            .map_err(map_send_error)?;
         // A 426 refers to this build's level, a 409 floor refusal to the content's.
         let resp = match check_capability(resp, SYNC_CAPABILITY_LEVEL).await {
             Err(SyncError::CapabilityFloor {
@@ -462,7 +463,8 @@ impl SyncTransport for HttpTransport {
             .header("content-length", ciphertext.len())
             .body(ciphertext.to_vec())
             .send()
-            .await?
+            .await
+            .map_err(map_send_error)?
             .error_for_status()?;
         Ok(())
     }
@@ -474,7 +476,8 @@ impl SyncTransport for HttpTransport {
             .bearer_auth(self.bearer())
             .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
             .send()
-            .await?;
+            .await
+            .map_err(map_send_error)?;
         let head: SnapshotHeadResponse =
             check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?
                 .json()
@@ -485,7 +488,7 @@ impl SyncTransport for HttpTransport {
         let url = head.download_url.ok_or_else(|| {
             SyncError::Transport("snapshot head present but no download_url".into())
         })?;
-        let resp = self.client.get(url).send().await?;
+        let resp = self.client.get(url).send().await.map_err(map_send_error)?;
         // The head advertised a snapshot, but the object may be gone (e.g. a dead PUT whose
         // row outlived its bytes, or a race with relay GC). Degrade to changeset replay
         // instead of hard-failing bootstrap.
@@ -1302,6 +1305,33 @@ mod tests {
             "a refused connection must classify as Network (relay unreachable), got {err:?}"
         );
         assert!(err.is_network(), "SyncError::is_network() must agree");
+
+        // The snapshot routes classify the same way.
+        let meta = SnapshotMeta {
+            generation: 1,
+            baseline_seq: 0,
+        };
+        let err = t.put_snapshot(meta, b"ct", 0).await.unwrap_err();
+        assert!(err.is_network(), "snapshot presign, got {err:?}");
+        let err = t.get_snapshot().await.unwrap_err();
+        assert!(err.is_network(), "snapshot head, got {err:?}");
+    }
+
+    /// A 5xx is the relay (or the proxy in front of it) failing, which is how a relay being
+    /// swapped behind a proxy shows; a 4xx is the relay answering.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_5xx_is_a_server_error_and_a_4xx_is_not() {
+        let (addr, server) = canned_server(vec![
+            status_only("503 Service Unavailable"),
+            status_only("502 Bad Gateway"),
+            status_only("404 Not Found"),
+        ]);
+        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
+        for expected in [true, true, false] {
+            let e = t.completeness().await.unwrap_err();
+            assert_eq!(e.is_server_error(), expected, "got {e:?}");
+        }
+        server.join().unwrap();
     }
 
     #[test]
