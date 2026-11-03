@@ -3090,17 +3090,15 @@ fn spawn_sse_subscriber(
                 // on stop, the select drops the `stream_wakeups` future, which drops the reqwest
                 // stream and closes the connection — otherwise `join()` would block until the
                 // relay closed a keep-alive stream (possibly never). `None` = shutdown requested.
+                let mut opened = false;
                 let result = rt.block_on(async {
                     tokio::select! {
                         r = yapstack_sync::transport::stream_wakeups(
                             &client,
                             &server_url,
                             &current_bearer,
-                            |seq| {
-                                if should_wake(seq, pull_watermark_pub().load(Ordering::Acquire)) {
-                                    drain_wake().notify_one();
-                                }
-                            },
+                            || opened = true,
+                            on_sse_wake,
                         ) => Some(r),
                         () = async {
                             while !stop.load(Ordering::SeqCst) {
@@ -3114,9 +3112,13 @@ fn spawn_sse_subscriber(
                     Some(r) => r,
                     None => break, // shutdown requested mid-stream
                 };
-                // The stream ended: what answers at this address next may be a different
-                // relay (rolled back or upgraded), so the drain proves the gate again (O2).
-                note_relay_stream_dropped();
+                // An established stream ended: what answers at this address next may be a
+                // different relay (rolled back or upgraded), so the drain proves the gate again
+                // (O2). A subscription that never opened (unreachable, 401, no SSE route) says
+                // nothing about the relay, so it leaves a cached "no gate" answer alone.
+                if opened {
+                    CAPABILITY_RESETS.note_relay_stream_dropped();
+                }
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -3408,34 +3410,60 @@ enum CapabilityNotice {
 
 static CAPABILITY_NOTICE: PubCell<CapabilityNotice> = PubCell::new();
 
-/// O3: set by the events that may have unblocked a refused floor raise (the roster shows every
-/// blocker updated or gone, a device removed here). The drain takes it before its next cycle
-/// and clears the raise backoff, so that cycle asks the relay again.
-static RAISE_BACKOFF_RESET: AtomicBool = AtomicBool::new(false);
-
-/// O2: set when the relay's event stream ends. The relay at this address may have been
-/// replaced (rolled back, or upgraded), so the drain forgets what it proved about the gate.
-static RELAY_STREAM_DROPPED: AtomicBool = AtomicBool::new(false);
-
-fn request_raise_backoff_reset() {
-    RAISE_BACKOFF_RESET.store(true, Ordering::Release);
+/// Capability resets other lanes request for the drain's connection, which only the drain
+/// thread touches. The drain applies them before its next cycle.
+struct CapabilityResets {
+    /// O3: set by the events that may have unblocked a refused floor raise (the roster shows
+    /// every blocker updated or gone, a device removed here): clear the raise backoff.
+    raise_backoff: AtomicBool,
+    /// O2: set when an established event stream from the relay ends. The relay at this
+    /// address may have been replaced (rolled back, or upgraded): forget the gate proof.
+    relay_stream_dropped: AtomicBool,
 }
 
-fn note_relay_stream_dropped() {
-    RELAY_STREAM_DROPPED.store(true, Ordering::Release);
-}
-
-/// Apply the capability resets requested since the last call to the drain's connection.
-fn take_capability_resets(conn: &rusqlite::Connection) {
-    if RAISE_BACKOFF_RESET.swap(false, Ordering::AcqRel) {
-        if let Err(e) = yapstack_sync::state::clear_raise_backoff(conn) {
-            tracing::warn!("sync drain: could not clear the floor-raise backoff: {e}");
+impl CapabilityResets {
+    const fn new() -> Self {
+        Self {
+            raise_backoff: AtomicBool::new(false),
+            relay_stream_dropped: AtomicBool::new(false),
         }
     }
-    if RELAY_STREAM_DROPPED.swap(false, Ordering::AcqRel) {
-        if let Err(e) = yapstack_sync::state::forget_capability_gate(conn) {
-            tracing::warn!("sync drain: could not forget the relay's gate proof: {e}");
+
+    fn request_raise_backoff_reset(&self) {
+        self.raise_backoff.store(true, Ordering::Release);
+    }
+
+    fn note_relay_stream_dropped(&self) {
+        self.relay_stream_dropped.store(true, Ordering::Release);
+    }
+
+    fn pending(&self) -> bool {
+        self.raise_backoff.load(Ordering::Acquire)
+            || self.relay_stream_dropped.load(Ordering::Acquire)
+    }
+
+    /// Apply the resets requested since the last call to the drain's connection.
+    fn apply(&self, conn: &rusqlite::Connection) {
+        if self.raise_backoff.swap(false, Ordering::AcqRel) {
+            if let Err(e) = yapstack_sync::state::clear_raise_backoff(conn) {
+                tracing::warn!("sync drain: could not clear the floor-raise backoff: {e}");
+            }
         }
+        if self.relay_stream_dropped.swap(false, Ordering::AcqRel) {
+            if let Err(e) = yapstack_sync::state::forget_capability_gate(conn) {
+                tracing::warn!("sync drain: could not forget the relay's gate proof: {e}");
+            }
+        }
+    }
+}
+
+static CAPABILITY_RESETS: CapabilityResets = CapabilityResets::new();
+
+/// The SSE lane's handler for one wakeup: run a drain cycle when the seq is beyond the local
+/// pull watermark. A wake by itself resets no capability state (O3 as amended).
+fn on_sse_wake(seq: i64) {
+    if should_wake(seq, pull_watermark_pub().load(Ordering::Acquire)) {
+        drain_wake().notify_one();
     }
 }
 
@@ -4245,7 +4273,7 @@ fn spawn_drain(
                     });
                 }
 
-                take_capability_resets(conn);
+                CAPABILITY_RESETS.apply(conn);
 
                 // A cycle now ALWAYS attempts BOTH push and pull (F1); a per-direction
                 // transport error rides on the report rather than aborting the cycle. Only a
@@ -5394,7 +5422,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
             // O3: once every device a refused raise named has updated or left, ask again now
             // rather than at the end of the backoff.
             if roster_clears_capability_blockers(&CAPABILITY_NOTICE.get(), &devs.devices) {
-                request_raise_backoff_reset();
+                CAPABILITY_RESETS.request_raise_backoff_reset();
                 drain_wake().notify_one();
             }
             for d in devs.devices {
@@ -6088,7 +6116,7 @@ pub async fn sync_remove_device(
         }
     }
     // The removed device may have been what held a floor raise: ask again now (O3).
-    request_raise_backoff_reset();
+    CAPABILITY_RESETS.request_raise_backoff_reset();
     drain_wake().notify_one();
     Ok(build_status_dto(&session).await)
 }
@@ -7732,32 +7760,45 @@ mod tests {
             refusal: RaiseRefusal::GateMissing,
         };
         let held = |conn: &rusqlite::Connection| state::raise_backoff(conn, now + 1).unwrap();
+        // A local instance, so no other test can touch these flags.
+        let resets = CapabilityResets::new();
 
         state::record_refused_raise(&conn, &blocked, now).unwrap();
-        take_capability_resets(&conn);
+        resets.apply(&conn);
         assert!(
             held(&conn).is_some(),
             "nothing requested: the backoff stands"
         );
-        request_raise_backoff_reset();
-        take_capability_resets(&conn);
+        resets.request_raise_backoff_reset();
+        resets.apply(&conn);
         assert!(held(&conn).is_none());
         state::record_refused_raise(&conn, &blocked, now).unwrap();
-        take_capability_resets(&conn);
+        resets.apply(&conn);
         assert!(held(&conn).is_some(), "a reset is taken once");
 
         // A dropped event stream (the relay may have been replaced) forgets the gate proof and
         // a cached "no gate" answer, but not a blocker refusal.
         state::mark_capability_gate_proven(&conn).unwrap();
-        note_relay_stream_dropped();
-        take_capability_resets(&conn);
+        resets.note_relay_stream_dropped();
+        resets.apply(&conn);
         assert!(!state::capability_gate_proven(&conn).unwrap());
         assert!(held(&conn).is_some(), "a blocker refusal outlives a drop");
         state::clear_raise_backoff(&conn).unwrap();
         state::record_refused_raise(&conn, &gate_missing, now).unwrap();
-        note_relay_stream_dropped();
-        take_capability_resets(&conn);
+        resets.note_relay_stream_dropped();
+        resets.apply(&conn);
         assert!(held(&conn).is_none());
+    }
+
+    #[test]
+    fn an_sse_wake_alone_requests_no_capability_reset() {
+        // O3 as amended: only the relay's levels, the roster and a local removal reset the
+        // backoff. Nothing in the tests requests a reset of the process-wide flags, so any
+        // pending flag here came from the wakes.
+        for seq in [i64::MAX, 0, 1] {
+            on_sse_wake(seq);
+        }
+        assert!(!CAPABILITY_RESETS.pending());
     }
 
     #[test]

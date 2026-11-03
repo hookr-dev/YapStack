@@ -642,10 +642,14 @@ fn parse_sse_data_seq(line: &str) -> Option<i64> {
 /// The body is parsed frame-by-frame off `bytes_stream()` (O(line) working set); it never
 /// buffers the whole never-ending response. The bearer is sent as an `Authorization`
 /// header and is absent from any returned error (which carries at most the relay URL).
+///
+/// `on_open` runs once the relay has accepted the subscription (a 2xx), so the caller can tell
+/// a stream that was established and then ended from one that never opened.
 pub async fn stream_wakeups(
     client: &reqwest::Client,
     base_url: &str,
     bearer: &str,
+    on_open: impl FnOnce(),
     mut on_wake: impl FnMut(i64),
 ) -> Result<(), SyncError> {
     use futures_util::StreamExt;
@@ -658,6 +662,7 @@ pub async fn stream_wakeups(
         .map_err(map_send_error)?;
     // 401 → refreshable (caller reloads the persisted token); other non-2xx → error_for_status.
     let resp = check_auth(resp)?;
+    on_open();
 
     let mut stream = resp.bytes_stream();
     // Accumulate bytes and process each complete LF-terminated line as it arrives. SSE lines
@@ -1365,10 +1370,16 @@ mod tests {
 
         let client = reqwest::Client::new();
         let mut wakes = Vec::new();
-        let r = stream_wakeups(&client, &format!("http://{addr}"), "access-token", |s| {
-            wakes.push(s)
-        })
+        let mut opened = false;
+        let r = stream_wakeups(
+            &client,
+            &format!("http://{addr}"),
+            "access-token",
+            || opened = true,
+            |s| wakes.push(s),
+        )
         .await;
+        assert!(opened, "an accepted subscription opened");
         assert!(r.is_ok(), "clean stream end must be Ok, got {r:?}");
         assert_eq!(wakes, vec![1, 2], "only the two data: seqs must surface");
         server.join().unwrap();
@@ -1382,9 +1393,17 @@ mod tests {
         let (addr, server) = canned_server(vec![status_only("401 Unauthorized")]);
 
         let client = reqwest::Client::new();
-        let err = stream_wakeups(&client, &format!("http://{addr}"), "stale", |_| {})
-            .await
-            .unwrap_err();
+        let mut opened = false;
+        let err = stream_wakeups(
+            &client,
+            &format!("http://{addr}"),
+            "stale",
+            || opened = true,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(!opened, "a refused subscription never opened");
         assert!(
             matches!(err, SyncError::Unauthorized),
             "a 401 stream must map to Unauthorized, got {err:?}"
