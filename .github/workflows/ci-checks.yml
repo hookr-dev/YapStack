@@ -77,6 +77,52 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
+  rust-sync:
+    name: Rust sync feature (macos-latest)
+    # `cargo test --all` above builds the desktop crate without its `sync` feature, so the
+    # desktop-side sync guards (migration runner on a CRR DB, CreateSyncTable, the drain's
+    # boot heal, lane status) only run here. Release builds use `-f sync`.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+
+      - name: Install pinned nightly for the vendored cr-sqlite bundle
+        # crates/yapstack-sync/build.rs builds vendor/cr-sqlite/.../bundle_static, whose
+        # rust-toolchain.toml pins nightly-2023-10-05 (channel only, no components). Same
+        # step as sync-test-build.yml and release.yml.
+        run: rustup toolchain install nightly-2023-10-05 --profile minimal
+
+      - name: Xcode fingerprint for cache key
+        # See the Rust (macos-latest) job.
+        id: xcode
+        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-macos-latest-sync
+          key: ${{ steps.xcode.outputs.version }}
+          cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: Create sidecar + framework placeholders
+        # See the Rust (macos-latest) job: the Tauri build script only checks they exist.
+        run: |
+          mkdir -p apps/desktop/src-tauri/binaries
+          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
+          touch apps/desktop/src-tauri/binaries/libwebgpu_dawn.dylib
+
+      - name: Clippy (desktop, sync)
+        run: cargo clippy -p yapstack-desktop --features sync --all-targets -- -D warnings
+
+      - name: Run tests (desktop, sync)
+        run: cargo test -p yapstack-desktop --features sync
+
   rust-windows:
     name: Rust (windows-latest)
     runs-on: windows-latest
