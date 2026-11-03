@@ -80,6 +80,8 @@ This is the path used for every release the project has shipped so far. PR title
 
 A peer that receives rows for a synced table it doesn't have yet must hold them in its schema quarantine, not stop syncing (ADR 0006 §4, SYNC_SPEC §6.4). Builds before that tolerance existed stall their pull on such a row. So **no release may introduce a new synced table (a `SYNC_TABLES` entry) unless the previous release already contained the table-readiness quarantine.** Adding one also needs the peer capability gate in ADR 0006 §5.
 
+The table is created by a `CreateSyncTable` migration (SYNC_SPEC §4.3), never by `lib/db.ts`. Before tagging, run `cargo test -p yapstack-desktop --features sync` (PR CI doesn't build `sync`): `every_create_sync_table_migration_is_crr_compatible` checks the new migration converts on a synced database. CI's `yapstack-sync` tests check its level (`no_table_needs_more_than_this_build_reports`).
+
 ## Verification before publish
 
 Don't skip these — the auto-updater silently pushes whatever `latest.json` references to every install.

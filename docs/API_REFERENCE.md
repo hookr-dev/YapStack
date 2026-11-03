@@ -788,7 +788,10 @@ pub struct SyncStatusDto {
     removed: bool,                     // this device was removed from the account by another device (SYNC_SPEC §5.7)
     capability_notice: Option<SyncCapabilityNoticeDto>, // ADR 0006 §5 lane-status notice
     version_advisory: Option<VersionAdvisory>,          // refreshed on the first drain cycle, on reconnect, else every 15 min (ADR 0006 §5.9)
+    sync_table_setup_failures: Vec<String>,             // tables whose CreateSyncTable didn't finish at launch (SYNC_SPEC §4.3); usually empty
+    relay_capability: Option<RelayCapabilityDto>,       // { required, requested } as the relay last returned them; UX only (lib/sync.ts syncCapabilityFloorReached)
 }
+pub struct RelayCapabilityDto { required: i32, requested: i32 }
 pub enum SyncCapabilityNoticeDto {     // tagged on `kind`, kebab-case
     UpdateRequired, AnotherDeviceNeedsUpdate,
     WaitingForDevices { blockers: Vec<CapabilityBlockerDto { label?, platform?, last_seen, fingerprint? }> },
