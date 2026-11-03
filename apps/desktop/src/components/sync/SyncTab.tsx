@@ -578,8 +578,8 @@ function RemoveDeviceButton({
 
 /** ADR 0006 §5: the sync capability notice. "Update required" stops this device's pull;
  *  "waiting for devices" holds its push behind a change that needs every recently active
- *  device on a newer build (named, with Remove); the nudge tells a lagging device it is
- *  holding the others up. */
+ *  device on a newer build (named, with Remove); "relay needs update" holds it because the
+ *  relay predates the gate; the nudge tells a lagging device it is holding the others up. */
 function SyncCapabilityNoticeRow({
   status,
   onRemove,
@@ -610,6 +610,18 @@ function SyncCapabilityNoticeRow({
         <AlertDescription className="text-xs">
           Sync still works here. Another device is waiting for this one to run a newer
           version before it can share some changes.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+  if (notice.kind === "relay-needs-update") {
+    return (
+      <Alert className={amber}>
+        <ShieldAlert className="h-4 w-4" />
+        <AlertTitle>Your sync server needs an update</AlertTitle>
+        <AlertDescription className="text-xs">
+          Changes made on this device are waiting until the sync server is updated. Changes
+          from your other devices still arrive.
         </AlertDescription>
       </Alert>
     );

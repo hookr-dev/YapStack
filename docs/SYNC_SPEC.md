@@ -143,6 +143,12 @@ Exactly these twelve tables are converted to cr-sqlite CRRs at cutover
 UUID junctions). Everything else (`*_fts*`, embeddings, `pending_audio_deletions`,
 `_sqlx_migrations`, `sqlite_sequence`, and every `_yapstack_*` table) is local-only.
 
+These twelve are the first `CUTOVER_SYNC_TABLE_COUNT` entries of `SYNC_TABLES` and are
+the only tables at sync capability level 0. A table added later is appended to
+`SYNC_TABLES` and, if it needs more than level 1, listed in `GATED_SYNC_TABLES`. Any
+other table defaults to `TABLE_READINESS_LEVEL` (1), so a table nobody listed still never
+reaches a peer without the table-readiness quarantine (§9.3, ADR 0006 §5.4).
+
 The CRR rebuild (`schema::derive_rebuild_body`) strips FK constraints, non-PK UNIQUE
 indexes and CHECKs, and gives NOT-NULL-no-default columns a synthetic default. Two
 app-layer passes reinstate what was stripped after each converged merge:
@@ -434,12 +440,22 @@ database.
 **row-atomic** chunks (5 000 rows or 512 KiB plaintext, never splitting a `(table,
 pk)` group), encrypts each chunk with a fresh data key wrapped under the vault key
 (CRYPTO_SPEC §4/§5, AAD binds tenant, client, `client_seq`, schema and engine
-versions), and stages it in the outbox. `push_outbox` ships batches under a 1.5 MB
+versions), and stages it in the outbox. A chunk also ends wherever the rows' sync
+capability level changes, so each entry carries one level (§9.3). That cut can fall inside
+one local transaction, so its level-0 half can ship while its gated half is held. Before
+the first push of a drain connection, every unacked entry's stored level is re-checked
+against the current table levels and raised where an older build rated a table lower.
+`push_outbox` ships batches under a 1.5 MB
 wire budget; an entry that can never fit surfaces once as `Blocked` rather than
 hot-looping. `(client_id, client_seq)` is the idempotency key; the relay returns dense
 commit-ordered `changeset_seq`s and rejects a reused `client_seq` with **different**
 content (counter regression after a restore) with 409, on which the client reseeds its
-counter from the relay's per-client tail.
+counter from the relay's per-client tail. A batch above level 0 goes through the
+capability gate first (`push_gated`, §9.3): the raise backoff, then proof the relay
+enforces the gate, then the floor. The proof is checked per batch, not per request: a relay
+swapped at the same address between two successful requests of one push loop, with no
+failed request in between to drop the proof, is not caught until the next drop or respawn.
+That residual window is accepted.
 
 ### 6.4 Pull
 
@@ -503,8 +519,10 @@ connected | syncing | catching_up | auth_expired | unreachable | error`, server 
 email, own fingerprint, roster (fingerprint, isSelf, pending, label, platform per
 device from `GET /devices`), epoch, roster fingerprint, `syncEnabled`, `lastError`,
 push progress (`pendingEntries`, `pendingBytes`, `ackedThisSession`, `lastSuccess`),
-`pullBehind`, `cryptoQuarantined`, five audio-lane counters, and `removed` (§5.7: this
-device was removed from the account by another device). Field-level shapes are in
+`pullBehind`, `cryptoQuarantined`, five audio-lane counters, `removed` (§5.7: this
+device was removed from the account by another device), `capabilityNotice`
+(`update-required` | `another-device-needs-update` | `waiting-for-devices` with blockers |
+`relay-needs-update`, §9.3) and `versionAdvisory`. Field-level shapes are in
 [`API_REFERENCE.md`](API_REFERENCE.md#sync-yapstack-desktop-yapstack-common).
 
 ---
@@ -665,19 +683,67 @@ Level 1 means "has the table-readiness quarantine" (ADR 0006 §4).
 
 **Client side.** Builds send level 1 (`SYNC_CAPABILITY_LEVEL`) on every pull, snapshot
 request and raise. Each outbox entry stores the highest level among its rows
-(`_yapstack_outbox.required_sync_capability`, local, added by `ensure_outbox_table`; a
-table's level is declared in `GATED_SYNC_TABLES` beside `SYNC_TABLES`, and every cutover
-table is 0). The push planner cuts a batch wherever the level changes, so batches are
-single-level and an ungated prefix still ships. A gated batch carries
-`X-YapStack-Batch-Capability`. On 409 `sync_capability_floor` the drain tries the raise
-and retries once. A refused raise holds the push in `client_seq` order and lane status
-names the blocking devices, offering the roster's Remove; pull carries on. A 426 shows
+(`_yapstack_outbox.required_sync_capability`, local, added by `ensure_outbox_table`; an
+entry from a build that predates the column reads 0). A stored level is only a floor:
+once per drain connection, before anything is pushed, each unacked entry is decrypted under
+the schema/engine versions it was captured with and its level raised to the highest current
+level among its rows, so an entry an older build stamped 0 for a post-cutover table's rows
+is held at that table's level after an upgrade or a restore. An entry that still can't be
+read (a client_id re-minted on the same account, a wrong key epoch) is held at the highest
+level any table can need (`schema::highest_table_sync_capability`) and logged; it doesn't
+stop the entries ahead of it and ships opaque once the floor reaches that level, as such
+entries did before. The re-check reads nothing while every CRR table is a cutover table,
+and skips entries already at the highest level. `schema::table_sync_capability` gives a table's
+level: 0 for the twelve cutover tables, the `GATED_SYNC_TABLES` level when listed, and
+otherwise `TABLE_READINESS_LEVEL` (1), so an unlisted table is never level 0 (§4.1).
+Capture cuts an entry, and the push planner a batch, wherever the level changes, so
+batches are single-level and an ungated prefix still ships. `crr_migrate` converts in
+`SYNC_TABLES` order and `crsql_as_crr` backfills at the next `db_version`, so after a
+cutover (watermarks reset to 0) the level-0 history is captured ahead of any later
+table's rows. A gated batch carries `X-YapStack-Batch-Capability`.
+
+Before the first batch above level 0, the drain needs proof that the relay enforces the
+gate: a raise that left the floor at or above the asked level, a raise refused naming
+blockers, a 409 `sync_capability_floor`, or a 426. A relay that predates the gate ignores
+the batch header and would store the batch. The proof is a connection-scoped TEMP marker
+(`state::capability_gate_proven`, like `seq_reconciled`), so each drain spawn proves it
+again against the relay it talks to now. It is also dropped when a cycle finds the relay
+unreachable or gets a 5xx (a swap behind a proxy answers 502/503), and when an established
+event stream from the relay ends, since a relay rolled back at the same address shows up as
+a drop. A subscription that never opened (unreachable, 401, no SSE route) drops nothing. Without it the drain asks for the raise first. An accepted
+raise that leaves the floor below the asked level proves nothing and counts as a missing
+gate. A 404 or 405 on `PUT /sync/capability` means the relay predates the gate
+(`SyncError::CapabilityGateMissing`): the push holds in `client_seq` order, lane status
+shows "Your sync server needs an update" ("Changes made on this device are waiting until
+the sync server is updated. Changes from your other devices still arrive."), and pull
+carries on. On 409 `sync_capability_floor` the drain tries the raise and retries once. A
+refused raise holds the push in `client_seq` order and lane status names the blocking
+devices, offering the roster's Remove; pull carries on.
+
+Both refusals back off (TEMP, per connection, O3 as amended 2026-11-02): 60 s from when
+the refusal arrived, doubling per refusal of the same kind and level to 15 min, which
+bounds how long an unblocked raise waits. While it waits, the cached refusal is returned
+without pushing or asking; it only ever withholds, and a batch below the refused level
+isn't held by it. A blocker refusal's backoff ends when a raise succeeds, when a pull
+shows the floor at or above the refused level or either relay level changed, when the
+device index (`GET /devices`, read for lane status) shows every named device at the level,
+revoked or gone, and when this device removes another device. A "no gate" backoff ends
+when an established event stream from the relay ends (upgrading the relay restarts it), or
+the relay is unreachable or answers 5xx. An SSE wake alone resets nothing. A 426 shows
 "Update YapStack to keep syncing". A device below `requested` sees "Another device needs
 you to update YapStack". The transport classifies capability 409s by body `code`, so they
 never reach the `client_seq`-regression recovery that drops the unacked outbox; only a
 409 whose body is the relay's `conflict` code does, and an unreadable or unrecognised 409
 stays an error that leaves the outbox intact. Lane status shows a capability refusal once,
 in its notice, and still shows the other direction's error.
+
+A snapshot publish declares its content level: `SyncTransport::put_snapshot` takes it,
+and `schema::snapshot_content_capability` gives the highest table level among the CRR
+tables, empty ones included (fail closed: a deleted table's tombstones and its schema are
+content too). `outbox::put_snapshot_gated` derives the level from the database itself and
+applies the push rule above level 0 (backoff, then proof, before the presign; a floor 409
+raises and retries once). It must run on the drain connection, which holds the proof and the
+backoff. The seed path has no caller yet.
 
 The client persists the last `required`/`requested` levels the relay returned, per
 workspace id (`_yapstack_sync_meta` key `relay_capability:<workspace>`; an account switch
@@ -828,6 +894,7 @@ onboarding completes.
 | I27 | A password holder cannot mint a token for another device's identity; a sign-in without a valid proof binds no device and cannot write (§15.K) | `auth_flow::password_holder_cannot_impersonate_another_device`, `yapstack-crypto sign::login_pop_message_field_order_and_domain` |
 | I28 | The relay's plaintext roster counter must match the signature-bound one before the client signs anything (§5.4) | `sync.rs` unit test `relay_plaintext_counter_must_match_the_signed_one` |
 | I-NT2 | The full secondary-index set of a freshly migrated non-CRR DB equals the set after cutover plus migrations; a `SyncIndex` migration never stales CRR triggers and refuses every UNIQUE index (§4.3) | `r3_migration::crr_migration_preserves_secondary_indexes`, `db_service` tests `cutover_keeps_the_fresh_index_set`, `v18_restores_the_fresh_index_set_on_a_db_cut_over_without_indexes`, `sync_index_*` |
+| I29 | A row of a post-cutover table never reaches a relay whose floor is below its level: an unlisted table is level 1, a stored entry level is re-checked before push, capture and push never mix levels, nothing above 0 (batch or snapshot) is sent before this connection has proof the relay enforces the gate, and a cached refusal only withholds (§9.3) | `schema::a_table_outside_the_cutover_set_needs_at_least_table_readiness`, `snapshot_content_level_counts_every_crr_table_even_when_empty`, `outbox::never_synced_device_holds_rows_of_a_post_cutover_table_until_the_floor_rises`, `an_entry_stamped_below_its_tables_level_is_held_at_that_level`, `restamp_reads_an_entry_under_the_versions_it_was_captured_with`, `an_unreadable_entry_is_held_at_the_highest_level_instead_of_wedging_the_push`, `an_accepted_raise_that_leaves_the_floor_below_proves_nothing`, `an_unreachable_relay_forgets_the_gate_proof`, `a_gated_snapshot_needs_the_same_proof_as_a_gated_push`, `captured_levels_cut_batches_and_the_ungated_prefix_acks`, `a_relay_without_the_capability_gate_never_receives_a_gated_batch`, `the_gate_proof_is_per_connection_so_a_respawn_proves_it_again`, `a_blocked_raise_backs_off_until_the_relay_or_the_roster_changes`, `the_backoff_runs_from_when_the_refusal_arrived`, `a_pull_showing_the_floor_raised_ends_the_backoff`, `a_persisted_floor_never_authorizes_a_gated_push`, `restored_outbox_keeps_entry_levels_and_stays_held`, `restored_relay_below_the_old_floor_refuses_again`, `transport::put_snapshot_declares_the_content_level_and_is_refused_above_the_floor` |
 
 ---
 
@@ -899,6 +966,7 @@ points to §15. Nothing in this table is still open.
 | D25 | Relay compaction design (2026-08-28, local scratchpad) | Not implemented; the owner's relay holds ~12 000 changesets, so a fresh join replays all of them | Design written up as [`plans/RELAY_COMPACTION.md`](plans/RELAY_COMPACTION.md); **awaiting ratification** (§15.F) |
 | D26 | ADR 0006 §2: the CRR rebuild keeps a table's secondary indexes | `transform_and_crrify` replayed triggers only, so cutover dropped every secondary index (the owner's synced DB kept just the two `lib/db.ts` re-creates); sessions-by-day and segments-by-session became full scans | **Done (FP2a):** indexes captured and replayed at cutover; migration v18 (`SyncIndex`) restores them on databases already cut over (§4.3, I-NT2) |
 | D26 | `docs/ARCHITECTURE.md`, `INDEX.md`, `GLOSSARY.md` | No sync section, no sync entries, no sync terms | **Done (c86d4eb)**; re-aligned with the shipped slices in the merge docs pass |
+| D27 | ADR 0006 §5.4: a missing batch header means 0, "which covers older builds"; entries captured by older builds can't hold rows for new tables | A relay that predates the gate ignores the header and stores any batch; capture is unfiltered, so a build that doesn't list a later table stamped its rows 0 | **Done (FP2b-1):** owner rulings O1–O3 (2026-11-02). Unlisted post-cutover tables are level 1; no gated batch is sent before the relay proves it enforces the gate (404/405 on the raise holds the push); refused raises and a missing gate back off; stored entry levels are re-checked before push, so an outbox captured by an older build (upgrade or restore) is held at its tables' levels, and an entry that can't be read is held at the highest level rather than stopping the push (§9.3, I29). A release tagged from main between #119 and #134 (FP2b-1) has the gate but not O1 or the re-check: it stamps unlisted post-cutover tables 0 and trusts stored levels, so it must not ship once a post-cutover table exists. Not covered: a downgrade to a build that predates the outbox level column pushes queued entries without the header; no client-side check can reach such a build |
 
 ---
 

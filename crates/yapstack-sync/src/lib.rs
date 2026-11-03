@@ -41,11 +41,15 @@ pub const CRSQLITE_ENGINE_VERSION: u32 = 16_003;
 /// synced schema changes; drives the §6 quarantine/handshake gate.
 pub const SYNC_SCHEMA_VERSION: u32 = 1;
 
+/// The sync capability level that means "has the table-readiness quarantine" (ADR 0006 §4):
+/// a row for a table that isn't a CRR locally never fails a changeset, so the device can
+/// safely receive rows for tables added after it shipped. The lowest level any table added
+/// after cutover can need.
+pub const TABLE_READINESS_LEVEL: i32 = 1;
+
 /// This build's sync capability level, sent on every pull and snapshot request
-/// (`X-YapStack-Sync-Capability`, ADR 0006 §5.1). Level 1 = "has the table-readiness
-/// quarantine" (ADR 0006 §4): a row for a table that isn't a CRR locally never fails a
-/// changeset, so this device can safely receive rows for tables added after it shipped.
-pub const SYNC_CAPABILITY_LEVEL: i32 = 1;
+/// (`X-YapStack-Sync-Capability`, ADR 0006 §5.1).
+pub const SYNC_CAPABILITY_LEVEL: i32 = TABLE_READINESS_LEVEL;
 
 /// Every fallible operation's error. All crypto/codec variants are quarantine/deny
 /// paths (never a panic on attacker-supplied bytes, CRYPTO_SPEC §11.3).
@@ -115,6 +119,13 @@ pub enum SyncError {
         level: i32,
         blockers: Vec<yapstack_common::sync::CapabilityBlocker>,
     },
+    /// The relay has no floor-raise route (HTTP 404 or 405 on `PUT /sync/capability`): it
+    /// predates the capability gate and would accept a gated batch without checking it. A
+    /// push needing level `level` holds in `client_seq` order until the relay is updated.
+    #[error(
+        "the sync server needs an update before changes that need sync capability {level} can sync"
+    )]
+    CapabilityGateMissing { level: i32 },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -144,5 +155,11 @@ impl SyncError {
     #[must_use]
     pub fn is_network(&self) -> bool {
         matches!(self, SyncError::Network(_))
+    }
+
+    /// True for an HTTP 5xx from the relay or a proxy in front of it.
+    #[must_use]
+    pub fn is_server_error(&self) -> bool {
+        matches!(self, SyncError::Http(e) if e.status().is_some_and(|s| s.is_server_error()))
     }
 }

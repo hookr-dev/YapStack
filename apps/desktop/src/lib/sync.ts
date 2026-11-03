@@ -195,7 +195,9 @@ export type SyncCapabilityNotice =
   /** Another device asked for a level this build lacks. A nudge, not a block. */
   | { kind: "another-device-needs-update" }
   /** This device's push is held until these devices update or are removed. */
-  | { kind: "waiting-for-devices"; blockers: CapabilityBlocker[] };
+  | { kind: "waiting-for-devices"; blockers: CapabilityBlocker[] }
+  /** This device's push is held because the relay predates the capability gate. */
+  | { kind: "relay-needs-update" };
 
 export interface SignupRequest {
   serverUrl: string;

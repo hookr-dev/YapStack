@@ -396,6 +396,21 @@ describe("SyncTab — on", () => {
     expect(screen.getByText("Another device needs you to update YapStack")).toBeInTheDocument();
   });
 
+  it("a relay without the capability gate asks for a server update", () => {
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ capabilityNotice: { kind: "relay-needs-update" } }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Your sync server needs an update")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Changes made on this device are waiting until the sync server is updated. Changes from your other devices still arrive.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Waiting for other devices to update")).not.toBeInTheDocument();
+  });
+
   it("a removed device is told so, offered Sign out, and cannot remove others", async () => {
     setup({ email: "user@example.com", status: makeStatus({ roster: [PEER], removed: true }) });
     render(<SyncTab />);
