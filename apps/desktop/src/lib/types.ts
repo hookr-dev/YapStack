@@ -1274,7 +1274,13 @@ capabilityNotice: SyncCapabilityNoticeDto | null;
  * ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
  * at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
  */
-versionAdvisory: VersionAdvisory | null }
+versionAdvisory: VersionAdvisory | null;
+/**
+ * ADR 0006 §1: synced tables whose `CreateSyncTable` migration didn't finish on this
+ * device at launch (and that the drain's boot heal hasn't converted since). Their
+ * peers' rows wait in the quarantine; lane status asks for a restart. Usually empty.
+ */
+syncTableSetupFailures: string[] }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors

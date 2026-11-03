@@ -516,6 +516,10 @@ fn value_ref_to_json(v: ValueRef<'_>) -> JsonValue {
 ///     UNIQUE index is refused.
 ///     Any other `Plain` migration that names a sync table is refused, and one
 ///     touching only NON-sync tables is applied plainly.
+///   * A new synced table is a [`crate::db::MigrationKind::CreateSyncTable`]
+///     migration: its guarded CREATE TABLE and indexes, converted to a CRR before it
+///     is recorded. One the run can't finish is reported to
+///     [`SyncTableSetupFailures::process`] for sync lane status.
 ///   * On a non-CRR DB (fresh install before cutover, or the `no-sync` build) every
 ///     migration is applied plainly, exactly as before.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
@@ -532,12 +536,73 @@ const SQLX_MIGRATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     execution_time BIGINT NOT NULL
 );";
 
+/// The tables whose [`crate::db::MigrationKind::CreateSyncTable`] migration the last
+/// migration run couldn't finish, for sync lane status (ADR 0006 §1). The writer's run
+/// fills [`SyncTableSetupFailures::process`] at open, the drain's boot heal resolves a
+/// table it converts, and `sync_status` reads it.
+#[derive(Debug, Default)]
+pub struct SyncTableSetupFailures {
+    tables: Mutex<Vec<&'static str>>,
+}
+
+impl SyncTableSetupFailures {
+    pub const fn new() -> Self {
+        Self {
+            tables: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The one the app's migration runs report to.
+    pub fn process() -> &'static SyncTableSetupFailures {
+        static PROCESS: SyncTableSetupFailures = SyncTableSetupFailures::new();
+        &PROCESS
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<&'static str>> {
+        self.tables.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    pub(crate) fn add(&self, table: &'static str) {
+        let mut tables = self.lock();
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+
+    /// `table` is a CRR now (the boot heal converted it).
+    #[cfg(feature = "sync")]
+    pub fn resolve(&self, table: &str) {
+        self.lock().retain(|t| *t != table);
+    }
+
+    /// Read only by sync lane status, which a build without sync doesn't have.
+    #[cfg(feature = "sync")]
+    pub fn tables(&self) -> Vec<String> {
+        self.lock().iter().map(|t| (*t).to_string()).collect()
+    }
+}
+
 /// Migration runner over an explicit list (so tests can drive the CRR-wrap path
 /// with a synthetic migration). See [`run_migrations`].
 pub fn run_migrations_list(
     conn: &Connection,
     migrations: &[crate::db::Migration],
 ) -> rusqlite::Result<Vec<i64>> {
+    run_migrations_list_with(conn, migrations, SyncTableSetupFailures::process())
+}
+
+/// [`run_migrations_list`], reporting the `CreateSyncTable` migrations it couldn't finish
+/// to `failures` (replacing what an earlier run reported).
+fn run_migrations_list_with(
+    conn: &Connection,
+    migrations: &[crate::db::Migration],
+    failures: &SyncTableSetupFailures,
+) -> rusqlite::Result<Vec<i64>> {
+    failures.clear();
     conn.execute_batch(SQLX_MIGRATIONS_DDL)?;
 
     let applied: std::collections::HashSet<i64> = {
@@ -569,6 +634,9 @@ pub fn run_migrations_list(
                         m.version,
                         m.description
                     );
+                    if let crate::db::MigrationKind::CreateSyncTable { table } = m.kind {
+                        failures.add(table);
+                    }
                 }
             }
         }
@@ -576,8 +644,8 @@ pub fn run_migrations_list(
     Ok(newly_applied)
 }
 
-/// For a migration that couldn't apply: record it when its declared
-/// [`crate::db::Migration::schema_effects`] are all present already (put there out
+/// For a migration that couldn't apply: record it when what it creates
+/// ([`recordable_effects`]) is all present already (put there out
 /// of band) with the definitions `migrations` gives them, so it isn't retried and
 /// failed on every boot. False when it declares none, any differs, or the probe or
 /// bookkeeping insert errors, leaving the migration unrecorded. `reference` holds
@@ -588,7 +656,8 @@ fn record_if_schema_present(
     migrations: &[crate::db::Migration],
     reference: &mut Option<Connection>,
 ) -> bool {
-    if m.schema_effects.is_empty() {
+    let effects = recordable_effects(m);
+    if effects.is_empty() {
         return false;
     }
     if reference.is_none() {
@@ -603,8 +672,29 @@ fn record_if_schema_present(
     let Some(reference) = reference.as_ref() else {
         return false;
     };
-    schema_effects_present(conn, reference, m.schema_effects).unwrap_or(false)
+    schema_effects_present(conn, reference, &effects).unwrap_or(false)
         && record_migration(conn, m, 0).is_ok()
+}
+
+/// The objects whose presence lets a failed `m` be recorded: its declared
+/// [`crate::db::Migration::schema_effects`], or for a `CreateSyncTable` its table and every
+/// index its SQL creates. The table check covers each column and, on a CRR DB, needs the
+/// table to be a CRR with current triggers ([`schema_effects_present`]), so a table the
+/// migration created but couldn't convert keeps it pending.
+fn recordable_effects(m: &crate::db::Migration) -> Vec<crate::db::SchemaObject> {
+    use crate::db::SchemaObject;
+    let crate::db::MigrationKind::CreateSyncTable { table } = m.kind else {
+        return m.schema_effects.to_vec();
+    };
+    let indexes = sql_statements(m.sql)
+        .filter_map(parse_index_stmt)
+        .filter_map(|s| match s {
+            IndexStmt::Create { name, .. } => Some(SchemaObject::Index(name)),
+            IndexStmt::Drop { .. } => None,
+        });
+    std::iter::once(SchemaObject::Table(table))
+        .chain(indexes)
+        .collect()
 }
 
 /// The schema `migrations` produce on a fresh install: an in-memory, non-CRR DB
@@ -865,6 +955,19 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
         validate_sync_index_migration(conn, m)?;
     }
 
+    if let crate::db::MigrationKind::CreateSyncTable { table } = m.kind {
+        // Validated the same way on every DB, so a never-synced DB can't gain a table a
+        // CRR DB would refuse. Not CRR-prepared, it is applied plainly below and cutover
+        // converts the table.
+        let stmts = validate_create_sync_table_migration(conn, m, table)?;
+        #[cfg(feature = "sync")]
+        if yapstack_sync::schema::is_crr(conn, "sessions").map_err(sync_to_rusqlite)? {
+            return apply_create_sync_table_on_crr(conn, m, table, &stmts, start);
+        }
+        #[cfg(not(feature = "sync"))]
+        let _ = stmts;
+    }
+
     #[cfg(feature = "sync")]
     if m.kind == crate::db::MigrationKind::Plain {
         // On a CRR-prepared DB, sync-table schema changes MUST route through
@@ -910,6 +1013,91 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
     }
 }
 
+/// Apply a validated `CreateSyncTable` migration on a CRR DB: the CREATE, then the
+/// conversion ([`yapstack_sync::schema::ensure_crr`], which puts `foreign_keys` back as
+/// it found it), then the indexes and the bookkeeping row in one transaction. The
+/// migration is recorded last and every step is idempotent, so a run cut short anywhere
+/// leaves it unrecorded and the next run finishes it.
+#[cfg(feature = "sync")]
+fn apply_create_sync_table_on_crr(
+    conn: &Connection,
+    m: &crate::db::Migration,
+    table: &str,
+    stmts: &[&str],
+    start: std::time::Instant,
+) -> rusqlite::Result<()> {
+    let Some((create, indexes)) = stmts.split_first() else {
+        return Err(migration_refusal(m, "no CREATE TABLE statement"));
+    };
+    conn.execute_batch(create)?;
+    yapstack_sync::schema::ensure_crr(conn, table).map_err(sync_to_rusqlite)?;
+    conn.execute_batch("BEGIN;")?;
+    let res = indexes
+        .iter()
+        .try_for_each(|i| conn.execute_batch(i))
+        .and_then(|()| record_migration(conn, m, start.elapsed().as_nanos() as i64));
+    match res {
+        Ok(()) => conn.execute_batch("COMMIT;"),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// The loud error for a SyncIndex or CreateSyncTable migration that breaks its kind's
+/// rules.
+fn migration_refusal(m: &crate::db::Migration, why: &str) -> rusqlite::Error {
+    let kind = match m.kind {
+        crate::db::MigrationKind::Plain => "Plain",
+        crate::db::MigrationKind::SyncIndex => "SyncIndex",
+        crate::db::MigrationKind::CreateSyncTable { .. } => "CreateSyncTable",
+    };
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!(
+            "{kind} migration v{} ({}): {why}. Refusing to apply.",
+            m.version, m.description
+        )),
+    )
+}
+
+/// The non-empty, trimmed `;`-separated statements of `sql`. Only a split: callers that
+/// check statement by statement refuse what could hide one first ([`checked_statements`]).
+fn sql_statements(sql: &str) -> impl Iterator<Item = &str> {
+    sql.split(';').map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The statements of a migration that is checked statement by statement. SQL comments
+/// are refused outright, so no statement can hide from the check, and so is a `;` inside
+/// quotes, which the split would cut a statement at.
+fn checked_statements(m: &crate::db::Migration) -> rusqlite::Result<Vec<&'static str>> {
+    if m.sql.contains("--") || m.sql.contains("/*") {
+        return Err(migration_refusal(m, "SQL comments are not allowed"));
+    }
+    let mut close: Option<char> = None;
+    for c in m.sql.chars() {
+        match close {
+            Some(q) if c == q => close = None,
+            Some(_) if c == ';' => {
+                return Err(migration_refusal(
+                    m,
+                    "a `;` inside quotes (statements are split on `;`)",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                close = match c {
+                    '\'' | '"' | '`' => Some(c),
+                    '[' => Some(']'),
+                    _ => None,
+                }
+            }
+        }
+    }
+    Ok(sql_statements(m.sql).collect())
+}
+
 /// Check a [`crate::db::MigrationKind::SyncIndex`] migration before it runs (ADR
 /// 0006 §1). It restricts rather than parses. Each statement must be one of:
 ///   * `CREATE INDEX IF NOT EXISTS <name> ON <table>(…) [WHERE …]`;
@@ -917,36 +1105,114 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
 ///     migration re-creates `<name>` (the way to replace an index whose shape
 ///     changed, since `IF NOT EXISTS` matches on the name alone).
 ///
+/// `<table>` is a bare sync-table name; the rest is [`validate_index_statements`].
+fn validate_sync_index_migration(
+    conn: &Connection,
+    m: &crate::db::Migration,
+) -> rusqlite::Result<()> {
+    let stmts = checked_statements(m)?;
+    validate_index_statements(conn, m, &stmts, |table| {
+        if names_sync_table(table) {
+            Ok(())
+        } else {
+            Err(format!("`{table}` is not a sync table"))
+        }
+    })
+}
+
+/// Check a [`crate::db::MigrationKind::CreateSyncTable`] migration of `table` before it
+/// runs (ADR 0006 §1), returning its statements. Like [`validate_sync_index_migration`]
+/// it restricts rather than parses:
+///   * `table` is a sync table added after cutover ([`creatable_sync_table`]);
+///   * the first statement is `CREATE TABLE IF NOT EXISTS <table>(…)` with `<table>`
+///     bare (no quotes, no schema prefix), so it creates exactly that table;
+///   * it has no `UNIQUE`: the CRR rebuild strips every non-PK UNIQUE, so a never-synced
+///     DB would enforce what a synced one doesn't, and uniqueness on a synced table is
+///     app-layer (`uniqueness`). A string that merely contains the word is refused too;
+///   * every later statement is a `CREATE INDEX IF NOT EXISTS … ON <table>(…)` (or a
+///     re-created `DROP INDEX`), checked as [`validate_index_statements`] does.
+fn validate_create_sync_table_migration(
+    conn: &Connection,
+    m: &crate::db::Migration,
+    table: &str,
+) -> rusqlite::Result<Vec<&'static str>> {
+    if !creatable_sync_table(table) {
+        return Err(migration_refusal(
+            m,
+            &format!("`{table}` is not a sync table added after cutover"),
+        ));
+    }
+    let stmts = checked_statements(m)?;
+    let Some((create, rest)) = stmts.split_first() else {
+        return Err(migration_refusal(m, "no CREATE TABLE statement"));
+    };
+    let head: Vec<&str> = create
+        .find('(')
+        .map(|open| create[..open].split_whitespace().collect())
+        .unwrap_or_default();
+    let keywords = ["CREATE", "TABLE", "IF", "NOT", "EXISTS"];
+    let creates_table = head.len() == keywords.len() + 1
+        && head
+            .iter()
+            .zip(keywords)
+            .all(|(w, k)| w.eq_ignore_ascii_case(k))
+        && head[keywords.len()] == table
+        && is_bare_ident(table);
+    if !creates_table {
+        return Err(migration_refusal(
+            m,
+            &format!(
+                "the first statement is not `CREATE TABLE IF NOT EXISTS {table}(…)`: {}",
+                sql_preview(create)
+            ),
+        ));
+    }
+    let unique = stmts.iter().any(|s| {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|w| w.eq_ignore_ascii_case("UNIQUE"))
+    });
+    if unique {
+        return Err(migration_refusal(
+            m,
+            &format!(
+                "UNIQUE in a synced table: the CRR rebuild drops it, so `{table}` would \
+                 enforce it only until cutover (enforce it in the app layer)"
+            ),
+        ));
+    }
+    validate_index_statements(conn, m, rest, |t| {
+        if t == table {
+            Ok(())
+        } else {
+            Err(format!("an index on `{t}`, not on `{table}`"))
+        }
+    })?;
+    Ok(stmts)
+}
+
+/// Check guarded index statements (see [`validate_sync_index_migration`]) whose
+/// `CREATE`s name a table `on_table` accepts.
+///
 /// `<name>` is a bare `idx_[a-z0-9_]+` identifier, never a cr-sqlite internal
-/// (`__crsql`); `<table>` is a bare sync-table name. No quotes, no schema prefix, so
-/// what is checked is exactly what SQLite resolves. A DROP target must be absent or
-/// a declared, non-UNIQUE index on the same table its re-create names, so a DROP can
-/// never remove a constraint's autoindex, a UNIQUE index or another table's index.
+/// (`__crsql`), and `<table>` is bare too. No quotes, no schema prefix, so what is
+/// checked is exactly what SQLite resolves. A DROP target must be absent or a declared,
+/// non-UNIQUE index on the same table its re-create names, so a DROP can never remove a
+/// constraint's autoindex, a UNIQUE index or another table's index.
 ///
 /// Every declared UNIQUE index is refused, even one over exactly the PK: the
 /// vendored cr-sqlite rejects any unique index whose origin isn't `pk`
 /// (`vendor/cr-sqlite/core/rs/core/src/tableinfo.rs`), which would break later
 /// wrapped ALTERs and trigger heal, and cutover drops UNIQUE indexes anyway.
-/// Uniqueness on a synced table is app-layer (`uniqueness`). SQL comments are
-/// refused outright, so no statement can hide from the per-statement check.
-fn validate_sync_index_migration(
+/// Uniqueness on a synced table is app-layer (`uniqueness`).
+fn validate_index_statements(
     conn: &Connection,
     m: &crate::db::Migration,
+    statements: &[&str],
+    on_table: impl Fn(&str) -> Result<(), String>,
 ) -> rusqlite::Result<()> {
-    let refuse = |why: String| {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-            Some(format!(
-                "SyncIndex migration v{} ({}): {why}. Refusing to apply.",
-                m.version, m.description
-            )),
-        )
-    };
-    if m.sql.contains("--") || m.sql.contains("/*") {
-        return Err(refuse("SQL comments are not allowed".into()));
-    }
+    let refuse = |why: String| migration_refusal(m, &why);
     let mut stmts = Vec::new();
-    for stmt in m.sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+    for stmt in statements {
         let parsed = parse_index_stmt(stmt).ok_or_else(|| {
             refuse(format!(
                 "not a `CREATE INDEX IF NOT EXISTS idx_… ON <sync_table>(…)` or a re-created \
@@ -965,10 +1231,8 @@ fn validate_sync_index_migration(
                      CRR table doesn't get from its PRIMARY KEY (enforce it in the app layer)"
                 )));
             }
-            IndexStmt::Create { table, .. } if !names_sync_table(table) => {
-                return Err(refuse(format!("`{table}` is not a sync table")));
-            }
-            _ => {}
+            IndexStmt::Create { table, .. } => on_table(table).map_err(refuse)?,
+            IndexStmt::Drop { .. } => {}
         }
         stmts.push(parsed);
     }
@@ -1031,15 +1295,35 @@ fn names_sync_table(table: &str) -> bool {
     }
 }
 
-/// One statement a [`crate::db::MigrationKind::SyncIndex`] migration may hold.
-enum IndexStmt {
+/// Whether a `CreateSyncTable` migration may create `table`: a `SYNC_TABLES` entry after
+/// the cutover set, so it is gated at a level above 0. A build without sync can't tell and
+/// accepts any name, as [`names_sync_table`] does. Tests may also create `shares`: no table
+/// has been added since cutover, so they drop that leaf table and re-create it instead.
+fn creatable_sync_table(table: &str) -> bool {
+    #[cfg(all(feature = "sync", test))]
+    if table == "shares" {
+        return true;
+    }
+    #[cfg(feature = "sync")]
+    return yapstack_sync::schema::SYNC_TABLES[yapstack_sync::schema::CUTOVER_SYNC_TABLE_COUNT..]
+        .contains(&table);
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = table;
+        true
+    }
+}
+
+/// One guarded index statement (see [`validate_index_statements`]), borrowing its names
+/// from the statement.
+enum IndexStmt<'a> {
     Create {
         unique: bool,
-        name: String,
-        table: String,
+        name: &'a str,
+        table: &'a str,
     },
     Drop {
-        name: String,
+        name: &'a str,
     },
 }
 
@@ -1060,9 +1344,9 @@ fn is_sync_index_name(t: &str) -> bool {
 
 /// Parse a `CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON <table>(…) [WHERE …]` or a
 /// `DROP INDEX IF EXISTS <name>` statement with bare names (see
-/// [`validate_sync_index_migration`]), or `None` for anything else (including a
+/// [`validate_index_statements`]), or `None` for anything else (including a
 /// guard-less `CREATE INDEX`, which fails on a DB that already has the index).
-fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
+fn parse_index_stmt(stmt: &str) -> Option<IndexStmt<'_>> {
     let words: Vec<&str> = stmt.split_whitespace().collect();
     let is = |ws: &[&str], i: usize, w: &str| ws.get(i).is_some_and(|t| t.eq_ignore_ascii_case(w));
     if is(&words, 0, "DROP") {
@@ -1071,9 +1355,7 @@ fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
             && is(&words, 2, "IF")
             && is(&words, 3, "EXISTS")
             && is_sync_index_name(words[4]);
-        return ok.then(|| IndexStmt::Drop {
-            name: words[4].to_string(),
-        });
+        return ok.then(|| IndexStmt::Drop { name: words[4] });
     }
     let open = stmt.find('(')?;
     let head: Vec<&str> = stmt[..open].split_whitespace().collect();
@@ -1123,8 +1405,8 @@ fn parse_index_stmt(stmt: &str) -> Option<IndexStmt> {
     }
     Some(IndexStmt::Create {
         unique,
-        name: name.to_string(),
-        table: table.to_string(),
+        name,
+        table,
     })
 }
 
@@ -2683,7 +2965,7 @@ mod tests {
         assert_eq!(schema_snapshot(&fresh), schema_snapshot(&reference));
         for m in &migrations {
             assert!(
-                schema_effects_present(&fresh, &reference, m.schema_effects).unwrap(),
+                schema_effects_present(&fresh, &reference, &recordable_effects(m)).unwrap(),
                 "v{}",
                 m.version
             );
@@ -2789,5 +3071,361 @@ mod tests {
             recorded.contains(&13) && recorded.contains(&14),
             "{recorded:?}"
         );
+    }
+
+    // ── CreateSyncTable (ADR 0006 §1) ──
+    //
+    // No synced table has been added since cutover, so these drop `shares` (a leaf: nothing
+    // references it, and `cascade` tolerates its absence) and re-create it through a
+    // test-local migration. `creatable_sync_table` lets tests create it.
+
+    /// `shares` as v6 creates it, with its index, as a CreateSyncTable migration would.
+    const SHARES_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS shares (
+            id TEXT PRIMARY KEY,
+            folder_id TEXT NOT NULL,
+            shared_with_email TEXT,
+            permission TEXT NOT NULL DEFAULT 'viewer',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT,
+            FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id);";
+
+    fn create_sync_table(
+        version: i64,
+        table: &'static str,
+        sql: &'static str,
+    ) -> crate::db::Migration {
+        crate::db::Migration {
+            version,
+            description: "test: create sync table",
+            sql,
+            kind: crate::db::MigrationKind::CreateSyncTable { table },
+            schema_effects: &[],
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    fn foreign_keys_on(conn: &Connection) -> bool {
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 1
+    }
+
+    #[cfg(feature = "sync")]
+    fn changes_for(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM crsql_changes WHERE \"table\" = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A CRR DB cut over without `shares`, on a connection opened like the app's writer
+    /// (`foreign_keys` on).
+    #[cfg(feature = "sync")]
+    fn crr_db_without_shares() -> (tempfile::TempDir, ManagedConn) {
+        let (dir, path) = temp_db();
+        let conn = open_managed(&path).unwrap();
+        run_migrations(conn.conn()).unwrap();
+        conn.conn().execute_batch("DROP TABLE shares;").unwrap();
+        cut_over(conn.conn(), &crate::db::migrations());
+        assert!(!table_exists_for_test(conn.conn(), "shares"));
+        assert!(foreign_keys_on(conn.conn()));
+        (dir, conn)
+    }
+
+    /// What every `CreateSyncTable` must do on a CRR DB cut over just before it: apply,
+    /// convert its table with current triggers, record, report nothing and leave
+    /// `foreign_keys` as it was.
+    #[cfg(feature = "sync")]
+    fn assert_creates_a_crr(conn: &Connection, m: crate::db::Migration) {
+        let crate::db::MigrationKind::CreateSyncTable { table } = m.kind else {
+            panic!("v{} is not a CreateSyncTable", m.version);
+        };
+        let v = m.version;
+        let fk = foreign_keys_on(conn);
+        let failures = SyncTableSetupFailures::new();
+        assert_eq!(
+            run_migrations_list_with(conn, &[m], &failures).unwrap(),
+            vec![v]
+        );
+        assert!(yapstack_sync::schema::is_crr(conn, table).unwrap(), "v{v}");
+        assert_crr_triggers_fresh(conn);
+        assert!(recorded_versions(conn).contains(&v));
+        assert!(failures.tables().is_empty());
+        assert_eq!(foreign_keys_on(conn), fk, "v{v} restored foreign_keys");
+    }
+
+    /// Every real `CreateSyncTable` creates a table the CRR rebuild accepts (a UUID TEXT
+    /// primary key, ADR 0006 §1) and names a table added after cutover. None exists yet.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn every_create_sync_table_migration_is_crr_compatible() {
+        for m in crate::db::migrations() {
+            let crate::db::MigrationKind::CreateSyncTable { table } = m.kind else {
+                continue;
+            };
+            assert!(
+                yapstack_sync::schema::SYNC_TABLES
+                    [yapstack_sync::schema::CUTOVER_SYNC_TABLE_COUNT..]
+                    .contains(&table),
+                "v{}: `{table}` must be a SYNC_TABLES entry after the cutover set",
+                m.version
+            );
+            assert!(m.schema_effects.is_empty(), "v{}", m.version);
+            let (_dir, path) = temp_db();
+            let conn = open_managed(&path).unwrap();
+            cut_over(conn.conn(), &migrations_below(m.version));
+            assert_creates_a_crr(conn.conn(), m);
+        }
+    }
+
+    /// (a) On a CRR DB the table is created, converted and indexed, and only then recorded;
+    /// `foreign_keys` is on again afterwards, and writes to the table are captured.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_on_a_crr_db_converts_records_and_keeps_fks_on() {
+        let (_dir, conn) = crr_db_without_shares();
+        let conn = conn.conn();
+        assert_creates_a_crr(conn, create_sync_table(990, "shares", SHARES_SQL));
+        assert_eq!(synced_index_set(conn), fresh_index_set());
+        conn.execute(
+            "INSERT INTO shares (id, folder_id) VALUES ('sh1', 'f1')",
+            [],
+        )
+        .unwrap();
+        assert!(changes_for(conn, "shares") > 0);
+        assert_hot_queries_use_indexes(conn);
+    }
+
+    /// (b) A run cut short after the CREATE committed (or after the conversion, before the
+    /// indexes and the bookkeeping) left the migration unrecorded. The next run finishes it,
+    /// and rows written in between are captured.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_rerun_after_a_crash_before_crrify_converts_and_records() {
+        let create = SHARES_SQL.split(';').next().unwrap();
+        for converted in [false, true] {
+            let (_dir, conn) = crr_db_without_shares();
+            let conn = conn.conn();
+            conn.execute_batch(create).unwrap();
+            // The plain table still has its FOREIGN KEY, so the folder must exist.
+            conn.execute_batch(
+                "INSERT INTO folders (id, name) VALUES ('f1', 'Work'); \
+                 INSERT INTO shares (id, folder_id) VALUES ('early', 'f1');",
+            )
+            .unwrap();
+            if converted {
+                yapstack_sync::schema::ensure_crr(conn, "shares").unwrap();
+            }
+            assert!(!recorded_versions(conn).contains(&990));
+
+            assert_creates_a_crr(conn, create_sync_table(990, "shares", SHARES_SQL));
+            assert_eq!(
+                synced_index_set(conn),
+                fresh_index_set(),
+                "converted: {converted}"
+            );
+            assert!(
+                changes_for(conn, "shares") > 0,
+                "the row written before the conversion is a change"
+            );
+        }
+    }
+
+    /// (d) On a DB that never synced it is applied plainly (no CRR), and cutover converts
+    /// the table later because it is a `SYNC_TABLES` member, keeping its index.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_on_a_non_crr_db_applies_plainly_then_cutover_converts_it() {
+        let (_dir, path) = temp_db();
+        let conn = open_managed(&path).unwrap();
+        let conn = conn.conn();
+        run_migrations(conn).unwrap();
+        conn.execute_batch("DROP TABLE shares;").unwrap();
+        let failures = SyncTableSetupFailures::new();
+        let m = create_sync_table(990, "shares", SHARES_SQL);
+        assert_eq!(
+            run_migrations_list_with(conn, &[m], &failures).unwrap(),
+            vec![990]
+        );
+        assert!(failures.tables().is_empty());
+        assert!(table_exists_for_test(conn, "shares"));
+        assert!(!yapstack_sync::schema::is_crr(conn, "sessions").unwrap());
+        assert!(!yapstack_sync::schema::is_crr(conn, "shares").unwrap());
+        assert_eq!(synced_index_set(conn), fresh_index_set());
+
+        cut_over(conn, &crate::db::migrations());
+        assert!(yapstack_sync::schema::is_crr(conn, "shares").unwrap());
+        assert_crr_triggers_fresh(conn);
+        assert_eq!(synced_index_set(conn), fresh_index_set());
+    }
+
+    /// (e) Refused before any DDL, on a never-synced DB and on a CRR DB alike: a table that
+    /// isn't a post-cutover sync table, and SQL that isn't exactly one guarded CREATE TABLE
+    /// of that table followed by guarded, non-UNIQUE indexes on it.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn create_sync_table_refuses_a_non_sync_table_and_non_conforming_sql() {
+        let bad = [
+            // Not a sync table, and a cutover table.
+            create_sync_table(990, "t_new", "CREATE TABLE IF NOT EXISTS t_new (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "sessions", "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)"),
+            // The CREATE TABLE itself.
+            create_sync_table(990, "shares", "CREATE TABLE shares (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS tags_copy (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS \"shares\" (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS main.shares (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "shares", "CREATE TEMP TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares AS SELECT * FROM tags"),
+            create_sync_table(990, "shares", "CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id)"),
+            create_sync_table(990, "shares", ""),
+            // UNIQUE, as a column constraint and a table constraint.
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT UNIQUE)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT, UNIQUE (folder_id))"),
+            // Comments, and a `;` inside quotes (the statements are split on `;`).
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY) -- ; DROP TABLE tags"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY) /* x */"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, v TEXT DEFAULT 'a;b')"),
+            // Split on `;`, this reads as two indexes; SQLite creates one.
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, v TEXT); CREATE INDEX IF NOT EXISTS idx_a ON shares(v) WHERE v <> ';CREATE INDEX IF NOT EXISTS idx_b ON shares(v) WHERE v = '"),
+            // What may follow: only guarded, non-UNIQUE indexes on the same table.
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY); DROP TABLE tags"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT); CREATE INDEX IF NOT EXISTS idx_x ON tags(name)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT); CREATE UNIQUE INDEX IF NOT EXISTS idx_x ON shares(folder_id)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT); CREATE INDEX idx_x ON shares(folder_id)"),
+            create_sync_table(990, "shares", "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY)"),
+        ];
+        let plain = {
+            let (dir, path) = temp_db();
+            let conn = open_managed(&path).unwrap();
+            run_migrations(conn.conn()).unwrap();
+            conn.conn().execute_batch("DROP TABLE shares;").unwrap();
+            (dir, conn)
+        };
+        let crr = crr_db_without_shares();
+        for (_dir, conn) in [&plain, &crr] {
+            let conn = conn.conn();
+            let before = schema_snapshot(conn);
+            for m in &bad {
+                let err = apply_migration(conn, m).expect_err(m.sql);
+                assert!(
+                    err.to_string().contains("Refusing to apply"),
+                    "{}: {err}",
+                    m.sql
+                );
+                assert_eq!(
+                    schema_snapshot(conn),
+                    before,
+                    "{} changed the schema",
+                    m.sql
+                );
+            }
+            // The guarded forms of the same statements are accepted.
+            let ok = create_sync_table(
+                991,
+                "shares",
+                "create table if not exists shares(id TEXT PRIMARY KEY, folder_id TEXT, v TEXT DEFAULT 'a b'); \
+                 CREATE INDEX IF NOT EXISTS idx_x ON shares (folder_id) WHERE v IS NOT NULL",
+            );
+            apply_migration(conn, &ok).expect(ok.sql);
+        }
+    }
+
+    /// A run that can't finish a `CreateSyncTable` (here the rebuild refuses a non-TEXT
+    /// primary key) reports its table for lane status and leaves it unrecorded, so the next
+    /// launch tries again; the presence check doesn't record it, since the table isn't a CRR.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn a_failed_create_sync_table_is_reported_in_lane_status_and_not_recorded() {
+        let (_dir, conn) = crr_db_without_shares();
+        let conn = conn.conn();
+        let m = || {
+            create_sync_table(
+                990,
+                "shares",
+                "CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY, folder_id TEXT)",
+            )
+        };
+        let failures = SyncTableSetupFailures::new();
+        for _ in 0..2 {
+            assert!(run_migrations_list_with(conn, &[m()], &failures)
+                .unwrap()
+                .is_empty());
+            assert_eq!(failures.tables(), vec!["shares"]);
+            assert!(!recorded_versions(conn).contains(&990));
+            assert!(table_exists_for_test(conn, "shares"));
+            assert!(!yapstack_sync::schema::is_crr(conn, "shares").unwrap());
+            assert!(foreign_keys_on(conn));
+        }
+        // A later run that has nothing left to finish reports nothing.
+        assert!(run_migrations_list_with(conn, &[], &failures)
+            .unwrap()
+            .is_empty());
+        assert!(failures.tables().is_empty());
+    }
+
+    /// #133's presence check for a failed `CreateSyncTable`: its table (in the fresh-install
+    /// shape) and every index its SQL declares, and on a CRR DB the table must be a CRR with
+    /// current triggers. Anything less keeps it pending.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn a_failed_create_sync_table_counts_as_landed_only_as_a_crr_with_its_indexes() {
+        let present = |conn: &Connection| {
+            let m = create_sync_table(990, "shares", SHARES_SQL);
+            let mut reference = None;
+            let ok = record_if_schema_present(conn, &m, std::slice::from_ref(&m), &mut reference);
+            forget_versions(conn, &[990]);
+            ok
+        };
+        let (create, index) = SHARES_SQL.split_once(';').unwrap();
+
+        let (_dir, conn) = crr_db_without_shares();
+        let conn = conn.conn();
+        assert!(!present(conn), "absent");
+        conn.execute_batch(create).unwrap();
+        conn.execute_batch(index).unwrap();
+        assert!(!present(conn), "a plain table on a CRR DB doesn't sync");
+        conn.execute_batch("DROP INDEX idx_shares_folder;").unwrap();
+        yapstack_sync::schema::ensure_crr(conn, "shares").unwrap();
+        assert!(!present(conn), "its index is missing");
+        conn.execute_batch(index).unwrap();
+        assert!(present(conn), "a CRR with its index");
+        conn.execute_batch("ALTER TABLE shares ADD COLUMN extra TEXT;")
+            .unwrap();
+        assert!(!present(conn), "a column the migration doesn't create");
+
+        // On a DB that never synced, the plain table with its index is what it creates.
+        let (_dir, path) = temp_db();
+        let plain = open_managed(&path).unwrap();
+        let plain = plain.conn();
+        run_migrations(plain).unwrap();
+        assert!(present(plain));
+        plain
+            .execute_batch("DROP INDEX idx_shares_folder;")
+            .unwrap();
+        assert!(!present(plain), "its index is missing");
+    }
+
+    /// The objects that decide whether a failed `CreateSyncTable` landed are exactly what
+    /// it creates: its table (whose check covers every column) and its indexes.
+    #[test]
+    fn create_sync_table_effects_are_its_table_and_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch("DROP TABLE shares;").unwrap();
+        let before = schema_snapshot(&conn);
+        let m = create_sync_table(990, "shares", SHARES_SQL);
+        apply_migration(&conn, &m).unwrap();
+        let created: std::collections::BTreeSet<String> = schema_snapshot(&conn)
+            .into_keys()
+            .filter(|k| !before.contains_key(k) && !k.starts_with("column:"))
+            .collect();
+        let effects: std::collections::BTreeSet<String> =
+            recordable_effects(&m).iter().map(render_effect).collect();
+        assert_eq!(effects, created);
     }
 }

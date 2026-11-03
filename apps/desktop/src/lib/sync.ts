@@ -177,6 +177,10 @@ export interface SyncStatus {
   /** ADR 0006 §5.9: this app is older than the relay's minimum, rechecked at drain
    *  start, on reconnect and every 15 min (last-seen kept while unreachable). Advisory. */
   versionAdvisory?: RelayVersionAdvisory | null;
+  /** ADR 0006 §1: synced tables whose setup (a `CreateSyncTable` migration) didn't finish
+   *  on this device. Non-empty shows the "restart to try again" notice. Optional so older
+   *  status snapshots read as none. */
+  syncTableSetupFailures?: string[];
 }
 
 /** One device holding up a sync capability raise (it reports a lower level). */

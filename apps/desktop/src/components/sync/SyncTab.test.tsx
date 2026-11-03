@@ -411,6 +411,26 @@ describe("SyncTab — on", () => {
     expect(screen.queryByText("Waiting for other devices to update")).not.toBeInTheDocument();
   });
 
+  it("a synced table whose setup didn't finish asks for a restart", () => {
+    setup({ email: "user@example.com", status: makeStatus({ syncTableSetupFailures: [] }) });
+    const { unmount } = render(<SyncTab />);
+    expect(screen.queryByText("Part of this device's sync setup didn't finish")).not.toBeInTheDocument();
+    unmount();
+
+    setup({
+      email: "user@example.com",
+      status: makeStatus({ syncTableSetupFailures: ["artifacts"] }),
+    });
+    render(<SyncTab />);
+    expect(screen.getByText("Part of this device's sync setup didn't finish")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "YapStack couldn't prepare a new kind of synced data on this device. Changes of that kind from your other devices are kept and will apply once it finishes. Restart YapStack to try again.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("artifacts")).not.toBeInTheDocument();
+  });
+
   it("a removed device is told so, offered Sign out, and cannot remove others", async () => {
     setup({ email: "user@example.com", status: makeStatus({ roster: [PEER], removed: true }) });
     render(<SyncTab />);

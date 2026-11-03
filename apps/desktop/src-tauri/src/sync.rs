@@ -1674,6 +1674,10 @@ pub struct SyncStatusDto {
     /// ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
     /// at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
     version_advisory: Option<VersionAdvisory>,
+    /// ADR 0006 §1: synced tables whose `CreateSyncTable` migration didn't finish on this
+    /// device at launch (and that the drain's boot heal hasn't converted since). Their
+    /// peers' rows wait in the quarantine; lane status asks for a restart. Usually empty.
+    sync_table_setup_failures: Vec<String>,
 }
 
 /// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
@@ -1794,6 +1798,39 @@ fn heal_crr_trigger_arity(conn: &Connection) {
             healed.join(", ")
         ),
         Err(e) => tracing::error!("sync: crsql trigger-arity self-heal failed: {e}"),
+    }
+}
+
+/// Convert every `SYNC_TABLES` table that exists here but isn't a CRR yet (ADR 0006 §3):
+/// one a `CreateSyncTable` migration created and didn't convert, or one recorded where it
+/// couldn't be converted (a build without sync applies the migration plainly). Rows
+/// written to it in the meantime get clocks and are captured. A table it converts is no
+/// longer a setup failure in lane status.
+///
+/// Takes the write turn: it rebuilds tables on the drain's connection while the app's
+/// writer is live. NON-FATAL, like [`heal_crr_trigger_arity`]: a failure is logged and the
+/// drain starts anyway, and peers' rows for the table wait in the quarantine.
+fn heal_unconverted_sync_tables(
+    conn: &Connection,
+    failures: &crate::db_service::SyncTableSetupFailures,
+) {
+    let converted = {
+        let _turn = yapstack_common::write_turnstile::WriteTurnstile::process().acquire();
+        schema::ensure_sync_tables_crr(conn)
+    };
+    match converted {
+        Ok(tables) if tables.is_empty() => {}
+        Ok(tables) => {
+            tracing::warn!(
+                "sync: converted {} synced table(s) a migration left unconverted: {}",
+                tables.len(),
+                tables.join(", ")
+            );
+            for t in tables {
+                failures.resolve(t);
+            }
+        }
+        Err(e) => tracing::error!("sync: converting unconverted synced tables failed: {e}"),
     }
 }
 
@@ -4085,6 +4122,12 @@ fn spawn_drain(
                 tracing::error!("sync drain: outbox table: {e}");
                 return;
             }
+            // ADR 0006 §3: first finish any synced table a migration created without
+            // converting, so the passes below and the first cycle see it as a CRR.
+            heal_unconverted_sync_tables(
+                conn,
+                crate::db_service::SyncTableSetupFailures::process(),
+            );
             // F2 boot-time self-heal: this connection has the crsql extension loaded and
             // the live DB is CRR-prepared by the time any drain starts (start_drain_if_enabled
             // guarantees cutover ran; enable/re-login likewise). A DB that was CRR-prepared by
@@ -5523,6 +5566,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         removed,
         capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
         version_advisory: VERSION_ADVISORY.get(),
+        sync_table_setup_failures: crate::db_service::SyncTableSetupFailures::process().tables(),
     }
 }
 
@@ -5875,6 +5919,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             removed: false,
             capability_notice: None,
             version_advisory: None,
+            sync_table_setup_failures: vec![],
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -8699,6 +8744,65 @@ mod tests {
     /// The same pass on a HEALTHY device (Mac-shaped: cut over at the full 14-column
     /// shape) heals nothing and leaves sync state — site id, db_version, watermarks —
     /// untouched, so it can run unconditionally at every boot.
+    /// ADR 0006 §3: a synced table whose migration is recorded but that isn't a CRR (a build
+    /// without sync applied it plainly) is converted by the drain's boot heal while the app's
+    /// writer stays open, its rows written before then become changes, and lane status stops
+    /// reporting it.
+    #[test]
+    fn drain_heal_converts_a_recorded_but_non_crr_sync_table() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        // Stand-in for a table no build converted: `shares` without its CRR machinery.
+        for t in ["shares", "shares__crsql_clock", "shares__crsql_pks"] {
+            svc.execute(&format!("DROP TABLE IF EXISTS {t}"), &[])
+                .unwrap();
+        }
+        svc.execute(
+            "CREATE TABLE shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, note TEXT)",
+            &[],
+        )
+        .unwrap();
+        svc.execute(
+            "INSERT INTO shares (id, folder_id) VALUES ('sh1', 'f1')",
+            &[],
+        )
+        .unwrap();
+        let failures = crate::db_service::SyncTableSetupFailures::new();
+        failures.add("shares");
+
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        assert!(!schema::is_crr(conn, "shares").unwrap());
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(schema::is_crr(conn, "shares").unwrap());
+        assert!(!schema::crr_triggers_are_stale(conn, "shares").unwrap());
+        assert!(failures.tables().is_empty(), "no longer a setup failure");
+        let changes = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'shares'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            changes(conn) > 0,
+            "the row written before the heal is a change"
+        );
+
+        // The app's writer, open the whole time, writes through the new CRR, and a second
+        // heal finds nothing to do.
+        let before = changes(conn);
+        svc.execute(
+            "INSERT INTO shares (id, folder_id) VALUES ('sh2', 'f1')",
+            &[],
+        )
+        .unwrap();
+        assert!(changes(conn) > before);
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(failures.tables().is_empty());
+    }
+
     #[test]
     fn boot_heal_is_inert_on_a_healthy_device() {
         let (_dir, path, svc) = migration_chain_fixture(true);
