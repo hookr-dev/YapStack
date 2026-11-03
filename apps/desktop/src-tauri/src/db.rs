@@ -14,9 +14,8 @@ pub struct Migration {
     /// Every schema object this migration creates, or empty: each table with each
     /// of its columns, each index, trigger and virtual table. A test checks the
     /// list equals what the migration really creates. When the migration can't be
-    /// applied and all of them are already present with the definitions a fresh
-    /// install of the migration list gives them (on a CRR DB, a synced table must
-    /// also be a CRR with current triggers), the runner records it as applied
+    /// applied and all of them are already present by name (on a CRR DB, a synced
+    /// table must also be a CRR with current triggers), the runner records it as applied
     /// instead of failing it on every boot. Declare them only for a migration whose
     /// schema can land out of band (a runtime schema patch, cutover) and whose data
     /// changes that path also makes; an empty list never records a failed migration.
@@ -25,22 +24,16 @@ pub struct Migration {
     pub schema_effects: &'static [SchemaObject],
 }
 
-/// A schema object a [`Migration`] creates. The runner compares it with the same
-/// object in a fresh-install reference schema (`db_service::schema_effects_present`).
+/// A schema object a [`Migration`] creates, probed by name in `sqlite_master` (or
+/// `pragma_table_info` for a column) by `db_service::schema_effects_present`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaObject {
-    /// An ordinary table: same columns, each in the same shape (type, primary-key
-    /// place, NOT NULL, default; up to what a CRR cutover changes). Declare its
-    /// columns too.
+    /// An ordinary table. Declare its columns too.
     Table(&'static str),
-    /// A column `(table, column)`: same shape as in the reference.
+    /// A column: `(table, column)`.
     Column(&'static str, &'static str),
-    /// Same normalized `CREATE INDEX` statement.
     Index(&'static str),
-    /// Same normalized `CREATE TRIGGER` statement, body included.
     Trigger(&'static str),
-    /// Same normalized `CREATE VIRTUAL TABLE` statement (an FTS table's options
-    /// decide what it stores).
     VirtualTable(&'static str),
 }
 

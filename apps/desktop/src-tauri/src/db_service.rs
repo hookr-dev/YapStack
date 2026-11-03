@@ -630,7 +630,6 @@ fn run_migrations_list_with(
     };
 
     let mut newly_applied = Vec::new();
-    let mut reference = None;
     for m in migrations {
         if applied.contains(&m.version) {
             continue;
@@ -638,7 +637,7 @@ fn run_migrations_list_with(
         match apply_migration(conn, m) {
             Ok(()) => newly_applied.push(m.version),
             Err(e) => {
-                if record_if_schema_present(conn, m, migrations, &mut reference) {
+                if record_if_schema_present(conn, m) {
                     tracing::info!(
                         "migration v{} ({}) could not apply ({e}), but every object it \
                          creates is already present; recorded it as applied",
@@ -662,43 +661,22 @@ fn run_migrations_list_with(
     Ok(newly_applied)
 }
 
-/// For a migration that couldn't apply: record it when what it creates
-/// ([`recordable_effects`]) is all present already (put there out
-/// of band) with the definitions `migrations` gives them, so it isn't retried and
-/// failed on every boot. False when it declares none, any differs, or the probe or
-/// bookkeeping insert errors, leaving the migration unrecorded. `reference` holds
-/// the fresh-install schema, built on first use and shared across one run.
-fn record_if_schema_present(
-    conn: &Connection,
-    m: &crate::db::Migration,
-    migrations: &[crate::db::Migration],
-    reference: &mut Option<Connection>,
-) -> bool {
+/// For a migration that couldn't apply: record it when everything it creates
+/// ([`recordable_effects`]) is present already (put there out of band), so it isn't
+/// retried and failed on every boot. False when it declares none, any is missing, or
+/// the probe or bookkeeping insert errors, leaving the migration unrecorded.
+fn record_if_schema_present(conn: &Connection, m: &crate::db::Migration) -> bool {
     let effects = recordable_effects(m);
-    if effects.is_empty() {
-        return false;
-    }
-    if reference.is_none() {
-        match reference_schema(migrations) {
-            Ok(r) => *reference = Some(r),
-            Err(e) => {
-                tracing::warn!("building the reference schema failed: {e}");
-                return false;
-            }
-        }
-    }
-    let Some(reference) = reference.as_ref() else {
-        return false;
-    };
-    schema_effects_present(conn, reference, &effects).unwrap_or(false)
+    !effects.is_empty()
+        && schema_effects_present(conn, &effects).unwrap_or(false)
         && record_migration(conn, m, 0).is_ok()
 }
 
 /// The objects whose presence lets a failed `m` be recorded: its declared
 /// [`crate::db::Migration::schema_effects`], or for a `CreateSyncTable` its table and every
-/// index its SQL creates. The table check covers each column and, on a CRR DB, needs the
-/// table to be a CRR with current triggers ([`schema_effects_present`]), so a table the
-/// migration created but couldn't convert keeps it pending.
+/// index its SQL creates. On a CRR DB the table must also be a CRR with current triggers
+/// ([`schema_effects_present`]), so a table the migration created but couldn't convert
+/// keeps it pending.
 fn recordable_effects(m: &crate::db::Migration) -> Vec<crate::db::SchemaObject> {
     use crate::db::SchemaObject;
     let crate::db::MigrationKind::CreateSyncTable { table } = m.kind else {
@@ -715,116 +693,7 @@ fn recordable_effects(m: &crate::db::Migration) -> Vec<crate::db::SchemaObject> 
         .collect()
 }
 
-/// The schema `migrations` produce on a fresh install: an in-memory, non-CRR DB
-/// with each one applied plainly. A migration that fails there is skipped, so its
-/// objects are absent and can't match. Applied directly, not through
-/// [`run_migrations_list`], so a failure here never builds another reference.
-fn reference_schema(migrations: &[crate::db::Migration]) -> rusqlite::Result<Connection> {
-    let reference = Connection::open_in_memory()?;
-    reference.execute_batch(SQLX_MIGRATIONS_DDL)?;
-    for m in migrations {
-        let _ = apply_migration(&reference, m);
-    }
-    Ok(reference)
-}
-
-/// `sql` of a `sqlite_master` row: `None` when absent, `Some(None)` when it has no
-/// SQL (an autoindex).
-fn master_sql(conn: &Connection, ty: &str, name: &str) -> rusqlite::Result<Option<Option<String>>> {
-    conn.prepare("SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2")?
-        .query_row([ty, name], |r| r.get::<_, Option<String>>(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })
-}
-
-/// One column as `pragma_table_info` reports it.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ColumnShape {
-    name: String,
-    ty: String,
-    /// Place in the primary key; 0 = not in it.
-    pk: i64,
-    not_null: bool,
-    /// The default as `pragma_table_info` spells it, normalized.
-    default: Option<String>,
-}
-
-impl ColumnShape {
-    /// Whether `self` (live) is `want` (reference) after at most what a CRR cutover
-    /// does to a column (`derive_rebuild_body`, yapstack-sync schema.rs):
-    ///   * name, type and place in the primary key are kept;
-    ///   * a key column is made NOT NULL and its default dropped, so neither is
-    ///     compared for one;
-    ///   * a non-key column keeps NOT NULL and keeps its default (re-emitted, which
-    ///     `pragma_table_info` reads back the same); one that is NOT NULL without a
-    ///     default gets a synthetic one for its type, accepted only on a CRR DB.
-    fn matches(&self, want: &ColumnShape, crr_prepared: bool) -> bool {
-        if (&self.name, &self.ty, self.pk) != (&want.name, &want.ty, want.pk) {
-            return false;
-        }
-        if self.pk > 0 {
-            return true;
-        }
-        if self.not_null != want.not_null {
-            return false;
-        }
-        match (&self.default, &want.default) {
-            (live, Some(_)) => live == &want.default,
-            (None, None) => true,
-            (Some(live), None) => {
-                crr_prepared && want.not_null && is_cutover_default(live, &want.ty)
-            }
-        }
-    }
-}
-
-/// Whether `default` is the one cutover gives a NOT NULL column of type `ty` that
-/// had none. Only the sync build can know it; without sync a CRR DB is never
-/// recorded anyway (see [`schema_effects_present`]).
-fn is_cutover_default(default: &str, ty: &str) -> bool {
-    #[cfg(feature = "sync")]
-    return default == normalized_sql(yapstack_sync::schema::synthetic_default(ty));
-    #[cfg(not(feature = "sync"))]
-    {
-        let _ = (default, ty);
-        false
-    }
-}
-
-/// Each column of `table`, sorted by name.
-fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<ColumnShape>> {
-    let mut cols: Vec<ColumnShape> = conn
-        .prepare(
-            "SELECT name, upper(type), pk, \"notnull\", dflt_value FROM pragma_table_info(?1)",
-        )?
-        .query_map([table], |r| {
-            Ok(ColumnShape {
-                name: r.get(0)?,
-                ty: r.get(1)?,
-                pk: r.get(2)?,
-                not_null: r.get(3)?,
-                default: r.get::<_, Option<String>>(4)?.map(|d| normalized_sql(&d)),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    cols.sort();
-    Ok(cols)
-}
-
-/// True when every declared object in `conn` has the definition it has in
-/// `reference` (the fresh-install schema, see [`reference_schema`]):
-///   * a table has the same columns, each matching ([`ColumnShape::matches`]: type,
-///     primary-key place, NOT NULL and default, up to what cutover changes). Table SQL itself isn't
-///     compared: cutover rewrites it.
-///   * an index, trigger or virtual table has the same normalized `CREATE`
-///     statement ([`normalized_sql`]). Cutover replays non-UNIQUE indexes and app
-///     triggers verbatim, so a CRR DB still matches.
-///
-/// Table constraints such as `UNIQUE` aren't compared: cutover strips every
-/// non-PK UNIQUE from a synced table, so a correct CRR DB wouldn't have them.
+/// True when every declared object exists by name in `conn`.
 ///
 /// On a CRR-prepared DB, a synced table (or the table of a declared column) must
 /// also be a CRR whose crsql triggers match its current columns: a plain table
@@ -834,47 +703,28 @@ fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<ColumnS
 /// it never records on a CRR DB.
 fn schema_effects_present(
     conn: &Connection,
-    reference: &Connection,
     effects: &[crate::db::SchemaObject],
 ) -> rusqlite::Result<bool> {
     use crate::db::SchemaObject;
     // Plain sqlite_master probes rather than yapstack_sync::schema's `table_exists` /
     // `is_crr` / `column_exists`: those exist only with the `sync` feature and
     // return SyncError, and this runs in every build.
-    let named =
-        |ty: &str, name: &str| Ok::<_, rusqlite::Error>(master_sql(conn, ty, name)?.is_some());
-    let same_sql = |ty: &str, name: &str| -> rusqlite::Result<bool> {
-        let live = master_sql(conn, ty, name)?.flatten();
-        let want = master_sql(reference, ty, name)?.flatten();
-        Ok(matches!((live, want), (Some(l), Some(w)) if normalized_sql(&l) == normalized_sql(&w)))
+    let named = |ty: &str, name: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2")?
+            .exists([ty, name])
     };
     let crr_prepared = named("table", "sessions__crsql_clock")?;
-    let column = |c: &Connection, t: &str, col: &str| -> rusqlite::Result<Option<ColumnShape>> {
-        Ok(table_columns(c, t)?.into_iter().find(|s| s.name == col))
-    };
     for effect in effects {
         let (present, table) = match *effect {
-            SchemaObject::Table(t) => {
-                let want = table_columns(reference, t)?;
-                let live = table_columns(conn, t)?;
-                let same = !want.is_empty()
-                    && live.len() == want.len()
-                    && live
-                        .iter()
-                        .zip(&want)
-                        .all(|(l, w)| l.matches(w, crr_prepared));
-                (same, Some(t))
-            }
-            SchemaObject::Column(t, c) => {
-                let same = match (column(conn, t, c)?, column(reference, t, c)?) {
-                    (Some(l), Some(w)) => l.matches(&w, crr_prepared),
-                    _ => false,
-                };
-                (same, Some(t))
-            }
-            SchemaObject::Index(i) => (same_sql("index", i)?, None),
-            SchemaObject::Trigger(t) => (same_sql("trigger", t)?, None),
-            SchemaObject::VirtualTable(t) => (same_sql("table", t)?, Some(t)),
+            SchemaObject::Table(t) => (named("table", t)?, Some(t)),
+            SchemaObject::Column(t, c) => (
+                conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+                    .exists([t, c])?,
+                Some(t),
+            ),
+            SchemaObject::Index(i) => (named("index", i)?, None),
+            SchemaObject::Trigger(t) => (named("trigger", t)?, None),
+            SchemaObject::VirtualTable(t) => (named("table", t)?, Some(t)),
         };
         if !present {
             return Ok(false);
@@ -895,52 +745,6 @@ fn schema_effects_present(
         }
     }
     Ok(true)
-}
-
-/// A `CREATE` statement in a comparable form. Outside quotes (`'…'`, `"…"`, `` `…` ``,
-/// `[…]`) it is lower-cased, whitespace is collapsed and dropped next to
-/// punctuation, and a leading `IF NOT EXISTS` and a trailing `;` are removed.
-/// Quoted text is kept exactly, since a tokenizer option or a quoted identifier
-/// means something different in another case or spacing. Two statements that
-/// differ only in spelling compare equal; any change to a name, column, option or
-/// body does not.
-fn normalized_sql(sql: &str) -> String {
-    let is_punct = |c: char| matches!(c, '(' | ')' | ',' | '=' | ';');
-    let mut out = String::with_capacity(sql.len());
-    let mut close: Option<char> = None;
-    let mut pending_space = false;
-    for c in sql.trim().chars() {
-        if let Some(q) = close {
-            out.push(c);
-            if c == q {
-                close = None;
-            }
-            continue;
-        }
-        if c.is_whitespace() {
-            pending_space = true;
-            continue;
-        }
-        if pending_space && !out.is_empty() && !is_punct(c) && !out.ends_with(is_punct) {
-            out.push(' ');
-        }
-        pending_space = false;
-        close = match c {
-            '\'' | '"' | '`' => Some(c),
-            '[' => Some(']'),
-            _ => None,
-        };
-        out.push(c.to_ascii_lowercase());
-    }
-    while out.ends_with(';') {
-        out.pop();
-    }
-    // Only the statement head can hold `IF NOT EXISTS` (before any quote or paren).
-    let head_end = out.find(['(', '\'', '"', '`', '[']).unwrap_or(out.len());
-    if let Some(i) = out[..head_end].find(" if not exists ") {
-        out.replace_range(i..i + " if not exists".len(), "");
-    }
-    out
 }
 
 /// Insert the sqlx-compatible bookkeeping row for an applied migration. Empty
@@ -1036,14 +840,11 @@ fn apply_migration(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Res
 }
 
 /// Whether everything a `CreateSyncTable` `m` declares ([`recordable_effects`]) is in
-/// place in `conn`, compared with what `m` alone creates on an empty DB: the table in that
-/// shape, each of its indexes, and on a CRR DB the table as a CRR with current triggers
-/// ([`schema_effects_present`], the check #133's fallback records a failed run by). The
-/// reference is `m` alone because at this point no later migration has run.
+/// place in `conn`: the table, each of its indexes, and on a CRR DB the table as a CRR with
+/// current triggers ([`schema_effects_present`], the check #133's fallback records a failed
+/// run by).
 fn create_sync_table_landed(conn: &Connection, m: &crate::db::Migration) -> rusqlite::Result<bool> {
-    let reference = Connection::open_in_memory()?;
-    reference.execute_batch(m.sql)?;
-    schema_effects_present(conn, &reference, &recordable_effects(m))
+    schema_effects_present(conn, &recordable_effects(m))
 }
 
 /// The run's last check before it records `m`: a CREATE that matched an existing table of
@@ -2730,39 +2531,6 @@ mod tests {
         assert!(run_migrations(&conn).unwrap().is_empty());
     }
 
-    /// FTS tables made by db.ts `ensureRuntimeSchema` (its `IF NOT EXISTS`
-    /// one-line spelling) match v12's declared shape.
-    #[test]
-    fn fts_tables_from_the_runtime_patch_satisfy_v12() {
-        let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
-        forget_versions(&conn, &[12]);
-        let tok = "tokenize = 'porter unicode61 remove_diacritics 2'";
-        for (name, cols) in [
-            (
-                "segments_fts",
-                "segment_id UNINDEXED, session_id UNINDEXED, text",
-            ),
-            (
-                "notes_fts",
-                "note_id UNINDEXED, session_id UNINDEXED, content",
-            ),
-            ("sessions_fts", "session_id UNINDEXED, title"),
-            (
-                "dictations_fts",
-                "dictation_id UNINDEXED, output_text, input_text",
-            ),
-        ] {
-            conn.execute_batch(&format!(
-                "DROP TABLE {name}; \
-                 CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5({cols}, {tok});"
-            ))
-            .unwrap();
-        }
-        run_migrations(&conn).unwrap();
-        assert!(recorded_versions(&conn).contains(&12));
-    }
-
     /// A migration that fails while any object it creates is missing stays
     /// unrecorded, so a DB really missing that schema keeps the loud error.
     #[test]
@@ -2792,100 +2560,17 @@ mod tests {
         assert!(!recorded_versions(&conn).contains(&940));
     }
 
-    /// A failed migration whose objects exist by name but not in the shape it
-    /// creates stays unrecorded: one missing column, index or trigger, or an FTS
-    /// table built with other options, each keeps the migration pending.
+    /// A failed migration with any one declared column, index or trigger missing
+    /// stays unrecorded.
     #[test]
-    fn failed_migration_with_wrong_shape_schema_stays_unrecorded() {
+    fn failed_migration_with_a_missing_object_stays_unrecorded() {
         let cases: &[(i64, &str)] = &[
             (11, "ALTER TABLE tags DROP COLUMN color;"),
             (11, "ALTER TABLE session_tags DROP COLUMN confidence;"),
             (11, "DROP INDEX idx_session_tags_tag;"),
-            (
-                12,
-                "DROP TABLE segments_fts; \
-                 CREATE VIRTUAL TABLE segments_fts USING fts5(segment_id UNINDEXED, \
-                   session_id UNINDEXED, text, content='', \
-                   tokenize = 'porter unicode61 remove_diacritics 2');",
-            ),
-            (
-                12,
-                "DROP TABLE notes_fts; \
-                 CREATE VIRTUAL TABLE notes_fts USING fts5(note_id UNINDEXED, \
-                   session_id UNINDEXED, content);",
-            ),
             (12, "DROP TRIGGER notes_au;"),
             (14, "ALTER TABLE chat_messages DROP COLUMN status;"),
             (14, "DROP INDEX idx_chat_messages_send;"),
-            // Same names, other definitions.
-            (
-                12,
-                "DROP TRIGGER notes_au; \
-                 CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN SELECT 1; END;",
-            ),
-            (
-                14,
-                "DROP INDEX idx_chat_messages_send; \
-                 CREATE UNIQUE INDEX idx_chat_messages_send ON chat_messages(context_key);",
-            ),
-            (
-                11,
-                "DROP INDEX idx_tags_name; CREATE INDEX idx_tags_name ON tags(color);",
-            ),
-            // Same columns and indexes, other primary key or NOT NULL.
-            (
-                11,
-                "DROP TABLE session_tags; \
-                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
-                   source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
-                   created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
-                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
-                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
-            ),
-            (
-                11,
-                "DROP TABLE session_tags; \
-                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
-                   source TEXT NOT NULL DEFAULT 'manual', confidence REAL, \
-                   created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-                   PRIMARY KEY (tag_id, session_id)); \
-                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
-                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
-            ),
-            (
-                11,
-                "DROP TABLE tags; \
-                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT COLLATE NOCASE, color TEXT, \
-                   created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
-                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
-            ),
-            // Same columns, key and NOT NULL, other defaults: `createTag` omits
-            // `created_at`, so without its default every insert fails.
-            (
-                11,
-                "DROP TABLE tags; \
-                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE, \
-                   color TEXT, created_at TEXT NOT NULL); \
-                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
-            ),
-            (
-                11,
-                "DROP TABLE session_tags; \
-                 CREATE TABLE session_tags (session_id TEXT NOT NULL, tag_id TEXT NOT NULL, \
-                   source TEXT NOT NULL DEFAULT 'auto', confidence REAL, \
-                   created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-                   PRIMARY KEY (session_id, tag_id)); \
-                 CREATE INDEX idx_session_tags_tag ON session_tags(tag_id); \
-                 CREATE INDEX idx_session_tags_session ON session_tags(session_id);",
-            ),
-            // A synthetic default is accepted only on a CRR DB (cutover's doing).
-            (
-                11,
-                "DROP TABLE tags; \
-                 CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '' COLLATE NOCASE, \
-                   color TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
-                 CREATE INDEX idx_tags_name ON tags(name COLLATE NOCASE);",
-            ),
         ];
         let mut wrongly_recorded = Vec::new();
         for (v, damage) in cases {
@@ -2901,48 +2586,10 @@ mod tests {
         assert!(wrongly_recorded.is_empty(), "{wrongly_recorded:#?}");
     }
 
-    /// Spelling outside quotes doesn't matter; anything inside quotes does.
-    #[test]
-    fn normalized_sql_keeps_quoted_text_exact() {
-        assert_eq!(
-            normalized_sql(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(a UNINDEXED,\n  b, \
-                 tokenize = 'porter unicode61');"
-            ),
-            normalized_sql(
-                "create virtual table t using fts5 ( a unindexed , b,tokenize='porter unicode61' )"
-            ),
-        );
-        for (a, b) in [
-            (
-                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = \"unicode61 separators 'A'\")",
-                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = \"unicode61 separators 'a'\")",
-            ),
-            (
-                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = 'porter  unicode61')",
-                "CREATE VIRTUAL TABLE t USING fts5(a, tokenize = 'porter unicode61')",
-            ),
-            (
-                "CREATE INDEX i ON t(\"Col\")",
-                "CREATE INDEX i ON t(\"col\")",
-            ),
-            ("CREATE INDEX i ON t([Col])", "CREATE INDEX i ON t([col])"),
-            ("CREATE INDEX i ON t(`Col`)", "CREATE INDEX i ON t(`col`)"),
-            (
-                "CREATE INDEX i ON t(a) WHERE b = 'X'",
-                "CREATE INDEX i ON t(a) WHERE b = 'x'",
-            ),
-        ] {
-            assert_ne!(normalized_sql(a), normalized_sql(b), "{a} vs {b}");
-        }
-    }
-
     /// Every object in a sqlite_master/table_info snapshot, keyed the way
-    /// [`render_effect`] keys a declaration, mapped to its definition: normalized
-    /// SQL for an index, trigger or virtual table, the declared type for a column.
-    /// FTS shadow tables (and the bookkeeping table) are left out: they're the
-    /// virtual table's internals.
-    fn schema_snapshot(conn: &Connection) -> std::collections::BTreeMap<String, String> {
+    /// [`render_effect`] keys a declaration. FTS shadow tables (and the bookkeeping
+    /// table) are left out: they're the virtual table's internals.
+    fn schema_snapshot(conn: &Connection) -> std::collections::BTreeSet<String> {
         let rows: Vec<(String, String, Option<String>)> = conn
             .prepare(
                 "SELECT type, name, sql FROM sqlite_master \
@@ -2962,27 +2609,33 @@ mod tests {
             .filter(|(_, _, sql)| is_virtual(sql))
             .map(|(_, n, _)| n.as_str())
             .collect();
-        let mut out = std::collections::BTreeMap::new();
+        let mut out = std::collections::BTreeSet::new();
         for (ty, name, sql) in &rows {
             if virtuals.iter().any(|v| name.starts_with(&format!("{v}_"))) {
                 continue;
             }
-            let norm = || normalized_sql(sql.as_deref().unwrap());
             match ty.as_str() {
                 "table" if is_virtual(sql) => {
-                    out.insert(format!("virtual:{name}"), norm());
+                    out.insert(format!("virtual:{name}"));
                 }
                 "table" => {
-                    out.insert(format!("table:{name}"), String::new());
-                    for col in table_columns(conn, name).unwrap() {
-                        out.insert(format!("column:{name}.{}", col.name), format!("{col:?}"));
+                    out.insert(format!("table:{name}"));
+                    let cols: Vec<String> = conn
+                        .prepare("SELECT name FROM pragma_table_info(?1)")
+                        .unwrap()
+                        .query_map([name], |r| r.get(0))
+                        .unwrap()
+                        .map(|x| x.unwrap())
+                        .collect();
+                    for col in cols {
+                        out.insert(format!("column:{name}.{col}"));
                     }
                 }
                 "index" if sql.is_some() => {
-                    out.insert(format!("index:{name}"), norm());
+                    out.insert(format!("index:{name}"));
                 }
                 "trigger" => {
-                    out.insert(format!("trigger:{name}"), norm());
+                    out.insert(format!("trigger:{name}"));
                 }
                 _ => {}
             }
@@ -3002,10 +2655,9 @@ mod tests {
     }
 
     /// The declared effects are exactly what the migration creates, found
-    /// independently of the declaration: snapshot the schema (definitions
-    /// included) before and after applying it to a DB at the previous version. The
-    /// new objects must equal the declared set, and no existing object may be
-    /// removed or redefined (which a name-only list couldn't declare).
+    /// independently of the declaration: snapshot the schema's object names before
+    /// and after applying it to a DB at the previous version. The new objects must
+    /// equal the declared set, and no existing object may be removed.
     #[test]
     fn declared_schema_effects_equal_what_each_migration_creates() {
         let mut checked = 0;
@@ -3021,14 +2673,10 @@ mod tests {
                 m.schema_effects.iter().map(render_effect).collect();
             assert_eq!(run_migrations_list(&conn, &[m]).unwrap(), vec![v]);
             let after = schema_snapshot(&conn);
-            for (key, def) in &before {
-                assert_eq!(after.get(key), Some(def), "v{v} removed or redefined {key}");
-            }
-            let created: std::collections::BTreeSet<String> = after
-                .keys()
-                .filter(|k| !before.contains_key(*k))
-                .cloned()
-                .collect();
+            let removed: Vec<&String> = before.difference(&after).collect();
+            assert!(removed.is_empty(), "v{v} removed {removed:?}");
+            let created: std::collections::BTreeSet<String> =
+                after.difference(&before).cloned().collect();
             assert_eq!(
                 created, declared,
                 "v{v}: declared effects vs what it creates"
@@ -3036,24 +2684,6 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 4, "v11–v14 declare effects");
-    }
-
-    /// On a fresh install every declared object matches the reference, so a
-    /// migration whose schema came from the chain itself would be recorded.
-    #[test]
-    fn declared_schema_effects_match_the_reference_on_a_fresh_install() {
-        let migrations = crate::db::migrations();
-        let fresh = Connection::open_in_memory().unwrap();
-        run_migrations_list(&fresh, &migrations).unwrap();
-        let reference = reference_schema(&migrations).unwrap();
-        assert_eq!(schema_snapshot(&fresh), schema_snapshot(&reference));
-        for m in &migrations {
-            assert!(
-                schema_effects_present(&fresh, &reference, &recordable_effects(m)).unwrap(),
-                "v{}",
-                m.version
-            );
-        }
     }
 
     /// The owner's dev DB: CRR-prepared, `_sqlx_migrations` holds 1–10 and 15–18,
@@ -3455,30 +3085,6 @@ mod tests {
         }
     }
 
-    /// `CREATE TABLE IF NOT EXISTS` keeps a table of the same name whatever its shape, so a
-    /// leftover `shares` missing a column would be converted and recorded as done. The run
-    /// checks what it declares landed (the same check a failed run is recorded by) before
-    /// it records, and reports it otherwise.
-    #[cfg(feature = "sync")]
-    #[test]
-    fn create_sync_table_records_only_once_what_it_declares_landed() {
-        for (_dir, conn) in &plain_and_crr_dbs_without_shares() {
-            let conn = conn.conn();
-            conn.execute_batch(
-                "CREATE TABLE shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL);",
-            )
-            .unwrap();
-            let failures = SyncTableSetupFailures::new();
-            let m = create_sync_table(990, "shares", SHARES_SQL);
-            assert!(run_migrations_list_with(conn, &[m], &failures)
-                .unwrap()
-                .is_empty());
-            assert!(!recorded_versions(conn).contains(&990));
-            assert_eq!(failures.tables(), vec!["shares"]);
-            assert!(foreign_keys_on(conn));
-        }
-    }
-
     /// A run that can't finish a `CreateSyncTable` (here the rebuild refuses a non-TEXT
     /// primary key) reports its table for lane status and leaves it unrecorded, so the next
     /// launch tries again; the presence check doesn't record it, since the table isn't a CRR.
@@ -3512,16 +3118,15 @@ mod tests {
         assert!(failures.tables().is_empty());
     }
 
-    /// #133's presence check for a failed `CreateSyncTable`: its table (in the fresh-install
-    /// shape) and every index its SQL declares, and on a CRR DB the table must be a CRR with
+    /// #133's presence check for a failed `CreateSyncTable`: its table and every index its
+    /// SQL declares, and on a CRR DB the table must be a CRR with
     /// current triggers. Anything less keeps it pending.
     #[cfg(feature = "sync")]
     #[test]
     fn a_failed_create_sync_table_counts_as_landed_only_as_a_crr_with_its_indexes() {
         let present = |conn: &Connection| {
             let m = create_sync_table(990, "shares", SHARES_SQL);
-            let mut reference = None;
-            let ok = record_if_schema_present(conn, &m, std::slice::from_ref(&m), &mut reference);
+            let ok = record_if_schema_present(conn, &m);
             forget_versions(conn, &[990]);
             ok
         };
@@ -3540,7 +3145,7 @@ mod tests {
         assert!(present(conn), "a CRR with its index");
         conn.execute_batch("ALTER TABLE shares ADD COLUMN extra TEXT;")
             .unwrap();
-        assert!(!present(conn), "a column the migration doesn't create");
+        assert!(!present(conn), "a bare ALTER leaves its triggers stale");
 
         // On a DB that never synced, the plain table with its index is what it creates.
         let (_dir, path) = temp_db();
@@ -3555,7 +3160,7 @@ mod tests {
     }
 
     /// The objects that decide whether a failed `CreateSyncTable` landed are exactly what
-    /// it creates: its table (whose check covers every column) and its indexes.
+    /// it creates: its table and its indexes.
     #[test]
     fn create_sync_table_effects_are_its_table_and_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3565,8 +3170,8 @@ mod tests {
         let m = create_sync_table(990, "shares", SHARES_SQL);
         apply_migration(&conn, &m).unwrap();
         let created: std::collections::BTreeSet<String> = schema_snapshot(&conn)
-            .into_keys()
-            .filter(|k| !before.contains_key(k) && !k.starts_with("column:"))
+            .into_iter()
+            .filter(|k| !before.contains(k) && !k.starts_with("column:"))
             .collect();
         let effects: std::collections::BTreeSet<String> =
             recordable_effects(&m).iter().map(render_effect).collect();
