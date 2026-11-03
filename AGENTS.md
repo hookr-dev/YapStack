@@ -180,11 +180,12 @@ CI (`.github/workflows/ci-checks.yml`) runs more than `pnpm check` does on one m
 | Rust Format | Ubuntu | `cargo fmt --all -- --check` |
 | Frontend | Ubuntu, Node 24 | ESLint, typecheck, vitest (pnpm 10.28.2) |
 | Rust (macos-latest) | macOS | `cargo clippy --all -- -D warnings`, `cargo test --all` |
+| Rust sync feature (macos-latest) | macOS, plus `nightly-2023-10-05` | `cargo clippy -p yapstack-desktop --features sync --all-targets -- -D warnings`, `cargo test -p yapstack-desktop --features sync` |
 | Rust (windows-latest) | Windows | `cargo clippy --all -- -D warnings`, clippy on the sidecar with `--features webgpu`, `cargo test --all` |
 
 - **Windows-only code compiles only in CI.** Anything behind `#[cfg(windows)]` / `cfg(target_os = "windows")` is never built on a Mac. Review those paths by reading them, keep them small, and expect the Windows leg to be the first to catch mistakes.
 - **The Rust toolchain is pinned** in `rust-toolchain.toml`. Bump it in its own PR; new releases routinely add clippy lints, and CI runs clippy with `-D warnings`.
-- **PR CI doesn't build the desktop `sync` feature.** Release builds do. If you touch sync integration in the desktop crate, run `cargo test -p yapstack-desktop --features sync` locally (it needs `rustup toolchain install nightly-2023-10-05` for the vendored cr-sqlite bundle).
+- **The desktop `sync` feature has its own CI job** ("Rust sync feature (macos-latest)"); `pnpm check` doesn't build it. If you touch sync integration in the desktop crate, run `cargo test -p yapstack-desktop --features sync` locally first (it needs `rustup toolchain install nightly-2023-10-05` for the vendored cr-sqlite bundle).
 - **Tests must be deterministic.** Don't assert on thread timing or lock races; SQLite's busy handler isn't fair, so a race that passes locally can starve on a slower runner. Use hooks, channels, or explicit ordering instead.
 - **Never make CI green by retrying, sleeping, or `#[ignore]`-ing a failing test.** Find the cause. If a test is genuinely flaky and blocking, say so and ask before quarantining it.
 - **Dependabot PRs fail for real reasons too.** Check whether the failure reproduces on `main` before blaming the bump, and vice versa.
