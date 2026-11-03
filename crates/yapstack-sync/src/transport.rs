@@ -18,7 +18,7 @@ use yapstack_common::sync::{
     CapabilityBlocker, ClientTail, CompletenessResponse, PresignResponse, PullResponse,
     PulledChange, PushAck, PushRequest, PushResponse, RaiseSyncCapabilityRequest,
     SyncCapabilityBlocked, SyncCapabilityLevels, SyncCapabilityRefusal, BATCH_CAPABILITY_HEADER,
-    SNAPSHOT_CAPABILITY_HEADER, SYNC_CAPABILITY_HEADER,
+    SYNC_CAPABILITY_HEADER,
 };
 
 use crate::snapshot::SnapshotMeta;
@@ -66,18 +66,10 @@ pub trait SyncTransport: Send + Sync {
     }
 
     /// R2: publish the encrypted DB snapshot (the seed device's bootstrap artifact).
-    /// The relay stores it as an opaque blob and never reads it. `content_capability` is the
-    /// highest sync capability level among the tables the snapshot holds rows for
-    /// ([`crate::schema::snapshot_content_capability`], ADR 0006 §5.5); the relay refuses it
-    /// with [`SyncError::CapabilityFloor`] when its floor is lower.
+    /// The relay stores it as an opaque blob and never reads it.
     ///
     /// Default: unsupported (test transports that never touch the snapshot seam inherit this).
-    async fn put_snapshot(
-        &self,
-        _meta: SnapshotMeta,
-        _ciphertext: &[u8],
-        _content_capability: i32,
-    ) -> Result<(), SyncError> {
+    async fn put_snapshot(&self, _meta: SnapshotMeta, _ciphertext: &[u8]) -> Result<(), SyncError> {
         Err(SyncError::Transport("snapshot put not supported".into()))
     }
 
@@ -409,14 +401,8 @@ impl SyncTransport for HttpTransport {
         Ok(r.json().await?)
     }
 
-    // ADR 0006 §5.5: the relay refuses a snapshot whose declared content level
-    // (`X-YapStack-Snapshot-Capability`) is above its floor.
-    async fn put_snapshot(
-        &self,
-        meta: SnapshotMeta,
-        ciphertext: &[u8],
-        content_capability: i32,
-    ) -> Result<(), SyncError> {
+    // TODO(seed path): declare the content level (`X-YapStack-Snapshot-Capability`, ADR 0006 §5.5).
+    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
         // Presign step: content-address by ciphertext hash (§9-style; relay stays blind
         // and byte-free — the bytes go directly to object storage).
         let sha = crate::snapshot::ciphertext_sha256_hex(ciphertext);
@@ -425,7 +411,6 @@ impl SyncTransport for HttpTransport {
             .post(format!("{}/snapshot/presign", self.base_url))
             .bearer_auth(self.bearer())
             .header(SYNC_CAPABILITY_HEADER, SYNC_CAPABILITY_LEVEL.to_string())
-            .header(SNAPSHOT_CAPABILITY_HEADER, content_capability.to_string())
             .json(&SnapshotPresignRequest {
                 sha256: sha,
                 size: ciphertext.len() as u64,
@@ -435,22 +420,10 @@ impl SyncTransport for HttpTransport {
             .send()
             .await
             .map_err(map_send_error)?;
-        // A 426 refers to this build's level, a 409 floor refusal to the content's.
-        let resp = match check_capability(resp, SYNC_CAPABILITY_LEVEL).await {
-            Err(SyncError::CapabilityFloor {
-                required,
-                requested,
-                ..
-            }) => {
-                return Err(SyncError::CapabilityFloor {
-                    batch: content_capability,
-                    required,
-                    requested,
-                })
-            }
-            r => r?,
-        };
-        let presign: SnapshotPresignResponse = check_auth(resp)?.json().await?;
+        let presign: SnapshotPresignResponse =
+            check_auth(check_capability(resp, SYNC_CAPABILITY_LEVEL).await?)?
+                .json()
+                .await?;
         if presign.already_exists {
             return Ok(());
         }
@@ -642,14 +615,10 @@ fn parse_sse_data_seq(line: &str) -> Option<i64> {
 /// The body is parsed frame-by-frame off `bytes_stream()` (O(line) working set); it never
 /// buffers the whole never-ending response. The bearer is sent as an `Authorization`
 /// header and is absent from any returned error (which carries at most the relay URL).
-///
-/// `on_open` runs once the relay has accepted the subscription (a 2xx), so the caller can tell
-/// a stream that was established and then ended from one that never opened.
 pub async fn stream_wakeups(
     client: &reqwest::Client,
     base_url: &str,
     bearer: &str,
-    on_open: impl FnOnce(),
     mut on_wake: impl FnMut(i64),
 ) -> Result<(), SyncError> {
     use futures_util::StreamExt;
@@ -662,7 +631,6 @@ pub async fn stream_wakeups(
         .map_err(map_send_error)?;
     // 401 → refreshable (caller reloads the persisted token); other non-2xx → error_for_status.
     let resp = check_auth(resp)?;
-    on_open();
 
     let mut stream = resp.bytes_stream();
     // Accumulate bytes and process each complete LF-terminated line as it arrives. SSE lines
@@ -896,20 +864,8 @@ impl SyncTransport for MockRelay {
         })
     }
 
-    async fn put_snapshot(
-        &self,
-        meta: SnapshotMeta,
-        ciphertext: &[u8],
-        content_capability: i32,
-    ) -> Result<(), SyncError> {
+    async fn put_snapshot(&self, meta: SnapshotMeta, ciphertext: &[u8]) -> Result<(), SyncError> {
         let mut g = self.inner.lock().unwrap();
-        if !g.gate_missing && content_capability > g.floor {
-            return Err(SyncError::CapabilityFloor {
-                batch: content_capability,
-                required: g.floor,
-                requested: g.requested,
-            });
-        }
         g.snapshot = Some((meta, ciphertext.to_vec()));
         Ok(())
     }
@@ -1145,57 +1101,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn put_snapshot_declares_the_content_level_and_is_refused_above_the_floor() {
-        let meta = SnapshotMeta {
-            generation: 1,
-            baseline_seq: 0,
-        };
-        let relay = MockRelay::new();
-        let e = relay.put_snapshot(meta, b"ct", 1).await.unwrap_err();
-        assert!(
-            matches!(
-                e,
-                SyncError::CapabilityFloor {
-                    batch: 1,
-                    required: 0,
-                    ..
-                }
-            ),
-            "got {e:?}"
-        );
-        assert!(
-            relay.get_snapshot().await.unwrap().is_none(),
-            "nothing recorded"
-        );
-        relay.put_snapshot(meta, b"ct", 0).await.unwrap();
-        assert!(relay.get_snapshot().await.unwrap().is_some());
-
-        let floor = r#"{"code":"sync_capability_floor","message":"m","required_sync_capability":0,"requested_sync_capability":0}"#;
-        let (addr, server) = canned_server(vec![json_response("409 Conflict", floor)]);
-        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
-        let e = t.put_snapshot(meta, b"ct", 1).await.unwrap_err();
-        assert!(
-            matches!(
-                e,
-                SyncError::CapabilityFloor {
-                    batch: 1,
-                    required: 0,
-                    ..
-                }
-            ),
-            "got {e:?}"
-        );
-        let heads = server.join().unwrap();
-        assert!(
-            heads[0]
-                .to_ascii_lowercase()
-                .contains("x-yapstack-snapshot-capability: 1\r\n"),
-            "the presign declares the content level: {}",
-            heads[0]
-        );
-    }
-
     /// O2: a relay without `PUT /sync/capability` predates the gate. Only 404 and 405 say
     /// so; any other failure stays an ordinary error.
     #[tokio::test(flavor = "current_thread")]
@@ -1316,27 +1221,10 @@ mod tests {
             generation: 1,
             baseline_seq: 0,
         };
-        let err = t.put_snapshot(meta, b"ct", 0).await.unwrap_err();
+        let err = t.put_snapshot(meta, b"ct").await.unwrap_err();
         assert!(err.is_network(), "snapshot presign, got {err:?}");
         let err = t.get_snapshot().await.unwrap_err();
         assert!(err.is_network(), "snapshot head, got {err:?}");
-    }
-
-    /// A 5xx is the relay (or the proxy in front of it) failing, which is how a relay being
-    /// swapped behind a proxy shows; a 4xx is the relay answering.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_5xx_is_a_server_error_and_a_4xx_is_not() {
-        let (addr, server) = canned_server(vec![
-            status_only("503 Service Unavailable"),
-            status_only("502 Bad Gateway"),
-            status_only("404 Not Found"),
-        ]);
-        let t = HttpTransport::new(format!("http://{addr}"), "access-token");
-        for expected in [true, true, false] {
-            let e = t.completeness().await.unwrap_err();
-            assert_eq!(e.is_server_error(), expected, "got {e:?}");
-        }
-        server.join().unwrap();
     }
 
     #[test]
@@ -1370,16 +1258,10 @@ mod tests {
 
         let client = reqwest::Client::new();
         let mut wakes = Vec::new();
-        let mut opened = false;
-        let r = stream_wakeups(
-            &client,
-            &format!("http://{addr}"),
-            "access-token",
-            || opened = true,
-            |s| wakes.push(s),
-        )
+        let r = stream_wakeups(&client, &format!("http://{addr}"), "access-token", |s| {
+            wakes.push(s)
+        })
         .await;
-        assert!(opened, "an accepted subscription opened");
         assert!(r.is_ok(), "clean stream end must be Ok, got {r:?}");
         assert_eq!(wakes, vec![1, 2], "only the two data: seqs must surface");
         server.join().unwrap();
@@ -1393,17 +1275,9 @@ mod tests {
         let (addr, server) = canned_server(vec![status_only("401 Unauthorized")]);
 
         let client = reqwest::Client::new();
-        let mut opened = false;
-        let err = stream_wakeups(
-            &client,
-            &format!("http://{addr}"),
-            "stale",
-            || opened = true,
-            |_| {},
-        )
-        .await
-        .unwrap_err();
-        assert!(!opened, "a refused subscription never opened");
+        let err = stream_wakeups(&client, &format!("http://{addr}"), "stale", |_| {})
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, SyncError::Unauthorized),
             "a 401 stream must map to Unauthorized, got {err:?}"
