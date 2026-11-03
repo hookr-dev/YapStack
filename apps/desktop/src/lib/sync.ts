@@ -177,6 +177,38 @@ export interface SyncStatus {
   /** ADR 0006 §5.9: this app is older than the relay's minimum, rechecked at drain
    *  start, on reconnect and every 15 min (last-seen kept while unreachable). Advisory. */
   versionAdvisory?: RelayVersionAdvisory | null;
+  /** ADR 0006 §1: synced tables whose setup (a `CreateSyncTable` migration) didn't finish
+   *  on this device. Non-empty shows the "restart to try again" notice. Optional so older
+   *  status snapshots read as none. */
+  syncTableSetupFailures?: string[];
+  /** ADR 0006 §5.6: the workspace's levels as the relay last returned them (persisted per
+   *  workspace), or null while no drain runs. UX only: read by
+   *  {@link syncCapabilityFloorReached}, never an authorization to publish. */
+  relayCapability?: { required: number; requested: number } | null;
+}
+
+/**
+ * ADR 0006 §5.6, the UX-only feature gate: whether a feature that writes a table gated at
+ * `level` is enabled. Always for level 0, and on a device that isn't syncing ("devices that
+ * aren't syncing write freely"; the push path holds their rows once sync is enabled).
+ * Whether it is syncing comes from `status`, or from `configSyncEnabled`
+ * (`syncConfig.syncEnabled`, always loaded) before the first status arrives: a device that
+ * never turned sync on has no status at all. A syncing device is off until a status
+ * arrives, then on once the floor the relay last returned is at least `level`, an unknown
+ * floor counting as 0. It never reads the roster.
+ *
+ * It looks at the floor only. A feature must also stay off while its own table is in
+ * `status.syncTableSetupFailures` (its setup on this device didn't finish).
+ */
+export function syncCapabilityFloorReached(
+  status: SyncStatus | null,
+  configSyncEnabled: boolean,
+  level: number,
+): boolean {
+  if (level <= 0) return true;
+  if (!(status ? status.syncEnabled : configSyncEnabled)) return true;
+  if (!status) return false;
+  return (status.relayCapability?.required ?? 0) >= level;
 }
 
 /** One device holding up a sync capability raise (it reports a lower level). */

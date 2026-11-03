@@ -321,6 +321,17 @@ export function SyncTab() {
         status={status}
         onRemove={status.removed ? undefined : handleRemoveDevice}
       />
+      {(status.syncTableSetupFailures?.length ?? 0) > 0 && (
+        <Alert className="border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-400">
+          <ShieldAlert className="h-4 w-4" />
+          <AlertTitle>Part of this device's sync setup didn't finish</AlertTitle>
+          <AlertDescription className="text-xs">
+            YapStack couldn't prepare a new kind of synced data on this device. Changes of that
+            kind from your other devices are kept and will apply once it finishes. Restart
+            YapStack to try again.
+          </AlertDescription>
+        </Alert>
+      )}
       <UnreadableChangesWarning status={status} onRetried={() => void refreshSyncStatus()} />
 
       {/* Devices */}

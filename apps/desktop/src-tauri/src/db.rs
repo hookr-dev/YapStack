@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 /// which preserves continuity with the plugin's `_sqlx_migrations` bookkeeping.
 /// All migrations are `Up`; `kind` says how the runner may apply them on a CRR DB
 /// (ADR 0006 §1).
+#[derive(Clone, Copy, Debug)]
 pub struct Migration {
     pub version: i64,
     pub description: &'static str,
@@ -19,6 +20,8 @@ pub struct Migration {
     /// instead of failing it on every boot. Declare them only for a migration whose
     /// schema can land out of band (a runtime schema patch, cutover) and whose data
     /// changes that path also makes; an empty list never records a failed migration.
+    /// A [`MigrationKind::CreateSyncTable`] leaves it empty: the runner takes its table
+    /// and indexes from its SQL.
     pub schema_effects: &'static [SchemaObject],
 }
 
@@ -55,6 +58,25 @@ pub enum MigrationKind {
     /// refused: cr-sqlite rejects any that doesn't come from the PRIMARY KEY, and
     /// uniqueness on a synced table is app-layer.
     SyncIndex,
+    /// A synced table added after cutover (ADR 0006 §1): `CREATE TABLE IF NOT EXISTS
+    /// <table>(…)` for a `SYNC_TABLES` entry past the cutover set, then only
+    /// `CREATE INDEX IF NOT EXISTS … ON <table>(…)` statements. On a CRR DB the runner
+    /// creates the table, converts it to a CRR (`schema::ensure_crr`), creates the
+    /// indexes and only then records the migration, so a run cut short anywhere reruns
+    /// from the top; the drain's boot heal converts a table that was recorded without
+    /// being converted. On a non-CRR DB it is applied plainly and cutover converts the
+    /// table. UNIQUE is refused anywhere in it: the CRR rebuild strips it, and
+    /// uniqueness on a synced table is app-layer. A run that can't finish it shows in
+    /// sync lane status. Leave `schema_effects` empty: the table and the indexes it
+    /// declares are what decide whether a failed one already landed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no CreateSyncTable migration ships yet; the first (SP3) constructs it"
+        )
+    )]
+    CreateSyncTable { table: &'static str },
 }
 
 /// Row to insert into `session_audio_parts`. Mirrors the columns in the v15

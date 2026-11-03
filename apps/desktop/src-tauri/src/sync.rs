@@ -1572,11 +1572,7 @@ fn clear_session() -> Result<(), String> {
     clear_session_from_store()?;
     // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    reset_published_lane_state(None);
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -1674,6 +1670,33 @@ pub struct SyncStatusDto {
     /// ADR 0006 §5.9: this app is older than the relay's `min_client_version`, refreshed
     /// at drain start, on reconnect and every 15 min (last-seen kept while unreachable).
     version_advisory: Option<VersionAdvisory>,
+    /// ADR 0006 §1: synced tables whose `CreateSyncTable` migration didn't finish on this
+    /// device at launch (and that the drain's boot heal hasn't converted since). Their
+    /// peers' rows wait in the quarantine; lane status asks for a restart. Usually empty.
+    sync_table_setup_failures: Vec<String>,
+    /// ADR 0006 §5.6: the workspace levels the relay last returned (persisted per
+    /// workspace, so known before the relay answers), or `None` while no drain runs or no
+    /// level is known yet. UX only: it enables features, never authorizes a push.
+    relay_capability: Option<RelayCapabilityDto>,
+}
+
+/// The workspace's sync capability levels as lane status shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayCapabilityDto {
+    /// The floor: the relay refuses a push of rows above this level.
+    required: i32,
+    /// The highest level a device asked the floor to rise to.
+    requested: i32,
+}
+
+impl From<yapstack_common::sync::SyncCapabilityLevels> for RelayCapabilityDto {
+    fn from(l: yapstack_common::sync::SyncCapabilityLevels) -> Self {
+        Self {
+            required: l.required_sync_capability,
+            requested: l.requested_sync_capability,
+        }
+    }
 }
 
 /// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
@@ -1795,6 +1818,78 @@ fn heal_crr_trigger_arity(conn: &Connection) {
         ),
         Err(e) => tracing::error!("sync: crsql trigger-arity self-heal failed: {e}"),
     }
+}
+
+/// Convert every `SYNC_TABLES` table that exists here but isn't a CRR yet (ADR 0006 §3):
+/// one a `CreateSyncTable` migration created but didn't convert, when the migration's own
+/// rerun at launch didn't finish it either (a backstop: a run can stop or fail between the
+/// CREATE and the conversion). Rows
+/// written to it in the meantime get clocks and are captured. Then every setup failure
+/// whose migration's whole setup is now in place leaves lane status; one still missing an
+/// index stays until a restart reruns its migration.
+///
+/// Takes the write turn: it rebuilds tables on the drain's connection while the app's
+/// writer is live. NON-FATAL, like [`heal_crr_trigger_arity`]: a failure is logged and the
+/// drain starts anyway, and peers' rows for the table wait in the quarantine.
+fn heal_unconverted_sync_tables(
+    conn: &Connection,
+    failures: &crate::db_service::SyncTableSetupFailures,
+) {
+    let converted = {
+        let _turn = yapstack_common::write_turnstile::WriteTurnstile::process().acquire();
+        schema::ensure_sync_tables_crr(conn)
+    };
+    match converted {
+        Ok(tables) if tables.is_empty() => {}
+        Ok(tables) => tracing::warn!(
+            "sync: converted {} synced table(s) a migration left unconverted: {}",
+            tables.len(),
+            tables.join(", ")
+        ),
+        Err(e) => tracing::error!("sync: converting unconverted synced tables failed: {e}"),
+    }
+    failures.resolve_landed(conn);
+}
+
+/// Ready the drain's own connection before its first cycle: the outbox table, then the
+/// boot heals in order (unconverted synced tables, out-of-band columns, stale triggers).
+/// Only a missing outbox table stops the drain; the heals log and carry on.
+fn prepare_drain_connection(
+    conn: &Connection,
+    failures: &crate::db_service::SyncTableSetupFailures,
+) -> Result<(), String> {
+    outbox::ensure_outbox_table(conn).map_err(|e| format!("outbox table: {e}"))?;
+    // ADR 0006 §3: first finish any synced table a migration created without
+    // converting, so the passes below and the first cycle see it as a CRR.
+    heal_unconverted_sync_tables(conn, failures);
+    // F2 boot-time self-heal: this connection has the crsql extension loaded and
+    // the live DB is CRR-prepared by the time any drain starts (start_drain_if_enabled
+    // guarantees cutover ran; enable/re-login likewise). A DB that was CRR-prepared by
+    // a build PRIOR to the cutover fix above — or that gains new OUT_OF_BAND_ALTERS
+    // entries in a future update — is missing those CRR-tracked columns, so every
+    // incoming change for them quarantines (is_unknown_column) and never replays. Apply
+    // the codified alters here once, on the drain's own connection, BEFORE the loop:
+    // idempotent (skips columns that already exist), and the very next replay_pending
+    // cycle then recovers all previously quarantined changes automatically. No separate
+    // replay trigger is needed.
+    if let Err(e) = schema::apply_out_of_band_alters(conn) {
+        // Non-fatal: a failure here leaves the pre-existing (quarantining) behaviour
+        // rather than aborting the drain. Log loudly so it is not silent.
+        tracing::error!("sync drain: out-of-band alter self-heal failed: {e}");
+    }
+    // Boot-time TRIGGER-ARITY self-heal, immediately after the column self-heal
+    // above and for the same reason: a device CRR-prepared by an older build can
+    // carry a column that was added by a BARE `ALTER TABLE ... ADD COLUMN` (the
+    // frontend did that before the db.ts CRR gate landed) instead of through the
+    // crsql alter dance. cr-sqlite accepts the bare ALTER but does not regenerate
+    // the AFTER UPDATE trigger, so the trigger keeps passing the OLD column list
+    // while `crsql_after_update` expects the NEW one — every direct UPDATE then
+    // dies with "expected N values, got M" (the owner's segment edit / soft-delete
+    // / hide failure). `apply_out_of_band_alters` cannot fix it: it skips columns
+    // that already exist. This pass detects the drift and rebuilds the machinery
+    // for the CURRENT shape, with no schema change and no sync-state reset.
+    heal_crr_trigger_arity(conn);
+    Ok(())
 }
 
 fn ensure_prep_table(conn: &Connection) -> rusqlite::Result<()> {
@@ -3485,6 +3580,55 @@ fn roster_clears_capability_blockers(notice: &CapabilityNotice, devices: &[Devic
 /// The drain's latest version advisory (ADR 0006 §5.9), published for lane status.
 static VERSION_ADVISORY: PubCell<Option<VersionAdvisory>> = PubCell::new();
 
+/// The workspace's capability levels as the relay last returned them (ADR 0006 §5.4, §5.6),
+/// seeded from the persisted copy at drain start. For the UX feature gate only: it never
+/// authorizes a push, which the relay checks per batch.
+static RELAY_CAPABILITY: PubCell<Option<yapstack_common::sync::SyncCapabilityLevels>> =
+    PubCell::new();
+
+/// Clear every lane's published state, so a status poll never shows what a stopped drain,
+/// uploader or cleared session last published. The relay levels are replaced by
+/// `relay_capability` in the same step: a starting drain passes the floor persisted for its
+/// workspace, so a respawn never shows "no floor" in between; sign-out and sync off pass
+/// `None`.
+fn reset_published_lane_state(
+    relay_capability: Option<yapstack_common::sync::SyncCapabilityLevels>,
+) {
+    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+    DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
+    RELAY_CAPABILITY.set(relay_capability);
+    VERSION_ADVISORY.reset();
+    AUDIO_LANE.reset();
+}
+
+/// The levels persisted for `workspace` in the DB at `path`, or `None` when there are none
+/// or the DB can't be read.
+fn persisted_relay_capability(
+    path: &Path,
+    workspace: Uuid,
+) -> Option<yapstack_common::sync::SyncCapabilityLevels> {
+    let db = CrsqlDb::open(path).ok()?;
+    yapstack_sync::state::relay_capability(db.conn(), workspace).unwrap_or(None)
+}
+
+/// Fold one cycle's relay levels into `cell` (for lane status) and persist them for the
+/// workspace (for the next drain start). A cycle that learned nothing changes nothing.
+fn publish_relay_capability(
+    cell: &PubCell<Option<yapstack_common::sync::SyncCapabilityLevels>>,
+    conn: &Connection,
+    workspace: Uuid,
+    levels: Option<yapstack_common::sync::SyncCapabilityLevels>,
+) {
+    let Some(levels) = levels else {
+        return;
+    };
+    cell.set(Some(levels));
+    if let Err(e) = yapstack_sync::state::record_relay_capability(conn, workspace, levels) {
+        tracing::warn!("sync drain: could not persist the relay floor: {e}");
+    }
+}
+
 /// The notice a drain starts with, from the levels persisted by earlier runs: the nudge
 /// survives a restart while the relay is unreachable. Refusals and holds are not seeded;
 /// they come back from the first cycle that meets them.
@@ -4012,12 +4156,9 @@ fn spawn_drain(
 ) -> Result<DrainHandle, String> {
     // A fresh drain starts from a clean health slate (clears any lingering auth-expired
     // / blocked state from a previously stopped drain, e.g. after a re-login) and a clean
-    // progress slate (session ack count resets; no stale backlog shown, T024).
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    // progress slate (session ack count resets; no stale backlog shown, T024). The relay
+    // levels start from what this workspace persisted (ADR 0006 §5.6).
+    reset_published_lane_state(persisted_relay_capability(&sync_db, tenant_id));
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
     reset_first_drain_cycle();
@@ -4081,37 +4222,12 @@ fn spawn_drain(
                 }
             };
             let conn = db.conn();
-            if let Err(e) = outbox::ensure_outbox_table(conn) {
-                tracing::error!("sync drain: outbox table: {e}");
+            if let Err(e) =
+                prepare_drain_connection(conn, crate::db_service::SyncTableSetupFailures::process())
+            {
+                tracing::error!("sync drain: {e}");
                 return;
             }
-            // F2 boot-time self-heal: this connection has the crsql extension loaded and
-            // the live DB is CRR-prepared by the time any drain starts (start_drain_if_enabled
-            // guarantees cutover ran; enable/re-login likewise). A DB that was CRR-prepared by
-            // a build PRIOR to the cutover fix above — or that gains new OUT_OF_BAND_ALTERS
-            // entries in a future update — is missing those CRR-tracked columns, so every
-            // incoming change for them quarantines (is_unknown_column) and never replays. Apply
-            // the codified alters here once, on the drain's own connection, BEFORE the loop:
-            // idempotent (skips columns that already exist), and the very next replay_pending
-            // cycle then recovers all previously quarantined changes automatically. No separate
-            // replay trigger is needed.
-            if let Err(e) = schema::apply_out_of_band_alters(conn) {
-                // Non-fatal: a failure here leaves the pre-existing (quarantining) behaviour
-                // rather than aborting the drain. Log loudly so it is not silent.
-                tracing::error!("sync drain: out-of-band alter self-heal failed: {e}");
-            }
-            // Boot-time TRIGGER-ARITY self-heal, immediately after the column self-heal
-            // above and for the same reason: a device CRR-prepared by an older build can
-            // carry a column that was added by a BARE `ALTER TABLE ... ADD COLUMN` (the
-            // frontend did that before the db.ts CRR gate landed) instead of through the
-            // crsql alter dance. cr-sqlite accepts the bare ALTER but does not regenerate
-            // the AFTER UPDATE trigger, so the trigger keeps passing the OLD column list
-            // while `crsql_after_update` expects the NEW one — every direct UPDATE then
-            // dies with "expected N values, got M" (the owner's segment edit / soft-delete
-            // / hide failure). `apply_out_of_band_alters` cannot fix it: it skips columns
-            // that already exist. This pass detects the drift and rebuilds the machinery
-            // for the CURRENT shape, with no schema change and no sync-state reset.
-            heal_crr_trigger_arity(conn);
             let cipher = ChangesetCipher::new(
                 vault_key,
                 epoch,
@@ -4131,6 +4247,7 @@ fn spawn_drain(
             let mut advisory = AdvisoryRefresher::new(transport.http_client(), info_url);
             // ADR 0006 §5: start from what earlier runs persisted for this workspace, so the
             // nudge and the version advisory show even before the relay answers.
+            // (`RELAY_CAPABILITY` was seeded from the same row by the spawn's reset.)
             CAPABILITY_NOTICE.set_if_changed(seeded_capability_notice(
                 yapstack_sync::state::relay_capability(conn, tenant_id).unwrap_or(None),
                 yapstack_sync::SYNC_CAPABILITY_LEVEL,
@@ -4423,13 +4540,12 @@ fn spawn_drain(
                     CAPABILITY_NOTICE.get(),
                     yapstack_sync::SYNC_CAPABILITY_LEVEL,
                 ));
-                if let Some(levels) = report.relay_capability {
-                    if let Err(e) =
-                        yapstack_sync::state::record_relay_capability(conn, tenant_id, levels)
-                    {
-                        tracing::warn!("sync drain: could not persist the relay floor: {e}");
-                    }
-                }
+                publish_relay_capability(
+                    &RELAY_CAPABILITY,
+                    conn,
+                    tenant_id,
+                    report.relay_capability,
+                );
                 // ADR 0006 §5.9: refresh the version advisory on the first cycle, on a
                 // reachability flip, and otherwise every 15 min, without ever waiting on it;
                 // keep the last-seen minimum while the relay is unreachable.
@@ -5523,6 +5639,8 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         removed,
         capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
         version_advisory: VERSION_ADVISORY.get(),
+        sync_table_setup_failures: crate::db_service::SyncTableSetupFailures::process().tables(),
+        relay_capability: RELAY_CAPABILITY.get().map(RelayCapabilityDto::from),
     }
 }
 
@@ -5875,6 +5993,8 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             removed: false,
             capability_notice: None,
             version_advisory: None,
+            sync_table_setup_failures: vec![],
+            relay_capability: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -6137,11 +6257,7 @@ pub async fn sync_disable(runtime: State<'_, SyncRuntimeState>) -> Result<SyncSt
     }
     // Clear the lanes' published state so the next status poll does not show a stale
     // backlog or health from the drain that just stopped.
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    reset_published_lane_state(None);
     let session = update_session(|s| s.sync_enabled = false)?;
     Ok(build_status_dto(&session).await)
 }
@@ -8696,6 +8812,130 @@ mod tests {
         assert!(n > 0, "post-heal UPDATEs must be captured by crsql_changes");
     }
 
+    /// A `CreateSyncTable` of `shares` (the stand-in for a table added after cutover) with
+    /// the given SQL.
+    fn shares_migration(sql: &'static str) -> crate::db::Migration {
+        crate::db::Migration {
+            version: 990,
+            description: "test: create sync table",
+            sql,
+            kind: crate::db::MigrationKind::CreateSyncTable { table: "shares" },
+            schema_effects: &[],
+        }
+    }
+
+    const SHARES_TABLE: &str =
+        "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, note TEXT)";
+
+    /// A cut-over live DB whose `shares` is a plain table with one row, as a `CreateSyncTable`
+    /// migration that never converted it leaves it (`shares` dropped with its CRR machinery,
+    /// then re-created from `create`).
+    fn live_db_with_unconverted_shares(
+        create: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::db_service::DbServiceState,
+    ) {
+        let (dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        for t in ["shares", "shares__crsql_clock", "shares__crsql_pks"] {
+            svc.execute(&format!("DROP TABLE IF EXISTS {t}"), &[])
+                .unwrap();
+        }
+        svc.execute(create, &[]).unwrap();
+        svc.execute(
+            "INSERT INTO shares (id, folder_id) VALUES ('sh1', 'f1')",
+            &[],
+        )
+        .unwrap();
+        (dir, path, svc)
+    }
+
+    /// ADR 0006 §3: a synced table its migration created but didn't convert (the run stopped
+    /// between the CREATE and the conversion) is converted by the drain's boot heal while the app's
+    /// writer stays open, its rows written before then become changes, and lane status stops
+    /// reporting it once everything the migration declares is in place.
+    #[test]
+    fn drain_heal_converts_a_recorded_but_non_crr_sync_table() {
+        let (_dir, path, svc) = live_db_with_unconverted_shares(SHARES_TABLE);
+        let failures = crate::db_service::SyncTableSetupFailures::new();
+        failures.add(shares_migration(SHARES_TABLE));
+
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        assert!(!schema::is_crr(conn, "shares").unwrap());
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(schema::is_crr(conn, "shares").unwrap());
+        assert!(!schema::crr_triggers_are_stale(conn, "shares").unwrap());
+        assert!(failures.tables().is_empty(), "no longer a setup failure");
+        let changes = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'shares'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            changes(conn) > 0,
+            "the row written before the heal is a change"
+        );
+
+        // The app's writer, open the whole time, writes through the new CRR, and a second
+        // heal finds nothing to do.
+        let before = changes(conn);
+        svc.execute(
+            "INSERT INTO shares (id, folder_id) VALUES ('sh2', 'f1')",
+            &[],
+        )
+        .unwrap();
+        assert!(changes(conn) > before);
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(failures.tables().is_empty());
+    }
+
+    /// The setup notice stays until the migration's whole setup is in place, not just the
+    /// conversion: a heal that converts the table while its index is missing keeps it, and
+    /// so does a table already converted (a run that failed after the conversion, at its
+    /// indexes). Once the index is there too, the next heal clears it.
+    #[test]
+    fn drain_heal_clears_the_setup_notice_only_once_the_migration_s_setup_is_complete() {
+        const WITH_INDEX: &str = "CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, \
+             folder_id TEXT NOT NULL, note TEXT); \
+             CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id)";
+        let (_dir, path, svc) = live_db_with_unconverted_shares(SHARES_TABLE);
+        let failures = crate::db_service::SyncTableSetupFailures::new();
+        failures.add(shares_migration(WITH_INDEX));
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(schema::is_crr(conn, "shares").unwrap());
+        assert_eq!(
+            failures.tables(),
+            vec!["shares"],
+            "converted, index missing"
+        );
+        heal_unconverted_sync_tables(conn, &failures);
+        assert_eq!(
+            failures.tables(),
+            vec!["shares"],
+            "a CRR, index still missing"
+        );
+
+        svc.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shares_folder ON shares(folder_id)",
+            &[],
+        )
+        .unwrap();
+        heal_unconverted_sync_tables(conn, &failures);
+        assert!(
+            failures.tables().is_empty(),
+            "everything it declares is in place"
+        );
+    }
+
     /// The same pass on a HEALTHY device (Mac-shaped: cut over at the full 14-column
     /// shape) heals nothing and leaves sync state — site id, db_version, watermarks —
     /// untouched, so it can run unconditionally at every boot.
@@ -8849,6 +9089,158 @@ mod tests {
                 "account switch must RESET the push watermark"
             );
         }
+    }
+
+    /// ADR 0006 §5.4: an account switch resets the push watermark, so the whole history is
+    /// captured again for the new workspace. Rows of a post-cutover table are captured at
+    /// their table's level (held until the new workspace's floor reaches it), and the floor
+    /// the old workspace reached doesn't carry over: the new one starts from nothing.
+    #[test]
+    fn account_switch_recaptures_gated_rows_at_their_level_and_starts_the_floor_from_nothing() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        let (tenant_a, tenant_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let levels = yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 1,
+        };
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE t_new (id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO t_new VALUES ('n1', 'gated');",
+        )
+        .unwrap();
+        schema::ensure_crr(conn, "t_new").unwrap();
+        reconcile_account_binding(&path, tenant_a).unwrap();
+        state::record_relay_capability(conn, tenant_a, levels).unwrap();
+
+        reconcile_account_binding(&path, tenant_b).expect("account switch A→B");
+        let cipher = ChangesetCipher::new(
+            [7u8; 32],
+            1,
+            tenant_b,
+            SYNC_SCHEMA_VERSION,
+            CRSQLITE_ENGINE_VERSION,
+        );
+        outbox::ensure_outbox_table(conn).unwrap();
+        let captured = outbox::enqueue_local(
+            conn,
+            &cipher,
+            Uuid::new_v4(),
+            SYNC_SCHEMA_VERSION as i32,
+            CRSQLITE_ENGINE_VERSION as i32,
+        )
+        .unwrap();
+        assert!(!captured.is_empty(), "the history is captured again");
+        let entry_levels: Vec<i32> = conn
+            .prepare("SELECT required_sync_capability FROM _yapstack_outbox ORDER BY client_seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        assert!(entry_levels.contains(&0), "the cutover history ships at 0");
+        assert_eq!(
+            entry_levels.iter().max(),
+            Some(&schema::table_sync_capability("t_new")),
+            "the t_new row is held at its table's level: {entry_levels:?}"
+        );
+        assert_eq!(state::relay_capability(conn, tenant_b).unwrap(), None);
+        assert_eq!(
+            state::relay_capability(conn, tenant_a).unwrap(),
+            Some(levels),
+            "kept for workspace A, never read for B"
+        );
+    }
+
+    /// Sign-out and turning sync off clear the published relay levels, so the feature gate
+    /// never runs on a stopped drain's (or another workspace's) floor.
+    #[test]
+    fn resetting_lane_state_clears_the_relay_capability() {
+        RELAY_CAPABILITY.set(Some(yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        }));
+        reset_published_lane_state(None);
+        assert_eq!(RELAY_CAPABILITY.get(), None);
+    }
+
+    /// A drain spawn seeds the levels from what its own workspace persisted, read in the same
+    /// step as the reset, so a respawn on the same account never shows "no floor"; another
+    /// workspace, or a DB that can't be read, starts from nothing.
+    #[test]
+    fn a_drain_starts_from_the_floor_its_workspace_persisted() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let levels = yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 1,
+        };
+        state::record_relay_capability(CrsqlDb::open(&path).unwrap().conn(), a, levels).unwrap();
+        assert_eq!(persisted_relay_capability(&path, a), Some(levels));
+        assert_eq!(persisted_relay_capability(&path, b), None);
+        assert_eq!(
+            persisted_relay_capability(&path.with_file_name("missing/none.db"), a),
+            None
+        );
+    }
+
+    /// Each cycle's levels reach lane status and are persisted for the next drain start; a
+    /// cycle that learned none (the relay was unreachable) keeps what was there.
+    #[test]
+    fn a_cycle_publishes_and_persists_the_relay_levels_it_learned() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        let workspace = Uuid::new_v4();
+        let cell = PubCell::new();
+        let levels = yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        };
+        publish_relay_capability(&cell, conn, workspace, None);
+        assert_eq!(cell.get(), None);
+        assert_eq!(state::relay_capability(conn, workspace).unwrap(), None);
+        publish_relay_capability(&cell, conn, workspace, Some(levels));
+        assert_eq!(cell.get(), Some(levels));
+        assert_eq!(
+            state::relay_capability(conn, workspace).unwrap(),
+            Some(levels)
+        );
+        publish_relay_capability(&cell, conn, workspace, None);
+        assert_eq!(
+            cell.get(),
+            Some(levels),
+            "an unreachable cycle keeps the floor"
+        );
+    }
+
+    /// The drain's connection prep runs the boot heal: a synced table left unconverted is a
+    /// CRR, and its setup failure cleared, before the first cycle.
+    #[test]
+    fn drain_connection_prep_converts_unconverted_sync_tables() {
+        let (_dir, path, _svc) = live_db_with_unconverted_shares(SHARES_TABLE);
+        let failures = crate::db_service::SyncTableSetupFailures::new();
+        failures.add(shares_migration(SHARES_TABLE));
+        let db = CrsqlDb::open(&path).unwrap();
+        prepare_drain_connection(db.conn(), &failures).unwrap();
+        assert!(schema::is_crr(db.conn(), "shares").unwrap());
+        assert!(failures.tables().is_empty());
+    }
+
+    #[test]
+    fn relay_capability_dto_names_both_levels() {
+        let dto = RelayCapabilityDto::from(yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        });
+        assert_eq!(
+            serde_json::to_value(dto).unwrap(),
+            serde_json::json!({ "required": 1, "requested": 2 })
+        );
     }
 
     #[test]

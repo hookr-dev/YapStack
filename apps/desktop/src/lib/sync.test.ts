@@ -23,7 +23,9 @@ import {
   nextPollDelayMs,
   AUTH_EXPIRED_FETCH_COPY,
   ON_DEVICE_REPROBE_MS,
+  syncCapabilityFloorReached,
   type AudioPartPrepare,
+  type SyncStatus,
 } from "./sync";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -710,5 +712,69 @@ describe("prepareAudioPart / cancelAudioPart / enqueueAudioForDictation IPC", ()
     invokeMock.mockReset();
     enqueueAudioForDictation("");
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("syncCapabilityFloorReached", () => {
+  const status = (over: Partial<SyncStatus>): SyncStatus => ({
+    phase: "connected",
+    serverUrl: "https://relay.example",
+    email: "user@example.com",
+    deviceFingerprint: null,
+    roster: [],
+    vaultKeyEpoch: 1,
+    rosterFingerprint: null,
+    syncEnabled: true,
+    lastError: null,
+    pendingEntries: 0,
+    pendingBytes: 0,
+    ackedThisSession: 0,
+    lastSuccess: null,
+    pullBehind: 0,
+    audioUploadOutstanding: 0,
+    audioBackfillOutstanding: 0,
+    audioUploadFailed: 0,
+    audioUploadedTotal: 0,
+    audioBackfillComplete: true,
+    ...over,
+  });
+  const floor = (required: number) => ({ relayCapability: { required, requested: required } });
+
+  it.each([
+    // [what, status, syncConfig.syncEnabled, level, enabled]
+    ["level 0 is never gated", status(floor(0)), true, 0, true],
+    ["a negative level is never gated", status({}), true, -1, true],
+    ["no status yet, sync never turned on: writes freely", null, false, 1, true],
+    ["no status yet, sync on: off until the first poll", null, true, 1, false],
+    ["no status yet, level 0", null, true, 0, true],
+    ["sync off writes freely", status({ syncEnabled: false, ...floor(0) }), true, 1, true],
+    ["the status wins over the config", status(floor(0)), false, 1, false],
+    ["floor below the level", status(floor(0)), true, 1, false],
+    ["floor at the level", status(floor(1)), true, 1, true],
+    ["floor above the level", status(floor(2)), true, 1, true],
+    ["floor one short", status(floor(1)), true, 2, false],
+    ["unknown floor (null) counts as 0", status({ relayCapability: null }), true, 1, false],
+    ["unknown floor (older snapshot) counts as 0", status({}), true, 1, false],
+    [
+      "requested alone never enables",
+      status({ relayCapability: { required: 0, requested: 5 } }),
+      true,
+      1,
+      false,
+    ],
+  ] as const)("%s", (_what, s, configEnabled, level, enabled) => {
+    expect(syncCapabilityFloorReached(s, configEnabled, level)).toBe(enabled);
+  });
+
+  it("never reads the roster", () => {
+    const peer = {
+      fingerprint: "AAAA",
+      isSelf: false,
+      pending: false,
+      label: "Old laptop",
+      platform: "windows",
+    };
+    expect(syncCapabilityFloorReached(status({ roster: [peer], ...floor(1) }), true, 1)).toBe(true);
+    expect(syncCapabilityFloorReached(status({ roster: [], ...floor(0) }), true, 1)).toBe(false);
   });
 });
