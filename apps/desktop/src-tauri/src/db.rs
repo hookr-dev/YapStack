@@ -10,6 +10,35 @@ pub struct Migration {
     pub description: &'static str,
     pub sql: &'static str,
     pub kind: MigrationKind,
+    /// Every schema object this migration creates, or empty: each table with each
+    /// of its columns, each index, trigger and virtual table. A test checks the
+    /// list equals what the migration really creates. When the migration can't be
+    /// applied and all of them are already present with the definitions a fresh
+    /// install of the migration list gives them (on a CRR DB, a synced table must
+    /// also be a CRR with current triggers), the runner records it as applied
+    /// instead of failing it on every boot. Declare them only for a migration whose
+    /// schema can land out of band (a runtime schema patch, cutover) and whose data
+    /// changes that path also makes; an empty list never records a failed migration.
+    pub schema_effects: &'static [SchemaObject],
+}
+
+/// A schema object a [`Migration`] creates. The runner compares it with the same
+/// object in a fresh-install reference schema (`db_service::schema_effects_present`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaObject {
+    /// An ordinary table: same columns, each in the same shape (type, primary-key
+    /// place, NOT NULL, default; up to what a CRR cutover changes). Declare its
+    /// columns too.
+    Table(&'static str),
+    /// A column `(table, column)`: same shape as in the reference.
+    Column(&'static str, &'static str),
+    /// Same normalized `CREATE INDEX` statement.
+    Index(&'static str),
+    /// Same normalized `CREATE TRIGGER` statement, body included.
+    Trigger(&'static str),
+    /// Same normalized `CREATE VIRTUAL TABLE` statement (an FTS table's options
+    /// decide what it stores).
+    VirtualTable(&'static str),
 }
 
 /// How [`crate::db_service::run_migrations`] treats a migration on a cr-sqlite
@@ -637,6 +666,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_sessions_created ON sessions(created_at DESC);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 2,
@@ -659,6 +689,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_sessions_pinned ON sessions(is_pinned, pinned_at DESC);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 3,
@@ -670,6 +701,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE segments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 4,
@@ -695,6 +727,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'transcription';
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 5,
@@ -704,6 +737,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN wav_duration_seconds REAL;
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 6,
@@ -723,6 +757,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_shares_folder ON shares(folder_id);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 7,
@@ -740,6 +775,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id, created_at ASC);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 8,
@@ -763,6 +799,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 9,
@@ -787,6 +824,7 @@ pub fn migrations() -> Vec<Migration> {
             SELECT id, folder_id FROM sessions WHERE folder_id IS NOT NULL;
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 10,
@@ -810,6 +848,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_dictation_history_slot ON dictation_history(slot_id);
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 11,
@@ -837,6 +876,24 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX idx_session_tags_session ON session_tags(session_id);
         "#,
             kind: MigrationKind::Plain,
+            // Dev DBs with misaligned `_sqlx_migrations` history carry these tables
+            // while v11 is unrecorded; on a CRR DB the guard refuses v11 outright.
+            schema_effects: &[
+                SchemaObject::Table("tags"),
+                SchemaObject::Column("tags", "id"),
+                SchemaObject::Column("tags", "name"),
+                SchemaObject::Column("tags", "color"),
+                SchemaObject::Column("tags", "created_at"),
+                SchemaObject::Index("idx_tags_name"),
+                SchemaObject::Table("session_tags"),
+                SchemaObject::Column("session_tags", "session_id"),
+                SchemaObject::Column("session_tags", "tag_id"),
+                SchemaObject::Column("session_tags", "source"),
+                SchemaObject::Column("session_tags", "confidence"),
+                SchemaObject::Column("session_tags", "created_at"),
+                SchemaObject::Index("idx_session_tags_tag"),
+                SchemaObject::Index("idx_session_tags_session"),
+            ],
         },
         Migration {
             version: 12,
@@ -951,6 +1008,26 @@ pub fn migrations() -> Vec<Migration> {
             END;
         "#,
             kind: MigrationKind::Plain,
+            // db.ts `ensureRuntimeSchema` creates the same tables, backfill and
+            // triggers.
+            schema_effects: &[
+                SchemaObject::VirtualTable("segments_fts"),
+                SchemaObject::VirtualTable("notes_fts"),
+                SchemaObject::VirtualTable("sessions_fts"),
+                SchemaObject::VirtualTable("dictations_fts"),
+                SchemaObject::Trigger("segments_ai"),
+                SchemaObject::Trigger("segments_ad"),
+                SchemaObject::Trigger("segments_au"),
+                SchemaObject::Trigger("notes_ai"),
+                SchemaObject::Trigger("notes_ad"),
+                SchemaObject::Trigger("notes_au"),
+                SchemaObject::Trigger("sessions_ai"),
+                SchemaObject::Trigger("sessions_ad"),
+                SchemaObject::Trigger("sessions_au"),
+                SchemaObject::Trigger("dictations_ai"),
+                SchemaObject::Trigger("dictations_ad"),
+                SchemaObject::Trigger("dictations_au"),
+            ],
         },
         Migration {
             version: 13,
@@ -959,6 +1036,9 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT;
         "#,
             kind: MigrationKind::Plain,
+            // db.ts `ensureRuntimeSchema`, or on a CRR DB the boot self-heal
+            // (`OUT_OF_BAND_ALTERS`), adds the column.
+            schema_effects: &[SchemaObject::Column("chat_messages", "tool_calls")],
         },
         Migration {
             version: 14,
@@ -997,6 +1077,16 @@ pub fn migrations() -> Vec<Migration> {
                 ON chat_messages(context_key, send_id, sequence);
         "#,
             kind: MigrationKind::Plain,
+            // db.ts `ensureRuntimeSchema` adds the columns (on a CRR DB the boot
+            // self-heal does), and runs the backfill and the index on every launch.
+            schema_effects: &[
+                SchemaObject::Column("chat_messages", "send_id"),
+                SchemaObject::Column("chat_messages", "sequence"),
+                SchemaObject::Column("chat_messages", "tool_call_id"),
+                SchemaObject::Column("chat_messages", "observation"),
+                SchemaObject::Column("chat_messages", "status"),
+                SchemaObject::Index("idx_chat_messages_send"),
+            ],
         },
         Migration {
             version: 15,
@@ -1053,6 +1143,7 @@ pub fn migrations() -> Vec<Migration> {
             WHERE wav_file_path IS NOT NULL;
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 16,
@@ -1068,6 +1159,7 @@ pub fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN recording_device_id TEXT;
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 17,
@@ -1088,6 +1180,7 @@ pub fn migrations() -> Vec<Migration> {
             );
         "#,
             kind: MigrationKind::Plain,
+            schema_effects: &[],
         },
         Migration {
             version: 18,
@@ -1131,6 +1224,7 @@ pub fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_audio_parts_session ON session_audio_parts(session_id, part_index);
         "#,
             kind: MigrationKind::SyncIndex,
+            schema_effects: &[],
         },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
