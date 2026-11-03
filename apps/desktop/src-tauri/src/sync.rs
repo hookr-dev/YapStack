@@ -1572,11 +1572,7 @@ fn clear_session() -> Result<(), String> {
     clear_session_from_store()?;
     // A signed-out state has no drain; clear any lingering auth-expired/blocked health and
     // push-progress so a subsequent sign-in does not inherit a stale status or backlog.
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    reset_published_lane_state();
     let mut g = cred_cache().write().unwrap_or_else(|e| e.into_inner());
     g.session = None;
     g.loaded = true;
@@ -1678,6 +1674,29 @@ pub struct SyncStatusDto {
     /// device at launch (and that the drain's boot heal hasn't converted since). Their
     /// peers' rows wait in the quarantine; lane status asks for a restart. Usually empty.
     sync_table_setup_failures: Vec<String>,
+    /// ADR 0006 §5.6: the workspace levels the relay last returned (persisted per
+    /// workspace, so known before the relay answers), or `None` while no drain runs or no
+    /// level is known yet. UX only: it enables features, never authorizes a push.
+    relay_capability: Option<RelayCapabilityDto>,
+}
+
+/// The workspace's sync capability levels as lane status shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayCapabilityDto {
+    /// The floor: the relay refuses a push of rows above this level.
+    required: i32,
+    /// The highest level a device asked the floor to rise to.
+    requested: i32,
+}
+
+impl From<yapstack_common::sync::SyncCapabilityLevels> for RelayCapabilityDto {
+    fn from(l: yapstack_common::sync::SyncCapabilityLevels) -> Self {
+        Self {
+            required: l.required_sync_capability,
+            requested: l.requested_sync_capability,
+        }
+    }
 }
 
 /// A sync capability notice (ADR 0006 §5.4, §5.7), tagged on `kind`.
@@ -3522,6 +3541,23 @@ fn roster_clears_capability_blockers(notice: &CapabilityNotice, devices: &[Devic
 /// The drain's latest version advisory (ADR 0006 §5.9), published for lane status.
 static VERSION_ADVISORY: PubCell<Option<VersionAdvisory>> = PubCell::new();
 
+/// The workspace's capability levels as the relay last returned them (ADR 0006 §5.4, §5.6),
+/// seeded from the persisted copy at drain start. For the UX feature gate only: it never
+/// authorizes a push, which the relay checks per batch.
+static RELAY_CAPABILITY: PubCell<Option<yapstack_common::sync::SyncCapabilityLevels>> =
+    PubCell::new();
+
+/// Clear every lane's published state, so a status poll never shows what a stopped drain,
+/// uploader or cleared session last published.
+fn reset_published_lane_state() {
+    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
+    DRAIN_PROGRESS.reset();
+    CAPABILITY_NOTICE.reset();
+    RELAY_CAPABILITY.reset();
+    VERSION_ADVISORY.reset();
+    AUDIO_LANE.reset();
+}
+
 /// The notice a drain starts with, from the levels persisted by earlier runs: the nudge
 /// survives a restart while the relay is unreachable. Refusals and holds are not seeded;
 /// they come back from the first cycle that meets them.
@@ -4050,11 +4086,7 @@ fn spawn_drain(
     // A fresh drain starts from a clean health slate (clears any lingering auth-expired
     // / blocked state from a previously stopped drain, e.g. after a re-login) and a clean
     // progress slate (session ack count resets; no stale backlog shown, T024).
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    reset_published_lane_state();
     // Re-arm the boot-stagger latch BEFORE the audio lane is spawned, so THIS drain's first
     // cycle (not a previous spawn's) is what releases the backfill walk.
     reset_first_drain_cycle();
@@ -4174,8 +4206,11 @@ fn spawn_drain(
             let mut advisory = AdvisoryRefresher::new(transport.http_client(), info_url);
             // ADR 0006 §5: start from what earlier runs persisted for this workspace, so the
             // nudge and the version advisory show even before the relay answers.
+            let persisted_levels =
+                yapstack_sync::state::relay_capability(conn, tenant_id).unwrap_or(None);
+            RELAY_CAPABILITY.set(persisted_levels);
             CAPABILITY_NOTICE.set_if_changed(seeded_capability_notice(
-                yapstack_sync::state::relay_capability(conn, tenant_id).unwrap_or(None),
+                persisted_levels,
                 yapstack_sync::SYNC_CAPABILITY_LEVEL,
             ));
             let mut last_min_client_version =
@@ -4467,6 +4502,7 @@ fn spawn_drain(
                     yapstack_sync::SYNC_CAPABILITY_LEVEL,
                 ));
                 if let Some(levels) = report.relay_capability {
+                    RELAY_CAPABILITY.set(Some(levels));
                     if let Err(e) =
                         yapstack_sync::state::record_relay_capability(conn, tenant_id, levels)
                     {
@@ -5567,6 +5603,7 @@ async fn build_status_dto(session: &Session) -> SyncStatusDto {
         capability_notice: capability_notice_dto(CAPABILITY_NOTICE.get(), &fingerprints),
         version_advisory: VERSION_ADVISORY.get(),
         sync_table_setup_failures: crate::db_service::SyncTableSetupFailures::process().tables(),
+        relay_capability: RELAY_CAPABILITY.get().map(RelayCapabilityDto::from),
     }
 }
 
@@ -5920,6 +5957,7 @@ pub async fn sync_status() -> Result<SyncStatusDto, String> {
             capability_notice: None,
             version_advisory: None,
             sync_table_setup_failures: vec![],
+            relay_capability: None,
         }),
         // Signed in: surface the live device index (incl. pending approvals, §7.5).
         Some(s) => Ok(build_status_dto(&s).await),
@@ -6182,11 +6220,7 @@ pub async fn sync_disable(runtime: State<'_, SyncRuntimeState>) -> Result<SyncSt
     }
     // Clear the lanes' published state so the next status poll does not show a stale
     // backlog or health from the drain that just stopped.
-    DRAIN_HEALTH.set_if_changed(DrainHealth::Ok);
-    DRAIN_PROGRESS.reset();
-    CAPABILITY_NOTICE.reset();
-    VERSION_ADVISORY.reset();
-    AUDIO_LANE.reset();
+    reset_published_lane_state();
     let session = update_session(|s| s.sync_enabled = false)?;
     Ok(build_status_dto(&session).await)
 }
@@ -8953,6 +8987,93 @@ mod tests {
                 "account switch must RESET the push watermark"
             );
         }
+    }
+
+    /// ADR 0006 §5.4: an account switch resets the push watermark, so the whole history is
+    /// captured again for the new workspace. Rows of a post-cutover table are captured at
+    /// their table's level (held until the new workspace's floor reaches it), and the floor
+    /// the old workspace reached doesn't carry over: the new one starts from nothing.
+    #[test]
+    fn account_switch_recaptures_gated_rows_at_their_level_and_starts_the_floor_from_nothing() {
+        let (_dir, path, svc) = cutover_fixture();
+        perform_cutover(&path, &svc).expect("cutover → CRR live DB");
+        let (tenant_a, tenant_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let levels = yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 1,
+        };
+        let db = CrsqlDb::open(&path).unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE t_new (id TEXT PRIMARY KEY, v TEXT); \
+             INSERT INTO t_new VALUES ('n1', 'gated');",
+        )
+        .unwrap();
+        schema::ensure_crr(conn, "t_new").unwrap();
+        reconcile_account_binding(&path, tenant_a).unwrap();
+        state::record_relay_capability(conn, tenant_a, levels).unwrap();
+
+        reconcile_account_binding(&path, tenant_b).expect("account switch A→B");
+        let cipher = ChangesetCipher::new(
+            [7u8; 32],
+            1,
+            tenant_b,
+            SYNC_SCHEMA_VERSION,
+            CRSQLITE_ENGINE_VERSION,
+        );
+        outbox::ensure_outbox_table(conn).unwrap();
+        let captured = outbox::enqueue_local(
+            conn,
+            &cipher,
+            Uuid::new_v4(),
+            SYNC_SCHEMA_VERSION as i32,
+            CRSQLITE_ENGINE_VERSION as i32,
+        )
+        .unwrap();
+        assert!(!captured.is_empty(), "the history is captured again");
+        let entry_levels: Vec<i32> = conn
+            .prepare("SELECT required_sync_capability FROM _yapstack_outbox ORDER BY client_seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        assert!(entry_levels.contains(&0), "the cutover history ships at 0");
+        assert_eq!(
+            entry_levels.iter().max(),
+            Some(&schema::table_sync_capability("t_new")),
+            "the t_new row is held at its table's level: {entry_levels:?}"
+        );
+        assert_eq!(state::relay_capability(conn, tenant_b).unwrap(), None);
+        assert_eq!(
+            state::relay_capability(conn, tenant_a).unwrap(),
+            Some(levels),
+            "kept for workspace A, never read for B"
+        );
+    }
+
+    /// Sign-out, turning sync off and a new drain all clear the published relay levels, so
+    /// the feature gate never runs on a stopped drain's (or another workspace's) floor.
+    #[test]
+    fn resetting_lane_state_clears_the_relay_capability() {
+        RELAY_CAPABILITY.set(Some(yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        }));
+        reset_published_lane_state();
+        assert_eq!(RELAY_CAPABILITY.get(), None);
+    }
+
+    #[test]
+    fn relay_capability_dto_names_both_levels() {
+        let dto = RelayCapabilityDto::from(yapstack_common::sync::SyncCapabilityLevels {
+            required_sync_capability: 1,
+            requested_sync_capability: 2,
+        });
+        assert_eq!(
+            serde_json::to_value(dto).unwrap(),
+            serde_json::json!({ "required": 1, "requested": 2 })
+        );
     }
 
     #[test]

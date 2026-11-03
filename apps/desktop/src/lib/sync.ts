@@ -181,6 +181,21 @@ export interface SyncStatus {
    *  on this device. Non-empty shows the "restart to try again" notice. Optional so older
    *  status snapshots read as none. */
   syncTableSetupFailures?: string[];
+  /** ADR 0006 §5.6: the workspace's levels as the relay last returned them (persisted per
+   *  workspace), or null while no drain runs. UX only: read by
+   *  {@link syncCapabilityFloorReached}, never an authorization to publish. */
+  relayCapability?: { required: number; requested: number } | null;
+}
+
+/**
+ * ADR 0006 §5.6, the UX-only feature gate: whether a feature that writes a table gated at
+ * `level` is enabled. Always on a device that isn't syncing (the push path holds its rows
+ * once sync is enabled) and for level 0; otherwise once the floor the relay last returned
+ * is at least `level`, an unknown floor counting as 0. It never reads the roster.
+ */
+export function syncCapabilityFloorReached(status: SyncStatus | null, level: number): boolean {
+  if (level <= 0 || !status?.syncEnabled) return true;
+  return (status.relayCapability?.required ?? 0) >= level;
 }
 
 /** One device holding up a sync capability raise (it reports a lower level). */

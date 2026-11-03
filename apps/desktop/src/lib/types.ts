@@ -1122,6 +1122,18 @@ export type ParakeetVariantDto = "TdtV3" |
 "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 /**
+ * The workspace's sync capability levels as lane status shows them.
+ */
+export type RelayCapabilityDto = {
+/**
+ * The floor: the relay refuses a push of rows above this level.
+ */
+required: number;
+/**
+ * The highest level a device asked the floor to rise to.
+ */
+requested: number }
+/**
  * Typed probe failure classes (mirrors `RelayProbeError` in `lib/sync.ts`). Serialized
  * tagged on `kind` (kebab-case) so TS can discriminate. Every variant carries the
  * verbatim `raw` detail — errors are surfaced to the user, never swallowed.
@@ -1280,7 +1292,13 @@ versionAdvisory: VersionAdvisory | null;
  * device at launch (and that the drain's boot heal hasn't converted since). Their
  * peers' rows wait in the quarantine; lane status asks for a restart. Usually empty.
  */
-syncTableSetupFailures: string[] }
+syncTableSetupFailures: string[];
+/**
+ * ADR 0006 §5.6: the workspace levels the relay last returned (persisted per
+ * workspace, so known before the relay answers), or `None` while no drain runs or no
+ * level is known yet. UX only: it enables features, never authorizes a push.
+ */
+relayCapability: RelayCapabilityDto | null }
 export type TranscriptionStatusDto = { initialized: boolean }
 /**
  * Advisory that this client is behind the relay's published minimum (mirrors
