@@ -1872,6 +1872,9 @@ const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
 /// Sidecar work is not preemptible once started, so keeping historical jobs
 /// short bounds how long newly-arrived live speech can wait behind one.
 const BACKFILL_JOB_QUANTUM_SECS: f32 = 5.0;
+/// Shortest piece a length split may leave. Parakeet decodes nothing for
+/// most sub-2 s fragments cut out of running speech.
+const MIN_SPLIT_PIECE_SECS: f32 = 2.0;
 /// A chunk cut for length rather than at a pause may end this much before
 /// its cap, at the quietest Silero frame. Cutting mid-word made Parakeet
 /// return nothing for the chunk that started with the rest of the word.
@@ -2120,21 +2123,29 @@ fn pause_search_window_ms() -> f32 {
 
 /// Where a chunk over `[start, cap)` that has to end by `cap` should end:
 /// the middle of the quietest frame of `probabilities` in the
-/// `PAUSE_SEARCH_WINDOW` before `cap`. Frame `k` covers samples
-/// `[k * frame_samples, (k + 1) * frame_samples)`. `None` when no frame's
-/// middle lies in `(start, cap]`.
+/// `PAUSE_SEARCH_WINDOW` before `cap`, in samples of a buffer at
+/// `sample_rate`. Frame `k` covers `[frame_start_sample(k),
+/// frame_start_sample(k + 1))`. `None` when no frame's middle lies in
+/// `(start, cap]`.
 fn quietest_frame_midpoint(
     probabilities: &[f32],
-    frame_samples: usize,
+    sample_rate: u32,
     start: usize,
     cap: usize,
 ) -> Option<usize> {
-    let half = frame_samples / 2;
-    let first = (start + frame_samples - half) / frame_samples;
-    let end = cap
-        .checked_sub(half)
-        .map_or(0, |c| c / frame_samples + 1)
-        .min(probabilities.len());
+    use super::silero_vad::{frame_at_sample, frame_start_sample};
+    let mid = |k: usize| {
+        (frame_start_sample(k, sample_rate) + frame_start_sample(k + 1, sample_rate)) / 2
+    };
+    let mut first = frame_at_sample(start, sample_rate);
+    if mid(first) <= start {
+        first += 1;
+    }
+    let mut last = frame_at_sample(cap, sample_rate);
+    if mid(last) > cap {
+        last = last.checked_sub(1)?;
+    }
+    let end = (last + 1).min(probabilities.len());
     if first >= end {
         return None;
     }
@@ -2143,7 +2154,7 @@ fn quietest_frame_midpoint(
         super::silero_vad::FRAME_DURATION_SECS * 1000.0,
         pause_search_window_ms(),
     )?;
-    Some((first + quietest) * frame_samples + half)
+    Some(mid(first + quietest))
 }
 
 /// Ring-buffer position where a live chunk over `[start_pos, cap_pos)` that
@@ -2176,7 +2187,10 @@ fn quietest_recent_frame_pos(
 
 /// Bound each backfill job to `BACKFILL_JOB_QUANTUM_SECS`, ending each piece
 /// at the quietest frame before its bound (`quietest_frame_midpoint`), or
-/// exactly at the bound when `probabilities` is empty.
+/// exactly at the bound when `probabilities` is empty. Every piece of a split
+/// chunk is at least `MIN_SPLIT_PIECE_SECS`: the bound is pulled in so the
+/// rest of the chunk can still fill one, and no cut lands earlier than that
+/// minimum after the piece's start.
 fn split_backfill_chunks(
     chunks: Vec<VadBackfillChunk>,
     probabilities: &[f32],
@@ -2186,15 +2200,15 @@ fn split_backfill_chunks(
     if max_samples == 0 {
         return chunks;
     }
-    let frame_samples = (super::silero_vad::FRAME_DURATION_SECS * sample_rate as f32) as usize;
+    let min_samples = (MIN_SPLIT_PIECE_SECS * sample_rate as f32) as usize;
 
     let mut split = Vec::new();
     for chunk in chunks {
         let mut start = chunk.start;
         while chunk.end - start > max_samples {
-            let cap = start + max_samples;
-            let end =
-                quietest_frame_midpoint(probabilities, frame_samples, start, cap).unwrap_or(cap);
+            let cap = (start + max_samples).min(chunk.end - min_samples);
+            let end = quietest_frame_midpoint(probabilities, sample_rate, start + min_samples, cap)
+                .unwrap_or(cap);
             split.push(VadBackfillChunk { start, end });
             start = end;
         }
@@ -2225,10 +2239,11 @@ fn backfill_chunks_from_probabilities(
     // One probability covers FRAME_DURATION_SECS (32 ms) of audio. Map
     // each frame back to the corresponding slice in the *original*
     // (un-resampled) buffer so chunk boundaries are expressed in the
-    // caller's coordinate system.
-    let frame_samples_original =
-        (super::silero_vad::FRAME_DURATION_SECS * sample_rate as f32) as usize;
-    if frame_samples_original == 0 {
+    // caller's coordinate system. The mapping is exact: at 44.1 kHz a frame
+    // is 1411.2 samples, and rounding it to 1411 drifted every boundary of
+    // a five-minute backfill by up to 42 ms.
+    use super::silero_vad::{frame_at_sample, frame_start_sample};
+    if sample_rate == 0 {
         return Vec::new();
     }
 
@@ -2252,8 +2267,8 @@ fn backfill_chunks_from_probabilities(
     let mut prev_chunk_end: usize = 0;
 
     for (frame_idx, &prob) in probabilities.iter().enumerate() {
-        let w_start = frame_idx * frame_samples_original;
-        let w_end = ((frame_idx + 1) * frame_samples_original).min(total_samples);
+        let w_start = frame_start_sample(frame_idx, sample_rate);
+        let w_end = frame_start_sample(frame_idx + 1, sample_rate).min(total_samples);
         if w_start >= total_samples {
             break;
         }
@@ -2265,20 +2280,21 @@ fn backfill_chunks_from_probabilities(
                 silence_run = 0;
                 if speech_run >= max_chunk_windows {
                     // The audio after the cut opens the next chunk.
-                    let cut = quietest_frame_midpoint(
-                        probabilities,
-                        frame_samples_original,
-                        speech_start,
-                        w_end,
-                    )
-                    .unwrap_or(w_end);
+                    let cut =
+                        quietest_frame_midpoint(probabilities, sample_rate, speech_start, w_end)
+                            .unwrap_or(w_end);
                     chunks.push(VadBackfillChunk {
                         start: speech_start,
                         end: cut,
                     });
                     prev_chunk_end = cut;
                     speech_start = cut;
-                    speech_run = (w_end - cut) / frame_samples_original;
+                    // Frames after the one the cut fell in.
+                    speech_run = if cut < w_end {
+                        frame_idx - frame_at_sample(cut, sample_rate)
+                    } else {
+                        0
+                    };
                 }
             } else {
                 silence_run += 1;
@@ -6211,6 +6227,73 @@ mod tests {
 
         assert_eq!(chunks[0].end, dip * FRAME_16K + FRAME_16K / 2, "{chunks:?}");
         assert_tiles(&chunks, 0, total);
+    }
+
+    /// A VAD chunk a little over one quantum used to leave a remainder piece
+    /// of a few hundred ms (here 0.4 s after the dip at 4.9 s), which every
+    /// engine decodes to nothing. Every piece of a split chunk is now at
+    /// least `MIN_SPLIT_PIECE_SECS` and at most one quantum, with or
+    /// without probabilities to steer the cut.
+    #[test]
+    fn backfill_quantum_split_leaves_no_short_piece() {
+        let sr = 16_000u32;
+        let min = (MIN_SPLIT_PIECE_SECS * sr as f32) as usize;
+        let quantum = (BACKFILL_JOB_QUANTUM_SECS * sr as f32) as usize;
+        let (dip_probs, _) = speech_with_dip(5.3, 4.9);
+        let cases: Vec<(usize, Vec<f32>)> = vec![
+            (dip_probs.len() * FRAME_16K, dip_probs),
+            (6 * sr as usize + 300, Vec::new()),
+            (11 * sr as usize, Vec::new()),
+        ]
+        .into_iter()
+        .chain((10..=30).map(|half_secs| {
+            let probs = uneven_speech((half_secs as f32 * 0.5 / FRAME_SECS) as usize);
+            (probs.len() * FRAME_16K, probs)
+        }))
+        .collect();
+
+        for (total, probs) in cases {
+            let pieces = split_backfill_chunks(
+                vec![VadBackfillChunk {
+                    start: 0,
+                    end: total,
+                }],
+                &probs,
+                sr,
+            );
+            assert_tiles(&pieces, 0, total);
+            for p in &pieces {
+                let len = p.end - p.start;
+                assert!(
+                    (min..=quantum).contains(&len) || pieces.len() == 1,
+                    "{total}: {pieces:?}"
+                );
+            }
+        }
+    }
+
+    /// At 44.1 kHz a Silero frame is 1411.2 samples. Rounding it to 1411
+    /// placed a cut near the end of a five-minute backfill ~41 ms (1800
+    /// samples) before the pause it was aimed at.
+    #[test]
+    fn backfill_cut_lands_on_the_pause_late_in_a_44k_buffer() {
+        let sr = 44_100u32;
+        let frame = FRAME_SECS as f64 * sr as f64;
+        let mut probs = uneven_speech((300.0 / FRAME_SECS) as usize);
+        let dip = (293.5 / FRAME_SECS) as usize;
+        probs[dip] = 0.05;
+        let start = (290.0 * sr as f32) as usize;
+        let end = (296.0 * sr as f32) as usize;
+
+        let pieces = split_backfill_chunks(vec![VadBackfillChunk { start, end }], &probs, sr);
+
+        let expected = ((dip as f64 + 0.5) * frame).round() as usize;
+        assert!(
+            pieces[0].end.abs_diff(expected) <= 1,
+            "cut at {}, pause middle at {expected}",
+            pieces[0].end
+        );
+        assert_tiles(&pieces, start, end);
     }
 
     /// A minute of unbroken speech: forced chunks and then backfill quanta
