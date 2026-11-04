@@ -6352,6 +6352,57 @@ mod tests {
         }
     }
 
+    /// The chunk after the first forced cut in LibriSpeech
+    /// `1320-122612-0000_to_0002` (CC BY 4.0). Cut at the 10 s cap it was
+    /// 10.432-13.504 s, began mid-word, and Parakeet returned nothing for it.
+    /// Cut at the pause search it is 9.040-13.504 s and the first decode is
+    /// still empty; the sidecar's empty-decode retry recovers it.
+    /// The audio isn't stored in the repo; point the env vars at a local copy
+    /// (16 kHz mono WAV), a model dir, and a built sidecar.
+    #[tokio::test]
+    #[ignore = "needs YAPSTACK_TEST_FORCED_CUT_WAV, YAPSTACK_TEST_PARAKEET_DIR and YAPSTACK_TEST_SIDECAR"]
+    async fn chunk_after_a_forced_cut_transcribes() {
+        use yapstack_common::types::EngineKind;
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let wav = var("YAPSTACK_TEST_FORCED_CUT_WAV");
+        let model = std::path::PathBuf::from(var("YAPSTACK_TEST_PARAKEET_DIR"));
+        let sidecar = std::path::PathBuf::from(var("YAPSTACK_TEST_SIDECAR"));
+
+        let mut reader = hound::WavReader::open(&wav).expect("open wav");
+        let sr = reader.spec().sample_rate;
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("sample") as f32 / 32768.0)
+            .collect();
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let probs = SileroVad::new().expect("silero").score_all(&samples, sr);
+        let chunks = backfill_chunks_from_probabilities(&probs, samples.len(), sr, &tuning);
+        let after_cut = chunks[1];
+        assert_eq!(chunks[0].end, after_cut.start, "{chunks:?}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chunk.wav");
+        yapstack_audio::export::write_wav(&samples[after_cut.start..after_cut.end], sr, 1, &path)
+            .expect("write chunk");
+        let client = yapstack_transcription::TranscriptionClient::spawn(
+            &sidecar,
+            EngineKind::Parakeet,
+            &model,
+            None,
+            None,
+        )
+        .await
+        .expect("spawn sidecar");
+        let result = client.transcribe(&path, None).await.expect("transcribe");
+        let _ = client.shutdown().await;
+        assert!(
+            !result.text.trim().is_empty(),
+            "empty transcript for {:.3}-{:.3} s",
+            after_cut.start as f32 / sr as f32,
+            after_cut.end as f32 / sr as f32
+        );
+    }
+
     #[test]
     fn stop_tail_samples_are_frame_aligned() {
         assert_eq!(tail_samples_for(48_000, 2), 28_800);

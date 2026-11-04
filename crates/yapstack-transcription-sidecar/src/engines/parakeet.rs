@@ -188,19 +188,24 @@ impl TranscriptionBackend for ParakeetBackend {
         _ = opts.language;
 
         let start = std::time::Instant::now();
-        let (transcribe_input, diarize_input) = if opts.diarization {
-            (mono_16k.clone(), Some(mono_16k))
-        } else {
-            (mono_16k, None)
+        let mut decode = |samples: &[f32]| {
+            model
+                .transcribe_samples(
+                    samples.to_vec(),
+                    PARAKEET_SAMPLE_RATE,
+                    1,
+                    Some(TimestampMode::Words),
+                )
+                .map(|r| r.tokens)
+                .map_err(|e| format!("parakeet transcription failed: {e}"))
         };
-        let result = model
-            .transcribe_samples(
-                transcribe_input,
-                PARAKEET_SAMPLE_RATE,
-                1,
-                Some(TimestampMode::Words),
-            )
-            .map_err(|e| format!("parakeet transcription failed: {e}"))?;
+        let mut tokens = decode(&mono_16k)?;
+        if word_count(&tokens) == 0 && empty_decode_is_suspect(&mono_16k) {
+            if let Some(retried) = retry_empty_decode(&mono_16k, &mut decode) {
+                tokens = retried;
+            }
+        }
+        let diarize_input = opts.diarization.then_some(mono_16k);
         let elapsed_ms = start.elapsed().as_millis();
         let rtfx = if elapsed_ms > 0 {
             (audio_seconds * 1000.0) / elapsed_ms as f32
@@ -209,12 +214,12 @@ impl TranscriptionBackend for ParakeetBackend {
         };
         info!(
             "parakeet transcribe: {} tokens in {} ms ({:.1}x realtime)",
-            result.tokens.len(),
+            tokens.len(),
             elapsed_ms,
             rtfx
         );
 
-        let segments = group_tokens_into_segments(&result.tokens);
+        let segments = group_tokens_into_segments(&tokens);
         let mut text = String::new();
         let mut filtered: Vec<TranscriptSegment> = Vec::with_capacity(segments.len());
         for seg in segments {
@@ -719,6 +724,103 @@ fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegmen
     }
 }
 
+/// An empty decode is retried only on a chunk at least this long...
+const RETRY_MIN_SECS: f32 = 2.0;
+/// ...whose RMS is at least this, so silence and near-silence aren't
+/// pushed until the model says something.
+const RETRY_MIN_RMS: f32 = 0.003;
+/// A retry's result is kept only when it has at least this many words.
+const RETRY_MIN_WORDS: usize = 2;
+
+/// One retry of an empty decode: decode the same chunk again without its
+/// first `drop_start_ms` and last `drop_end_ms`. Parakeet sometimes returns
+/// nothing for a whole chunk of clear speech, and a slightly different
+/// window usually decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryRung {
+    drop_start_ms: usize,
+    drop_end_ms: usize,
+}
+
+const RETRY_LADDER: [RetryRung; 3] = [
+    RetryRung {
+        drop_start_ms: 0,
+        drop_end_ms: 200,
+    },
+    RetryRung {
+        drop_start_ms: 80,
+        drop_end_ms: 0,
+    },
+    RetryRung {
+        drop_start_ms: 0,
+        drop_end_ms: 400,
+    },
+];
+
+impl RetryRung {
+    /// The `[start, end)` sample range of a `len`-sample chunk to decode.
+    fn range(self, len: usize) -> (usize, usize) {
+        let samples = |ms: usize| ms * PARAKEET_SAMPLE_RATE as usize / 1000;
+        let end = len.saturating_sub(samples(self.drop_end_ms));
+        (samples(self.drop_start_ms).min(end), end)
+    }
+}
+
+fn word_count(tokens: &[TimedToken]) -> usize {
+    tokens
+        .iter()
+        .filter(|t| t.text.chars().any(char::is_alphanumeric))
+        .count()
+}
+
+/// Whether an empty decode of `samples` (16 kHz mono) is worth retrying.
+fn empty_decode_is_suspect(samples: &[f32]) -> bool {
+    if (samples.len() as f32) < RETRY_MIN_SECS * PARAKEET_SAMPLE_RATE as f32 {
+        return false;
+    }
+    let mean_square = samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32;
+    mean_square.sqrt() >= RETRY_MIN_RMS
+}
+
+/// Walk `RETRY_LADDER` with `decode` and return the first result with at
+/// least `RETRY_MIN_WORDS` words, its timestamps shifted back onto the
+/// whole chunk. `None` when no rung produced one. A rung whose decode
+/// fails counts as a miss.
+fn retry_empty_decode<F>(samples: &[f32], decode: &mut F) -> Option<Vec<TimedToken>>
+where
+    F: FnMut(&[f32]) -> Result<Vec<TimedToken>, String>,
+{
+    for (n, rung) in RETRY_LADDER.into_iter().enumerate() {
+        let (from, to) = rung.range(samples.len());
+        let started = std::time::Instant::now();
+        let result = decode(&samples[from..to]);
+        let ms = started.elapsed().as_millis();
+        let words = result.as_deref().map(word_count).unwrap_or(0);
+        let accepted = words >= RETRY_MIN_WORDS;
+        info!(
+            marker = "parakeet_empty_decode_retry",
+            rung = n + 1,
+            drop_start_ms = rung.drop_start_ms,
+            drop_end_ms = rung.drop_end_ms,
+            words,
+            accepted,
+            failed = result.is_err(),
+            ms,
+            "retried an empty decode"
+        );
+        if accepted {
+            let shift = from as f32 / PARAKEET_SAMPLE_RATE as f32;
+            let mut tokens = result.ok()?;
+            for t in &mut tokens {
+                t.start += shift;
+                t.end += shift;
+            }
+            return Some(tokens);
+        }
+    }
+    None
+}
+
 struct GroupedSegment {
     text: String,
     start_secs: f32,
@@ -777,6 +879,96 @@ fn group_tokens_into_segments(tokens: &[TimedToken]) -> Vec<GroupedSegment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Speech-level audio (RMS 0.1) of `secs` seconds at 16 kHz.
+    fn loud(secs: f32) -> Vec<f32> {
+        (0..(secs * 16_000.0) as usize)
+            .map(|i| if i % 2 == 0 { 0.1 } else { -0.1 })
+            .collect()
+    }
+
+    fn words(n: usize) -> Vec<TimedToken> {
+        (0..n)
+            .map(|i| tok("word", i as f32 * 0.3, i as f32 * 0.3 + 0.2))
+            .collect()
+    }
+
+    /// A decoder that returns nothing until its `succeed_on`-th call
+    /// (1-based), then `result`. Records each call's sample count.
+    fn fake_decoder(
+        succeed_on: usize,
+        result: Vec<TimedToken>,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+        impl FnMut(&[f32]) -> Result<Vec<TimedToken>, String>,
+    ) {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = calls.clone();
+        let decode = move |s: &[f32]| {
+            seen.borrow_mut().push(s.len());
+            if seen.borrow().len() >= succeed_on {
+                Ok(result.clone())
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        (calls, decode)
+    }
+
+    #[test]
+    fn retry_walks_the_ladder_in_order_and_takes_the_first_two_word_result() {
+        let audio = loud(3.0);
+        let (calls, mut decode) = fake_decoder(2, words(2));
+        let tokens = retry_empty_decode(&audio, &mut decode).expect("second rung decodes");
+        // Rung 1 trims 200 ms off the tail, rung 2 skips the first 80 ms.
+        assert_eq!(*calls.borrow(), vec![48_000 - 3_200, 48_000 - 1_280]);
+        // Rung 2's timestamps are moved back onto the whole chunk.
+        assert!((tokens[0].start - 0.08).abs() < 1e-6, "{:?}", tokens[0]);
+    }
+
+    #[test]
+    fn retry_rejects_one_word_results_and_stops_after_three_attempts() {
+        let audio = loud(3.0);
+        let (calls, mut decode) = fake_decoder(1, words(1));
+        assert!(retry_empty_decode(&audio, &mut decode).is_none());
+        assert_eq!(
+            *calls.borrow(),
+            vec![48_000 - 3_200, 48_000 - 1_280, 48_000 - 6_400]
+        );
+    }
+
+    #[test]
+    fn retry_treats_a_failed_decode_as_a_miss() {
+        let audio = loud(3.0);
+        let mut n = 0;
+        let mut decode = |_: &[f32]| {
+            n += 1;
+            if n == 1 {
+                Err("boom".to_string())
+            } else {
+                Ok(words(3))
+            }
+        };
+        assert_eq!(
+            retry_empty_decode(&audio, &mut decode).map(|t| t.len()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn only_long_enough_and_loud_enough_empty_decodes_are_retried() {
+        assert!(empty_decode_is_suspect(&loud(2.0)));
+        assert!(!empty_decode_is_suspect(&loud(1.99)));
+        let quiet: Vec<f32> = loud(3.0).iter().map(|x| x * 0.029).collect();
+        assert!(!empty_decode_is_suspect(&quiet));
+        assert!(!empty_decode_is_suspect(&vec![0.0; 48_000]));
+    }
+
+    #[test]
+    fn word_count_ignores_punctuation_tokens() {
+        assert_eq!(word_count(&[tok("Hi", 0.0, 0.1), tok(".", 0.1, 0.2)]), 1);
+        assert_eq!(word_count(&[]), 0);
+    }
 
     fn tok(text: &str, start: f32, end: f32) -> TimedToken {
         TimedToken {
