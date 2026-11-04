@@ -3550,8 +3550,9 @@ function createAppStore() {
           delete (state.settings as Record<string, unknown>)._legacyAi;
         }
         if (version < 33 && state.settings) {
-          // The fp32 Parakeet variant is gone; int8 is the only one.
+          // Whisper (ADR 0005) and the fp32 Parakeet variant are gone.
           const old = state.settings as Record<string, unknown>;
+          if (old.selectedEngine !== "Parakeet") old.selectedEngine = "Parakeet";
           if (old.selectedParakeetVariant === "TdtV3")
             old.selectedParakeetVariant = "TdtV3Int8";
         }

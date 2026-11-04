@@ -135,7 +135,8 @@ silently" decision and the Whisper settings coercion.
 - The fp32 `TdtV3` variant is removed. Intel Macs aren't shipped (release
   builds are aarch64 only), so int8 is the only variant on every target.
   Settings migration v33 rewrites a persisted `"TdtV3"` to `"TdtV3Int8"`.
-- The Whisper settings coercion (`coerceWhisperSettings` in the v32 migration
-  and in `merge`) and the one-time "Whisper has been removed" notice are
-  removed. Startup always initializes Parakeet regardless of the persisted
-  `selectedEngine`.
+- `coerceWhisperSettings` (the v32 migration and `merge`) and the one-time
+  "Whisper has been removed" notice are removed. Settings migration v33 keeps
+  one line of it: any persisted `selectedEngine` other than Parakeet becomes
+  Parakeet, so an alpha.12 Whisper user updating straight to this release is
+  moved over.

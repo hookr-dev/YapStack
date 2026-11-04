@@ -1029,7 +1029,7 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 29→30 | Dropped the redundant per-Insight `enabled` flag. |
 | 30→31 | Remove the redundant `_legacyAi` snapshot written by an early build of the AI refactor (duplicate of legacy `ai`, including plaintext keys, never read). |
 | 31→32 | No-op. It first held the Whisper coercion (`coerceWhisperSettings`), removed before release by the ADR 0005 amendment. |
-| 32→33 | The fp32 Parakeet variant is removed: a persisted `selectedParakeetVariant: "TdtV3"` becomes `"TdtV3Int8"`. |
+| 32→33 | A persisted `selectedEngine` other than `"Parakeet"` (an alpha.12 Whisper user) becomes `"Parakeet"`, and the removed fp32 variant `selectedParakeetVariant: "TdtV3"` becomes `"TdtV3Int8"`. |
 
 ---
 
