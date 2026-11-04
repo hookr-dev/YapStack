@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,9 +15,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronsUpDown, Info, RotateCw, Trash2 } from "lucide-react";
+import { ChevronsUpDown, Info, RotateCw } from "lucide-react";
 import { toast } from "sonner";
-import { formatBytes } from "@/lib/utils";
 import { ParakeetModelSection } from "./ParakeetModelSection";
 
 /// Friendly display labels for the language codes the engine catalogue
@@ -79,19 +78,9 @@ export function TranscriptionTab() {
   const enginePhase = useAppStore((s) => s.enginePhase);
   const engineError = useAppStore((s) => s.engineError);
   const autoSetup = useAppStore((s) => s.autoSetup);
-  const legacyModelFiles = useAppStore((s) => s.legacyModelFiles);
-  const refreshLegacyModelFiles = useAppStore(
-    (s) => s.refreshLegacyModelFiles,
-  );
-  const deleteLegacyModelFiles = useAppStore((s) => s.deleteLegacyModelFiles);
   const setDiarizationEnabled = useAppStore((s) => s.setDiarizationEnabled);
   const [showLanguages, setShowLanguages] = useState(false);
-  const [removingLegacy, setRemovingLegacy] = useState(false);
   const [retrying, setRetrying] = useState(false);
-
-  useEffect(() => {
-    refreshLegacyModelFiles().catch(() => {});
-  }, [refreshLegacyModelFiles]);
 
   // Parakeet is the only engine (ADR 0005), so the catalogue has one entry.
   const descriptor = engineCatalogue[0];
@@ -109,20 +98,6 @@ export function TranscriptionTab() {
     !descriptor.languages.some(
       (code) => code.toLowerCase() === language.toLowerCase(),
     );
-
-  const legacyBytes = legacyModelFiles.reduce((sum, f) => sum + f.bytes, 0);
-
-  const handleRemoveLegacy = async () => {
-    setRemovingLegacy(true);
-    try {
-      await deleteLegacyModelFiles();
-      toast.success(`Removed old Whisper models (${formatBytes(legacyBytes)} freed)`);
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRemovingLegacy(false);
-    }
-  };
 
   return (
     <>
@@ -195,27 +170,6 @@ export function TranscriptionTab() {
             >
               <RotateCw className="mr-1 h-3 w-3" />
               Retry
-            </Button>
-          </div>
-        )}
-        {legacyModelFiles.length > 0 && (
-          <div className="flex items-center justify-between rounded-md px-2 py-1.5 hover:bg-muted/50">
-            <div className="space-y-0.5">
-              <p className="text-sm text-muted-foreground">
-                Remove old Whisper models ({formatBytes(legacyBytes)})
-              </p>
-              <p className="text-[10px] text-muted-foreground/60">
-                Whisper is no longer used. Removing its files frees disk space.
-              </p>
-            </div>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Remove old Whisper models"
-              disabled={removingLegacy}
-              onClick={handleRemoveLegacy}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
             </Button>
           </div>
         )}

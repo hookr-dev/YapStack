@@ -9,7 +9,7 @@ use tracing::{error, info};
 use yapstack_common::engines::engine_catalogue;
 use yapstack_common::types::EngineKind;
 use yapstack_transcription::{
-    LegacyModelFile, ModelManager, ParakeetVariant, SortformerVariant, TranscriptionClient,
+    ModelManager, ParakeetVariant, SortformerVariant, TranscriptionClient,
 };
 
 use super::error::CommandError;
@@ -34,13 +34,9 @@ pub enum EngineKindDto {
     Parakeet,
 }
 
+/// Parakeet model variant. int8 Parakeet TDT v3 is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum ParakeetVariantDto {
-    TdtV3,
-    /// int8-quantized variant — same model, smaller footprint, no
-    /// external `.onnx.data` so accelerators can load it. Used on
-    /// Apple Silicon by default; the FE migration coerces existing
-    /// `TdtV3` users on Apple Silicon to this variant on next launch.
     TdtV3Int8,
 }
 
@@ -58,14 +54,6 @@ pub struct EngineDescriptorDto {
     pub supports_diarization: bool,
 }
 
-/// A model file left behind by an earlier release (today: Whisper GGML
-/// weights and the GGML Silero VAD file) that no current model uses.
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct LegacyModelFileDto {
-    pub name: String,
-    pub bytes: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct ParakeetModelInfoDto {
     pub variant: ParakeetVariantDto,
@@ -80,8 +68,7 @@ pub struct ParakeetModelInfoDto {
 /// frontend show a "Parakeet · WebGPU" badge keyed to ground truth
 /// from the sidecar instead of inferring from FE state. The
 /// `model_dir` ends in the variant directory (e.g.
-/// `…/parakeet-tdt-v3-int8`) so the FE can derive whether int8 or
-/// fp32 is active without a separate field.
+/// `…/parakeet-tdt-v3-int8`).
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct TranscriptionEngineLoadedEvent {
     pub engine: EngineKindDto,
@@ -124,7 +111,6 @@ impl From<EngineKind> for EngineKindDto {
 impl From<ParakeetVariantDto> for ParakeetVariant {
     fn from(v: ParakeetVariantDto) -> Self {
         match v {
-            ParakeetVariantDto::TdtV3 => ParakeetVariant::TdtV3,
             ParakeetVariantDto::TdtV3Int8 => ParakeetVariant::TdtV3Int8,
         }
     }
@@ -133,7 +119,6 @@ impl From<ParakeetVariantDto> for ParakeetVariant {
 impl From<ParakeetVariant> for ParakeetVariantDto {
     fn from(v: ParakeetVariant) -> Self {
         match v {
-            ParakeetVariant::TdtV3 => ParakeetVariantDto::TdtV3,
             ParakeetVariant::TdtV3Int8 => ParakeetVariantDto::TdtV3Int8,
         }
     }
@@ -143,15 +128,6 @@ impl From<SortformerVariantDto> for SortformerVariant {
     fn from(v: SortformerVariantDto) -> Self {
         match v {
             SortformerVariantDto::V2_1 => SortformerVariant::V2_1,
-        }
-    }
-}
-
-impl From<LegacyModelFile> for LegacyModelFileDto {
-    fn from(f: LegacyModelFile) -> Self {
-        Self {
-            name: f.name,
-            bytes: f.bytes,
         }
     }
 }
@@ -438,43 +414,6 @@ pub type DictationOwnsMicState = Arc<DictationOwnsMic>;
 
 // --- Commands ---
 
-/// Lists model files left behind by earlier releases, with their sizes, so
-/// Settings can offer to remove them. Nothing is deleted without the user.
-#[tauri::command]
-#[specta::specta]
-pub async fn list_legacy_model_files(
-    state: tauri::State<'_, ModelManagerState>,
-) -> Result<Vec<LegacyModelFileDto>, CommandError> {
-    let manager = state.lock().await;
-    Ok(manager
-        .list_legacy_model_files()
-        .into_iter()
-        .map(LegacyModelFileDto::from)
-        .collect())
-}
-
-/// Deletes the named legacy model files. Names that aren't legacy model
-/// files are refused.
-#[tauri::command]
-#[specta::specta]
-pub async fn delete_legacy_model_files(
-    state: tauri::State<'_, ModelManagerState>,
-    names: Vec<String>,
-) -> Result<(), CommandError> {
-    info!(?names, "deleting legacy model files");
-    let manager = {
-        let guard = state.lock().await;
-        guard.clone()
-    };
-    manager
-        .delete_legacy_model_files(&names)
-        .await
-        .map_err(|e| {
-            error!("legacy model file deletion failed: {}", e);
-            CommandError::from(e)
-        })
-}
-
 #[tauri::command]
 #[specta::specta]
 pub async fn shutdown_transcription_client(
@@ -568,15 +507,8 @@ pub async fn get_parakeet_models(
         .collect())
 }
 
-/// Returns the Parakeet variant the current host should run. Apple Silicon
-/// gets the int8 bundle (smaller, no external `.onnx.data`, accelerator-
-/// compatible); other targets keep the fp32 bundle.
-///
-/// The frontend uses this in two places:
-///   1. As the source of truth for the v24 store migration that coerces
-///      pre-existing `selectedParakeetVariant` values.
-///   2. To render a single-variant Parakeet UI keyed to whatever the host
-///      is meant to run, so users never have to pick int8 vs fp32.
+/// Returns the Parakeet variant the current host should run. `autoSetup`
+/// downloads and loads it and stores it as `selectedParakeetVariant`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_recommended_parakeet_variant() -> Result<ParakeetVariantDto, CommandError> {

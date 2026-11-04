@@ -4,32 +4,27 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::TranscriptionError;
 
 type Result<T> = std::result::Result<T, TranscriptionError>;
 
-// ----------- Legacy model files -----------
+// ----------- Unused model files -----------
 
-/// Files earlier releases downloaded into `models/` that no current model
-/// uses: the Whisper GGML weights and the GGML Silero VAD file (both retired
-/// by ADR 0005). They are never deleted silently; the user removes them from
-/// Transcription settings.
-const LEGACY_MODEL_FILES: &[&str] = &[
+/// Paths under `models/` that earlier releases wrote and no current model
+/// reads: the Whisper GGML weights and GGML Silero VAD file (ADR 0005), the
+/// fp32 Parakeet bundle, and the int8 bundle's preprocessor, which
+/// `parakeet-rs` never loads.
+const UNUSED_MODEL_PATHS: &[&str] = &[
     "ggml-tiny.bin",
     "ggml-base.bin",
     "ggml-small.bin",
     "ggml-medium.bin",
     "ggml-silero-v6.2.0.bin",
+    "parakeet-tdt-v3",
+    "parakeet-tdt-v3-int8/nemo128.onnx",
 ];
-
-/// A legacy model file present on disk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LegacyModelFile {
-    pub name: String,
-    pub bytes: u64,
-}
 
 // ----------- Parakeet TDT v3 -----------
 
@@ -67,50 +62,25 @@ const VOCAB_V3: ModelFile = ModelFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParakeetVariant {
-    /// nvidia/parakeet-tdt-0.6b-v3 (multilingual, 25 European languages),
-    /// repackaged to ONNX by `istupakov` on HuggingFace. fp32 weights — the
-    /// encoder ships a 2.4 GB external `.onnx.data` blob which prevents
-    /// accelerator EPs (CoreML, WebGPU) from loading the model. Retained
-    /// only for the CPU-only Intel-macOS build, which has no GPU EP path;
-    /// every WebGPU-capable host (Apple Silicon, Windows, Linux) uses the
-    /// int8 single-file bundle instead.
-    TdtV3,
-    /// int8-quantized variant of the same `nvidia/parakeet-tdt-0.6b-v3`
-    /// model, also from `istupakov`. Single-file inlined ONNX bundles —
-    /// no `.onnx.data` external initializer, so accelerators can load
-    /// the encoder. Published GPU benchmarks show INT8/FP16/FP32 hit
-    /// identical accuracy on LibriSpeech (97.84%) and indistinguishable
-    /// WER on the leaderboard (15.72–15.77%); RNN-T joint decisions are
-    /// driven by relative logit magnitudes so quantization doesn't change
-    /// argmax decoding. Default on every WebGPU-capable host — Apple Silicon
-    /// (Metal), Windows and Linux (Dawn → Vulkan/D3D12).
+    /// int8-quantized `nvidia/parakeet-tdt-0.6b-v3` (multilingual, 25
+    /// European languages), repackaged to ONNX by `istupakov`. Single-file
+    /// inlined ONNX bundles with no `.onnx.data` external initializer, so
+    /// accelerator EPs can load the encoder. Published GPU benchmarks show
+    /// INT8/FP16/FP32 hit identical accuracy on LibriSpeech (97.84%) and
+    /// indistinguishable WER on the leaderboard (15.72–15.77%).
     TdtV3Int8,
 }
 
 impl ParakeetVariant {
-    /// The variant we should pick at install time for the current host.
-    /// Apple Silicon and non-macOS hosts (Windows/Linux) both run the int8
-    /// bundle so the WebGPU EP can load it — int8 is a single-file inlined
-    /// ONNX bundle with no external `.onnx.data` initializer, which is what
-    /// blocks accelerator EPs from loading the fp32 encoder. The fp32
-    /// `TdtV3` variant is retained only for the CPU-only Intel-macOS build,
-    /// which has neither a WebGPU nor a CoreML acceleration path today.
+    /// The variant to install on this host. Every target runs the int8
+    /// bundle.
     pub fn recommended_for_host() -> Self {
-        // macOS + aarch64 (Apple Silicon, WebGPU/Metal) → int8.
-        // Non-macOS (Windows/Linux, WebGPU/Dawn) → int8.
-        // Only CPU-only Intel macOS falls back to the fp32 bundle.
-        let macos_intel = cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64");
-        if macos_intel {
-            ParakeetVariant::TdtV3
-        } else {
-            ParakeetVariant::TdtV3Int8
-        }
+        ParakeetVariant::TdtV3Int8
     }
 
     /// Subdirectory under `$APP_DATA_DIR/models/` where this variant's files live.
     pub fn dir_name(&self) -> &'static str {
         match self {
-            ParakeetVariant::TdtV3 => "parakeet-tdt-v3",
             ParakeetVariant::TdtV3Int8 => "parakeet-tdt-v3-int8",
         }
     }
@@ -120,27 +90,6 @@ impl ParakeetVariant {
     /// itself, so the bundle's `nemo128.onnx` preprocessor is not fetched.
     pub fn files(&self) -> &'static [ModelFile] {
         match self {
-            ParakeetVariant::TdtV3 => &[
-                ModelFile {
-                    name: "encoder-model.onnx",
-                    url: istupakov_v3_url!("encoder-model.onnx"),
-                    bytes: 41_770_866,
-                    sha256: "98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1",
-                },
-                ModelFile {
-                    name: "encoder-model.onnx.data",
-                    url: istupakov_v3_url!("encoder-model.onnx.data"),
-                    bytes: 2_435_420_160,
-                    sha256: "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36",
-                },
-                ModelFile {
-                    name: "decoder_joint-model.onnx",
-                    url: istupakov_v3_url!("decoder_joint-model.onnx"),
-                    bytes: 72_520_893,
-                    sha256: "e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1",
-                },
-                VOCAB_V3,
-            ],
             ParakeetVariant::TdtV3Int8 => &[
                 ModelFile {
                     name: "encoder-model.int8.onnx",
@@ -163,20 +112,14 @@ impl ParakeetVariant {
         self.files().iter().map(|f| f.bytes).sum()
     }
 
-    /// User-facing label. Both variants intentionally report the same
-    /// model identity (`Parakeet TDT v3`) — the int8 vs fp32 split is an
-    /// implementation detail driven by what the host can accelerate, not
-    /// something the user picks. Size ranges are the only honest hint
-    /// that they differ on disk.
     pub fn display_name(&self) -> &'static str {
         match self {
-            ParakeetVariant::TdtV3 => "Parakeet TDT v3 (~2.5 GB)",
             ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 (~700 MB)",
         }
     }
 
     pub fn all() -> &'static [ParakeetVariant] {
-        &[ParakeetVariant::TdtV3, ParakeetVariant::TdtV3Int8]
+        &[ParakeetVariant::TdtV3Int8]
     }
 }
 
@@ -352,44 +295,26 @@ impl ModelManager {
         &self.models_dir
     }
 
-    // ---------- Legacy files ----------
+    // ---------- Unused files ----------
 
-    /// Legacy model files present in `models/`, in catalogue order.
-    pub fn list_legacy_model_files(&self) -> Vec<LegacyModelFile> {
-        LEGACY_MODEL_FILES
-            .iter()
-            .filter_map(|name| {
-                // symlink_metadata: a symlink is removed, not its target, so
-                // its own size is what deleting it frees.
-                let meta = std::fs::symlink_metadata(self.models_dir.join(name)).ok()?;
-                (!meta.is_dir()).then(|| LegacyModelFile {
-                    name: (*name).to_string(),
-                    bytes: meta.len(),
-                })
-            })
-            .collect()
-    }
-
-    /// Delete the named legacy model files. Names outside the legacy list are
-    /// refused, so a caller can never delete a current model through this
-    /// path. Files already gone are skipped.
-    pub async fn delete_legacy_model_files(&self, names: &[String]) -> Result<()> {
-        if let Some(bad) = names
-            .iter()
-            .find(|n| !LEGACY_MODEL_FILES.contains(&n.as_str()))
-        {
-            return Err(TranscriptionError::ModelNotFound(format!(
-                "not a legacy model file: {bad}"
-            )));
-        }
-        for name in names {
-            match tokio::fs::remove_file(self.models_dir.join(name)).await {
-                Ok(()) => info!("deleted legacy model file {name}"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+    /// Delete every path in [`UNUSED_MODEL_PATHS`] that exists. Each removal
+    /// is logged; one that fails is logged and skipped.
+    pub fn remove_unused_model_files(&self) {
+        for rel in UNUSED_MODEL_PATHS {
+            let path = self.models_dir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let removed = if meta.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match removed {
+                Ok(()) => info!("removed unused model file {}", path.display()),
+                Err(e) => warn!("couldn't remove unused model file {}: {e}", path.display()),
             }
         }
-        Ok(())
     }
 
     // ---------- Parakeet ----------
@@ -532,21 +457,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parakeet_variant_dir_names_distinct() {
-        let mut names: Vec<&str> = ParakeetVariant::all()
-            .iter()
-            .map(|v| v.dir_name())
-            .collect();
-        names.sort();
-        names.dedup();
-        assert_eq!(
-            names.len(),
-            ParakeetVariant::all().len(),
-            "every Parakeet variant must have a unique dir_name so download/delete don't collide"
-        );
-    }
-
-    #[test]
     fn parakeet_variant_int8_has_no_external_data_file() {
         // The whole reason int8 exists in this catalogue is so the encoder
         // bundle has no `.onnx.data` external initializer (which blocks
@@ -571,26 +481,6 @@ mod tests {
             .files()
             .iter()
             .all(|f| f.name != "nemo128.onnx"));
-    }
-
-    #[test]
-    fn existing_int8_install_with_preprocessor_stays_available() {
-        // Installs from before the trim have the extra file; they must not
-        // re-download anything.
-        let dir = tempfile::tempdir().unwrap();
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        let variant = ParakeetVariant::TdtV3Int8;
-        let v_dir = manager.parakeet_model_dir(variant);
-        std::fs::create_dir_all(&v_dir).unwrap();
-        for name in [
-            "encoder-model.int8.onnx",
-            "decoder_joint-model.int8.onnx",
-            "nemo128.onnx",
-            "vocab.txt",
-        ] {
-            std::fs::write(v_dir.join(name), b"placeholder").unwrap();
-        }
-        assert!(manager.parakeet_is_available(variant));
     }
 
     #[test]
@@ -663,23 +553,6 @@ mod tests {
         assert!(!dest.with_extension("download").exists());
     }
 
-    #[test]
-    fn parakeet_recommended_for_host_matches_target() {
-        // `recommended_for_host` is `cfg!`-driven, so the test runner sees
-        // exactly one branch on each CI runner. We assert against the same
-        // cfg flags here so the test is meaningful on every target without
-        // having to mock the host detection. Only CPU-only Intel macOS keeps
-        // the fp32 bundle; every WebGPU-capable host (Apple Silicon +
-        // Windows/Linux) takes the int8 single-file bundle.
-        let macos_intel = cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64");
-        let expected = if macos_intel {
-            ParakeetVariant::TdtV3
-        } else {
-            ParakeetVariant::TdtV3Int8
-        };
-        assert_eq!(ParakeetVariant::recommended_for_host(), expected);
-    }
-
     #[tokio::test]
     async fn concurrent_parakeet_download_of_same_variant_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,111 +597,68 @@ mod tests {
         let manager = ModelManager::new(dir.path().to_path_buf());
         let dest = manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8);
         drop(manager.claim_download(&dest).unwrap());
-        assert!(manager.claim_download(&dest).is_ok());
-        // Other variants are independent.
         let _a = manager.claim_download(&dest).unwrap();
+        // Other destinations are independent.
         assert!(manager
-            .claim_download(&manager.parakeet_model_dir(ParakeetVariant::TdtV3))
+            .claim_download(
+                &manager
+                    .models_dir()
+                    .join(SortformerVariant::V2_1.filename())
+            )
             .is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn legacy_model_files_report_symlink_size_not_target() {
+    fn remove_unused_model_files_keeps_current_models_and_unrelated_files() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        let target = dir.path().join("big.bin");
-        std::fs::write(&target, vec![0u8; 4096]).unwrap();
-        std::os::unix::fs::symlink(&target, models_dir.join("ggml-small.bin")).unwrap();
-
         let manager = ModelManager::new(dir.path().to_path_buf());
-        let files = manager.list_legacy_model_files();
-        assert_eq!(files.len(), 1);
-        assert!(files[0].bytes < 4096, "{files:?}");
+        let models = manager.models_dir().to_path_buf();
+        let int8 = manager.parakeet_model_dir(ParakeetVariant::TdtV3Int8);
+        let fp32 = models.join("parakeet-tdt-v3");
+        std::fs::create_dir_all(&int8).unwrap();
+        std::fs::create_dir_all(&fp32).unwrap();
+        for f in ParakeetVariant::TdtV3Int8.files() {
+            std::fs::write(int8.join(f.name), b"current").unwrap();
+        }
+        std::fs::write(int8.join("nemo128.onnx"), b"unused").unwrap();
+        std::fs::write(fp32.join("encoder-model.onnx.data"), b"fp32").unwrap();
+        for name in [
+            "ggml-small.bin",
+            "ggml-medium.bin",
+            "ggml-silero-v6.2.0.bin",
+        ] {
+            std::fs::write(models.join(name), b"whisper").unwrap();
+        }
+        let sortformer = models.join(SortformerVariant::V2_1.filename());
+        std::fs::write(&sortformer, b"current").unwrap();
+        std::fs::write(models.join("notes.txt"), b"keep me").unwrap();
+
+        manager.remove_unused_model_files();
+
+        assert!(!fp32.exists());
+        assert!(!int8.join("nemo128.onnx").exists());
+        for name in [
+            "ggml-small.bin",
+            "ggml-medium.bin",
+            "ggml-silero-v6.2.0.bin",
+        ] {
+            assert!(!models.join(name).exists(), "{name}");
+        }
+        assert!(manager.parakeet_is_available(ParakeetVariant::TdtV3Int8));
+        assert!(sortformer.exists());
+        assert!(models.join("notes.txt").exists());
     }
 
     #[test]
-    fn legacy_model_files_empty_when_none_on_disk() {
+    fn remove_unused_model_files_without_models_dir_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert!(manager.list_legacy_model_files().is_empty());
-    }
-
-    #[test]
-    fn legacy_model_files_lists_only_known_files_with_sizes() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("ggml-small.bin"), b"12345").unwrap();
-        std::fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"12").unwrap();
-        std::fs::write(models_dir.join("notes.txt"), b"keep me").unwrap();
-        std::fs::write(
-            models_dir.join(SortformerVariant::V2_1.filename()),
-            b"current",
-        )
-        .unwrap();
-
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        assert_eq!(
-            manager.list_legacy_model_files(),
-            vec![
-                LegacyModelFile {
-                    name: "ggml-small.bin".into(),
-                    bytes: 5
-                },
-                LegacyModelFile {
-                    name: "ggml-silero-v6.2.0.bin".into(),
-                    bytes: 2
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_legacy_model_files_removes_listed_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(models_dir.join("ggml-small.bin"), b"x").unwrap();
-        std::fs::write(models_dir.join("ggml-medium.bin"), b"x").unwrap();
-
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        manager
-            .delete_legacy_model_files(&["ggml-small.bin".into(), "ggml-tiny.bin".into()])
-            .await
-            .unwrap();
-        assert!(!models_dir.join("ggml-small.bin").exists());
-        assert!(models_dir.join("ggml-medium.bin").exists());
-    }
-
-    #[tokio::test]
-    async fn delete_legacy_model_files_refuses_other_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        let current = models_dir.join(SortformerVariant::V2_1.filename());
-        std::fs::write(&current, b"current").unwrap();
-        std::fs::write(models_dir.join("ggml-small.bin"), b"x").unwrap();
-
-        let manager = ModelManager::new(dir.path().to_path_buf());
-        let names = vec![
-            "ggml-small.bin".to_string(),
-            SortformerVariant::V2_1.filename().to_string(),
-        ];
-        assert!(manager.delete_legacy_model_files(&names).await.is_err());
-        assert!(current.exists());
-        assert!(
-            models_dir.join("ggml-small.bin").exists(),
-            "a refused batch deletes nothing"
-        );
-        let traversal = vec!["../outside.bin".to_string()];
-        assert!(manager.delete_legacy_model_files(&traversal).await.is_err());
+        ModelManager::new(dir.path().to_path_buf()).remove_unused_model_files();
+        assert!(!dir.path().join("models").exists());
     }
 
     #[test]
     fn test_parakeet_variant_files_are_consistent() {
-        let v = ParakeetVariant::TdtV3;
+        let v = ParakeetVariant::TdtV3Int8;
         let files = v.files();
         assert!(!files.is_empty());
         // Required by parakeet-rs's ParakeetTDT::from_pretrained.
@@ -842,7 +672,7 @@ mod tests {
     fn test_parakeet_not_available_until_all_files_present() {
         let dir = tempfile::tempdir().unwrap();
         let manager = ModelManager::new(dir.path().to_path_buf());
-        let variant = ParakeetVariant::TdtV3;
+        let variant = ParakeetVariant::TdtV3Int8;
         assert!(!manager.parakeet_is_available(variant));
 
         // Drop one of the required files into the variant dir; partial
@@ -857,7 +687,7 @@ mod tests {
     fn test_parakeet_available_when_all_files_present() {
         let dir = tempfile::tempdir().unwrap();
         let manager = ModelManager::new(dir.path().to_path_buf());
-        let variant = ParakeetVariant::TdtV3;
+        let variant = ParakeetVariant::TdtV3Int8;
         let v_dir = manager.parakeet_model_dir(variant);
         std::fs::create_dir_all(&v_dir).unwrap();
         for f in variant.files() {

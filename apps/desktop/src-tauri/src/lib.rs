@@ -293,8 +293,6 @@ pub fn run() {
             commands::capture::delete_session_wav,
             commands::capture::delete_audio_files,
             commands::capture::audio_files_exist,
-            commands::transcription::list_legacy_model_files,
-            commands::transcription::delete_legacy_model_files,
             commands::transcription::init_transcription_client,
             commands::transcription::shutdown_transcription_client,
             commands::transcription::get_transcription_status,
@@ -345,8 +343,6 @@ pub fn run() {
             commands::capture::delete_session_wav,
             commands::capture::delete_audio_files,
             commands::capture::audio_files_exist,
-            commands::transcription::list_legacy_model_files,
-            commands::transcription::delete_legacy_model_files,
             commands::transcription::init_transcription_client,
             commands::transcription::shutdown_transcription_client,
             commands::transcription::get_transcription_status,
@@ -776,6 +772,7 @@ pub fn run() {
             }
 
             let model_manager = ModelManager::new(app_data_dir.clone());
+            model_manager.remove_unused_model_files();
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );

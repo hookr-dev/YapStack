@@ -178,9 +178,6 @@ export function StatusPopover() {
   );
   const devices = useAppStore((s) => s.devices);
   const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
-  const selectedParakeetVariant = useAppStore(
-    (s) => s.settings.selectedParakeetVariant,
-  );
   const diarizationEnabled = useAppStore(
     (s) => s.settings.diarizationEnabled,
   );
@@ -238,14 +235,7 @@ export function StatusPopover() {
     : null;
   const sourceLabel = SOURCE_LABELS_FULL[captureSource];
 
-  // Parakeet variants intentionally collapse to one user-facing label —
-  // int8 vs fp32 is an implementation detail driven by host capability,
-  // not a user-visible choice.
-  const modelLabel =
-    selectedParakeetVariant === "TdtV3" ||
-    selectedParakeetVariant === "TdtV3Int8"
-      ? "TDT v3"
-      : selectedParakeetVariant;
+  const modelLabel = "TDT v3";
 
   const micActive = captureStatus?.mic_active ?? false;
   const systemActive = captureStatus?.system_audio_active ?? false;

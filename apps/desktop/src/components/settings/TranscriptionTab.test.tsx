@@ -38,8 +38,6 @@ function setup(
     engineCatalogue: [PARAKEET],
     enginePhase: "ready",
     engineError: null,
-    legacyModelFiles: [],
-    refreshLegacyModelFiles: vi.fn().mockResolvedValue(undefined),
     settings: { ...useAppStore.getState().settings, language },
     updateSettings: vi.fn(),
     ...overrides,
@@ -98,32 +96,6 @@ describe("TranscriptionTab — Parakeet only", () => {
     setup({}, "de");
     render(<TranscriptionTab />);
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
-  });
-
-  it("offers to remove old Whisper models with their total size and removes them on click", async () => {
-    const deleteLegacyModelFiles = vi.fn().mockResolvedValue(undefined);
-    setup({
-      legacyModelFiles: [
-        { name: "ggml-small.bin", bytes: 466_000_000 },
-        { name: "ggml-silero-v6.2.0.bin", bytes: 885_000 },
-      ],
-      deleteLegacyModelFiles,
-    });
-    render(<TranscriptionTab />);
-
-    expect(screen.getByText(/Remove old Whisper models \(/)).toBeInTheDocument();
-    await userEvent.click(
-      screen.getByRole("button", { name: "Remove old Whisper models" }),
-    );
-    expect(deleteLegacyModelFiles).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides the old-models row when nothing is left on disk", () => {
-    setup();
-    render(<TranscriptionTab />);
-    expect(
-      screen.queryByText(/Remove old Whisper models/),
-    ).not.toBeInTheDocument();
   });
 
   it("disables Retry while setup is running, so a double click retries once", async () => {

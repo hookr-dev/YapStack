@@ -302,9 +302,9 @@ Without `S3_ENDPOINT`, the two object-store tests (`gc_deletes_object_and_row_li
 
 Models are stored in the app's data directory under `models/`:
 - macOS: `~/Library/Application Support/dev.yapstack.app/models/`
-- Parakeet: one subdirectory per variant (`parakeet-tdt-v3/`, `parakeet-tdt-v3-int8/`) holding the ONNX bundle.
+- Parakeet: `parakeet-tdt-v3-int8/` holding the int8 ONNX bundle.
 - Sortformer: a single ONNX file, downloaded on first diarization use.
-- Legacy files: earlier releases left Whisper GGML weights (`ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin`) and the GGML Silero VAD file (`ggml-silero-v6.2.0.bin`) here. Nothing uses them now and they are never deleted automatically; `list_legacy_model_files` / `delete_legacy_model_files` let the user remove them.
+- Unused files: earlier releases left Whisper GGML weights (`ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin`), the GGML Silero VAD file (`ggml-silero-v6.2.0.bin`), the fp32 `parakeet-tdt-v3/` bundle and `parakeet-tdt-v3-int8/nemo128.onnx` here. `ModelManager::remove_unused_model_files` deletes them at startup.
 
 ## Temp File Cleanup
 

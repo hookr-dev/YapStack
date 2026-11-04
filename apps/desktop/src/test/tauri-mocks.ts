@@ -118,12 +118,6 @@ export const tauriCommandsMock = () => ({
       status: "ok",
       data: { mic: null, system: null },
     }),
-    listLegacyModelFiles: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: [] }),
-    deleteLegacyModelFiles: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     initTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
@@ -140,11 +134,9 @@ export const tauriCommandsMock = () => ({
     getParakeetModels: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: [] }),
-    // Test environment defaults to the fp32 variant — matches non-Apple-Silicon
-    // CI runners. Tests that exercise the int8 path can override this mock.
     getRecommendedParakeetVariant: vi
       .fn()
-      .mockResolvedValue({ status: "ok", data: "TdtV3" }),
+      .mockResolvedValue({ status: "ok", data: "TdtV3Int8" }),
     downloadParakeetModel: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "" }),

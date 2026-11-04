@@ -20,21 +20,16 @@ vi.mock("sonner", () => ({
   toast: { info: vi.fn(), error: vi.fn(), warning: vi.fn(), success: vi.fn() },
 }));
 
-/** A Whisper user's persisted settings as v31 wrote them (ADR 0005). */
+/** Persisted settings naming the removed fp32 Parakeet variant. */
 function seedPersisted(version: number) {
   localStorage.setItem(
     "yapstack-settings",
     JSON.stringify({
       state: {
         settings: {
-          selectedEngine: "Whisper",
-          selectedModelSize: "Small",
+          selectedEngine: "Parakeet",
           selectedParakeetVariant: "TdtV3",
-          language: "ja",
-          silenceDurationMs: 800,
-          maxChunkSeconds: 30,
-          promptContextChars: 350,
-          promptDecaySilenceSeconds: 5,
+          language: "de",
         },
       },
       version,
@@ -61,49 +56,34 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-describe("Whisper user upgrading to the Parakeet-only build", () => {
-  it("rehydrates v31 Whisper settings as Parakeet and drops the Whisper-only fields", async () => {
-    seedPersisted(31);
+describe("upgrading from the fp32 Parakeet variant", () => {
+  it("rehydrates a persisted TdtV3 as TdtV3Int8", async () => {
+    seedPersisted(32);
     const { useAppStore } = await launch();
-    const settings = useAppStore.getState().settings as unknown as Record<
-      string,
-      unknown
-    >;
+    const { settings } = useAppStore.getState();
 
-    expect(settings.selectedEngine).toBe("Parakeet");
-    expect(settings.whisperRemovedNotice).toBe(true);
-    // The language is kept for later routing; only the notice uses it today.
-    expect(settings.language).toBe("ja");
-    for (const key of [
-      "selectedModelSize",
-      "silenceDurationMs",
-      "maxChunkSeconds",
-      "promptContextChars",
-      "promptDecaySilenceSeconds",
-    ]) {
-      expect(settings).not.toHaveProperty(key);
-    }
+    expect(settings.selectedParakeetVariant).toBe("TdtV3Int8");
+    expect(settings.language).toBe("de");
   });
 
-  it("launch takes the Parakeet download path with progress, then initializes Parakeet", async () => {
-    seedPersisted(31);
+  it("launch downloads the int8 model with progress, then initializes it", async () => {
+    seedPersisted(32);
     const { useAppStore, commands, phases } = await launch();
 
     await useAppStore.getState().autoSetup();
 
-    expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3");
+    expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3Int8");
     expect(phases).toContain("downloading");
     expect(commands.initTranscriptionClient).toHaveBeenCalledWith(
       "Parakeet",
-      "TdtV3",
+      "TdtV3Int8",
       false,
     );
     expect(useAppStore.getState().enginePhase).toBe("ready");
-    expect(useAppStore.getState().settings.whisperRemovedNotice).toBe(false);
   });
 
-  it("a failed download (offline first launch) ends in enginePhase error with no fallback", async () => {
-    seedPersisted(31);
+  it("a failed download ends in enginePhase error with no fallback", async () => {
+    seedPersisted(32);
     const { useAppStore, commands } = await launch();
     commands.downloadParakeetModel.mockResolvedValueOnce({
       status: "error",
@@ -118,7 +98,7 @@ describe("Whisper user upgrading to the Parakeet-only build", () => {
   });
 
   it("a second autoSetup while the first is still running starts no second download", async () => {
-    seedPersisted(31);
+    seedPersisted(32);
     const { useAppStore, commands } = await launch();
 
     // Retry double-clicked from the error state: both calls start before
@@ -130,14 +110,5 @@ describe("Whisper user upgrading to the Parakeet-only build", () => {
 
     expect(commands.downloadParakeetModel).toHaveBeenCalledTimes(1);
     expect(commands.initTranscriptionClient).toHaveBeenCalledTimes(1);
-  });
-
-  it("merge coerces a Whisper engine even when the persisted version is already current", async () => {
-    // Persist-version skew: a v32 blob that still says Whisper must never
-    // reach the backend, which no longer accepts that engine.
-    seedPersisted(32);
-    const { useAppStore } = await launch();
-
-    expect(useAppStore.getState().settings.selectedEngine).toBe("Parakeet");
   });
 });
