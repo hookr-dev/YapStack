@@ -158,14 +158,20 @@ jobs:
           cache-directories: ~/Library/Caches/ort.pyke.io
 
       - name: SwiftPM cache
-        # The FluidAudio checkout and its binary artifacts, keyed by the
-        # pinned versions in Package.resolved.
+        # The FluidAudio checkout, its binary artifacts and the Swift build
+        # dir build.rs uses (target/swift-yfa). rust-cache prunes everything
+        # in target/ that isn't a dependency artifact, so without this the
+        # FluidAudio compile reruns every time. Saved before rust-cache's
+        # cleanup: post steps run in reverse order.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
-          key: swiftpm-${{ steps.xcode.outputs.version }}-${{ hashFiles('crates/yapstack-transcription-sidecar/swift/YapFluidAudio/Package.resolved') }}
+            target/swift-yfa
+          key: swiftpm-${{ steps.xcode.outputs.version }}-${{ hashFiles('crates/yapstack-transcription-sidecar/swift/YapFluidAudio/**') }}
+          restore-keys: |
+            swiftpm-${{ steps.xcode.outputs.version }}-
 
       - name: Clippy (sidecar, fluidaudio)
         run: cargo clippy -p yapstack-transcription-sidecar --features webgpu,fluidaudio --all-targets -- -D warnings
