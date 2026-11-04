@@ -1224,9 +1224,10 @@ mod tests {
         }
     }
 
-    /// Gate G4 on a real model: the EP Auto reports must hold >= 90% of the
-    /// encoder's MatMul/Conv-family nodes, unless the load reports
-    /// `accel_partial` — then the static table must agree that it doesn't.
+    /// Gate G4 on a real model (ratified at 100% on 2026-10-31): the EP Auto
+    /// reports must hold every one of the encoder's MatMul/Conv-family nodes,
+    /// unless the load reports `accel_partial`; any share below 100% must be
+    /// reported partial.
     /// Red for int8 under the old macOS Auto (`webgpu`, 19.7%, not flagged).
     #[test]
     #[ignore = "needs YAPSTACK_TEST_PARAKEET_DIR set to a downloaded Parakeet model dir"]
@@ -1247,7 +1248,7 @@ mod tests {
         let encoder = sessions.first().expect("encoder placement recorded");
         let share = encoder.heavy_share(ep);
         assert_eq!(
-            share < 0.90,
+            share < 1.0,
             info.accel_partial,
             "reported {reported} (partial={}) with {:.1}% of MatMul/Conv nodes placed there: {:?}",
             info.accel_partial,
