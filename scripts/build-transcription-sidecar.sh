@@ -83,6 +83,10 @@ for target in "${TARGETS[@]}"; do
     FEATURES="parakeet"
     if [[ "$target" == *"apple"* ]]; then
         FEATURES="parakeet,webgpu"
+        # The app's floor (tauri.conf.json bundle.macOS.minimumSystemVersion,
+        # ADR 0008). tauri-build sets it for the app binary; the sidecar is
+        # built here, outside the Tauri build, so it needs it explicitly.
+        export MACOSX_DEPLOYMENT_TARGET=14.0
     elif [[ "$target" == *"windows"* ]]; then
         # Parakeet WebGPU (Dawn -> D3D12/Vulkan). The feature adds a
         # load-time webgpu_dawn.dll import (ort-sys links Dawn dynamically);

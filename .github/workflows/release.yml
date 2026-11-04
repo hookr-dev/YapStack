@@ -194,6 +194,21 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm --filter @yapstack/desktop tauri build --target aarch64-apple-darwin -f sync
 
+      - name: Assert the macOS 14 floor
+        # ADR 0008: the bundle declares macOS 14 and every executable in it
+        # targets 14.0 (tauri-build sets the app's target from
+        # minimumSystemVersion; build-transcription-sidecar.sh sets the
+        # sidecar's), so neither can drift off the floor unnoticed.
+        run: |
+          app=$(ls -d target/aarch64-apple-darwin/release/bundle/macos/*.app)
+          plist_min=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist")
+          [ "$plist_min" = "14.0" ] || { echo "::error::LSMinimumSystemVersion is $plist_min, expected 14.0"; exit 1; }
+          for bin in "$app"/Contents/MacOS/*; do
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/ {b=1} b && $1 == "minos" {print $2; exit}')
+            [ "$minos" = "14.0" ] || { echo "::error::$bin targets macOS $minos, expected 14.0"; exit 1; }
+            echo "$bin targets macOS $minos"
+          done
+
       - name: Generate checksum
         run: |
           cd target/aarch64-apple-darwin/release/bundle/dmg
