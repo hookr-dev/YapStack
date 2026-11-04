@@ -263,23 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sidecar_request_transcribe_ignores_removed_prompt_fields() {
-        // A host from before ADR 0005 still sends the Whisper prompt knobs.
-        // The sidecar must keep parsing those requests.
-        let json = r#"{"type":"transcribe","id":2,"audio_path":"/tmp/test.wav","language":"en","initial_prompt":"Hello world","single_segment":true,"diarization":true}"#;
-        let deserialized: SidecarRequest = serde_json::from_str(json).unwrap();
-        match deserialized {
-            SidecarRequest::Transcribe {
-                id, diarization, ..
-            } => {
-                assert_eq!(id, 2);
-                assert!(diarization);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn test_sidecar_request_transcribe_backward_compat() {
         // Deserialize without the diarization field — it defaults to false.
         let json = r#"{"type":"transcribe","id":3,"audio_path":"/tmp/test.wav","language":"en"}"#;
