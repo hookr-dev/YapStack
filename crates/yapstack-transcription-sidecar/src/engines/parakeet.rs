@@ -150,43 +150,29 @@ impl ParakeetBackend {
             model_dir = %model_path.display(),
             "parakeet acceleration resolved"
         );
-        let attempt = ParakeetTDT::from_pretrained(
-            model_path,
-            Some(build_exec_config(target, placement.as_ref())),
-        );
-        // `loaded` diverges from `target` only on the fallback path below.
-        let (model, loaded, accel_fallback) = match attempt {
-            Ok(m) => (m, target, None),
-            Err(e) if target != AccelTarget::Cpu => {
-                warn!(
-                    marker = "live_accel_fallback",
-                    engine = "parakeet",
-                    requested = target.label(),
-                    error = %e,
-                    "accelerator load failed; falling back to CPU \
-                     (set YAPSTACK_PARAKEET_ACCEL=cpu to suppress this attempt)"
-                );
+        let (model, loaded, accel_fallback) = load_with_cpu_fallback(
+            target,
+            |t| {
+                ParakeetTDT::from_pretrained(
+                    model_path,
+                    Some(build_exec_config(t, placement.as_ref())),
+                )
+                .map(|m| LoadedModel::Ort(Box::new(m)))
+                .map_err(|e| e.to_string())
+            },
+            |model| warm_up(|s| model.decode(s)),
+            || {
                 // Drop whatever the failed attempt reported so the
                 // placement below describes only the sessions that loaded.
                 if let Some(recorder) = placement.as_ref() {
                     recorder.take();
                 }
-                let m = ParakeetTDT::from_pretrained(
-                    model_path,
-                    Some(build_exec_config(AccelTarget::Cpu, placement.as_ref())),
-                )
-                .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
-                let reason = format!("{} failed to load: {e}", target.label());
-                (m, AccelTarget::Cpu, Some(reason))
-            }
-            Err(e) => return Err(format!("failed to load parakeet model: {e}")),
-        };
+            },
+        )?;
 
         let sessions = placement.map(|r| r.take()).unwrap_or_default();
         log_placement(loaded, &sessions);
 
-        let mut model = LoadedModel::Ort(Box::new(model));
-        warm_up(|s| model.decode(s))?;
         self.model = Some(model);
         self.last_engine_info = Some(EngineInfo {
             accel: loaded.label().to_string(),
@@ -264,6 +250,44 @@ impl ParakeetBackend {
              (the `fluidaudio` feature, Apple silicon only)",
             model_path.display()
         ))
+    }
+}
+
+/// Loads and warms up a model on `target`, returning it with the target it
+/// ended up on and, when that isn't `target`, why `target` failed. A failure
+/// of either step on a non-CPU target (EP init, or a warm-up the GPU can't
+/// run) is logged, `reset` runs, and the model loads and warms up on the CPU
+/// instead. On the CPU either failure is the load's error.
+fn load_with_cpu_fallback<M>(
+    target: AccelTarget,
+    mut load: impl FnMut(AccelTarget) -> Result<M, String>,
+    mut warm: impl FnMut(&mut M) -> Result<(), String>,
+    reset: impl FnOnce(),
+) -> Result<(M, AccelTarget, Option<String>), String> {
+    let mut load_and_warm = |t| {
+        let mut m = load(t)?;
+        warm(&mut m)?;
+        Ok::<_, String>(m)
+    };
+    // `loaded` diverges from `target` only on the fallback path below.
+    match load_and_warm(target) {
+        Ok(m) => Ok((m, target, None)),
+        Err(e) if target != AccelTarget::Cpu => {
+            warn!(
+                marker = "live_accel_fallback",
+                engine = "parakeet",
+                requested = target.label(),
+                error = %e,
+                "accelerator load failed; falling back to CPU \
+                 (set YAPSTACK_PARAKEET_ACCEL=cpu to suppress this attempt)"
+            );
+            reset();
+            let m = load_and_warm(AccelTarget::Cpu)
+                .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
+            let reason = format!("{} failed to load: {e}", target.label());
+            Ok((m, AccelTarget::Cpu, Some(reason)))
+        }
+        Err(e) => Err(format!("failed to load parakeet model: {e}")),
     }
 }
 
@@ -1376,6 +1400,69 @@ mod tests {
             Ok(Vec::new())
         })
         .is_ok());
+    }
+
+    /// A warm-up failure on a GPU target takes the same labelled CPU
+    /// fallback as an EP-init failure, with the reason.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn a_warm_up_failure_on_webgpu_falls_back_to_cpu_with_the_reason() {
+        let mut loads = Vec::new();
+        let mut resets = 0;
+        let (model, loaded, reason) = load_with_cpu_fallback(
+            AccelTarget::WebGpu,
+            |t| {
+                loads.push(t);
+                Ok(t)
+            },
+            |m: &mut AccelTarget| match m {
+                AccelTarget::WebGpu => Err("warm-up boom".to_string()),
+                AccelTarget::Cpu => Ok(()),
+            },
+            || resets += 1,
+        )
+        .expect("falls back to CPU");
+        assert_eq!((model, loaded), (AccelTarget::Cpu, AccelTarget::Cpu));
+        assert_eq!(loads, [AccelTarget::WebGpu, AccelTarget::Cpu]);
+        assert_eq!(resets, 1);
+        let reason = reason.expect("fallback reason");
+        assert!(reason.contains("warm-up boom"), "{reason}");
+    }
+
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn an_ep_init_failure_on_webgpu_falls_back_to_cpu_with_the_reason() {
+        let (_, loaded, reason) = load_with_cpu_fallback(
+            AccelTarget::WebGpu,
+            |t| match t {
+                AccelTarget::WebGpu => Err("no adapter".to_string()),
+                AccelTarget::Cpu => Ok(()),
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .expect("falls back to CPU");
+        assert_eq!(loaded, AccelTarget::Cpu);
+        assert!(reason.is_some_and(|r| r.contains("no adapter")));
+    }
+
+    /// On the CPU there is nothing to fall back to: a warm-up failure is
+    /// the load's error.
+    #[test]
+    fn a_warm_up_failure_on_cpu_is_a_load_error() {
+        let mut loads = 0;
+        let err = load_with_cpu_fallback(
+            AccelTarget::Cpu,
+            |t| {
+                loads += 1;
+                Ok(t)
+            },
+            |_| Err("warm-up boom".to_string()),
+            || panic!("no fallback from the CPU"),
+        )
+        .unwrap_err();
+        assert!(err.contains("warm-up boom"), "{err}");
+        assert_eq!(loads, 1);
     }
 
     /// A CoreML folder is never handed to ORT (or silently skipped) on a
