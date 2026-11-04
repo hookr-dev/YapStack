@@ -206,9 +206,12 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam
         4. Skip entirely silent windows (no chunk emitted)
-        5. Split each historical chunk into the fixed backfill quantum before
-           scheduler submission. Sidecar inference is not preemptible, so this
-           bounds the worst-case live delay from an already-running backfill job.
+        5. Split each historical chunk into the fixed backfill quantum (5 s)
+           before scheduler submission. Sidecar inference is not preemptible,
+           so this bounds the worst-case live delay from an already-running
+           backfill job. Each split ends at the quietest Silero frame in the
+           2 s before the quantum bound, not exactly on it (see the length
+           cuts note in Track 2).
         6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
            chunk 1, etc.), and *await each chunk's scheduler response*
@@ -239,20 +242,35 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
             b. Feed each source's samples through the shared Silero V5
                session via score_stream() — returns one probability per
                32 ms frame, maintained across polls by per-source LSTM
-               state in SileroSource
+               state in SileroSource. SileroSource also keeps the last
+               ~33 s of frame probabilities, each tied to the ring-buffer
+               position of its audio, for choosing length cuts.
         4. poll_vad() per source, once per Silero frame — state machine
            iterates every probability so intra-poll speech isn't missed.
            Best-action summary (ForceChunk > Chunk > None) picked per tick.
         5. On VadAction::Chunk (silence detected), ForceChunk (max duration),
            or force-drain after a prior max-size slice:
             a. Extract the oldest contiguous max-size range from the source.
-               If more already-captured audio remains, preserve the source
-               cursor and drain one chunk per source without growing the
-               scheduler queue. Status/pressure events report the remaining
-               drain backlog so slow-sidecar catch-up is visible in the UI.
+               A chunk ended for length (ForceChunk, or more audio waiting
+               than one chunk holds) ends at the quietest Silero frame in
+               the 2 s before the 10 s cap instead of on the cap, and the
+               audio after that cut opens the next chunk. If a full chunk's
+               worth or more remains, drain one chunk per source without
+               growing the scheduler queue; a shorter carry-over keeps
+               growing until a pause or the next cap. Status/pressure events
+               report the remaining drain backlog so slow-sidecar catch-up
+               is visible in the UI.
             b. write_wav_to_temp() → temp WAV
             c. Submit JobRequest to the scheduler at JobOrigin::Live
             d. Emit "live-segment" event with segments + metadata + origin
+           Length cuts: a cut on the cap almost never lands in a pause
+           (in a LibriSpeech replay none of 53 did; the median VAD
+           probability at the cut was 1.0), and Parakeet often returns
+           nothing for a chunk that starts mid-word. Live, backfill, and
+           the backfill quantum split all pick the cut with
+           `silero_vad::trailing_minimum_frame` (lowest probability in
+           the trailing window, ties to the latest frame). Dictation
+           flushes and the final flush at stop keep their exact bounds.
         6. On stop: set the live-busy scheduler gate, skip normal VAD polling,
            idle cursor advancement, stream-health restarts, and unbounded WAV
            flushing. Wait only for the bounded tail grace, copy final source

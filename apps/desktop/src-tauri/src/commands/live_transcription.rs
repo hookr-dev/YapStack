@@ -1543,6 +1543,38 @@ async fn prepare_chunk_dispatch_until(
     .await
 }
 
+/// Where a live chunk starting at `vad.speech_start_pos` ends, given the
+/// write position `current_pos`, and whether that end was moved to a pause.
+/// A chunk ended for length (forced, or more audio waiting than fits)
+/// ends at the quietest recent frame before its cap when `may_seek_pause`;
+/// the audio after it opens the next chunk. Otherwise it ends at the cap.
+fn live_dispatch_end(
+    vad: &SourceVadState,
+    current_pos: usize,
+    max_raw_samples: usize,
+    is_force_chunk: bool,
+    may_seek_pause: bool,
+) -> (usize, bool) {
+    let length_cap = current_pos.min(vad.speech_start_pos.saturating_add(max_raw_samples));
+    if !may_seek_pause || !(is_force_chunk || current_pos > length_cap) {
+        return (length_cap, false);
+    }
+    let window = max_raw_samples_for_duration(
+        PAUSE_SEARCH_WINDOW,
+        vad.source_sample_rate,
+        vad.source_channels,
+    );
+    let end = quietest_recent_frame_pos(
+        &vad.silero.recent_frames,
+        vad.speech_start_pos,
+        length_cap,
+        window,
+        vad.source_channels,
+    )
+    .unwrap_or(length_cap);
+    (end, true)
+}
+
 async fn prepare_chunk_dispatch_inner(
     vad: &mut SourceVadState,
     audio_state: &AudioManagerState,
@@ -1563,7 +1595,16 @@ async fn prepare_chunk_dispatch_inner(
             source_write_pos(&manager, &vad.label)
         }
     };
-    let dispatch_until = current_pos.min(vad.speech_start_pos.saturating_add(max_raw_samples));
+    // Dictation flushes (`ceiling_pos`) and the final flush keep their
+    // exact bounds.
+    let may_seek_pause = ceiling_pos.is_none() && !matches!(origin, JobOrigin::FinalFlush);
+    let (dispatch_until, seek_pause) = live_dispatch_end(
+        vad,
+        current_pos,
+        max_raw_samples,
+        is_force_chunk,
+        may_seek_pause,
+    );
 
     let extraction = {
         let manager = audio_state.lock().await;
@@ -1646,9 +1687,20 @@ async fn prepare_chunk_dispatch_inner(
     // before this point, or the next chunk would redundantly transcribe
     // the tail of the audio this task is about to send.
     vad.earliest_next_chunk_pos = extraction.end_pos;
-    vad.force_drain = has_remaining;
+    // After a pause cut, only a full chunk's worth of backlog is drained
+    // straight away; a shorter carry-over keeps growing into the next chunk
+    // instead of going out as a fragment.
+    vad.force_drain = if seek_pause {
+        current_pos.saturating_sub(extraction.end_pos) >= max_raw_samples
+    } else {
+        has_remaining
+    };
     if is_force_chunk || has_remaining {
-        vad.speech_start_time = Some(Instant::now());
+        // Date the next chunk's start from the audio already carried over,
+        // so the max-duration clock counts it.
+        let carried = Duration::from_secs_f32(drain_backlog_seconds);
+        let now = Instant::now();
+        vad.speech_start_time = Some(now.checked_sub(carried).unwrap_or(now));
     } else {
         vad.speech_start_time = None;
     }
@@ -1832,6 +1884,10 @@ const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
 /// Sidecar work is not preemptible once started, so keeping historical jobs
 /// short bounds how long newly-arrived live speech can wait behind one.
 const BACKFILL_JOB_QUANTUM_SECS: f32 = 5.0;
+/// A chunk cut for length rather than at a pause may end this much before
+/// its cap, at the quietest Silero frame. Cutting mid-word made Parakeet
+/// return nothing for the chunk that started with the rest of the word.
+const PAUSE_SEARCH_WINDOW: Duration = Duration::from_secs(2);
 /// Small bounded grace period included after the stop command snapshots the
 /// ring-buffer positions. This catches the final syllable already in the
 /// OS/audio callback pipeline without returning to unbounded post-stop reads.
@@ -2052,6 +2108,7 @@ fn vad_chunk_historical_audio(
                     start: 0,
                     end: samples.len(),
                 }],
+                &[],
                 sample_rate,
             );
         }
@@ -2064,23 +2121,100 @@ fn vad_chunk_historical_audio(
 
     split_backfill_chunks(
         backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning),
+        &probabilities,
         sample_rate,
     )
 }
 
-fn split_backfill_chunks(chunks: Vec<VadBackfillChunk>, sample_rate: u32) -> Vec<VadBackfillChunk> {
+fn pause_search_window_ms() -> f32 {
+    PAUSE_SEARCH_WINDOW.as_secs_f32() * 1000.0
+}
+
+/// Where a chunk over `[start, cap)` that has to end by `cap` should end:
+/// the middle of the quietest frame of `probabilities` in the
+/// `PAUSE_SEARCH_WINDOW` before `cap`. Frame `k` covers samples
+/// `[k * frame_samples, (k + 1) * frame_samples)`. `None` when no frame's
+/// middle lies in `(start, cap]`.
+fn quietest_frame_midpoint(
+    probabilities: &[f32],
+    frame_samples: usize,
+    start: usize,
+    cap: usize,
+) -> Option<usize> {
+    let half = frame_samples / 2;
+    let first = (start + frame_samples - half) / frame_samples;
+    let end = cap
+        .checked_sub(half)
+        .map_or(0, |c| c / frame_samples + 1)
+        .min(probabilities.len());
+    if first >= end {
+        return None;
+    }
+    let quietest = super::silero_vad::trailing_minimum_frame(
+        &probabilities[first..end],
+        super::silero_vad::FRAME_DURATION_SECS * 1000.0,
+        pause_search_window_ms(),
+    )?;
+    Some((first + quietest) * frame_samples + half)
+}
+
+/// Ring-buffer position where a live chunk over `[start_pos, cap_pos)` that
+/// has to end by `cap_pos` should end: the middle of the quietest recorded
+/// frame (`SileroSource::recent_frames`) within `window_positions` before
+/// `cap_pos`, rounded down to a whole interleaved frame. `None` when no
+/// recorded frame lies in that range.
+fn quietest_recent_frame_pos(
+    recent_frames: &std::collections::VecDeque<(usize, f32)>,
+    start_pos: usize,
+    cap_pos: usize,
+    window_positions: usize,
+    channels: u16,
+) -> Option<usize> {
+    let floor = start_pos.max(cap_pos.saturating_sub(window_positions));
+    let (mids, probs): (Vec<usize>, Vec<f32>) = recent_frames
+        .iter()
+        .filter(|&&(mid, _)| mid > floor && mid <= cap_pos)
+        .copied()
+        .unzip();
+    let quietest = super::silero_vad::trailing_minimum_frame(
+        &probs,
+        super::silero_vad::FRAME_DURATION_SECS * 1000.0,
+        pause_search_window_ms(),
+    )?;
+    let ch = channels.max(1) as usize;
+    let pos = mids[quietest] - mids[quietest] % ch;
+    (pos > start_pos).then_some(pos)
+}
+
+/// Bound each backfill job to `BACKFILL_JOB_QUANTUM_SECS`, ending each piece
+/// at the quietest frame before its bound (`quietest_frame_midpoint`), or
+/// exactly at the bound when `probabilities` is empty.
+fn split_backfill_chunks(
+    chunks: Vec<VadBackfillChunk>,
+    probabilities: &[f32],
+    sample_rate: u32,
+) -> Vec<VadBackfillChunk> {
     let max_samples = (BACKFILL_JOB_QUANTUM_SECS * sample_rate as f32) as usize;
     if max_samples == 0 {
         return chunks;
     }
+    let frame_samples = (super::silero_vad::FRAME_DURATION_SECS * sample_rate as f32) as usize;
 
     let mut split = Vec::new();
     for chunk in chunks {
         let mut start = chunk.start;
-        while start < chunk.end {
-            let end = start.saturating_add(max_samples).min(chunk.end);
+        while chunk.end - start > max_samples {
+            let cap = start + max_samples;
+            let end =
+                quietest_frame_midpoint(probabilities, frame_samples, start, cap).unwrap_or(cap);
             split.push(VadBackfillChunk { start, end });
             start = end;
+        }
+        if start < chunk.end {
+            split.push(VadBackfillChunk {
+                start,
+                end: chunk.end,
+            });
         }
     }
     split
@@ -2142,13 +2276,21 @@ fn backfill_chunks_from_probabilities(
             if is_loud {
                 silence_run = 0;
                 if speech_run >= max_chunk_windows {
+                    // The audio after the cut opens the next chunk.
+                    let cut = quietest_frame_midpoint(
+                        probabilities,
+                        frame_samples_original,
+                        speech_start,
+                        w_end,
+                    )
+                    .unwrap_or(w_end);
                     chunks.push(VadBackfillChunk {
                         start: speech_start,
-                        end: w_end,
+                        end: cut,
                     });
-                    prev_chunk_end = w_end;
-                    speech_start = w_end;
-                    speech_run = 0;
+                    prev_chunk_end = cut;
+                    speech_start = cut;
+                    speech_run = (w_end - cut) / frame_samples_original;
                 }
             } else {
                 silence_run += 1;
@@ -3361,7 +3503,10 @@ async fn live_transcription_loop(
                 s.silero.read_pos = input.new_pos;
                 let probs = match input.samples {
                     Some((mono, source_sr)) => {
-                        silero.score_stream(&mut s.silero.stream, &mono, source_sr)
+                        let probs = silero.score_stream(&mut s.silero.stream, &mono, source_sr);
+                        s.silero
+                            .record_frames(&probs, input.new_pos, source_sr, s.source_channels);
+                        probs
                     }
                     None => Vec::new(),
                 };
@@ -5990,6 +6135,7 @@ mod tests {
                 start: 0,
                 end: 12_500,
             }],
+            &[],
             sr,
         );
 
@@ -6013,6 +6159,197 @@ mod tests {
         assert!(chunks.iter().all(|chunk| {
             chunk.end - chunk.start <= (BACKFILL_JOB_QUANTUM_SECS * sr as f32) as usize
         }));
+    }
+
+    // --- Length cuts land in pauses ---
+
+    const FRAME_SECS: f32 = super::super::silero_vad::FRAME_DURATION_SECS;
+    /// Samples per Silero frame at 16 kHz.
+    const FRAME_16K: usize = 512;
+
+    /// `secs` of steady speech probability with one quiet frame at
+    /// `dip_secs`. Returns the probabilities and the dip's frame index.
+    fn speech_with_dip(secs: f32, dip_secs: f32) -> (Vec<f32>, usize) {
+        let mut probs = vec![0.9f32; (secs / FRAME_SECS) as usize];
+        let dip = (dip_secs / FRAME_SECS) as usize;
+        probs[dip] = 0.1;
+        (probs, dip)
+    }
+
+    /// Continuous speech whose probability varies from frame to frame but
+    /// never drops low enough to end a chunk.
+    fn uneven_speech(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .map(|i| 0.6 + 0.3 * ((i * 37 % 101) as f32 / 101.0))
+            .collect()
+    }
+
+    /// The chunks cover `[start, end)` exactly: no gap, no overlap.
+    fn assert_tiles(chunks: &[VadBackfillChunk], start: usize, end: usize) {
+        assert_eq!(chunks.first().map(|c| c.start), Some(start), "{chunks:?}");
+        assert_eq!(chunks.last().map(|c| c.end), Some(end), "{chunks:?}");
+        for w in chunks.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "gap or overlap: {chunks:?}");
+        }
+        assert!(chunks.iter().all(|c| c.start < c.end), "{chunks:?}");
+    }
+
+    #[test]
+    fn backfill_forced_cut_lands_on_the_pause_before_the_cap() {
+        use yapstack_common::types::EngineKind;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let (probs, dip) = speech_with_dip(12.0, 9.2);
+        let total = probs.len() * FRAME_16K;
+
+        let chunks = backfill_chunks_from_probabilities(&probs, total, 16_000, &tuning);
+
+        assert_eq!(chunks[0].end, dip * FRAME_16K + FRAME_16K / 2, "{chunks:?}");
+        assert_tiles(&chunks, 0, total);
+    }
+
+    #[test]
+    fn backfill_quantum_split_lands_on_the_pause_before_the_bound() {
+        let (probs, dip) = speech_with_dip(9.0, 4.2);
+        let total = probs.len() * FRAME_16K;
+
+        let chunks = split_backfill_chunks(
+            vec![VadBackfillChunk {
+                start: 0,
+                end: total,
+            }],
+            &probs,
+            16_000,
+        );
+
+        assert_eq!(chunks[0].end, dip * FRAME_16K + FRAME_16K / 2, "{chunks:?}");
+        assert_tiles(&chunks, 0, total);
+    }
+
+    /// A minute of unbroken speech: forced chunks and then backfill quanta
+    /// still concatenate back to exactly the input.
+    #[test]
+    fn backfill_cuts_keep_every_sample_exactly_once() {
+        use yapstack_common::types::EngineKind;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let sr = 16_000u32;
+        let probs = uneven_speech((60.0 / FRAME_SECS) as usize);
+        let total = probs.len() * FRAME_16K + 100;
+
+        let chunks = backfill_chunks_from_probabilities(&probs, total, sr, &tuning);
+        assert!(chunks.len() >= 6, "{chunks:?}");
+        assert_tiles(&chunks, 0, total);
+        let max = (tuning.max_chunk_duration.as_secs_f32() * sr as f32) as usize + FRAME_16K;
+        let min = max - (PAUSE_SEARCH_WINDOW.as_secs_f32() * sr as f32) as usize - 2 * FRAME_16K;
+        for c in &chunks[..chunks.len() - 1] {
+            assert!((min..=max).contains(&(c.end - c.start)), "{c:?}");
+        }
+
+        let quanta = split_backfill_chunks(chunks, &probs, sr);
+        assert_tiles(&quanta, 0, total);
+        let quantum = (BACKFILL_JOB_QUANTUM_SECS * sr as f32) as usize;
+        assert!(
+            quanta.iter().all(|c| c.end - c.start <= quantum),
+            "{quanta:?}"
+        );
+    }
+
+    /// 48 kHz stereo: each 16 kHz Silero sample spans 6 buffer positions.
+    const LIVE_SR: u32 = 48_000;
+    const LIVE_CH: u16 = 2;
+    const LIVE_FRAME: usize = FRAME_16K * 6;
+
+    /// Feed `probs[from..to]` into the source's Silero ring the way the live
+    /// loop does, three frames per poll, ending at the matching position.
+    fn feed_live_frames(vad: &mut SourceVadState, probs: &[f32], from: usize, to: usize) {
+        let mut k = from;
+        while k < to {
+            let next = (k + 3).min(to);
+            vad.silero
+                .record_frames(&probs[k..next], next * LIVE_FRAME, LIVE_SR, LIVE_CH);
+            k = next;
+        }
+    }
+
+    fn live_max_raw() -> usize {
+        max_raw_samples_for_duration(Duration::from_secs(10), LIVE_SR, LIVE_CH)
+    }
+
+    #[test]
+    fn live_forced_cut_lands_on_the_pause_before_the_cap() {
+        let (probs, dip) = speech_with_dip(12.0, 9.2);
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        // The max-duration force fires ~10.3 s in (pre-roll + poll latency).
+        let fed = (10.3 / FRAME_SECS) as usize;
+        feed_live_frames(&mut vad, &probs, 0, fed);
+
+        let end = live_dispatch_end(&vad, fed * LIVE_FRAME, live_max_raw(), true, true);
+
+        assert_eq!(end, (dip * LIVE_FRAME + LIVE_FRAME / 2, true));
+    }
+
+    #[test]
+    fn live_cut_keeps_exact_bounds_when_it_may_not_move() {
+        let (probs, _) = speech_with_dip(12.0, 9.2);
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        let fed = (10.3 / FRAME_SECS) as usize;
+        feed_live_frames(&mut vad, &probs, 0, fed);
+        let current = fed * LIVE_FRAME;
+
+        // Dictation flush / final flush.
+        assert_eq!(
+            live_dispatch_end(&vad, current, live_max_raw(), true, false),
+            (live_max_raw(), false)
+        );
+        // A pause-ended chunk that fits ends where the pause was seen.
+        assert_eq!(
+            live_dispatch_end(&vad, 200 * LIVE_FRAME, live_max_raw(), false, true),
+            (200 * LIVE_FRAME, false)
+        );
+        // No recorded frames: cut at the cap.
+        let empty = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        assert_eq!(
+            live_dispatch_end(&empty, current, live_max_raw(), true, true),
+            (live_max_raw(), true)
+        );
+    }
+
+    /// A minute of unbroken live speech cut chunk after chunk: each chunk
+    /// starts where the previous one ended and together they cover it all.
+    #[test]
+    fn live_forced_cuts_keep_every_sample_exactly_once() {
+        let probs = uneven_speech((60.0 / FRAME_SECS) as usize);
+        let total = probs.len() * LIVE_FRAME;
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        let force_after = (10.3 / FRAME_SECS) as usize * LIVE_FRAME;
+        let mut fed = 0;
+        let mut chunks = Vec::new();
+        while total - vad.speech_start_pos > live_max_raw() {
+            let current = (vad.speech_start_pos + force_after).min(total);
+            let to = current / LIVE_FRAME;
+            feed_live_frames(&mut vad, &probs, fed, to);
+            fed = to;
+            let (end, moved) = live_dispatch_end(&vad, current, live_max_raw(), true, true);
+            assert!(moved);
+            assert_eq!(end % LIVE_CH as usize, 0);
+            chunks.push(VadBackfillChunk {
+                start: vad.speech_start_pos,
+                end,
+            });
+            vad.speech_start_pos = end;
+        }
+        chunks.push(VadBackfillChunk {
+            start: vad.speech_start_pos,
+            end: total,
+        });
+
+        assert!(chunks.len() >= 6, "{chunks:?}");
+        assert_tiles(&chunks, 0, total);
+        let min = live_max_raw()
+            - max_raw_samples_for_duration(PAUSE_SEARCH_WINDOW, LIVE_SR, LIVE_CH)
+            - LIVE_FRAME;
+        for c in &chunks[..chunks.len() - 1] {
+            assert!((min..=live_max_raw()).contains(&(c.end - c.start)), "{c:?}");
+        }
     }
 
     #[test]

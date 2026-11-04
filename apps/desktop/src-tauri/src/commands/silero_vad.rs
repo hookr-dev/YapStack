@@ -14,6 +14,8 @@
 //! Apple-Silicon core, well under our 100 ms Parakeet poll interval. The
 //! model is bundled in the binary via `silero::BUNDLED_MODEL` (≈2 MB).
 
+use std::collections::VecDeque;
+
 use silero::{SampleRate, Session, SessionOptions, StreamState};
 use tracing::warn;
 use yapstack_common::audio::resample;
@@ -129,6 +131,35 @@ impl SileroVad {
 /// sample positions (e.g. backfill chunk boundaries) share the constant.
 pub(super) const FRAME_DURATION_SECS: f32 = 0.032;
 
+/// Samples per Silero frame at `TARGET_SAMPLE_RATE_HZ`.
+const FRAME_SAMPLES: usize = 512;
+
+/// How many recent frames `SileroSource` keeps (~33 s), enough to reach
+/// back past a drain backlog to where the next chunk would be cut.
+const RECENT_FRAME_CAPACITY: usize = 1024;
+
+/// Index of the lowest probability among the frames that make up the last
+/// `window_ms` of `probs` (each frame `frame_ms` long). Ties go to the latest
+/// frame. `None` when `probs` is empty.
+pub(super) fn trailing_minimum_frame(
+    probs: &[f32],
+    frame_ms: f32,
+    window_ms: f32,
+) -> Option<usize> {
+    if probs.is_empty() {
+        return None;
+    }
+    let window = ((window_ms / frame_ms) as usize).clamp(1, probs.len());
+    let first = probs.len() - window;
+    let mut best = first;
+    for (i, &p) in probs.iter().enumerate().skip(first) {
+        if p <= probs[best] {
+            best = i;
+        }
+    }
+    Some(best)
+}
+
 /// Per-source streaming state. One instance per audio source (mic, system).
 pub(super) struct SileroSource {
     pub(super) stream: StreamState,
@@ -140,6 +171,9 @@ pub(super) struct SileroSource {
     /// that don't accumulate a full 32 ms frame so `poll_vad` keeps
     /// seeing a value rather than toggling to `None`.
     pub(super) last_probability: Option<f32>,
+    /// The most recent frame probabilities, oldest first, each paired with
+    /// the ring-buffer position of the middle of that frame's audio.
+    pub(super) recent_frames: VecDeque<(usize, f32)>,
 }
 
 impl SileroSource {
@@ -148,6 +182,33 @@ impl SileroSource {
             stream: StreamState::new(SampleRate::Rate16k),
             read_pos: initial_read_pos,
             last_probability: None,
+            recent_frames: VecDeque::new(),
+        }
+    }
+
+    /// Remember `probs`, the frames one `score_stream` call just produced.
+    /// The audio fed so far ends at ring-buffer position `end_pos`, and the
+    /// stream's pending (not yet scored) samples are the last of it.
+    /// Positions are interleaved, so one 16 kHz sample spans
+    /// `source_sample_rate * channels / 16 000` of them.
+    pub(super) fn record_frames(
+        &mut self,
+        probs: &[f32],
+        end_pos: usize,
+        source_sample_rate: u32,
+        channels: u16,
+    ) {
+        let positions_per_sample =
+            source_sample_rate as f64 * channels.max(1) as f64 / TARGET_SAMPLE_RATE_HZ as f64;
+        let pending = self.stream.pending_len() as f64;
+        for (i, &p) in probs.iter().enumerate() {
+            let frames_after = (probs.len() - 1 - i) as f64;
+            let back = pending + frames_after * FRAME_SAMPLES as f64 + FRAME_SAMPLES as f64 / 2.0;
+            let mid = end_pos.saturating_sub((back * positions_per_sample).round() as usize);
+            if self.recent_frames.len() == RECENT_FRAME_CAPACITY {
+                self.recent_frames.pop_front();
+            }
+            self.recent_frames.push_back((mid, p));
         }
     }
 
@@ -157,12 +218,67 @@ impl SileroSource {
     pub(super) fn reset(&mut self) {
         self.stream.reset();
         self.last_probability = None;
+        self.recent_frames.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FRAME_MS: f32 = FRAME_DURATION_SECS * 1000.0;
+
+    /// 12 s of steady speech with one quiet frame at ~9.2 s: the lowest
+    /// frame in the 2 s before a 10 s cap is the dip.
+    #[test]
+    fn trailing_minimum_frame_finds_the_dip_before_the_cap() {
+        let dip = (9.2 / FRAME_DURATION_SECS) as usize;
+        let cap = (10.0 / FRAME_DURATION_SECS) as usize;
+        let mut probs = vec![0.9f32; (12.0 / FRAME_DURATION_SECS) as usize];
+        probs[dip] = 0.1;
+        assert_eq!(
+            trailing_minimum_frame(&probs[..cap], FRAME_MS, 2000.0),
+            Some(dip)
+        );
+    }
+
+    #[test]
+    fn trailing_minimum_frame_ignores_frames_before_the_window() {
+        let mut probs = vec![0.9f32; 200];
+        probs[10] = 0.0;
+        probs[150] = 0.5;
+        assert_eq!(trailing_minimum_frame(&probs, FRAME_MS, 2000.0), Some(150));
+    }
+
+    #[test]
+    fn trailing_minimum_frame_breaks_ties_toward_the_latest_frame() {
+        assert_eq!(
+            trailing_minimum_frame(&[0.9; 100], FRAME_MS, 2000.0),
+            Some(99)
+        );
+        assert_eq!(
+            trailing_minimum_frame(&[0.2, 0.1, 0.1, 0.3], FRAME_MS, 2000.0),
+            Some(2)
+        );
+        assert_eq!(trailing_minimum_frame(&[], FRAME_MS, 2000.0), None);
+    }
+
+    /// Frames scored across several polls get positions at the middle of
+    /// their own audio: 48 kHz stereo spans 6 positions per 16 kHz sample.
+    #[test]
+    fn record_frames_places_each_frame_at_its_audio_midpoint() {
+        let mut source = SileroSource::new(0);
+        let per_frame = FRAME_SAMPLES * 6;
+        source.record_frames(&[0.1, 0.2], 2 * per_frame, 48_000, 2);
+        source.record_frames(&[0.3], 3 * per_frame, 48_000, 2);
+        let mids: Vec<usize> = source.recent_frames.iter().map(|&(m, _)| m).collect();
+        assert_eq!(
+            mids,
+            vec![per_frame / 2, 3 * per_frame / 2, 5 * per_frame / 2]
+        );
+        source.reset();
+        assert!(source.recent_frames.is_empty());
+    }
 
     #[test]
     fn silero_session_loads_and_returns_probability_for_silence() {
