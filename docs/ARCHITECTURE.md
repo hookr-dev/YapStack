@@ -277,7 +277,16 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
 
     → After loop exits (cleanup):
         1. Copy final pending live chunks from [speech_start_pos, stop_positions)
-           into memory before waiting on in-flight tasks.
+           into memory before waiting on in-flight tasks. A source that
+           wasn't mid-utterance first scores the audio Silero hadn't seen yet
+           (its own stream, so the LSTM context carries over) and copies
+           nothing if no frame reaches the speech threshold: otherwise the
+           ~0.4 s of room tone (last poll + stop grace) often decodes as
+           "Yeah.". A pending range under 0.35 s (the 250 ms pre-roll plus
+           under 100 ms of speech) is skipped, as everywhere a chunk is
+           dispatched. A range over one chunk is cut at the quietest recent
+           Silero frame before each 10 s cap and never leaves a piece under
+           2 s.
         2. Bounded final WAV flush from [flush_positions, stop_positions)
         3. Drain in-flight chunk tasks (15 s — they hold no
            Arc<TranscriptionClient> clones under the scheduler, so no abort
