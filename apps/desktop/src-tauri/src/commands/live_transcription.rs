@@ -2254,9 +2254,7 @@ fn vad_chunks_and_open_tail(
     // One probability covers FRAME_DURATION_SECS (32 ms) of audio. Map
     // each frame back to the corresponding slice in the *original*
     // (un-resampled) buffer so chunk boundaries are expressed in the
-    // caller's coordinate system. The mapping is exact: at 44.1 kHz a frame
-    // is 1411.2 samples, and rounding it to 1411 drifted every boundary of
-    // a five-minute backfill by up to 42 ms.
+    // caller's coordinate system.
     use super::silero_vad::{frame_at_sample, frame_start_sample};
     if sample_rate == 0 {
         return (Vec::new(), false);
@@ -6361,30 +6359,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// At 44.1 kHz a Silero frame is 1411.2 samples. Rounding it to 1411
-    /// placed a cut near the end of a five-minute backfill ~41 ms (1800
-    /// samples) before the pause it was aimed at.
-    #[test]
-    fn backfill_cut_lands_on_the_pause_late_in_a_44k_buffer() {
-        let sr = 44_100u32;
-        let frame = FRAME_SECS as f64 * sr as f64;
-        let mut probs = uneven_speech((300.0 / FRAME_SECS) as usize);
-        let dip = (293.5 / FRAME_SECS) as usize;
-        probs[dip] = 0.05;
-        let start = (290.0 * sr as f32) as usize;
-        let end = (296.0 * sr as f32) as usize;
-
-        let pieces = split_backfill_chunks(vec![VadBackfillChunk { start, end }], &probs, sr);
-
-        let expected = ((dip as f64 + 0.5) * frame).round() as usize;
-        assert!(
-            pieces[0].end.abs_diff(expected) <= 1,
-            "cut at {}, pause middle at {expected}",
-            pieces[0].end
-        );
-        assert_tiles(&pieces, start, end);
     }
 
     /// A rewind started while someone is talking: the backfill buffer ends

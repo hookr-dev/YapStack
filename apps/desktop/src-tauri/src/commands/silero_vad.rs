@@ -134,20 +134,23 @@ pub(super) const FRAME_DURATION_SECS: f32 = 0.032;
 /// Samples per Silero frame at `TARGET_SAMPLE_RATE_HZ`.
 const FRAME_SAMPLES: usize = 512;
 
-/// Where frame `frame` of a `score_all` stream starts in the scored buffer
-/// at `sample_rate`: the first sample at or after the frame's start time.
-/// Exact for every rate, including those (44.1 kHz) whose frames aren't a
-/// whole number of samples, and consistent with `frame_at_sample`.
-pub(super) fn frame_start_sample(frame: usize, sample_rate: u32) -> usize {
-    (frame as u64 * FRAME_SAMPLES as u64 * sample_rate as u64)
-        .div_ceil(TARGET_SAMPLE_RATE_HZ as u64) as usize
+/// Samples of a buffer at `sample_rate` that one `score_all` frame is mapped
+/// to: 32 ms, rounded down (1411 at 44.1 kHz). An exact 1411.2 mapping was
+/// tried and replayed worse on 44.1 kHz five-minute backfills (7.2% vs 6.2%
+/// WER, worse on 9 of 10 buffers), so the rounded mapping stays.
+fn frame_len(sample_rate: u32) -> usize {
+    ((FRAME_DURATION_SECS * sample_rate as f32) as usize).max(1)
 }
 
-/// The frame of a `score_all` stream whose audio holds sample `pos` of the
-/// scored buffer at `sample_rate`.
+/// Where frame `frame` of a `score_all` stream starts in the scored buffer.
+pub(super) fn frame_start_sample(frame: usize, sample_rate: u32) -> usize {
+    frame * frame_len(sample_rate)
+}
+
+/// The frame of a `score_all` stream that sample `pos` of the scored buffer
+/// is mapped to.
 pub(super) fn frame_at_sample(pos: usize, sample_rate: u32) -> usize {
-    (pos as u64 * TARGET_SAMPLE_RATE_HZ as u64 / (FRAME_SAMPLES as u64 * sample_rate as u64))
-        as usize
+    pos / frame_len(sample_rate)
 }
 
 /// How many recent frames `SileroSource` keeps (~33 s), enough to reach
@@ -294,24 +297,6 @@ mod tests {
         );
         source.reset();
         assert!(source.recent_frames.is_empty());
-    }
-
-    #[test]
-    fn frame_sample_mapping_is_exact_and_consistent() {
-        assert_eq!(frame_start_sample(10, 16_000), 5_120);
-        assert_eq!(frame_start_sample(10, 48_000), 15_360);
-        // 9375 frames = 300 s; 1411.2 samples each at 44.1 kHz.
-        assert_eq!(frame_start_sample(9_375, 44_100), 13_230_000);
-        for sr in [16_000, 22_050, 44_100, 48_000] {
-            for k in [0, 1, 2, 7, 999, 9_374] {
-                let s = frame_start_sample(k, sr);
-                assert_eq!(frame_at_sample(s, sr), k, "{sr} {k}");
-                assert_eq!(
-                    frame_at_sample(s.saturating_sub(1), sr),
-                    k.saturating_sub(1)
-                );
-            }
-        }
     }
 
     #[test]

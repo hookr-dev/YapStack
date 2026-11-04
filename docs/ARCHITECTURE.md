@@ -220,9 +220,7 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            2 s: when the rest would be, the bound is pulled in so the rest
            fills a piece, and no cut lands within 2 s of the piece's start
            (Parakeet decodes nothing for most shorter fragments of running
-           speech). Silero frames map back to the source buffer exactly, so
-           at 44.1 kHz (1411.2 samples a frame) cuts late in a long backfill
-           stay on the frame they were aimed at.
+           speech).
         6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
            chunk 1, etc.), and *await each chunk's scheduler response*
