@@ -201,6 +201,12 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
         2. Extract historical audio per source into owned Vec<f32> (no longer
            reads the ring buffer after this snapshot — backfill is durable
            against ring-buffer churn for the rest of the session)
+        2a. Score the last 15 s of it with Silero (carry_open_tail_into_live).
+           If speech is still open at its end (the rewind started while
+           someone was talking), backfill stops at that utterance's start
+           and the live source begins already speaking from there, with its
+           max-duration clock backdated and those frames recorded for length
+           cuts, so the word under the seam isn't cut in two.
         3. Run vad_chunk_historical_audio() over each source — same Silero
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam

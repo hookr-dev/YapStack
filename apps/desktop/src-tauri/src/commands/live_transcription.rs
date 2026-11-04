@@ -1875,6 +1875,10 @@ const BACKFILL_JOB_QUANTUM_SECS: f32 = 5.0;
 /// Shortest piece a length split may leave. Parakeet decodes nothing for
 /// most sub-2 s fragments cut out of running speech.
 const MIN_SPLIT_PIECE_SECS: f32 = 2.0;
+/// How much of the end of a backfill buffer is scored at session start to
+/// find speech running into the live start. Longer than one live chunk, so
+/// the open utterance's start (an onset or a length cut) is always inside.
+const BACKFILL_SEAM_SCORE_SECS: f32 = 15.0;
 /// A chunk cut for length rather than at a pause may end this much before
 /// its cap, at the quietest Silero frame. Cutting mid-word made Parakeet
 /// return nothing for the chunk that started with the rest of the word.
@@ -2233,8 +2237,19 @@ fn backfill_chunks_from_probabilities(
     sample_rate: u32,
     tuning: &VadTuning,
 ) -> Vec<VadBackfillChunk> {
+    vad_chunks_and_open_tail(probabilities, total_samples, sample_rate, tuning).0
+}
+
+/// `backfill_chunks_from_probabilities`, plus whether the last chunk is
+/// still open: speech that hadn't ended when the buffer did.
+fn vad_chunks_and_open_tail(
+    probabilities: &[f32],
+    total_samples: usize,
+    sample_rate: u32,
+    tuning: &VadTuning,
+) -> (Vec<VadBackfillChunk>, bool) {
     if probabilities.is_empty() || total_samples == 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     // One probability covers FRAME_DURATION_SECS (32 ms) of audio. Map
     // each frame back to the corresponding slice in the *original*
@@ -2244,7 +2259,7 @@ fn backfill_chunks_from_probabilities(
     // a five-minute backfill by up to 42 ms.
     use super::silero_vad::{frame_at_sample, frame_start_sample};
     if sample_rate == 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let onset_threshold = tuning.speech_threshold;
@@ -2322,14 +2337,65 @@ fn backfill_chunks_from_probabilities(
 
     // Trailing speech that never resolved into silence — emit as final chunk
     // so we don't lose the tail of the backfill window.
-    if is_speaking && speech_start < total_samples {
+    let open = is_speaking && speech_start < total_samples;
+    if open {
         chunks.push(VadBackfillChunk {
             start: speech_start,
             end: total_samples,
         });
     }
 
-    chunks
+    (chunks, open)
+}
+
+/// Hand speech that runs from the end of `source`'s backfill buffer into the
+/// live start over to the live loop, so the word under the seam is
+/// transcribed in one chunk instead of being cut in two. `tail_probs` scores
+/// the last part of the backfill (mono, `backfill_len` samples at
+/// `sample_rate`), starting at sample `tail_offset`. When that speech is
+/// still open at the end, the live source starts speaking at the open
+/// chunk's start, with its max-duration clock backdated and its frames
+/// recorded for length cuts. Returns how many samples backfill keeps.
+/// Call with the live source's `cursor` at the backfill's end.
+fn carry_open_tail_into_live(
+    source: &mut SourceVadState,
+    backfill_len: usize,
+    tail_offset: usize,
+    tail_probs: &[f32],
+    sample_rate: u32,
+    tuning: &VadTuning,
+) -> usize {
+    use super::silero_vad::frame_start_sample;
+    let (chunks, open) =
+        vad_chunks_and_open_tail(tail_probs, backfill_len - tail_offset, sample_rate, tuning);
+    let Some(last) = chunks.last().filter(|_| open) else {
+        return backfill_len;
+    };
+    let keep = tail_offset + last.start;
+    let ch = source.source_channels.max(1) as usize;
+    let ring_pos = |mono: usize| source.cursor.saturating_sub((backfill_len - mono) * ch);
+    let start_pos = ring_pos(keep);
+    let carried = Duration::from_secs_f32((backfill_len - keep) as f32 / sample_rate as f32);
+
+    let first_frame = super::silero_vad::frame_at_sample(last.start, sample_rate);
+    let mids: Vec<(usize, f32)> = (first_frame..tail_probs.len())
+        .map(|k| {
+            let mid =
+                (frame_start_sample(k, sample_rate) + frame_start_sample(k + 1, sample_rate)) / 2;
+            (
+                ring_pos((tail_offset + mid).min(backfill_len)),
+                tail_probs[k],
+            )
+        })
+        .collect();
+    source.silero.recent_frames.extend(mids);
+    source.speech_start_pos = start_pos;
+    source.earliest_next_chunk_pos = start_pos;
+    source.is_speaking = true;
+    source.silence_since = None;
+    let now = Instant::now();
+    source.speech_start_time = Some(now.checked_sub(carried).unwrap_or(now));
+    keep
 }
 
 /// Process backfill audio concurrently with the live VAD loop. Each source's
@@ -3244,7 +3310,7 @@ async fn live_transcription_loop(
     // the loop body can keep its existing `tuning.*` field accesses.
     let tuning = ctx.engine_profile.vad_tuning;
 
-    let (mut sources, backfill_audio) = build_initial_sources_and_backfill(
+    let (mut sources, mut backfill_audio) = build_initial_sources_and_backfill(
         &audio_state,
         &ctx.config,
         check_mic,
@@ -3254,6 +3320,31 @@ async fn live_transcription_loop(
         ctx.session_offset_base_seconds,
     )
     .await;
+    if !backfill_audio.is_empty() {
+        match SileroVad::new() {
+            Ok(mut seam_vad) => {
+                for (samples, sr, label) in backfill_audio.iter_mut() {
+                    let Some(s) = sources.iter_mut().find(|s| s.label == *label) else {
+                        continue;
+                    };
+                    let tail_len = (BACKFILL_SEAM_SCORE_SECS * *sr as f32) as usize;
+                    let tail_offset = samples.len().saturating_sub(tail_len);
+                    let probs = seam_vad.score_all(&samples[tail_offset..], *sr);
+                    let keep = carry_open_tail_into_live(
+                        s,
+                        samples.len(),
+                        tail_offset,
+                        &probs,
+                        *sr,
+                        &tuning,
+                    );
+                    samples.truncate(keep);
+                }
+                backfill_audio.retain(|(samples, _, _)| !samples.is_empty());
+            }
+            Err(e) => warn!("backfill seam: Silero init failed ({e}); live starts at the seam"),
+        }
+    }
 
     // Spawn concurrent backfill processing.
     //
@@ -6294,6 +6385,56 @@ mod tests {
             pieces[0].end
         );
         assert_tiles(&pieces, start, end);
+    }
+
+    /// A rewind started while someone is talking: the backfill buffer ends
+    /// mid-utterance. Backfill used to send that utterance's start as its
+    /// last chunk (often a fraction of a word) and live started a new chunk
+    /// mid-word at the seam; on a LibriSpeech replay with the seam mid-speech
+    /// that cost about 2.5 points of WER. Now live takes the open utterance
+    /// over from its onset, and backfill stops there.
+    #[test]
+    fn open_backfill_tail_is_carried_into_live() {
+        use yapstack_common::types::EngineKind;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let (sr, ch) = (48_000u32, 2u16);
+        let frame = FRAME_16K * 3;
+        let backfill_len = 20 * sr as usize;
+        let tail_offset = 5 * sr as usize;
+        let (silent, speech) = (406, 62);
+        let mut probs = vec![0.1f32; silent];
+        probs.extend(std::iter::repeat_n(0.9, speech));
+        let cursor = 10_000_000usize;
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
+
+        let keep =
+            carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &probs, sr, &tuning);
+
+        let pre_roll = (tuning.pre_roll.as_secs_f32() * sr as f32) as usize;
+        assert_eq!(keep, tail_offset + silent * frame - pre_roll);
+        assert!(vad.is_speaking);
+        assert_eq!(
+            vad.speech_start_pos,
+            cursor - (backfill_len - keep) * ch as usize
+        );
+        assert_eq!(vad.earliest_next_chunk_pos, vad.speech_start_pos);
+        assert!(vad.speech_start_time.unwrap().elapsed() >= Duration::from_secs(2));
+        assert!(!vad.silero.recent_frames.is_empty());
+        assert!(vad
+            .silero
+            .recent_frames
+            .iter()
+            .all(|&(pos, _)| pos >= vad.speech_start_pos && pos <= cursor));
+
+        // A backfill that ends in silence keeps everything.
+        let mut quiet = vec![0.9f32; speech];
+        quiet.extend(std::iter::repeat_n(0.1, silent));
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
+        let keep =
+            carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &quiet, sr, &tuning);
+        assert_eq!(keep, backfill_len);
+        assert!(!vad.is_speaking);
+        assert_eq!(vad.speech_start_pos, cursor);
     }
 
     /// A minute of unbroken speech: forced chunks and then backfill quanta
