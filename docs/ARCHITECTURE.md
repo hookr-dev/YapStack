@@ -201,6 +201,15 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
         2. Extract historical audio per source into owned Vec<f32> (no longer
            reads the ring buffer after this snapshot — backfill is durable
            against ring-buffer churn for the rest of the session)
+        2a. Score the last 15 s of it with Silero (carry_open_tail_into_live).
+           If speech is still open at its end (the rewind started while
+           someone was talking), backfill stops at that utterance's start
+           and the live source begins already speaking from there, with its
+           max-duration clock backdated and those frames recorded for length
+           cuts, so the word under the seam isn't cut in two.
+           A buffer cut short there ends at a point its own length cuts
+           don't know about, so a last chunk under 2 s that follows a length
+           cut joins the chunk before it before the quantum split.
         3. Run vad_chunk_historical_audio() over each source — same Silero
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam
@@ -210,7 +219,11 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            so this bounds the worst-case live delay from an already-running
            backfill job. Each split ends at the quietest Silero frame in the
            2 s before the quantum bound, not exactly on it (see the length
-           cuts note in Track 2).
+           cuts note in Track 2). No piece of a split chunk is shorter than
+           2 s: when the rest would be, the bound is pulled in so the rest
+           fills a piece, and no cut lands within 2 s of the piece's start
+           (Parakeet decodes nothing for most shorter fragments of running
+           speech).
         6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
            chunk 1, etc.), and *await each chunk's scheduler response*
