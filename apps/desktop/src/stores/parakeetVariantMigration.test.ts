@@ -66,6 +66,27 @@ describe("upgrading from the fp32 Parakeet variant", () => {
     expect(settings.language).toBe("de");
   });
 
+  it("migrates an alpha.12 (v31) Whisper user to Parakeet", async () => {
+    localStorage.setItem(
+      "yapstack-settings",
+      JSON.stringify({
+        state: {
+          settings: {
+            selectedEngine: "Whisper",
+            selectedModelSize: "Small",
+            selectedParakeetVariant: "TdtV3",
+          },
+        },
+        version: 31,
+      }),
+    );
+    const { useAppStore } = await launch();
+    const { settings } = useAppStore.getState();
+
+    expect(settings.selectedEngine).toBe("Parakeet");
+    expect(settings.selectedParakeetVariant).toBe("TdtV3Int8");
+  });
+
   it("launch downloads the int8 model with progress, then initializes it", async () => {
     seedPersisted(32);
     const { useAppStore, commands, phases } = await launch();
