@@ -55,6 +55,7 @@ pnpm typecheck                             # tsc
 # Feature-flag transcription sidecar builds
 cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
 cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP (what ships)
+cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio                      # + CoreML/ANE via FluidAudio (Apple silicon, Xcode 26; ADR 0008, not shipped yet)
 
 # Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
 ./scripts/build-sidecars.sh
@@ -179,6 +180,7 @@ CI (`.github/workflows/ci-checks.yml`) runs more than `pnpm check` does on one m
 | Frontend | Ubuntu, Node 24 | ESLint, typecheck, vitest (pnpm 10.28.2) |
 | Rust (macos-latest) | macOS | `cargo clippy --all -- -D warnings`, `cargo test --all` |
 | Rust sync feature (macos-latest) | macOS, plus `nightly-2023-10-05` | `cargo clippy -p yapstack-desktop --features sync --all-targets -- -D warnings`, `cargo test -p yapstack-desktop --features sync` |
+| Rust fluidaudio feature (macos-26) | macOS, Xcode 26.6 pinned | `cargo clippy -p yapstack-transcription-sidecar --features webgpu,fluidaudio --all-targets -- -D warnings`, `cargo test` with the same features, a `minos 14.0` check on the sidecar |
 | Rust (windows-latest) | Windows | `cargo clippy --all -- -D warnings`, clippy on the sidecar with `--features webgpu`, `cargo test --all` |
 
 - **Windows-only code compiles only in CI.** Anything behind `#[cfg(windows)]` / `cfg(target_os = "windows")` is never built on a Mac. Review those paths by reading them, keep them small, and expect the Windows leg to be the first to catch mistakes.
