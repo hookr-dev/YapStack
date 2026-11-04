@@ -18,6 +18,11 @@ parakeet = ["dep:parakeet-rs", "dep:ort"]
 # direct `ort` dep with error_on_failure — parakeet-rs's own arm registers
 # it soft.
 webgpu = ["parakeet", "parakeet-rs/webgpu"]
+# SPIKE (AE3), macOS 14+ only: Parakeet TDT v3 through FluidAudio
+# (Swift, CoreML / Neural Engine). Selected at run time with
+# YAPSTACK_PARAKEET_ACCEL=fluidaudio and a FluidAudio CoreML model dir.
+# build.rs builds and statically links swift/YapFluidAudio; needs `swift`.
+fluidaudio = ["parakeet"]
 
 [dependencies]
 yapstack-common = { path = "../yapstack-common" }

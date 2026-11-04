@@ -30,6 +30,10 @@ pub struct ParakeetBackend {
     /// Set after each successful `load_model` so `engine_info()` can
     /// report what's actually running. Cleared if reload fails.
     last_engine_info: Option<EngineInfo>,
+    /// SPIKE (AE3): FluidAudio CoreML model, loaded instead of `model` when
+    /// `YAPSTACK_PARAKEET_ACCEL=fluidaudio`.
+    #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+    fluid: Option<crate::engines::fluidaudio::FluidAudioModel>,
     /// Kept across transcribes: live chunks all arrive at the device rate.
     resampler: Option<MonoResampler>,
 }
@@ -41,6 +45,8 @@ impl ParakeetBackend {
             sortformer_model_path,
             sortformer: None,
             last_engine_info: None,
+            #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+            fluid: None,
             resampler: None,
         }
     }
@@ -130,6 +136,10 @@ impl ParakeetBackend {
 
         warm_up(&mut model);
         self.model = Some(model);
+        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+        {
+            self.fluid = None;
+        }
         self.last_engine_info = Some(EngineInfo {
             accel: loaded.label().to_string(),
             model_dir: model_path.display().to_string(),
@@ -146,6 +156,10 @@ impl ParakeetBackend {
 
 impl TranscriptionBackend for ParakeetBackend {
     fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
+        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+        if std::env::var("YAPSTACK_PARAKEET_ACCEL").as_deref() == Ok("fluidaudio") {
+            return self.load_fluidaudio(model_path);
+        }
         self.load_model_with(
             model_path,
             AccelChoice::from_env(),
@@ -163,8 +177,6 @@ impl TranscriptionBackend for ParakeetBackend {
         audio_path: &Path,
         opts: TranscribeOpts<'_>,
     ) -> Result<TranscriptionOutput, String> {
-        let model = self.model.as_mut().ok_or("no model loaded")?;
-
         let mono_16k = read_wav_as_mono_16k(audio_path, &mut self.resampler)?;
         let audio_seconds = mono_16k.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
         debug!(
@@ -177,8 +189,19 @@ impl TranscriptionBackend for ParakeetBackend {
         _ = opts.language;
 
         let start = std::time::Instant::now();
-        let mut decode = |samples: &[f32]| {
+        let model = &mut self.model;
+        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+        let fluid = &mut self.fluid;
+        // GATE-LOCAL: both runtimes decode through the same closure, so
+        // FluidAudio goes through the empty-decode retry ladder too.
+        let mut decode = |samples: &[f32]| -> Result<Vec<TimedToken>, String> {
+            #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+            if let Some(fluid) = fluid.as_mut() {
+                return Ok(fluid.transcribe(samples)?.words());
+            }
             model
+                .as_mut()
+                .ok_or_else(|| "no model loaded".to_string())?
                 .transcribe_samples(
                     samples.to_vec(),
                     PARAKEET_SAMPLE_RATE,
@@ -266,6 +289,37 @@ impl TranscriptionBackend for ParakeetBackend {
 }
 
 impl ParakeetBackend {
+    /// SPIKE (AE3): load a FluidAudio CoreML model directory in place of the
+    /// ORT model. No CPU fallback: a failed load is an error.
+    #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
+    fn load_fluidaudio(&mut self, model_path: &Path) -> Result<(), String> {
+        let load_start = std::time::Instant::now();
+        self.model = None;
+        self.fluid = None;
+        self.last_engine_info = None;
+        let (mut fluid, detail) = crate::engines::fluidaudio::FluidAudioModel::load(model_path)?;
+        info!(
+            "fluidaudio model loaded in {} ms ({detail})",
+            load_start.elapsed().as_millis()
+        );
+        let warm = std::time::Instant::now();
+        match fluid.transcribe(&vec![0.0_f32; PARAKEET_SAMPLE_RATE as usize]) {
+            Ok(_) => info!(
+                "fluidaudio warmup inference in {} ms",
+                warm.elapsed().as_millis()
+            ),
+            Err(e) => warn!("fluidaudio warmup inference failed: {e}"),
+        }
+        self.fluid = Some(fluid);
+        self.last_engine_info = Some(EngineInfo {
+            accel: "fluidaudio".to_string(),
+            model_dir: model_path.display().to_string(),
+            accel_fallback: None,
+            accel_partial: false,
+        });
+        Ok(())
+    }
+
     /// Run Sortformer diarization on a single chunk's audio.
     ///
     /// **Known limitation — chunk-local speaker IDs.** Sortformer::diarize()
