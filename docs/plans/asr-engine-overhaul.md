@@ -1,6 +1,6 @@
 # Plan: ASR engine overhaul — benchmark, fix the quant, drop Whisper, adopt Parakeet Unified EN
 
-**Status:** in progress (updated 2026-11-03). Proposed 2026-10-22; gates G1–G4 ratified 2026-10-31. Phase 0 harness is `tools/asr-bench`. Phase 1's truthful EP shipped (strict WebGPU, measured placement table, int8 on CPU on macOS). Phase 2 shipped (ADR 0005, #131, #132). The AE results below replace the macOS default question: FluidAudio (CoreML/ANE) is the planned Mac default. Phases 3–4 not started.
+**Status:** in progress (updated 2026-11-03). Proposed 2026-10-22; gates G1, G3 and G4 ratified 2026-10-31 (G4 at 100% placement); AE-G1 added 2026-11-03. Phase 0 harness is `tools/asr-bench`. Phase 1's truthful EP shipped (strict WebGPU, measured placement table, int8 on CPU on macOS). Phase 2 shipped (ADR 0005, #131, #132). The AE results below replace the macOS default question: FluidAudio (CoreML/ANE) is the planned Mac default. Phases 3–4 not started.
 **Research:** `docs/plans/research/asr-engine-2026-10/README.md` (gitignored).
 
 ## Context
@@ -108,14 +108,15 @@ All corpus data lives in a gitignored cache (`tools/asr-bench/.cache/`).
 
 **Output:** CSV plus a markdown report in `docs/plans/research/asr-bench-<date>/` (gitignored). The headline table goes into ADR 0005.
 
-### Gates (proposed — owner ratifies *before* the run; not relaxed after)
+### Gates (ratified before the run; not relaxed after)
 
 | Gate | Decides | Pass condition |
 |---|---|---|
-| **G1** Default variant + EP | Phase 1 | Among rows A–C, take the fastest row (p95 chunk latency, then energy) whose WER is ≤ D + 0.3 pt absolute on *every* gating slice (owner, quiet, chunk-replay). |
-| **G4** EP honesty | Phase 1 | An accelerator EP is default only if ≥ 90% of MatMul/Conv nodes are placed on it. Otherwise the default for that platform is CPU. |
-| **G3** Whisper drop | Phase 2 | The G1 winner's WER ≤ W2 (Whisper Medium) on the owner and chunk-replay slices. The owner explicitly accepts the loss of the languages outside the 25. |
-| **G2** Unified EN | Phase 4 | Unified (best variant) WER ≤ G1 winner − 0.3 pt on owner English and chunk-replay, *and* not worse on the quiet slice. Latency within 1.25× of the G1 winner. |
+| **G1** Default variant + EP (ratified 2026-10-31) | Phase 1 | Among rows A–C, take the fastest row (p95 chunk latency, then energy) whose WER is ≤ D (fp32) + 0.3 pt absolute on *every* gating slice (owner, quiet, chunk-replay). |
+| **G4** EP honesty (ratified 2026-10-31 at 100%) | Phase 1 | An accelerator EP is default only if 100% of heavy (MatMul/Conv) ops are placed on it. Any heavy op off the accelerator forces CPU as the default for that platform. |
+| **G3** Whisper drop (ratified 2026-10-31; passed, ADR 0005) | Phase 2 | The G1 winner's WER ≤ W2 (Whisper Medium) on the owner and chunk-replay slices. The owner explicitly accepts the loss of the languages outside the 25. |
+| **G2** Unified EN (not yet ratified) | Phase 4 | Unified (best variant) WER ≤ G1 winner − 0.3 pt on owner English and chunk-replay, *and* not worse on the quiet slice. Latency within 1.25× of the G1 winner. |
+| **AE-G1** Mac efficiency default (added 2026-11-03) | FluidAudio as Mac default | WER ≤ shipped int8 + 1.0 pt absolute on *every* gating slice, zero empty or truncated outputs, and word timestamps kept. |
 
 Phase 0 also closes the pre-GA "in-house int8 WER sanity-check" (windows-support.md:221).
 
@@ -132,7 +133,7 @@ Battery energy per audio-minute, Apple Silicon:
 
 - **Burn rejected.** It needs our own patch to maintain, and its `panic=abort` kills the sidecar on any panic.
 - **ORT CoreML EP:** 0% of heavy ops placed on it. It is not an acceleration path.
-- **FluidAudio is the planned Mac default**, gated on an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
+- **FluidAudio is the planned Mac default**, gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
 - **macOS 14 floor:** the minimum macOS version is raised to 14 directly, with no older-OS fallback path.
 
 ## Phase 1 — Fix quant and EP on the current stack (parakeet-rs 0.3.5)
@@ -215,7 +216,7 @@ Each PR passes `pnpm check`.
 
 ## Ask-first checklist (per AGENTS.md)
 
-- [ ] Ratify gates G1–G4 before the bench runs
+- [x] Ratify gates G1, G3, G4 before the bench runs (2026-10-31; G2 still open)
 - [ ] ADR 0005 (Parakeet-only)
 - [ ] Sidecar IPC change (`EngineKind::Whisper` removal)
 - [ ] Tauri command surface removal (Whisper model commands)
