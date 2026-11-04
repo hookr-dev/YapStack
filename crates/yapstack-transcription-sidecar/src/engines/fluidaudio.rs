@@ -104,18 +104,28 @@ impl FluidAudioModel {
         if rc != 0 {
             return Err(format!("parakeet CoreML transcription failed: {body}"));
         }
-        let out: Output = serde_json::from_str(&body)
-            .map_err(|e| format!("parakeet CoreML result parse: {e}"))?;
-        Ok(out
-            .words
-            .into_iter()
-            .map(|w| TimedToken {
-                text: w.w,
-                start: w.s as f32,
-                end: w.e as f32,
-            })
-            .collect())
+        tokens_from_output(&body, mono_16k.len() as f32 / 16_000.0)
     }
+}
+
+/// The shim's JSON result as word tokens of a chunk `audio_secs` long.
+/// FluidAudio pads the audio to whole 80 ms encoder frames and adds the TDT
+/// duration to the last token's end, so its times can run past the audio;
+/// parakeet-rs does neither. Clamping to the chunk keeps both runtimes'
+/// timestamps inside the audio they came from.
+fn tokens_from_output(body: &str, audio_secs: f32) -> Result<Vec<TimedToken>, String> {
+    let out: Output =
+        serde_json::from_str(body).map_err(|e| format!("parakeet CoreML result parse: {e}"))?;
+    let clamp = |t: f64| (t as f32).clamp(0.0, audio_secs);
+    Ok(out
+        .words
+        .into_iter()
+        .map(|w| TimedToken {
+            text: w.w,
+            start: clamp(w.s),
+            end: clamp(w.e),
+        })
+        .collect())
 }
 
 impl Drop for FluidAudioModel {
@@ -190,6 +200,38 @@ mod tests {
                 .or_default() += n;
         }
         plan
+    }
+
+    fn spans(tokens: &[TimedToken]) -> Vec<(&str, f32, f32)> {
+        tokens
+            .iter()
+            .map(|t| (t.text.as_str(), t.start, t.end))
+            .collect()
+    }
+
+    #[test]
+    fn the_shim_result_maps_to_word_tokens() {
+        let body = r#"{"words":[{"w":"Hello","s":0.08,"e":0.4},{"w":"world.","s":0.48,"e":0.96}]}"#;
+        let tokens = tokens_from_output(body, 2.0).unwrap();
+        assert_eq!(
+            spans(&tokens),
+            [("Hello", 0.08, 0.4), ("world.", 0.48, 0.96)]
+        );
+        assert!(tokens_from_output("{}", 2.0).is_err());
+    }
+
+    /// FluidAudio pads the audio to whole 80 ms encoder frames and adds the
+    /// TDT duration to the last token's end, so the last word can end past
+    /// the audio (up to 161 ms on the AE-G1 replay). parakeet-rs does
+    /// neither; times are clamped to the chunk so both runtimes agree.
+    #[test]
+    fn word_times_are_clamped_to_the_chunk() {
+        let body = r#"{"words":[{"w":"a","s":0.5,"e":1.2},{"w":"b","s":1.98,"e":2.16},{"w":"c","s":2.08,"e":2.24}]}"#;
+        let tokens = tokens_from_output(body, 2.0).unwrap();
+        assert_eq!(
+            spans(&tokens),
+            [("a", 0.5, 1.2), ("b", 1.98, 2.0), ("c", 2.0, 2.0)]
+        );
     }
 
     #[test]
