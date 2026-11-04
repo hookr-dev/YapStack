@@ -208,6 +208,15 @@ jobs:
             [ "$minos" = "14.0" ] || { echo "::error::$bin targets macOS $minos, expected 14.0"; exit 1; }
             echo "$bin targets macOS $minos"
           done
+          # Prebuilt frameworks (the Dawn dylib) keep their own minos, which
+          # may be older but must not be newer than the floor.
+          for lib in "$app"/Contents/Frameworks/*.dylib; do
+            [ -e "$lib" ] || continue
+            minos=$(otool -l "$lib" | awk '/LC_BUILD_VERSION/ {b=1} b && $1 == "minos" {print $2; exit}')
+            [ -n "$minos" ] && [ "$(printf '%s\n' "$minos" 14.0 | sort -V | tail -1)" = "14.0" ] \
+              || { echo "::error::$lib targets macOS ${minos:-unknown}, above the 14.0 floor"; exit 1; }
+            echo "$lib targets macOS $minos"
+          done
 
       - name: Generate checksum
         run: |
