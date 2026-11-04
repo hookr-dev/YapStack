@@ -1,36 +1,39 @@
-//! SPIKE (AE3): builds the FluidAudio Swift shim (`swift/YapFluidAudio`) and
-//! links it statically when the `fluidaudio` feature is on, on macOS only.
-//! Without the feature this script does nothing.
+//! With the `fluidaudio` feature on an Apple-silicon target, builds the
+//! FluidAudio Swift shim (`swift/YapFluidAudio`), links it statically and
+//! sets `cfg(fluidaudio_linked)` (ADR 0008). Anywhere else this script does
+//! nothing, and a CoreML model folder is a load error at run time.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rustc-check-cfg=cfg(fluidaudio_linked)");
     if std::env::var_os("CARGO_FEATURE_FLUIDAUDIO").is_none() {
         return;
     }
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if os != "macos" || arch != "aarch64" {
         return;
     }
     fluidaudio::build();
+    println!("cargo:rustc-cfg=fluidaudio_linked");
 }
 
 mod fluidaudio {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// FluidAudio needs macOS 14 (the app's floor, tauri.conf.json
+    /// minimumSystemVersion). Linking for an older target would mark the
+    /// sidecar as running on an OS the Swift code can't.
+    const DEPLOYMENT_TARGET: &str = "14.0";
+
     pub fn build() {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let pkg = manifest.join("swift/YapFluidAudio");
-        println!(
-            "cargo:rerun-if-changed={}",
-            pkg.join("Package.swift").display()
-        );
-        println!("cargo:rerun-if-changed={}", pkg.join("Sources").display());
+        for f in ["Package.swift", "Package.resolved", "Sources"] {
+            println!("cargo:rerun-if-changed={}", pkg.join(f).display());
+        }
 
-        let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
-            "aarch64" => "arm64",
-            "x86_64" => "x86_64",
-            other => panic!("fluidaudio: unsupported arch {other}"),
-        };
         // One Swift build dir per target dir (OUT_DIR is
         // <target>/<profile>/build/<pkg>-<hash>/out), so the package fetch and
         // FluidAudio compile are shared across profiles and rebuilds.
@@ -40,8 +43,18 @@ mod fluidaudio {
             .nth(4)
             .map(|t| t.join("swift-yfa"))
             .unwrap_or_else(|| out_dir.join("swift"));
+        // `--force-resolved-versions`: build exactly what Package.resolved
+        // pins, and fail rather than re-resolve when it's out of date.
         let status = Command::new("swift")
-            .args(["build", "-c", "release", "--arch", arch, "--package-path"])
+            .args([
+                "build",
+                "-c",
+                "release",
+                "--arch",
+                "arm64",
+                "--force-resolved-versions",
+                "--package-path",
+            ])
             .arg(&pkg)
             .arg("--build-path")
             .arg(&out)
@@ -52,7 +65,7 @@ mod fluidaudio {
         // SwiftPM's native build system and the swift-build backend (the
         // default from Swift 6.3) put the product in different places.
         let lib_dir = [
-            out.join(format!("{arch}-apple-macosx")).join("release"),
+            out.join("arm64-apple-macosx/release"),
             out.join("out/Products/Release"),
         ]
         .into_iter()
@@ -60,14 +73,14 @@ mod fluidaudio {
         .expect("fluidaudio: libYapFluidAudio.a not found after swift build");
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib=static=YapFluidAudio");
+        println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET={DEPLOYMENT_TARGET}");
 
         // Swift runtime: the OS copy in /usr/lib/swift at run time; the
         // toolchain's dir at link time for the back-deploy compatibility
         // shims the Swift objects reference.
-        let toolchain_swift = swift_toolchain_lib_dir();
         println!(
             "cargo:rustc-link-search=native={}",
-            toolchain_swift.display()
+            swift_toolchain_lib_dir().display()
         );
         // The Swift objects' autolink entries already add `-rpath /usr/lib/swift`.
         println!("cargo:rustc-link-search=native=/usr/lib/swift");

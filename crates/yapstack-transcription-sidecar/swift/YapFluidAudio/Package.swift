@@ -1,6 +1,6 @@
 // swift-tools-version: 6.2
-// SPIKE (AE3): minimal C-ABI shim over FluidAudio's Parakeet TDT v3 CoreML
-// path, built by the sidecar's build.rs under the `fluidaudio` feature.
+// C-ABI shim over FluidAudio's Parakeet TDT v3 CoreML path, built by the
+// sidecar's build.rs under the `fluidaudio` feature (ADR 0008).
 // `traits: []` builds FluidAudio ASR-only: no TTS, no diarizer and, in
 // particular, no prebuilt NemoTextProcessing xcframework binary target.
 import PackageDescription

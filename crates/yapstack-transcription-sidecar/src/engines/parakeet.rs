@@ -1,4 +1,6 @@
-//! Parakeet TDT-v3 backend (parakeet-rs 0.3 + ONNX Runtime via `ort`).
+//! Parakeet TDT-v3 backend: parakeet-rs 0.3 on ONNX Runtime (via `ort`), or
+//! CoreML through FluidAudio on Apple silicon (ADR 0008), picked from the
+//! model folder's format.
 
 use std::path::{Path, PathBuf};
 
@@ -23,17 +25,68 @@ const PARAKEET_SAMPLE_RATE: u32 = 16000;
 const SEGMENT_GAP_SECS: f32 = 0.5;
 const MAX_SEGMENT_SECS: f32 = 12.0;
 
+/// Which runtime a Parakeet model folder is for, from its format: compiled
+/// CoreML bundles (`*.mlmodelc`, FluidAudio's export) or ONNX graphs
+/// (parakeet-rs on ORT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParakeetRuntime {
+    Ort,
+    CoreMl,
+}
+
+impl ParakeetRuntime {
+    fn of_model_dir(model_dir: &Path) -> Self {
+        let has_coreml_bundle = std::fs::read_dir(model_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "mlmodelc")
+            });
+        if has_coreml_bundle {
+            Self::CoreMl
+        } else {
+            Self::Ort
+        }
+    }
+}
+
+/// A loaded Parakeet model on either runtime.
+enum LoadedModel {
+    Ort(Box<ParakeetTDT>),
+    #[cfg(fluidaudio_linked)]
+    CoreMl(crate::engines::fluidaudio::FluidAudioModel),
+}
+
+impl LoadedModel {
+    /// Word-timed tokens of 16 kHz mono audio.
+    fn decode(&mut self, samples: &[f32]) -> Result<Vec<TimedToken>, String> {
+        match self {
+            LoadedModel::Ort(model) => model
+                .transcribe_samples(
+                    samples.to_vec(),
+                    PARAKEET_SAMPLE_RATE,
+                    1,
+                    Some(TimestampMode::Words),
+                )
+                .map(|r| r.tokens)
+                .map_err(|e| format!("parakeet transcription failed: {e}")),
+            #[cfg(fluidaudio_linked)]
+            LoadedModel::CoreMl(model) => model.transcribe(samples),
+        }
+    }
+}
+
 pub struct ParakeetBackend {
-    model: Option<ParakeetTDT>,
+    model: Option<LoadedModel>,
     sortformer_model_path: Option<PathBuf>,
     sortformer: Option<Sortformer>,
     /// Set after each successful `load_model` so `engine_info()` can
     /// report what's actually running. Cleared if reload fails.
     last_engine_info: Option<EngineInfo>,
-    /// SPIKE (AE3): FluidAudio CoreML model, loaded instead of `model` when
-    /// `YAPSTACK_PARAKEET_ACCEL=fluidaudio`.
-    #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-    fluid: Option<crate::engines::fluidaudio::FluidAudioModel>,
     /// Kept across transcribes: live chunks all arrive at the device rate.
     resampler: Option<MonoResampler>,
 }
@@ -45,8 +98,6 @@ impl ParakeetBackend {
             sortformer_model_path,
             sortformer: None,
             last_engine_info: None,
-            #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-            fluid: None,
             resampler: None,
         }
     }
@@ -104,7 +155,7 @@ impl ParakeetBackend {
             Some(build_exec_config(target, placement.as_ref())),
         );
         // `loaded` diverges from `target` only on the fallback path below.
-        let (mut model, loaded, accel_fallback) = match attempt {
+        let (model, loaded, accel_fallback) = match attempt {
             Ok(m) => (m, target, None),
             Err(e) if target != AccelTarget::Cpu => {
                 warn!(
@@ -134,12 +185,9 @@ impl ParakeetBackend {
         let sessions = placement.map(|r| r.take()).unwrap_or_default();
         log_placement(loaded, &sessions);
 
-        warm_up(&mut model);
+        let mut model = LoadedModel::Ort(Box::new(model));
+        warm_up(|s| model.decode(s))?;
         self.model = Some(model);
-        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-        {
-            self.fluid = None;
-        }
         self.last_engine_info = Some(EngineInfo {
             accel: loaded.label().to_string(),
             model_dir: model_path.display().to_string(),
@@ -152,20 +200,82 @@ impl ParakeetBackend {
         );
         Ok(sessions)
     }
+
+    /// Loads a FluidAudio CoreML model folder. Auto runs it on the CPU and
+    /// the Neural Engine; `YAPSTACK_PARAKEET_ACCEL=cpu` on the CPU alone.
+    /// The label comes from the encoder's compute plan, never from the
+    /// request, and a failure is the load's error: there is no fallback to
+    /// the ORT engine.
+    #[cfg(fluidaudio_linked)]
+    fn load_coreml(&mut self, model_path: &Path, choice: AccelChoice) -> Result<(), String> {
+        use crate::engines::fluidaudio::{
+            accel_from_plan, encoder_compute_plan, ComputeUnits, FluidAudioModel,
+        };
+        let units = match choice {
+            AccelChoice::Auto => ComputeUnits::CpuAndNeuralEngine,
+            AccelChoice::Cpu => ComputeUnits::CpuOnly,
+            #[cfg(feature = "webgpu")]
+            AccelChoice::WebGpu => {
+                return Err(format!(
+                    "YAPSTACK_PARAKEET_ACCEL=webgpu doesn't apply to the CoreML model at {}",
+                    model_path.display()
+                ))
+            }
+        };
+        let load_start = std::time::Instant::now();
+        info!(
+            "loading parakeet CoreML model from {} ({units:?})",
+            model_path.display()
+        );
+        let plan = encoder_compute_plan(model_path, units)
+            .inspect_err(|e| {
+                warn!("no CoreML compute plan, so the encoder's placement is unverified: {e}")
+            })
+            .ok();
+        let (accel, accel_partial) = accel_from_plan(plan.as_ref());
+        info!(
+            marker = "coreml_placement",
+            accel,
+            accel_partial,
+            plan = ?plan,
+            "coreml encoder placement"
+        );
+        let mut model = LoadedModel::CoreMl(FluidAudioModel::load(model_path, units)?);
+        warm_up(|s| model.decode(s))?;
+        self.model = Some(model);
+        self.last_engine_info = Some(EngineInfo {
+            accel: accel.to_string(),
+            model_dir: model_path.display().to_string(),
+            accel_fallback: None,
+            accel_partial,
+        });
+        info!(
+            "parakeet CoreML model loaded in {} ms",
+            load_start.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(fluidaudio_linked))]
+    fn load_coreml(&mut self, model_path: &Path, choice: AccelChoice) -> Result<(), String> {
+        _ = choice;
+        Err(format!(
+            "{} is a CoreML model, and this sidecar was built without CoreML support \
+             (the `fluidaudio` feature, Apple silicon only)",
+            model_path.display()
+        ))
+    }
 }
 
 impl TranscriptionBackend for ParakeetBackend {
     fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
-        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-        if std::env::var("YAPSTACK_PARAKEET_ACCEL").as_deref() == Ok("fluidaudio") {
-            return self.load_fluidaudio(model_path);
+        let choice = AccelChoice::from_env();
+        match ParakeetRuntime::of_model_dir(model_path) {
+            ParakeetRuntime::Ort => self
+                .load_model_with(model_path, choice, PlacementRecorder::from_env())
+                .map(drop),
+            ParakeetRuntime::CoreMl => self.load_coreml(model_path, choice),
         }
-        self.load_model_with(
-            model_path,
-            AccelChoice::from_env(),
-            PlacementRecorder::from_env(),
-        )
-        .map(drop)
     }
 
     fn engine_info(&self) -> Option<EngineInfo> {
@@ -177,6 +287,8 @@ impl TranscriptionBackend for ParakeetBackend {
         audio_path: &Path,
         opts: TranscribeOpts<'_>,
     ) -> Result<TranscriptionOutput, String> {
+        let model = self.model.as_mut().ok_or("no model loaded")?;
+
         let mono_16k = read_wav_as_mono_16k(audio_path, &mut self.resampler)?;
         let audio_seconds = mono_16k.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
         debug!(
@@ -189,28 +301,7 @@ impl TranscriptionBackend for ParakeetBackend {
         _ = opts.language;
 
         let start = std::time::Instant::now();
-        let model = &mut self.model;
-        #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-        let fluid = &mut self.fluid;
-        // GATE-LOCAL: both runtimes decode through the same closure, so
-        // FluidAudio goes through the empty-decode retry ladder too.
-        let mut decode = |samples: &[f32]| -> Result<Vec<TimedToken>, String> {
-            #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-            if let Some(fluid) = fluid.as_mut() {
-                return Ok(fluid.transcribe(samples)?.words());
-            }
-            model
-                .as_mut()
-                .ok_or_else(|| "no model loaded".to_string())?
-                .transcribe_samples(
-                    samples.to_vec(),
-                    PARAKEET_SAMPLE_RATE,
-                    1,
-                    Some(TimestampMode::Words),
-                )
-                .map(|r| r.tokens)
-                .map_err(|e| format!("parakeet transcription failed: {e}"))
-        };
+        let mut decode = |samples: &[f32]| model.decode(samples);
         let mut tokens = decode(&mono_16k)?;
         if word_count(&tokens) == 0 && empty_decode_is_suspect(&mono_16k) {
             if let Some(retried) = retry_empty_decode(&mono_16k, &mut decode) {
@@ -289,37 +380,6 @@ impl TranscriptionBackend for ParakeetBackend {
 }
 
 impl ParakeetBackend {
-    /// SPIKE (AE3): load a FluidAudio CoreML model directory in place of the
-    /// ORT model. No CPU fallback: a failed load is an error.
-    #[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-    fn load_fluidaudio(&mut self, model_path: &Path) -> Result<(), String> {
-        let load_start = std::time::Instant::now();
-        self.model = None;
-        self.fluid = None;
-        self.last_engine_info = None;
-        let (mut fluid, detail) = crate::engines::fluidaudio::FluidAudioModel::load(model_path)?;
-        info!(
-            "fluidaudio model loaded in {} ms ({detail})",
-            load_start.elapsed().as_millis()
-        );
-        let warm = std::time::Instant::now();
-        match fluid.transcribe(&vec![0.0_f32; PARAKEET_SAMPLE_RATE as usize]) {
-            Ok(_) => info!(
-                "fluidaudio warmup inference in {} ms",
-                warm.elapsed().as_millis()
-            ),
-            Err(e) => warn!("fluidaudio warmup inference failed: {e}"),
-        }
-        self.fluid = Some(fluid);
-        self.last_engine_info = Some(EngineInfo {
-            accel: "fluidaudio".to_string(),
-            model_dir: model_path.display().to_string(),
-            accel_fallback: None,
-            accel_partial: false,
-        });
-        Ok(())
-    }
-
     /// Run Sortformer diarization on a single chunk's audio.
     ///
     /// **Known limitation — chunk-local speaker IDs.** Sortformer::diarize()
@@ -631,21 +691,21 @@ fn log_placement(loaded: AccelTarget, sessions: &[SessionPlacement]) {
     }
 }
 
-/// One silent second through the full pipeline right after load, so the
-/// first real chunk doesn't pay the cold-start cost (allocator arenas,
-/// WebGPU pipeline compilation): measured cold runs on WebGPU were up to
-/// ~45% slower than steady state. A failure is only logged — a broken model surfaces on the
-/// first real transcribe with its own error.
-fn warm_up(model: &mut ParakeetTDT) {
+/// One silent second through `decode` right after load, so the first real
+/// chunk doesn't pay the cold-start cost (allocator arenas, WebGPU pipeline
+/// compilation, CoreML's first prediction): measured cold runs on WebGPU were
+/// up to ~45% slower than steady state. A failure fails the load: a model
+/// that can't decode silence won't decode speech, and the error belongs to
+/// the load rather than to every chunk after it.
+fn warm_up(decode: impl FnOnce(&[f32]) -> Result<Vec<TimedToken>, String>) -> Result<(), String> {
     let start = std::time::Instant::now();
-    let silence = vec![0.0_f32; PARAKEET_SAMPLE_RATE as usize];
-    match model.transcribe_samples(silence, PARAKEET_SAMPLE_RATE, 1, Some(TimestampMode::Words)) {
-        Ok(_) => info!(
-            "parakeet warmup inference in {} ms",
-            start.elapsed().as_millis()
-        ),
-        Err(e) => warn!("parakeet warmup inference failed: {e}"),
-    }
+    decode(&vec![0.0_f32; PARAKEET_SAMPLE_RATE as usize])
+        .map_err(|e| format!("parakeet warm-up inference failed: {e}"))?;
+    info!(
+        "parakeet warmup inference in {} ms",
+        start.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 /// Strict WebGPU registration (Dawn → Metal on macOS, Vulkan/D3D12
@@ -1276,6 +1336,105 @@ mod tests {
             let builder = ort::session::Session::builder().expect("ort builder");
             configure(builder).expect("hook applies");
         }
+    }
+
+    // --- runtime selection, warm-up ---
+
+    /// A throwaway model dir holding empty directories with the given names
+    /// (CoreML compiled models are bundles).
+    fn coreml_dir(tag: &str) -> PathBuf {
+        let dir = model_dir(tag, &[]);
+        for bundle in ["Encoder_v2.mlmodelc", "Decoder.mlmodelc"] {
+            std::fs::create_dir_all(dir.join(bundle)).unwrap();
+        }
+        std::fs::write(dir.join("parakeet_vocab.json"), b"{}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_runtime_follows_the_model_folder_format() {
+        assert_eq!(
+            ParakeetRuntime::of_model_dir(&coreml_dir("runtime-coreml")),
+            ParakeetRuntime::CoreMl
+        );
+        assert_eq!(
+            ParakeetRuntime::of_model_dir(&model_dir("runtime-int8", &INT8_FILES)),
+            ParakeetRuntime::Ort
+        );
+        assert_eq!(
+            ParakeetRuntime::of_model_dir(Path::new("/nonexistent/parakeet")),
+            ParakeetRuntime::Ort
+        );
+    }
+
+    #[test]
+    fn a_failed_warm_up_fails_the_load() {
+        let err = warm_up(|_| Err("boom".to_string())).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert!(warm_up(|s| {
+            assert_eq!(s.len(), PARAKEET_SAMPLE_RATE as usize);
+            Ok(Vec::new())
+        })
+        .is_ok());
+    }
+
+    /// A CoreML folder is never handed to ORT (or silently skipped) on a
+    /// build without the CoreML runtime: it's a load error naming why.
+    #[cfg(not(fluidaudio_linked))]
+    #[test]
+    fn a_coreml_folder_is_a_load_error_without_the_coreml_runtime() {
+        let mut backend = ParakeetBackend::new(None);
+        let err = backend.load_model(&coreml_dir("no-runtime")).unwrap_err();
+        assert!(err.contains("built without CoreML"), "{err}");
+        assert!(backend.engine_info().is_none());
+    }
+
+    /// A FluidAudio CoreML model folder (FluidInference/parakeet-tdt-0.6b-v3-coreml).
+    #[cfg(fluidaudio_linked)]
+    fn coreml_model_dir() -> PathBuf {
+        PathBuf::from(
+            std::env::var("YAPSTACK_TEST_FLUIDAUDIO_DIR")
+                .expect("set YAPSTACK_TEST_FLUIDAUDIO_DIR"),
+        )
+    }
+
+    /// The runtime comes from the model folder: a CoreML folder loads on
+    /// CoreML with no env selection, and is labelled from the encoder's compute plan: `"ane"` only when
+    /// the plan puts its heavy ops on the Neural Engine.
+    #[cfg(fluidaudio_linked)]
+    #[test]
+    #[ignore = "needs YAPSTACK_TEST_FLUIDAUDIO_DIR set to a FluidAudio CoreML model dir"]
+    fn a_coreml_model_folder_loads_on_coreml() {
+        use crate::engines::fluidaudio::{accel_from_plan, encoder_compute_plan, ComputeUnits};
+        let dir = coreml_model_dir();
+        let mut backend = ParakeetBackend::new(None);
+        backend.load_model(&dir).expect("model loads");
+        let info = backend.engine_info().expect("engine info");
+        let plan = encoder_compute_plan(&dir, ComputeUnits::CpuAndNeuralEngine).ok();
+        assert_eq!(
+            (info.accel.as_str(), info.accel_partial),
+            accel_from_plan(plan.as_ref())
+        );
+        assert_eq!(info.accel, "ane", "plan: {plan:?}");
+    }
+
+    /// Only `Encoder_v2` (int8 per-channel) is ever loaded: a folder without
+    /// the palettized `Encoder.mlmodelc` loads.
+    #[cfg(fluidaudio_linked)]
+    #[test]
+    #[ignore = "needs YAPSTACK_TEST_FLUIDAUDIO_DIR set to a FluidAudio CoreML model dir"]
+    fn a_coreml_load_uses_encoder_v2() {
+        let src = coreml_model_dir();
+        let dir = model_dir("coreml-v2-only", &[]);
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            if entry.file_name() != "Encoder.mlmodelc" {
+                std::os::unix::fs::symlink(entry.path(), dir.join(entry.file_name())).unwrap();
+            }
+        }
+        let mut backend = ParakeetBackend::new(None);
+        backend
+            .load_model(&dir)
+            .expect("loads without Encoder.mlmodelc");
     }
 
     /// Gate G4 on a real model (ratified at 100% on 2026-10-31): the EP Auto

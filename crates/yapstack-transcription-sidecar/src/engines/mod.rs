@@ -16,10 +16,10 @@ use yapstack_common::audio::MonoResampler;
 #[cfg(feature = "parakeet")]
 use yapstack_common::types::TranscriptSegment;
 
-#[cfg(all(feature = "fluidaudio", target_os = "macos"))]
-pub mod fluidaudio;
 #[cfg(feature = "parakeet")]
 pub mod cpu_cores;
+#[cfg(fluidaudio_linked)]
+pub mod fluidaudio;
 #[cfg(feature = "parakeet")]
 pub mod ort_placement;
 #[cfg(feature = "parakeet")]

@@ -1,38 +1,25 @@
-//! SPIKE (AE3): Parakeet TDT v3 on CoreML / the Neural Engine through
-//! FluidAudio, via the C-ABI shim in `swift/YapFluidAudio` (built by
-//! build.rs). Models load from a local directory of FluidAudio's compiled
-//! `.mlmodelc` bundles; nothing is downloaded at run time.
-//!
-//! Run-time knobs (spike only):
-//! - `YAPSTACK_FLUIDAUDIO_UNITS`: `ane` (default, CPU + Neural Engine),
-//!   `gpu` (CPU + GPU), `cpu`, `all`. Applies to decoder/joint/encoder;
-//!   FluidAudio pins the preprocessor to CPU.
-//! - `YAPSTACK_FLUIDAUDIO_ENCODER`: `int8` (default, `Encoder.mlmodelc`) or
-//!   `int8-v2` (`Encoder_v2.mlmodelc`).
-//! - `YAPSTACK_FLUIDAUDIO_PLAN=1`: log `MLComputePlan` per-op device counts
-//!   for the encoder at load.
+//! Parakeet TDT v3 on CoreML through FluidAudio (ADR 0008), via the C-ABI
+//! shim in `swift/YapFluidAudio` that build.rs builds and links on Apple
+//! silicon. Models load from a local folder of FluidAudio's compiled
+//! `.mlmodelc` bundles; nothing is downloaded at run time. The shim always
+//! loads the int8 per-channel `Encoder_v2`.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 
 use parakeet_rs::TimedToken;
 use serde::Deserialize;
-use tracing::info;
 
 extern "C" {
-    fn yfa_load(
-        dir: *const c_char,
-        encoder: *const c_char,
-        units: i32,
-        err: *mut *mut c_char,
-    ) -> *mut c_void;
+    fn yfa_load(dir: *const c_char, units: i32, err: *mut *mut c_char) -> *mut c_void;
     fn yfa_transcribe(
         handle: *mut c_void,
         samples: *const f32,
         count: usize,
         json: *mut *mut c_char,
     ) -> i32;
-    fn yfa_compute_plan(path: *const c_char, units: i32, json: *mut *mut c_char) -> i32;
+    fn yfa_encoder_compute_plan(dir: *const c_char, units: i32, json: *mut *mut c_char) -> i32;
     fn yfa_destroy(handle: *mut c_void);
     fn yfa_free_string(s: *mut c_char);
 }
@@ -48,6 +35,28 @@ fn take_string(p: *mut c_char) -> String {
     s
 }
 
+fn c_path(dir: &Path) -> Result<CString, String> {
+    CString::new(dir.display().to_string()).map_err(|e| e.to_string())
+}
+
+/// The CoreML compute units every model of a load gets (FluidAudio pins the
+/// preprocessor to the CPU either way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeUnits {
+    CpuAndNeuralEngine,
+    CpuOnly,
+}
+
+impl ComputeUnits {
+    /// The shim's code for it.
+    fn raw(self) -> i32 {
+        match self {
+            ComputeUnits::CpuAndNeuralEngine => 0,
+            ComputeUnits::CpuOnly => 1,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Word {
     w: String,
@@ -56,28 +65,8 @@ struct Word {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Output {
-    // Decoded for parity checks in logs; segments are rebuilt from `words`.
-    #[allow(dead_code)]
-    pub text: String,
-    #[allow(dead_code)]
-    pub confidence: f32,
+struct Output {
     words: Vec<Word>,
-}
-
-impl Output {
-    /// Word timings in the same shape parakeet-rs's `TimestampMode::Words`
-    /// returns, so the ORT engine's segment grouping applies unchanged.
-    pub fn words(&self) -> Vec<TimedToken> {
-        self.words
-            .iter()
-            .map(|w| TimedToken {
-                text: w.w.clone(),
-                start: w.s as f32,
-                end: w.e as f32,
-            })
-            .collect()
-    }
 }
 
 pub struct FluidAudioModel {
@@ -88,55 +77,44 @@ pub struct FluidAudioModel {
 // actor; every call into it is serialized by the actor and by `&mut self`.
 unsafe impl Send for FluidAudioModel {}
 
-fn units_from_env() -> (i32, &'static str) {
-    match std::env::var("YAPSTACK_FLUIDAUDIO_UNITS")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "cpu" => (1, "cpu"),
-        "gpu" => (2, "gpu"),
-        "all" => (3, "all"),
-        _ => (0, "ane"),
-    }
-}
-
 impl FluidAudioModel {
-    pub fn load(dir: &Path) -> Result<(Self, String), String> {
-        let (units, units_label) = units_from_env();
-        let encoder =
-            std::env::var("YAPSTACK_FLUIDAUDIO_ENCODER").unwrap_or_else(|_| "int8".to_string());
-        let c_dir = CString::new(dir.display().to_string()).map_err(|e| e.to_string())?;
-        let c_enc = CString::new(encoder.clone()).map_err(|e| e.to_string())?;
-        if std::env::var_os("YAPSTACK_FLUIDAUDIO_PLAN").is_some() {
-            let file = if encoder == "int8-v2" {
-                "Encoder_v2.mlmodelc"
-            } else {
-                "Encoder.mlmodelc"
-            };
-            log_compute_plan(&dir.join(file), units);
-        }
+    pub fn load(dir: &Path, units: ComputeUnits) -> Result<Self, String> {
+        let c_dir = c_path(dir)?;
         let mut err: *mut c_char = std::ptr::null_mut();
-        // SAFETY: valid C strings; `err` is an out-pointer.
-        let handle = unsafe { yfa_load(c_dir.as_ptr(), c_enc.as_ptr(), units, &mut err) };
+        // SAFETY: valid C string; `err` is an out-pointer.
+        let handle = unsafe { yfa_load(c_dir.as_ptr(), units.raw(), &mut err) };
         if handle.is_null() {
-            return Err(format!("fluidaudio load failed: {}", take_string(err)));
+            return Err(format!(
+                "failed to load parakeet CoreML model: {}",
+                take_string(err)
+            ));
         }
-        Ok((
-            Self { handle },
-            format!("units={units_label} encoder={encoder}"),
-        ))
+        Ok(Self { handle })
     }
 
-    pub fn transcribe(&mut self, mono_16k: &[f32]) -> Result<Output, String> {
+    /// Word timings of 16 kHz mono audio, in the shape parakeet-rs's
+    /// `TimestampMode::Words` returns, so the ORT engine's segment grouping
+    /// applies unchanged.
+    pub fn transcribe(&mut self, mono_16k: &[f32]) -> Result<Vec<TimedToken>, String> {
         let mut json: *mut c_char = std::ptr::null_mut();
         // SAFETY: the slice outlives the call; `json` is an out-pointer.
         let rc =
             unsafe { yfa_transcribe(self.handle, mono_16k.as_ptr(), mono_16k.len(), &mut json) };
         let body = take_string(json);
         if rc != 0 {
-            return Err(format!("fluidaudio transcription failed: {body}"));
+            return Err(format!("parakeet CoreML transcription failed: {body}"));
         }
-        serde_json::from_str(&body).map_err(|e| format!("fluidaudio result parse: {e}"))
+        let out: Output = serde_json::from_str(&body)
+            .map_err(|e| format!("parakeet CoreML result parse: {e}"))?;
+        Ok(out
+            .words
+            .into_iter()
+            .map(|w| TimedToken {
+                text: w.w,
+                start: w.s as f32,
+                end: w.e as f32,
+            })
+            .collect())
     }
 }
 
@@ -147,19 +125,119 @@ impl Drop for FluidAudioModel {
     }
 }
 
-fn log_compute_plan(model: &Path, units: i32) {
-    let Ok(c_path) = CString::new(model.display().to_string()) else {
-        return;
-    };
+/// Where CoreML plans to run each operation: MIL operator name → preferred
+/// device (`"ane"`, `"cpu"`, `"gpu"`, `"none"`) → count.
+pub type ComputePlan = HashMap<String, HashMap<String, usize>>;
+
+/// `MLComputePlan` of the encoder `FluidAudioModel::load` loads from `dir`
+/// under `units`. Fails before macOS 14.4, which has no `MLComputePlan`.
+pub fn encoder_compute_plan(dir: &Path, units: ComputeUnits) -> Result<ComputePlan, String> {
+    let c_dir = c_path(dir)?;
     let mut json: *mut c_char = std::ptr::null_mut();
     // SAFETY: valid C string; `json` is an out-pointer.
-    let rc = unsafe { yfa_compute_plan(c_path.as_ptr(), units, &mut json) };
+    let rc = unsafe { yfa_encoder_compute_plan(c_dir.as_ptr(), units.raw(), &mut json) };
     let body = take_string(json);
-    info!(
-        marker = "fluidaudio_compute_plan",
-        model = %model.display(),
-        ok = rc == 0,
-        plan = %body,
-        "coreml compute plan"
-    );
+    if rc != 0 {
+        return Err(body);
+    }
+    serde_json::from_str(&body).map_err(|e| format!("compute plan parse: {e}"))
+}
+
+/// The MIL operators that carry the encoder's matmul and conv work: Gate
+/// G4's "heavy" ops in CoreML terms. A plan names them with their opset
+/// (`ios17.linear`); these are the bare names.
+const HEAVY_OPS: [&str; 4] = ["conv", "matmul", "linear", "einsum"];
+
+/// `ios17.linear` → `linear`.
+fn bare_op_name(op: &str) -> &str {
+    op.rsplit('.').next().unwrap_or(op)
+}
+
+/// The accelerator label for a CoreML load and whether some heavy ops run
+/// off it, from the encoder's compute plan (Gate G4's truthful label):
+/// `"ane"` only when the plan puts heavy ops on the Neural Engine (partial
+/// when some of them run elsewhere), `"cpu"` when it puts none there, and
+/// `"coreml"` when there is no plan, or no heavy op in it, to go by.
+pub fn accel_from_plan(plan: Option<&ComputePlan>) -> (&'static str, bool) {
+    let Some(plan) = plan else {
+        return ("coreml", false);
+    };
+    let (mut on_ane, mut total) = (0, 0);
+    for (op, devices) in plan {
+        if HEAVY_OPS.contains(&bare_op_name(op)) {
+            on_ane += devices.get("ane").copied().unwrap_or(0);
+            total += devices.values().sum::<usize>();
+        }
+    }
+    match (on_ane, total) {
+        (_, 0) => ("coreml", false),
+        (0, _) => ("cpu", false),
+        (ane, total) => ("ane", ane < total),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(entries: &[(&str, &str, usize)]) -> ComputePlan {
+        let mut plan = ComputePlan::new();
+        for (op, device, n) in entries {
+            *plan
+                .entry(op.to_string())
+                .or_default()
+                .entry(device.to_string())
+                .or_default() += n;
+        }
+        plan
+    }
+
+    #[test]
+    fn heavy_ops_all_on_the_ane_are_labelled_ane() {
+        let p = plan(&[
+            ("conv", "ane", 24),
+            ("linear", "ane", 300),
+            ("add", "cpu", 4),
+        ]);
+        assert_eq!(accel_from_plan(Some(&p)), ("ane", false));
+    }
+
+    /// The shape of the real Encoder_v2 plan (M5 Pro, macOS 27): opset
+    /// prefixes, dequantize ops with no device, two casts on the CPU.
+    #[test]
+    fn opset_prefixed_op_names_are_matched() {
+        let p = plan(&[
+            ("ios17.conv", "ane", 77),
+            ("ios17.linear", "ane", 193),
+            ("ios17.matmul", "ane", 72),
+            ("ios17.cast", "cpu", 2),
+            ("ios16.constexpr_affine_dequantize", "none", 294),
+        ]);
+        assert_eq!(accel_from_plan(Some(&p)), ("ane", false));
+        let p = plan(&[("ios17.linear", "ane", 192), ("ios17.linear", "cpu", 1)]);
+        assert_eq!(accel_from_plan(Some(&p)), ("ane", true));
+    }
+
+    #[test]
+    fn a_heavy_op_off_the_ane_makes_it_partial() {
+        let p = plan(&[("linear", "ane", 299), ("linear", "cpu", 1)]);
+        assert_eq!(accel_from_plan(Some(&p)), ("ane", true));
+    }
+
+    #[test]
+    fn no_heavy_op_on_the_ane_is_cpu() {
+        let p = plan(&[
+            ("conv", "cpu", 24),
+            ("matmul", "cpu", 10),
+            ("add", "ane", 5),
+        ]);
+        assert_eq!(accel_from_plan(Some(&p)), ("cpu", false));
+    }
+
+    #[test]
+    fn without_a_plan_the_ane_is_never_claimed() {
+        assert_eq!(accel_from_plan(None), ("coreml", false));
+        let p = plan(&[("add", "ane", 5), ("const", "none", 100)]);
+        assert_eq!(accel_from_plan(Some(&p)), ("coreml", false));
+    }
 }
