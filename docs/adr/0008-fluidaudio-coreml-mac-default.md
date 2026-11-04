@@ -57,20 +57,39 @@ only `Encoder_v2` is acceptable. FluidAudio needs macOS 14.
    model folder's format (`.mlmodelc` bundles mean CoreML, ONNX files mean
    ORT), and both runtimes decode through the same chunk path, empty-decode
    retry ladder, segment grouping and filters. The sidecar IPC is unchanged.
-3. **The accelerator label stays truthful (the G4 precedent).** The sidecar
-   reports `accel: "ane"` only when CoreML's `MLComputePlan` places the
-   encoder's heavy ops on the Neural Engine, and `accel_partial` when some
-   of them run elsewhere. It never labels a CoreML load "ane" on faith.
-4. **No silent fallback.** A CoreML load or warm-up failure is a load error
-   the user sees. It doesn't quietly drop to the ORT CPU engine, the same
-   rule as every other engine error (surface errors, the user fixes them).
+3. **The accelerator label stays truthful.** Gate G4 (heavy-op placement on
+   the EP) still applies to ORT execution providers only. A native engine
+   like FluidAudio has to prove it uses the accelerator with measurements
+   (`powermetrics` or Instruments), as the AE energy run did. At run time,
+   the sidecar's signal is CoreML's `MLComputePlan`:
+   - `accel: "ane"` when the plan places the encoder's heavy ops on the
+     Neural Engine;
+   - `accel_partial` when some of them run elsewhere;
+   - `"cpu"` when none of them run on the Neural Engine;
+   - `"coreml"` on macOS 14.0–14.3, which has no `MLComputePlan`.
+
+   A CoreML load is never labelled "ane" on faith.
+4. **No silent fallback.** In the sidecar, a CoreML load or warm-up failure
+   is a load error, never a quiet drop to the ORT engine. This is the same
+   rule as every other engine error: surface errors, and the user fixes
+   them. Keeping int8 before the first good CoreML load (decision 6) is the
+   host's visible choice, with a warning, not a fallback inside the
+   sidecar.
 5. **The minimum macOS version becomes 14 (Sonoma).** FluidAudio needs it.
    There is no macOS 13 path that keeps the old engine: one floor, one engine
-   per platform. macOS 13 users stay on the last release that supported it.
-6. **The CoreML model replaces the int8 bundle on disk.** When the CoreML
-   model has installed and loaded, the app deletes the int8 ONNX bundle. The
-   int8 bundle is about 640 MB of dead weight beside the CoreML model, and
-   nothing falls back to it.
+   per platform. The updater doesn't check the OS version, so a macOS 13 user
+   is offered the update, it installs, and then the app won't open. Release
+   notes warn about this, and there is no updater guard (owner ruling,
+   2026-11-04). Anyone it happens to should reinstall the 1.0.0-alpha.12 DMG
+   from Releases.
+6. **The CoreML model replaces the int8 bundle on disk.** The app deletes the
+   int8 ONNX bundle automatically, but only after the CoreML model has
+   loaded and warmed up successfully once. The int8 bundle is about 640 MB of
+   dead weight beside a working CoreML model. Until that first good load,
+   int8 stays the engine: if the CoreML download or load fails, the user
+   keeps transcribing on int8 and sees a warning saying why. The engine is
+   never switched silently. This replaces the "one click" removal ADR 0005
+   used for old model files (owner ruling, 2026-11-04).
 7. **What stays on ORT:**
    - **Sortformer diarization**, on every platform. FluidAudio's diarizer is
      a different model and out of scope.
@@ -83,8 +102,15 @@ only `Encoder_v2` is acceptable. FluidAudio needs macOS 14.
    app-style re-score (the real live and backfill chunkers, not whole files):
    - its WER is at most the shipped int8's WER + 1.0 pt absolute on every
      gating slice;
-   - it produces zero empty or truncated outputs beyond int8's;
+   - it produces no more empty or truncated outputs than the shipped int8
+     on the same replayed chunks;
    - word timestamps are kept.
+
+   **Owner ruling, 2026-11-04, on reading the gate:** the 2026-11-03 wording
+   "zero empty or truncated outputs" means no more than the shipped int8 on
+   the same replayed chunks. A replay corpus has truncation runs that no
+   engine recovers, so an absolute zero would fail int8 itself. The other
+   two conditions are unchanged.
 
 ## Consequences
 
