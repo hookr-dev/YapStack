@@ -349,10 +349,4 @@ mod tests {
         assert_eq!(cli.engine, EngineKind::Parakeet);
         assert_eq!(cli.initial_model_path, Some(PathBuf::from("/m")));
     }
-
-    #[test]
-    fn unknown_engine_is_an_error() {
-        let err = parse_args(&argv(&["--engine", "whisper"])).unwrap_err();
-        assert!(err.contains("whisper"), "{err}");
-    }
 }

@@ -92,7 +92,7 @@ Standalone binary. Reads JSON-line requests from stdin, writes responses to stdo
 **Architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection). `main.rs` is a thin IPC dispatcher that builds the backend at startup and forwards every request through the trait. A `--no-default-features` build has no engine, and every IPC request returns `no transcription engine compiled in`.
 
 **Parakeet backend (`engines/parakeet.rs`)**: Loads `ParakeetTDT::from_pretrained(model_dir, exec_config)` from a directory containing `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`. Resamples audio to 16 kHz mono via `yapstack_common::audio::resample` before calling `transcribe_samples` (parakeet-rs 0.3.5 rejects other rates despite its docs). Token-level timestamps grouped into segments at 0.5 s silence gaps + 12 s soft cap. Segments pass through `should_include_segment(text, confidence)`: drops empty / bracketed-token text, low-confidence repetition loops (< 0.7), anything below 0.4, `is_always_reject` matches, and `is_marginal_reject` matches below 0.6.
-- **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|webgpu` env var. Default `auto`: WebGPU for a graph whose heavy ops WebGPU fully takes; for the shipped int8 graph (partial placement) WebGPU on Windows and CPU on macOS, where each measured faster. Unmeasured graphs run on CPU. Per-load CPU fallback at the backend level catches WebGPU load failures and reports them (`accel_fallback`) — the sidecar never returns "no model loaded".
+- **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|webgpu` env var. `auto` resolves per model graph and platform: graphs whose heavy ops all run on WebGPU (the fp32 export) use WebGPU everywhere; the default int8 bundle (dynamic quantization, ~20% of heavy ops on WebGPU) runs on CPU on macOS, where WebGPU measured half CPU speed, and on WebGPU on Windows, where Gate C measured it faster than CPU. The placement table and policy live in `gpu_placement` / `resolve_auto` in `engines/parakeet.rs`. WebGPU registration is strict: an EP-init failure falls back to CPU explicitly, logged as `live_accel_fallback` with an honest `accel` label, so the sidecar never returns "no model loaded".
 - **Sortformer post-pass** (when `Transcribe.diarization=true` and the sidecar was spawned with `--sortformer-model`): runs Sortformer on the same resampled 16 kHz audio, returns `Vec<SpeakerSegment>` with sample-range + `speaker_id`. `assign_speakers()` maps speaker ranges onto produced transcript segments by maximum-overlap (samples → ms → segment range overlap) and populates `TranscriptSegment.speaker_id`. Sortformer model is loaded lazily on first diarization request to avoid the cost when diarization is off.
 
 ### yapstack-desktop (Tauri app)
@@ -168,7 +168,7 @@ Live transcription loop (one chunk):
       Parakeet backend:
         → loads WAV at native rate
         → resamples to 16kHz mono via yapstack_common::audio::resample
-        → calls ParakeetTDT.transcribe_samples (WebGPU/CPU per env var)
+        → calls ParakeetTDT.transcribe_samples (EP resolved at load: Auto policy or env var)
         → groups word-level tokens into segments at silence gaps
         → if diarization=true: also runs Sortformer on the same audio,
           assigns speaker_id by max-overlap onto produced segments

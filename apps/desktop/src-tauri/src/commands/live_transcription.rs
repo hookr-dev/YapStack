@@ -1011,29 +1011,19 @@ struct EngineProfile {
 fn profile_for(engine: yapstack_common::types::EngineKind) -> EngineProfile {
     use yapstack_common::types::EngineKind;
     match engine {
-        // Parakeet: meeting-tuned. Ignores frontend silence / chunk / poll
-        // knobs — these are engine-specific best practice, not user-facing
-        // tuning.
+        // Parakeet: meeting-tuned and fixed; there are no user-facing
+        // chunking knobs.
         //
-        // `silence_duration` was 200 ms originally, which mirrors a
-        // dictation-style "fire as soon as the speaker pauses" cadence.
-        // For multi-speaker meeting transcription that produces ~3× more
-        // dispatches than necessary — every comma-breath triggers a chunk —
-        // and the IPC + inference pressure of those extra dispatches is the
-        // proximate cause of the stall the cap commit (e6b05ea) was trying
-        // to bound. Comparable production stacks use 500 ms (Vad+Whisper
-        // dictation), 750 ms (FluidAudio meeting mode), or higher (Muesli
-        // aims for 3 s minimum chunks). Bumped to 500 ms — the conservative
-        // half of that range — to cut dispatch rate by ~2-3× on fast
-        // multi-speaker dialogue while keeping live-caption feel.
+        // `silence_duration` is 500 ms, not a dictation-style 200 ms: on
+        // fast multi-speaker dialogue 200 ms closes a chunk on every
+        // breath, roughly tripling dispatches and the sidecar queue
+        // pressure behind them. Comparable stacks use 500-750 ms.
         //
-        // `max_chunk_duration` stays at 10 s for now: the cap commit
-        // documented chunks ≥12 s degrading to RTFx < 1 on our CPU path.
-        // FluidAudio's 14.4 s window is feasible because they run on the
-        // ANE; we don't have that path until we either (a) add a native
-        // CoreML path or (b) switch to streaming Nemotron.
-        // Stage 6 of the pipeline overhaul plan revisits once we have
-        // real per-chunk wall-time data to validate.
+        // `max_chunk_duration` is 10 s because a sidecar job can't be
+        // preempted once it starts, so the cap bounds both caption latency
+        // and how long new speech waits behind one job. A chunk ended for
+        // length is cut at the quietest frame in the `PAUSE_SEARCH_WINDOW`
+        // before the cap, not on the cap itself.
         EngineKind::Parakeet => EngineProfile {
             engine_name: "Parakeet",
             vad_tuning: VadTuning {

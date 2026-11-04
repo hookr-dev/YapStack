@@ -45,7 +45,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Sidecar**         | A standalone worker process spawned by the desktop app that speaks JSON-line IPC. Generic pattern; today the only sidecar is the transcription sidecar. | Worker, helper process          |
 | **Transcription sidecar** | The `yapstack-transcription-sidecar` binary that hosts the engine (Parakeet) for one session.                 | Whisper sidecar, ASR worker     |
 | **Embedding sidecar** | Reserved name (`yapstack-embedding-sidecar`) for the planned embedding worker. Not yet implemented.              | Vectorizer, embedder            |
-| **Execution provider** | The ORT runtime backend for Parakeet: `cpu` or `webgpu`. Chosen per spawn via `YAPSTACK_PARAKEET_ACCEL`. | Accelerator, EP only            |
+| **Execution provider** | The ORT runtime backend for Parakeet: `cpu` or `webgpu`. Chosen per spawn: `auto` (default) picks per model and platform, `YAPSTACK_PARAKEET_ACCEL` overrides. | Accelerator, EP only            |
 | **Transcription client** | The Rust-side handle that owns the sidecar process and sends transcribe/load/shutdown requests.                | Whisper client (legacy alias)   |
 
 ## Live transcription

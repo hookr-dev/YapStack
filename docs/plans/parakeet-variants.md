@@ -1,10 +1,12 @@
 # Plan: Expand Parakeet model selection
 
+**Status:** superseded. TDT v2, CTC and the streaming variants were never added; the only variant added was the int8 TDT v3 bundle (67a677e). Model choice now lives in [`asr-engine-overhaul.md`](asr-engine-overhaul.md) (Unified EN in Phase 4, FluidAudio for the Mac default). Kept for the 2026-04 research.
+
 ## Context
 
 Today only **Parakeet TDT v3** is offered (`crates/yapstack-transcription/src/model.rs:88-145`).
-Whisper offers four sizes (Tiny / Base / Small / Medium); Parakeet should offer a
-comparable selection. The underlying `parakeet-rs 0.3` crate already supports
+Whisper then offered four sizes (Tiny / Base / Small / Medium; Whisper was removed
+in ADR 0005); this plan proposed a comparable Parakeet selection. The underlying `parakeet-rs 0.3` crate already supports
 multiple loader types, and `istupakov` / `onnx-community` host compatible ONNX bundles.
 
 ## What's available (researched 2026-04-25)

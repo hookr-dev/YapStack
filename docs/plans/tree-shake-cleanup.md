@@ -1,5 +1,7 @@
 # Tree-shake Cleanup
 
+**Status:** executed. Merged to main in 65df3a9 (`refactor/tree-shake-cleanup`). Kept as history; line references may be stale.
+
 Working branch: `refactor/tree-shake-cleanup`
 
 ## Problem Statement
