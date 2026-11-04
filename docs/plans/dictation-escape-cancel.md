@@ -2,6 +2,8 @@
 
 # Dictation Escape-to-Cancel
 
+**Status:** executed (7279d6f, documented in 6c1bbe2). The Escape hotkey is registered in `apps/desktop/src/hooks/useDictation.ts`; ARCHITECTURE.md describes the cancel flow.
+
 ## Problem Statement
 
 A Dictation, once started, has no exit door. The user holds (or toggles) the Dictation slot's Global hotkey, the Dictation Bubble appears, and from that moment on the only path forward is to let it run to completion — capture, transcribe, run AI processing, deliver the Output action, and write a Dictation history entry. If midway through dictating the user changes their mind — they misspoke, picked the wrong slot, the wrong app is focused, the AI prompt is wrong, or they simply don't want this output anymore — they have to wait for the whole pipeline to finish and then manually undo the result (delete the pasted text, clear the clipboard, delete the new note, delete the Dictation history entry). Worst case: the Bubble is stuck in `transcribing` or `processing` for several seconds while the user watches a result they don't want being assembled.

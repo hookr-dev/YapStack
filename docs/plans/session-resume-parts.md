@@ -1,5 +1,7 @@
 # Session Resume — Parts Model
 
+**Status:** executed. Merged in 29c4485 (`feat/session-resume-parts`); `session_audio_parts` is the durable source of truth (see ARCHITECTURE.md, "Multi-part playback and seeking").
+
 ## Context
 
 The first pass at session resume (commits `f3eca93` through the simplify pass on this branch) made MP3 the *mutable source of truth* — each resume decoded the prior MP3 back to PCM, appended new audio, and re-encoded the whole concatenated thing. That design failed code review on three P1 grounds (ignores persisted audio path, duration math wrong, destructive ops happen mid-startup) and one architectural ground (lossy generation loss on every resume; couples decoding into the live recording path).

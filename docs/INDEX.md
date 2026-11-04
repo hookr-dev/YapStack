@@ -47,6 +47,7 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 ## Cross-platform
 
 - [`plans/windows-support.md`](plans/windows-support.md) — **active** Windows rollout plan (pipeline → audio-device correctness gate → Parakeet WebGPU accel + polish).
+- [`plans/asr-engine-overhaul.md`](plans/asr-engine-overhaul.md) — **active** ASR plan: bench gates G1–G4, Whisper removal (done), AE energy results, FluidAudio as the planned Mac default.
 - [`plans/linux-support.md`](plans/linux-support.md) — Linux state + gap list, **deferred** (documented, not scheduled).
 - [`adr/0004-cross-platform-rollout-windows-first.md`](adr/0004-cross-platform-rollout-windows-first.md) — decision: Windows first, Linux deferred; Parakeet WebGPU/Dawn GPU (its Whisper-on-Windows clause is superseded by ADR 0005); Linux mic-only + X11/Wayland-best-effort.
 

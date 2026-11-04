@@ -392,7 +392,7 @@ impl ParakeetVariant {
     pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3"
     pub fn files(&self) -> &'static [(&'static str, &'static str, u64)];       // (name, url, size) per file
     pub fn approximate_size_bytes(&self) -> u64;
-    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~600 MB)"
+    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~700 MB)" for int8
     pub fn all() -> &'static [ParakeetVariant];
 }
 impl SortformerVariant { /* filename, download_url, approximate_size_bytes, display_name */ }
@@ -492,7 +492,7 @@ yapstack-transcription-sidecar
 ```
 
 **Env vars**:
-- `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = CoreML when no external `.onnx.data` files, else CPU)
+- `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = WebGPU for fully placed graphs such as fp32; the default int8 bundle runs on CPU on macOS and on WebGPU on Windows; EP-init failure falls back to CPU, logged)
 - `YAPSTACK_PARAKEET_THREADS=N` — ORT intra-op thread count for Parakeet (N >= 1). Default: physical cores capped at 8 (4 when the core count is unknown). Threads never spin.
 - `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
@@ -504,7 +504,7 @@ yapstack-transcription-sidecar
 
 A `--no-default-features` build has no engine compiled in; every IPC request returns `no transcription engine compiled in`.
 
-**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + CoreML/WebGPU/CPU EP via env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
+**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection: Auto policy or env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
 
 **Audio preprocessing**: `engines::read_wav_as_mono_16k()` loads the WAV, downmixes via `yapstack_common::audio::deinterleave_to_mono()`, and resamples to 16 kHz via `yapstack_common::audio::resample()`.
 
@@ -637,7 +637,7 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 
 **`LiveTranscriptionConfig`** field-level shape is the source-of-truth on the Rust struct. Notable fields the frontend touches:
 - `source_kind: LiveSourceKind` (default `Session`) — routing identity; the dictation hook passes `Dictation` explicitly. Drives every downstream filter.
-- `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`. Chunking is not configurable: the Parakeet profile is fixed (500 ms silence, 10 s max chunk, 100 ms poll, 250 ms pre-roll).
+- `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`. Chunking is not configurable: the Parakeet profile is fixed (500 ms silence, 10 s max chunk, 100 ms poll, 250 ms pre-roll). A chunk ended for length is cut at the quietest Silero frame in the 2 s before the cap, not on the cap.
 - `session_id?` enables streaming session audio recording into a new part.
 - `persist_audio_part?: bool` (default `true`; `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id).
 - `audio_save_location?`, `audio_export_format?: "wav" | "mp3"` (default `"mp3"`), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64).
