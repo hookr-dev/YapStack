@@ -18,6 +18,11 @@ parakeet = ["dep:parakeet-rs", "dep:ort"]
 # direct `ort` dep with error_on_failure — parakeet-rs's own arm registers
 # it soft.
 webgpu = ["parakeet", "parakeet-rs/webgpu"]
+# Parakeet TDT v3 on CoreML / the Neural Engine through FluidAudio (ADR 0008),
+# for a model folder of compiled `.mlmodelc` bundles. Apple silicon only:
+# build.rs builds and statically links swift/YapFluidAudio (needs Swift 6.2+,
+# i.e. Xcode 26) and is a no-op on other targets. macOS 14+.
+fluidaudio = ["parakeet"]
 
 [dependencies]
 yapstack-common = { path = "../yapstack-common" }

@@ -123,6 +123,69 @@ jobs:
       - name: Run tests (desktop, sync)
         run: cargo test -p yapstack-desktop --features sync
 
+  rust-fluidaudio:
+    name: Rust fluidaudio feature (macos-26)
+    # The sidecar's `fluidaudio` feature (ADR 0008) builds a Swift package
+    # from build.rs, so it needs Swift 6.2+ and is only built on Apple
+    # silicon. The other macOS jobs never enable it.
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      # Pinned rather than the image default, so a runner-image Xcode bump
+      # can't change the Swift toolchain under the build.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+
+      - name: Xcode fingerprint for cache key
+        # See the Rust (macos-latest) job.
+        id: xcode
+        run: |
+          xcodebuild -version
+          swift --version
+          echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-macos-26-fluidaudio
+          key: ${{ steps.xcode.outputs.version }}
+          cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: SwiftPM cache
+        # The FluidAudio checkout, its binary artifacts and the Swift build
+        # dir build.rs uses (target/swift-yfa). rust-cache prunes everything
+        # in target/ that isn't a dependency artifact, so without this the
+        # FluidAudio compile reruns every time. Saved before rust-cache's
+        # cleanup: post steps run in reverse order.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            target/swift-yfa
+          key: swiftpm-${{ steps.xcode.outputs.version }}-${{ hashFiles('crates/yapstack-transcription-sidecar/swift/YapFluidAudio/**') }}
+          restore-keys: |
+            swiftpm-${{ steps.xcode.outputs.version }}-
+
+      - name: Clippy (sidecar, fluidaudio)
+        run: cargo clippy -p yapstack-transcription-sidecar --features webgpu,fluidaudio --all-targets -- -D warnings
+
+      - name: Run tests (sidecar, fluidaudio)
+        run: cargo test -p yapstack-transcription-sidecar --features webgpu,fluidaudio
+
+      - name: Assert the sidecar targets macOS 14
+        # build.rs links the Swift code for macOS 14.0 (FluidAudio's floor).
+        run: |
+          minos=$(otool -l target/debug/yapstack-transcription-sidecar | awk '/LC_BUILD_VERSION/ {b=1} b && $1 == "minos" {print $2; exit}')
+          echo "minos $minos"
+          [ "$minos" = "14.0" ]
+
   rust-windows:
     name: Rust (windows-latest)
     runs-on: windows-latest

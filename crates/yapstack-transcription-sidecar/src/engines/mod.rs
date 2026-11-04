@@ -18,6 +18,8 @@ use yapstack_common::types::TranscriptSegment;
 
 #[cfg(feature = "parakeet")]
 pub mod cpu_cores;
+#[cfg(fluidaudio_linked)]
+pub mod fluidaudio;
 #[cfg(feature = "parakeet")]
 pub mod ort_placement;
 #[cfg(feature = "parakeet")]
