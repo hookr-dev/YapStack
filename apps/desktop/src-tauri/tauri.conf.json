@@ -121,7 +121,7 @@
     },
     "macOS": {
       "entitlements": "./Entitlements.plist",
-      "minimumSystemVersion": "13.0",
+      "minimumSystemVersion": "14.0",
       "frameworks": ["binaries/libwebgpu_dawn.dylib"],
       "dmg": {
         "windowSize": { "width": 660, "height": 400 },

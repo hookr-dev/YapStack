@@ -55,7 +55,7 @@ YapStack is a desktop app for **meeting transcription, AI note-taking, and voice
 ## Install
 
 1. Download the latest build from [**GitHub Releases**](https://github.com/hookr-dev/YapStack/releases):
-   - **macOS:** `.dmg` (macOS 13 Ventura or later, Apple Silicon recommended). Recording system audio from calls needs macOS 14.2 or later.
+   - **macOS:** `.dmg` (macOS 14 Sonoma or later, Apple Silicon recommended). Recording system audio from calls needs macOS 14.2 or later.
    - **Windows (x64):** `-setup.exe`
 2. Open YapStack and follow the setup. It downloads the speech-recognition model the first time it runs.
 3. Grant microphone access. On macOS, also grant screen-recording permission, which macOS requires for capturing system audio.
