@@ -133,7 +133,7 @@ Battery energy per audio-minute, Apple Silicon:
 
 - **Burn rejected.** It needs our own patch to maintain, and its `panic=abort` kills the sidecar on any panic.
 - **ORT CoreML EP:** 0% of heavy ops placed on it. It is not an acceleration path.
-- **FluidAudio is the planned Mac default**, gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
+- **FluidAudio is the planned Mac default** ([ADR 0008](../adr/0008-fluidaudio-coreml-mac-default.md)), gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
 - **macOS 14 floor:** the minimum macOS version is raised to 14 directly, with no older-OS fallback path.
 
 ## Phase 1 — Fix quant and EP on the current stack (parakeet-rs 0.3.5)
