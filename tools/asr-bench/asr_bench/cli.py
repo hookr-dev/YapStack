@@ -302,7 +302,7 @@ def main(argv=None) -> int:
 
     r = sub.add_parser("run", help="run every model × accel row over the corpora")
     r.add_argument("--model", action="append", required=True, metavar="NAME=DIR", help="a Parakeet model dir; repeatable")
-    r.add_argument("--accel", action="append", default=[], metavar="EP[,EP]", help="YAPSTACK_PARAKEET_ACCEL values: auto, cpu, webgpu, coreml (default: cpu)")
+    r.add_argument("--accel", action="append", default=[], metavar="EP[,EP]", help="YAPSTACK_PARAKEET_ACCEL values: auto, cpu, webgpu (default: cpu)")
     r.add_argument("--only", action="append", default=[], metavar="NAME:EP[,..]", help="restrict the model × accel product to these rows")
     r.add_argument("--corpus", action="append", required=True, metavar="SPEC", help="dir:PATH or librispeech:SPLIT:N; repeatable")
     r.add_argument("--sidecar", help=f"sidecar binary (default: {STAGED_SIDECAR})")

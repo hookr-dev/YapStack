@@ -82,7 +82,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 - **TS binding out of sync** → run `pnpm tauri dev` once; specta regenerates on a successful build.
 - **Migration didn't apply** → check `tauri-plugin-sql` migration version table in the SQLite file; you may need to bump and re-run.
 - **Auto-updater not firing** → updater hits `releases/latest/download/latest.json`. If the release is marked `prerelease: true`, GitHub's "latest" skips it.
-- **WebGPU/CoreML not engaging** → set `YAPSTACK_PARAKEET_ACCEL=cpu|coreml|webgpu` to override. Check the `live_accel_choice` log marker for what actually loaded.
+- **WebGPU not engaging** → set `YAPSTACK_PARAKEET_ACCEL=cpu|webgpu` to override. Check the `live_accel_choice` log marker for what actually loaded.
 
 ## What good agent output looks like here
 

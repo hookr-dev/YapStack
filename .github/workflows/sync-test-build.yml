@@ -153,7 +153,7 @@ jobs:
         # release.yml's build-macos does. No target arg: build-sidecars.sh's
         # detect_host_triple resolves the arm64 macos-latest runner to
         # aarch64-apple-darwin, builds -p yapstack-transcription-sidecar with
-        # parakeet,coreml,webgpu, copies the binary into
+        # parakeet,webgpu, copies the binary into
         # apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin,
         # and stages libwebgpu_dawn.dylib (which tauri.conf.json bundles as a macOS
         # framework). Uses no secrets — pure unsigned build. SOURCE_DATE_EPOCH matches

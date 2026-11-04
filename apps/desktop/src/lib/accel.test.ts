@@ -4,7 +4,6 @@ import { accelDisplayLabel } from "./accel";
 describe("accelDisplayLabel", () => {
   it("names the GPU path by its backend", () => {
     expect(accelDisplayLabel("webgpu", null, false)).toBe("GPU (WebGPU)");
-    expect(accelDisplayLabel("metal", null, false)).toBe("GPU (Metal)");
   });
 
   it("says when the GPU holds only part of the model's heavy work", () => {

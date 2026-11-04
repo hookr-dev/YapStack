@@ -17,10 +17,6 @@ export function accelDisplayLabel(
   switch (accel) {
     case "webgpu":
       return gpu("WebGPU");
-    case "metal":
-      return gpu("Metal");
-    case "coreml":
-      return "CoreML";
     case "cpu":
       return fallback ? "CPU (GPU unavailable)" : "CPU";
     default:

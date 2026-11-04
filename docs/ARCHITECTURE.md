@@ -81,18 +81,18 @@ Model management and sidecar client. No parakeet-rs / ort dependencies — those
   - **Parakeet** (multi-file ONNX bundle in `models_dir/parakeet-<variant>/`): `ParakeetVariant::TdtV3Int8`, `parakeet_model_dir`, `parakeet_is_available` (checks all required files), `download_parakeet` (loops over the variant's `files()` list, skipping files already on disk), `delete_parakeet`, `ensure_parakeet`.
   - **Sortformer** (single ONNX file, ~50MB): `SortformerVariant::V2_1`, `sortformer_model_path`, `download_sortformer`, `ensure_sortformer`.
   - **Unused files** left by earlier releases (Whisper GGML weights `ggml-{tiny,base,small,medium}.bin`, the GGML Silero VAD `ggml-silero-v6.2.0.bin`, the fp32 `parakeet-tdt-v3/` bundle and the int8 bundle's `nemo128.onnx`): `remove_unused_model_files` deletes them once at startup and logs each removal; a failed delete is a warning.
-- `client.rs` — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `sortformer_model_path?`, and `coreml_cache_dir?`. `transcribe_with(audio, language, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`.
+- `client.rs` — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, and `sortformer_model_path?`. `transcribe_with(audio, language, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`.
 - `error.rs` — `TranscriptionError` with variants for download, sidecar, timeout, IO, HTTP
 
 ### yapstack-transcription-sidecar
 Standalone binary. Reads JSON-line requests from stdin, writes responses to stdout. Logging goes to stderr.
 
-**CLI**: `yapstack-transcription-sidecar [--engine parakeet] [--model PATH] [--sortformer-model PATH] [--coreml-cache-dir PATH]`. `--engine` defaults to `parakeet`; any other value is a startup error (exit code 2).
+**CLI**: `yapstack-transcription-sidecar [--engine parakeet] [--model PATH] [--sortformer-model PATH]`. `--engine` defaults to `parakeet`; any other value is a startup error (exit code 2).
 
 **Architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection). `main.rs` is a thin IPC dispatcher that builds the backend at startup and forwards every request through the trait. A `--no-default-features` build has no engine, and every IPC request returns `no transcription engine compiled in`.
 
 **Parakeet backend (`engines/parakeet.rs`)**: Loads `ParakeetTDT::from_pretrained(model_dir, exec_config)` from a directory containing `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`. Resamples audio to 16 kHz mono via `yapstack_common::audio::resample` before calling `transcribe_samples` (parakeet-rs 0.3.5 rejects other rates despite its docs). Token-level timestamps grouped into segments at 0.5 s silence gaps + 12 s soft cap. Segments pass through `should_include_segment(text, confidence)`: drops empty / bracketed-token text, low-confidence repetition loops (< 0.7), anything below 0.4, `is_always_reject` matches, and `is_marginal_reject` matches below 0.6.
-- **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` env var. `auto` uses CoreML when compiled in *and* the model dir contains no external `.onnx.data` files (TDT v3 *does* — so Auto falls through to CPU on this model). Per-load CPU fallback at the backend level catches CoreML/WebGPU load failures and degrades silently — the sidecar never returns "no model loaded".
+- **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|webgpu` env var. Default `auto`: WebGPU for a graph whose heavy ops WebGPU fully takes; for the shipped int8 graph (partial placement) WebGPU on Windows and CPU on macOS, where each measured faster. Unmeasured graphs run on CPU. Per-load CPU fallback at the backend level catches WebGPU load failures and reports them (`accel_fallback`) — the sidecar never returns "no model loaded".
 - **Sortformer post-pass** (when `Transcribe.diarization=true` and the sidecar was spawned with `--sortformer-model`): runs Sortformer on the same resampled 16 kHz audio, returns `Vec<SpeakerSegment>` with sample-range + `speaker_id`. `assign_speakers()` maps speaker ranges onto produced transcript segments by maximum-overlap (samples → ms → segment range overlap) and populates `TranscriptSegment.speaker_id`. Sortformer model is loaded lazily on first diarization request to avoid the cost when diarization is off.
 
 ### yapstack-desktop (Tauri app)
@@ -157,8 +157,7 @@ its own session id.
 Frontend: init_transcription_client(engine, parakeet_variant?, enable_diarization)
     → Validates the engine's selected model is on disk; returns NotFound if not
     → For Parakeet+diarization, also ensure_sortformer() (auto-downloads ~50MB Sortformer ONNX)
-    → Resolves CoreML cache dir under $APP_DATA_DIR/cache/coreml/
-    → spawns yapstack-transcription-sidecar with: --engine, --model, [--sortformer-model] [--coreml-cache-dir]
+    → spawns yapstack-transcription-sidecar with: --engine, --model, [--sortformer-model]
     → JSON-line IPC over stdin/stdout
 
 Live transcription loop (one chunk):
@@ -169,7 +168,7 @@ Live transcription loop (one chunk):
       Parakeet backend:
         → loads WAV at native rate
         → resamples to 16kHz mono via yapstack_common::audio::resample
-        → calls ParakeetTDT.transcribe_samples (CoreML/WebGPU/CPU per env var)
+        → calls ParakeetTDT.transcribe_samples (WebGPU/CPU per env var)
         → groups word-level tokens into segments at silence gaps
         → if diarization=true: also runs Sortformer on the same audio,
           assigns speaker_id by max-overlap onto produced segments
@@ -985,7 +984,7 @@ JSON-line protocol over stdin/stdout. Each message is a single JSON object follo
 |---------|-------|---------------------|-------|
 | Microphone capture | cpal (CoreAudio) | cpal (WASAPI) | cpal (ALSA) |
 | System audio capture | cpal loopback (always available) | cpal loopback (WASAPI) | Unavailable |
-| Parakeet transcription | parakeet-rs + ORT (CoreML / WebGPU / CPU) | parakeet-rs + ORT (WebGPU / CPU) | parakeet-rs + ORT (CPU) |
+| Parakeet transcription | parakeet-rs + ORT (WebGPU / CPU) | parakeet-rs + ORT (WebGPU / CPU) | parakeet-rs + ORT (CPU) |
 | Entitlements | audio-input, screen-capture | N/A | N/A |
 
 ### Windows WASAPI notes
@@ -1031,7 +1030,7 @@ comments now cite `SYNC_SPEC` / `CRYPTO_SPEC` sections directly.
 1. **Sidecar process for inference** — Isolates the heavy native ML runtime (parakeet-rs + ONNX Runtime) from the main app binary. Crash isolation. Can be updated independently.
 2. **Lock-free ring buffer** — Audio callbacks cannot block. SPSC with atomics avoids mutex contention.
 3. **DTO layer in Tauri commands** — Domain types don't derive `specta::Type`. DTOs add the TypeScript generation derive and convert via `From` impls.
-4. **Feature flags for optional native deps** — `coreml` and `webgpu` on yapstack-transcription-sidecar are opt-in on top of the default `parakeet` feature. System audio is always compiled in via cpal loopback (no feature flag).
+4. **Feature flags for optional native deps** — `webgpu` on yapstack-transcription-sidecar is opt-in on top of the default `parakeet` feature. System audio is always compiled in via cpal loopback (no feature flag).
 5. **16-bit PCM WAV export** — WAV files are written at the configured capture source's output rate (mic for `MicOnly`, system for `SystemOnly`, mic-rate mixed output for `Mixed` when mic is present). The sidecar resamples to 16kHz mono before inference. 16-bit quantization is sufficient (-96 dB noise floor).
 6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start and stop. `SessionWavWriter` streams audio incrementally to disk every poll, and stop-time tails are flushed with `snapshot_range()` so post-stop samples never enter the finalized part.
 7. **Custom URI scheme for audio** — `audio-stream://` protocol serves session audio (WAV or MP3) from any allow-listed directory with range request support, avoiding cross-origin issues with the default asset protocol during development.

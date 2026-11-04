@@ -346,8 +346,7 @@ pub struct LiveTranscriptionPressureEvent {
     /// live chunk was dispatched. Non-zero means live transcription is
     /// draining preserved audio instead of dropping it.
     pub drain_backlog_seconds: f32,
-    /// Resolved accelerator (`"webgpu"`, `"coreml"`, `"cuda"`, `"cpu"`,
-    /// `"metal"`) for the active sidecar. Captured once at session start
+    /// Resolved accelerator (`"webgpu"` or `"cpu"`) for the active sidecar. Captured once at session start
     /// from the client's cached engine info — rises with the rest of the
     /// pressure payload so a single grep'd `live_pressure` line tells us
     /// whether a slow chunk happened on GPU or CPU.
@@ -1031,8 +1030,8 @@ fn profile_for(engine: yapstack_common::types::EngineKind) -> EngineProfile {
         // `max_chunk_duration` stays at 10 s for now: the cap commit
         // documented chunks ≥12 s degrading to RTFx < 1 on our CPU path.
         // FluidAudio's 14.4 s window is feasible because they run on the
-        // ANE; we don't have that path until we either (a) get TDT v3
-        // working on ORT-CoreML or (b) switch to streaming Nemotron.
+        // ANE; we don't have that path until we either (a) add a native
+        // CoreML path or (b) switch to streaming Nemotron.
         // Stage 6 of the pipeline overhaul plan revisits once we have
         // real per-chunk wall-time data to validate.
         EngineKind::Parakeet => EngineProfile {
@@ -6387,7 +6386,6 @@ mod tests {
             &sidecar,
             EngineKind::Parakeet,
             &model,
-            None,
             None,
         )
         .await

@@ -425,7 +425,7 @@ impl ModelManager {
 
 ### TranscriptionClient (`client.rs`)
 
-Engine-agnostic JSON-line IPC client for the sidecar. Spawns the sidecar with `--engine parakeet` and forwards the optional `--sortformer-model` and `--coreml-cache-dir` flags.
+Engine-agnostic JSON-line IPC client for the sidecar. Spawns the sidecar with `--engine parakeet` and forwards the optional `--sortformer-model` flag.
 
 ```rust
 pub struct TranscriptionResult {
@@ -442,7 +442,6 @@ impl TranscriptionClient {
         engine: EngineKind,
         model_path: &Path,
         sortformer_model_path: Option<&Path>,    // enables per-call diarization
-        coreml_cache_dir: Option<&Path>,         // Parakeet+CoreML only — persistent compile cache
     ) -> Result<Self>;
 
     pub fn engine(&self) -> EngineKind;          // read-only after construction
@@ -486,23 +485,21 @@ yapstack-transcription-sidecar
     [--engine parakeet]                         # default: parakeet; any other value exits with code 2
     [--model /path/to/model/dir]                # Parakeet model dir
     [--sortformer-model /path/to/sortformer.onnx]  # enables per-call diarization
-    [--coreml-cache-dir /path/to/cache/]        # persistent CoreML compile cache
 ```
 
 **Env vars**:
-- `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = CoreML when no external `.onnx.data` files, else CPU)
+- `YAPSTACK_PARAKEET_ACCEL=auto|cpu|webgpu` — selects the ORT execution provider for Parakeet. Default `auto`: WebGPU for a graph whose heavy ops WebGPU fully takes; for the shipped int8 graph (partial placement) WebGPU on Windows and CPU on macOS, where each measured faster. Unmeasured graphs run on CPU.
 - `YAPSTACK_PARAKEET_THREADS=N` — ORT intra-op thread count for Parakeet (N >= 1). Default: physical cores capped at 8 (4 when the core count is unknown). Threads never spin.
 - `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
 **Feature flags**:
 - `parakeet` — Parakeet TDT via parakeet-rs + ORT (also enables Sortformer diarization)
-- `coreml` — Adds the ORT-CoreML execution provider for Parakeet (Apple targets)
 - `webgpu` — Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS)
 - Default features = `["parakeet"]`
 
 A `--no-default-features` build has no engine compiled in; every IPC request returns `no transcription engine compiled in`.
 
-**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + CoreML/WebGPU/CPU EP via env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
+**Internal architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. The one concrete impl is `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + WebGPU/CPU EP via env var). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait.
 
 **Audio preprocessing**: `engines::read_wav_as_mono_16k()` loads the WAV, downmixes via `yapstack_common::audio::deinterleave_to_mono()`, and resamples to 16 kHz via `yapstack_common::audio::resample()`.
 
@@ -587,7 +584,7 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 | `download_sortformer_model` | `variant: SortformerVariantDto` | `String` (path) |
 | `delete_sortformer_model` | `variant: SortformerVariantDto` | `()` |
 
-`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), resolves the CoreML cache dir under `$APP_DATA_DIR/cache/coreml/`, optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths and constructs the long-lived `TranscriptionScheduler`.
+`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths and constructs the long-lived `TranscriptionScheduler`.
 
 Re-init semantics are precise:
 - If the engine is uninitialized: build client + scheduler, OK.

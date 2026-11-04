@@ -27,9 +27,6 @@ struct CliArgs {
     /// Parakeet-only Sortformer diarization model. Optional — when omitted,
     /// per-request `diarization: true` is silently treated as a no-op.
     sortformer_model_path: Option<PathBuf>,
-    /// Parakeet-only persistent CoreML model cache directory. Avoids the
-    /// ~5 s recompile cost on every sidecar spawn.
-    coreml_cache_dir: Option<PathBuf>,
 }
 
 /// Parse the sidecar CLI. `args[0]` is the program name. An unknown
@@ -39,7 +36,6 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut engine = EngineKind::Parakeet;
     let mut initial_model_path: Option<PathBuf> = None;
     let mut sortformer_model_path: Option<PathBuf> = None;
-    let mut coreml_cache_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -59,10 +55,6 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                 sortformer_model_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--coreml-cache-dir" if i + 1 < args.len() => {
-                coreml_cache_dir = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
             _ => {
                 i += 1;
             }
@@ -73,7 +65,6 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         engine,
         initial_model_path,
         sortformer_model_path,
-        coreml_cache_dir,
     })
 }
 
@@ -84,12 +75,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 fn build_backend(
     engine: EngineKind,
     sortformer_model_path: Option<PathBuf>,
-    coreml_cache_dir: Option<PathBuf>,
 ) -> Option<Box<dyn TranscriptionBackend>> {
     match engine {
         EngineKind::Parakeet => Some(Box::new(engines::parakeet::ParakeetBackend::new(
             sortformer_model_path,
-            coreml_cache_dir,
         ))),
     }
 }
@@ -144,16 +133,10 @@ async fn main() {
     if let Some(ref s_path) = cli.sortformer_model_path {
         info!("Sortformer model path: {}", s_path.display());
     }
-    if let Some(ref c_path) = cli.coreml_cache_dir {
-        info!("CoreML cache dir: {}", c_path.display());
-    }
 
     #[cfg(feature = "parakeet")]
-    let mut backend: Option<Box<dyn TranscriptionBackend>> = build_backend(
-        cli.engine,
-        cli.sortformer_model_path.clone(),
-        cli.coreml_cache_dir.clone(),
-    );
+    let mut backend: Option<Box<dyn TranscriptionBackend>> =
+        build_backend(cli.engine, cli.sortformer_model_path.clone());
 
     #[cfg(feature = "parakeet")]
     if let (Some(b), Some(model_path)) = (backend.as_mut(), cli.initial_model_path.as_ref()) {

@@ -54,16 +54,14 @@ pnpm typecheck                             # tsc
 
 # Feature-flag transcription sidecar builds
 cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
-cargo build -p yapstack-transcription-sidecar --features parakeet,coreml                        # + ORT-CoreML EP
-cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP
-cargo build -p yapstack-transcription-sidecar --features parakeet,coreml,webgpu                 # full Apple
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP (what ships)
 
 # Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
 ./scripts/build-sidecars.sh
 ./scripts/build-sidecars.sh --dev
 
 # Force a Parakeet ORT EP at runtime (overrides Auto)
-YAPSTACK_PARAKEET_ACCEL=cpu|coreml|webgpu pnpm tauri dev
+YAPSTACK_PARAKEET_ACCEL=cpu|webgpu pnpm tauri dev
 
 # Frontend only
 pnpm --filter @yapstack/desktop dev

@@ -13,14 +13,8 @@ default = ["parakeet"]
 # configure sessions itself: strict EP registration and the opt-in
 # YAPSTACK_ORT_PLACEMENT session logger.
 parakeet = ["dep:parakeet-rs", "dep:ort"]
-# Apple-only CoreML execution provider for Parakeet. Strict superset of
-# `parakeet`. Adds ~Metal/ANE acceleration via ort-coreml; CPU is kept as
-# automatic fallback by parakeet-rs (`error_on_failure()`).
-coreml = ["parakeet", "parakeet-rs/coreml"]
 # WebGPU execution provider for Parakeet (Metal under the hood on macOS,
-# Vulkan/Dawn elsewhere). Different ORT codepath than CoreML — doesn't
-# go through the cache-write step that fails on models with external
-# `.onnx.data` initializers. The sidecar registers the EP itself through the
+# Vulkan/Dawn elsewhere). The sidecar registers the EP itself through the
 # direct `ort` dep with error_on_failure — parakeet-rs's own arm registers
 # it soft.
 webgpu = ["parakeet", "parakeet-rs/webgpu"]

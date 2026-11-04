@@ -71,11 +71,7 @@ pnpm check
 cargo build -p yapstack-transcription-sidecar --features parakeet               # Parakeet (pulls ort + parakeet-rs)
 
 # Add accelerators
-cargo build -p yapstack-transcription-sidecar --features parakeet,coreml        # Parakeet + ORT-CoreML EP (Apple)
-cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on Windows)
-
-# Standard apple build (what scripts/build-transcription-sidecar.sh produces on macOS)
-cargo build -p yapstack-transcription-sidecar --features parakeet,coreml,webgpu
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on macOS and Windows)
 
 # Default features
 cargo build -p yapstack-transcription-sidecar                                   # = parakeet
@@ -84,14 +80,13 @@ cargo build -p yapstack-transcription-sidecar                                   
 | Feature | Purpose |
 |---------|---------|
 | `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
-| `coreml` | Adds the ORT-CoreML execution provider for Parakeet on Apple. Strict superset of `parakeet`. The Parakeet backend's "Auto" policy will skip CoreML at load time if the model dir contains external `.onnx.data` files (known ORT bug); set `YAPSTACK_PARAKEET_ACCEL=coreml` to force-attempt. |
 | `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows). Compiled into both the macOS and Windows sidecars, and selected by `Auto` on both since Gate C passed (ADR 0004); EP-init failure falls back to CPU with an honest `accel` label. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. |
 
 Parakeet is the only engine (ADR 0005). A `--no-default-features` build has no engine compiled in, and every IPC request returns `no transcription engine compiled in`. The sidecar defaults to `--engine parakeet`; an unknown `--engine` value is a startup error (exit code 2). The dispatcher in `main.rs` is engine-agnostic.
 
 ### Runtime env vars (sidecar)
 
-- **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: uses CoreML when compiled in *and* the model has no external `.onnx.data` initializers, otherwise CPU. Empirical RTFx on Apple Silicon for Parakeet TDT v3, 2-13 s chunks: CPU 4-8×, WebGPU 4-9× (similar mean, higher variance). CoreML doesn't load for TDT v3 (external-data bug); use Auto to silently fall through.
+- **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: WebGPU for a graph whose heavy ops WebGPU fully takes; for the shipped int8 graph (partial placement) WebGPU on Windows and CPU on macOS, where each measured faster. Unmeasured graphs run on CPU. A WebGPU init failure falls back to CPU, logged. Any other value is logged and treated as `auto`.
 - **`YAPSTACK_PARAKEET_THREADS=N`** — overrides the Parakeet ORT intra-op thread count (for benching). Default: physical cores capped at 8 (`hw.physicalcpu` on macOS, `GetLogicalProcessorInformationEx` on Windows), 4 when unknown; 8 measured fastest on an 18-core M5 Pro. Intra- and inter-op spinning are off; inter-op threads are 1.
 - **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` with `yapstack_desktop`, `yapstack_transcription`, the frontend bridge and the sidecar at `debug` (so every sync trace line lands in the log file), `yapstack_audio` at `info`, and `warn` for noisy upstream deps (`tao`, `wry`, `hyper`, `reqwest`). Example: `RUST_LOG=debug,ort=warn npm run dev`.
 
@@ -109,7 +104,7 @@ The sidecar is a standalone binary that must be built separately and placed in `
 ./scripts/build-transcription-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-This builds with `--release` and the per-target features (`parakeet,coreml,webgpu` on Apple, `parakeet,webgpu` on Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
+This builds with `--release` and the per-target features (`parakeet,webgpu` on Apple and Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
 
 The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 

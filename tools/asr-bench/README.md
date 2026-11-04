@@ -88,7 +88,7 @@ uv run asr-bench run \
   --corpus librispeech:test-other:200 --corpus dir:corpus/owner
 ```
 
-- `--accel` takes any `YAPSTACK_PARAKEET_ACCEL` value (`auto`, `cpu`, `webgpu`, `coreml`); the rows are model × accel.
+- `--accel` takes any `YAPSTACK_PARAKEET_ACCEL` value (`auto`, `cpu`, `webgpu`); the rows are model × accel.
 - `--only int8:cpu,fp16:webgpu` restricts the rows to that list.
 - `--repeat N` transcribes each clip N times. The hypothesis is taken from the first run, and the timing from all of them.
 - The tool removes `RUST_LOG` and `ORT_LOG` from the sidecar's environment, so the sidecar runs with its own default log filter, as in the app.

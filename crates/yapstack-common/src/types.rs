@@ -73,7 +73,7 @@ pub enum SidecarResponse {
     ModelLoaded {
         id: u64,
         /// Identifier of the execution provider that actually loaded the
-        /// model — `"webgpu"`, `"coreml"`, `"cuda"`, or `"cpu"`. Reflects
+        /// model — `"webgpu"`, `"cuda"`, or `"cpu"`. Reflects
         /// the *resolved* path including any fallback (e.g. WebGPU → CPU
         /// when EP init fails). None for engines that don't expose this
         /// (e.g. older sidecars — backward compat).
