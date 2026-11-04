@@ -1852,8 +1852,12 @@ async fn advance_idle_cursor(vad: &mut SourceVadState, audio_state: &AudioManage
 
 /// Internal poll interval for the VAD loop.
 const POLL_INTERVAL_MS: u64 = 300;
-/// Minimum chunk duration in seconds below which a chunk is skipped.
-const MIN_CHUNK_DURATION_SECS: f32 = 0.1;
+/// Minimum chunk duration in seconds below which a chunk is skipped. Every
+/// chunk opens with the 250 ms pre-roll, so a shorter one holds under 100 ms
+/// after speech onset: no word, and Parakeet decodes such fragments as
+/// "Yeah." or "Oh." A chunk that ends at a pause is never this short; only a
+/// flush cut right after an onset (dictation pre-window, stop) is.
+const MIN_CHUNK_DURATION_SECS: f32 = 0.35;
 /// Number of consecutive empty WAV flush extractions before emitting an error event.
 const WAV_FLUSH_ERROR_THRESHOLD: u32 = 10;
 /// Interval (in consecutive empty flushes) for emitting periodic warnings.
@@ -4044,12 +4048,29 @@ async fn live_transcription_loop(
                 None => false,
             }
         };
+        let mut stop_tail_speech = Vec::with_capacity(sources.len());
+        for source in sources.iter_mut().filter(|s| !s.is_speaking) {
+            let limit = match source.label {
+                AudioSourceLabel::Mic => req.positions.mic_pos,
+                AudioSourceLabel::System => req.positions.system_pos,
+            };
+            let speech = stop_tail_has_speech(
+                source,
+                &audio_state,
+                &mut silero,
+                limit,
+                tuning.speech_threshold,
+            )
+            .await;
+            stop_tail_speech.push((source.label, speech));
+        }
         copy_final_pending_chunks_until(
             &sources,
             &audio_state,
             tuning.max_chunk_duration,
             &req.positions,
             skip_mic,
+            &stop_tail_speech,
         )
         .await
     } else {
@@ -4411,12 +4432,75 @@ struct FinalPendingChunk {
     source_label: AudioSourceLabel,
 }
 
+/// The ranges of `[source.speech_start_pos, limit)` the stop-time flush
+/// sends, in order. A source that isn't mid-utterance sends nothing unless
+/// `tail_has_speech` (Silero heard speech in the audio it hadn't scored yet):
+/// the pending audio is then only the last poll plus the stop grace, room
+/// tone that Parakeet often decodes as "Yeah." Longer than one chunk, the
+/// range is cut at the quietest recent frame before each cap and never
+/// leaves a piece under `MIN_SPLIT_PIECE_SECS`; a whole range under
+/// `MIN_CHUNK_DURATION_SECS` is too short to hold a word and sends nothing.
+fn final_flush_ranges(
+    source: &SourceVadState,
+    limit: usize,
+    max_chunk_duration: Duration,
+    tail_has_speech: bool,
+) -> Vec<(usize, usize)> {
+    let (sr, ch) = (source.source_sample_rate, source.source_channels);
+    let min_chunk =
+        max_raw_samples_for_duration(Duration::from_secs_f32(MIN_CHUNK_DURATION_SECS), sr, ch);
+    let start = source.speech_start_pos;
+    if !(source.is_speaking || tail_has_speech) || limit < start.saturating_add(min_chunk) {
+        return Vec::new();
+    }
+    let max_raw = max_raw_samples_for_duration(max_chunk_duration, sr, ch);
+    let min_piece =
+        max_raw_samples_for_duration(Duration::from_secs_f32(MIN_SPLIT_PIECE_SECS), sr, ch);
+    let window = max_raw_samples_for_duration(PAUSE_SEARCH_WINDOW, sr, ch);
+    let mut ranges = Vec::new();
+    let mut from = start;
+    while limit - from > max_raw {
+        let cap = (from + max_raw).min(limit - min_piece);
+        let floor = from + min_piece;
+        let end = quietest_recent_frame_pos(&source.silero.recent_frames, floor, cap, window, ch)
+            .unwrap_or(cap);
+        ranges.push((from, end));
+        from = end;
+    }
+    ranges.push((from, limit));
+    ranges
+}
+
+/// Whether the stop-time flush should treat `source` as having speech in the
+/// audio Silero hadn't scored when stop arrived: `[silero.read_pos, limit)`.
+/// Scores it on the source's own stream so the LSTM context carries over.
+async fn stop_tail_has_speech(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    silero: &mut SileroVad,
+    limit: usize,
+    speech_threshold: f32,
+) -> bool {
+    let tail = {
+        let manager = audio_state.lock().await;
+        extract_source_audio_until(&manager, &source.label, source.silero.read_pos, limit)
+    };
+    let Some(tail) = tail else {
+        return false;
+    };
+    silero
+        .score_stream(&mut source.silero.stream, &tail.samples, tail.sample_rate)
+        .iter()
+        .any(|&p| p >= speech_threshold)
+}
+
 async fn copy_final_pending_chunks_until(
     sources: &[SourceVadState],
     audio_state: &AudioManagerState,
     max_chunk_duration: Duration,
     stop_positions: &BufferPositions,
     skip_mic: bool,
+    stop_tail_speech: &[(AudioSourceLabel, bool)],
 ) -> Vec<FinalPendingChunk> {
     let mut pending = Vec::new();
     for source in sources {
@@ -4433,15 +4517,11 @@ async fn copy_final_pending_chunks_until(
             AudioSourceLabel::Mic => stop_positions.mic_pos,
             AudioSourceLabel::System => stop_positions.system_pos,
         };
-        let mut from = source.speech_start_pos;
-        let max_raw = max_raw_samples_for_duration(
-            max_chunk_duration,
-            source.source_sample_rate,
-            source.source_channels,
-        );
-
-        while from < limit {
-            let until = from.saturating_add(max_raw).min(limit);
+        let tail_has_speech = stop_tail_speech
+            .iter()
+            .any(|(label, speech)| *label == source.label && *speech);
+        for (from, until) in final_flush_ranges(source, limit, max_chunk_duration, tail_has_speech)
+        {
             let extraction = {
                 let manager = audio_state.lock().await;
                 extract_source_audio_until(&manager, &source.label, from, until)
@@ -4481,10 +4561,6 @@ async fn copy_final_pending_chunks_until(
                     source_label: source.label,
                 });
             }
-            if extraction.end_pos <= from {
-                break;
-            }
-            from = extraction.end_pos;
         }
     }
     pending
@@ -6589,6 +6665,80 @@ mod tests {
             live_dispatch_end(&empty, current, live_max_raw(), true, true),
             (live_max_raw(), true)
         );
+    }
+
+    // --- Stop-time flush ---
+
+    fn secs_48k(secs: f32) -> usize {
+        max_raw_samples_for_duration(Duration::from_secs_f32(secs), LIVE_SR, LIVE_CH)
+    }
+
+    /// Stopping while silent used to send the last poll plus the 300 ms stop
+    /// grace (~0.4 s of room tone) to the engine, which decoded 17 of 40
+    /// LibriSpeech room-tone clips that long as "Yeah." or "Okay."
+    #[test]
+    fn stop_flush_sends_nothing_when_no_speech_is_pending() {
+        let vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        let limit = secs_48k(0.4);
+
+        assert_eq!(
+            final_flush_ranges(&vad, limit, Duration::from_secs(10), false),
+            vec![]
+        );
+        // Speech Silero hadn't scored yet when stop arrived is still sent.
+        assert_eq!(
+            final_flush_ranges(&vad, limit, Duration::from_secs(10), true),
+            vec![(0, limit)]
+        );
+    }
+
+    /// Stopping a few tens of ms after an onset leaves only the pre-roll and
+    /// the first sliver of the word, which decodes as "Yeah." or "Oh."
+    #[test]
+    fn stop_flush_skips_a_fragment_shorter_than_a_word() {
+        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+        vad.is_speaking = true;
+
+        assert_eq!(
+            final_flush_ranges(&vad, secs_48k(0.3), Duration::from_secs(10), false),
+            vec![]
+        );
+        // A short word with its pre-roll and the stop grace is sent whole.
+        let yes = secs_48k(0.25 + 0.4 + 0.3);
+        assert_eq!(
+            final_flush_ranges(&vad, yes, Duration::from_secs(10), false),
+            vec![(0, yes)]
+        );
+    }
+
+    /// A stop-time backlog a little over one chunk (a slow sidecar) used to
+    /// go out as a full chunk plus a 0.2 s remainder.
+    #[test]
+    fn stop_flush_leaves_no_short_piece_after_a_long_backlog() {
+        let max = Duration::from_secs(10);
+        let min = secs_48k(MIN_SPLIT_PIECE_SECS);
+        for secs in [10.2f32, 11.9, 17.0, 20.1, 31.5] {
+            let probs = uneven_speech((secs / FRAME_SECS) as usize);
+            let total = probs.len() * LIVE_FRAME;
+            let mut vad = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, LIVE_SR, LIVE_CH, 0.0);
+            vad.is_speaking = true;
+            feed_live_frames(&mut vad, &probs, 0, probs.len());
+
+            let ranges = final_flush_ranges(&vad, total, max, false);
+
+            let pieces: Vec<VadBackfillChunk> = ranges
+                .iter()
+                .map(|&(start, end)| VadBackfillChunk { start, end })
+                .collect();
+            assert_tiles(&pieces, 0, total);
+            for p in &pieces {
+                assert!(
+                    (min..=live_max_raw()).contains(&(p.end - p.start)),
+                    "{secs}: {pieces:?}"
+                );
+                assert_eq!(p.end % LIVE_CH as usize, 0);
+            }
+        }
     }
 
     /// A minute of unbroken live speech cut chunk after chunk: each chunk
