@@ -377,19 +377,20 @@ pub enum AudioError {
 ```rust
 pub use client::{EngineInfo, TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
-pub use model::{LegacyModelFile, ModelManager, ParakeetVariant, SortformerVariant};
+pub use model::{ModelManager, ParakeetVariant, SortformerVariant};
 ```
 
 ### ModelManager (`model.rs`)
 
-Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. There is no hash verification yet; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. It also lists and deletes legacy files earlier releases left in `models/` (Whisper GGML weights and the GGML Silero VAD file); it never deletes them on its own.
+Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. Parakeet files are pinned to a fixed HuggingFace revision and checked against their SHA-256; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. At startup `remove_unused_model_files` deletes what earlier releases left in `models/` that no current model reads (ADR 0005 amendment).
 
 ```rust
-pub enum ParakeetVariant { TdtV3, TdtV3Int8 }     // multilingual, 25 European languages
+pub enum ParakeetVariant { TdtV3Int8 }            // multilingual, 25 European languages
 pub enum SortformerVariant { V2_1 }               // up to 4 speakers
 
 impl ParakeetVariant {
-    pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3"
+    pub fn recommended_for_host() -> Self;                                     // TdtV3Int8 on every target
+    pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3-int8"
     pub fn files(&self) -> &'static [(&'static str, &'static str, u64)];       // (name, url, size) per file
     pub fn approximate_size_bytes(&self) -> u64;
     pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~700 MB)" for int8
@@ -397,18 +398,15 @@ impl ParakeetVariant {
 }
 impl SortformerVariant { /* filename, download_url, approximate_size_bytes, display_name */ }
 
-/// A legacy model file present in models/.
-pub struct LegacyModelFile { pub name: String, pub bytes: u64 }
-
 pub struct ModelManager { /* models_dir: PathBuf */ }
 
 impl ModelManager {
     pub fn new(app_data_dir: PathBuf) -> Self;        // stored in app_data_dir/models/
     pub fn models_dir(&self) -> &Path;
 
-    // ---- Legacy files (ggml-{tiny,base,small,medium}.bin, ggml-silero-v6.2.0.bin) ----
-    pub fn list_legacy_model_files(&self) -> Vec<LegacyModelFile>;             // present files, in catalogue order
-    pub async fn delete_legacy_model_files(&self, names: &[String]) -> Result<()>; // refuses names outside the legacy list; missing files skipped
+    // ---- Unused files: ggml-{tiny,base,small,medium}.bin, ggml-silero-v6.2.0.bin,
+    //      parakeet-tdt-v3/ (fp32 bundle), parakeet-tdt-v3-int8/nemo128.onnx ----
+    pub fn remove_unused_model_files(&self);   // run once at startup; logs each removal, a failure is a warning
 
     // ---- Parakeet (multi-file ONNX bundle in models_dir/parakeet-<variant>/) ----
     pub fn parakeet_model_dir(&self, variant: ParakeetVariant) -> PathBuf;
@@ -578,8 +576,6 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 ### Transcription Commands (`commands/transcription.rs`)
 | Command | Args | Returns |
 |---------|------|---------|
-| `list_legacy_model_files` | — | `Vec<LegacyModelFileDto { name, bytes }>` (legacy files present in `models/`) |
-| `delete_legacy_model_files` | `names: Vec<String>` | `()` (`Transcription` error, nothing deleted, if any name is outside the legacy list) |
 | `init_transcription_client` | `engine, parakeet_variant?, enable_diarization` | `()` |
 | `shutdown_transcription_client` | — | `()` |
 | `get_transcription_status` | — | `TranscriptionStatusDto { initialized: bool }` |
@@ -599,8 +595,6 @@ Re-init semantics are precise:
 - If already initialized with a *different* config: return `InvalidInput` with "engine already initialized; call shutdown_transcription_client first". Engine swap is an explicit two-step operation; there is no implicit drain.
 
 `shutdown_transcription_client` refuses with `InvalidInput` if any runtime slot is non-`Idle`; otherwise calls `scheduler.shutdown_client()` to drain the worker, take the client, and call `client.shutdown().await`.
-
-`list_legacy_model_files` / `delete_legacy_model_files` cover the files earlier releases left in `models/`: `ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin` (Whisper weights) and `ggml-silero-v6.2.0.bin` (GGML Silero VAD). Nothing deletes them without a user action; `delete_legacy_model_files` refuses any name outside that fixed list, so it cannot remove a current model.
 
 All `download_*` commands emit `"model-download-progress"` events to the window with `{ percent: f32, kind: "parakeet" | "sortformer", variant }`.
 
@@ -1034,7 +1028,8 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 28→29 | Insight cadence presets renamed (`summary`/`jargon`/`topic` → tempo tiers `responsive`/`balanced`/`relaxed`); added Insight `type`. |
 | 29→30 | Dropped the redundant per-Insight `enabled` flag. |
 | 30→31 | Remove the redundant `_legacyAi` snapshot written by an early build of the AI refactor (duplicate of legacy `ai`, including plaintext keys, never read). |
-| 31→32 | Whisper removed (ADR 0005): `coerceWhisperSettings` maps `selectedEngine: "Whisper"` to `"Parakeet"` and sets `whisperRemovedNotice: true`, and deletes `selectedModelSize`, `silenceDurationMs`, `maxChunkSeconds`, `promptContextChars`, `promptDecaySilenceSeconds`. The same idempotent coercion also runs in `merge`. |
+| 31→32 | No-op. It first held the Whisper coercion (`coerceWhisperSettings`), removed before release by the ADR 0005 amendment. |
+| 32→33 | A persisted `selectedEngine` other than `"Parakeet"` (an alpha.12 Whisper user) becomes `"Parakeet"`, and the removed fp32 variant `selectedParakeetVariant: "TdtV3"` becomes `"TdtV3Int8"`. |
 
 ---
 

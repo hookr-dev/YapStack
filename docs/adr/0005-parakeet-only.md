@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-11-02
+- **Amended**: 2026-11-03 (see [Amendments](#amendments))
 - **Supersedes in part**: ADR 0004 (the "Whisper stays CPU on Windows" clause).
 
 ## Context
@@ -117,3 +118,25 @@ explicitly accepted the loss of the languages outside Parakeet's 25.
 - [`0004-cross-platform-rollout-windows-first.md`](0004-cross-platform-rollout-windows-first.md) — the Whisper-on-Windows clause this ADR supersedes.
 - [`docs/plans/windows-support.md`](../plans/windows-support.md) — where Whisper was first labelled a deprecation candidate.
 - [`docs/plans/parakeet-variants.md`](../plans/parakeet-variants.md) — the Parakeet variant catalogue that becomes the only model catalogue.
+
+## Amendments
+
+### 2026-11-03: old model files are removed automatically
+
+Owner ruling. Replaces the "Old Whisper model files are never deleted
+silently" decision and the Whisper settings coercion.
+
+- At startup, `ModelManager::remove_unused_model_files` deletes the files no
+  current model reads: the Whisper GGML weights, the GGML Silero VAD file, the
+  fp32 Parakeet bundle (`parakeet-tdt-v3/`) and the int8 bundle's unused
+  `nemo128.onnx`. Each removal is logged; a failed one is logged as a warning
+  and retried next launch. The Settings row and the
+  `list_legacy_model_files` / `delete_legacy_model_files` commands are gone.
+- The fp32 `TdtV3` variant is removed. Intel Macs aren't shipped (release
+  builds are aarch64 only), so int8 is the only variant on every target.
+  Settings migration v33 rewrites a persisted `"TdtV3"` to `"TdtV3Int8"`.
+- `coerceWhisperSettings` (the v32 migration and `merge`) and the one-time
+  "Whisper has been removed" notice are removed. Settings migration v33 keeps
+  one line of it: any persisted `selectedEngine` other than Parakeet becomes
+  Parakeet, so an alpha.12 Whisper user updating straight to this release is
+  moved over.

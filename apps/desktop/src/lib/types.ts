@@ -131,30 +131,6 @@ async audioFilesExist(paths: string[]) : Promise<boolean[]> {
     return await TAURI_INVOKE("audio_files_exist", { paths });
 },
 /**
- * Lists model files left behind by earlier releases, with their sizes, so
- * Settings can offer to remove them. Nothing is deleted without the user.
- */
-async listLegacyModelFiles() : Promise<Result<LegacyModelFileDto[], CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("list_legacy_model_files") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Deletes the named legacy model files. Names that aren't legacy model
- * files are refused.
- */
-async deleteLegacyModelFiles(names: string[]) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_legacy_model_files", { names }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Spawn the sidecar with the requested engine. Parakeet requires
  * `parakeet_variant` and may optionally enable Sortformer diarization.
  *
@@ -220,15 +196,8 @@ async getParakeetModels() : Promise<Result<ParakeetModelInfoDto[], CommandError>
 }
 },
 /**
- * Returns the Parakeet variant the current host should run. Apple Silicon
- * gets the int8 bundle (smaller, no external `.onnx.data`, accelerator-
- * compatible); other targets keep the fp32 bundle.
- *
- * The frontend uses this in two places:
- * 1. As the source of truth for the v24 store migration that coerces
- * pre-existing `selectedParakeetVariant` values.
- * 2. To render a single-variant Parakeet UI keyed to whatever the host
- * is meant to run, so users never have to pick int8 vs fp32.
+ * Returns the Parakeet variant the current host should run. `autoSetup`
+ * downloads and loads it and stores it as `selectedParakeetVariant`.
  */
 async getRecommendedParakeetVariant() : Promise<Result<ParakeetVariantDto, CommandError>> {
     try {
@@ -976,11 +945,6 @@ export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
- * A model file left behind by an earlier release (today: Whisper GGML
- * weights and the GGML Silero VAD file) that no current model uses.
- */
-export type LegacyModelFileDto = { name: string; bytes: number }
-/**
  * Routing identity of a live-transcription runtime. `Session` is the
  * long-running recording flow that writes session audio parts; `Dictation`
  * is the user-triggered, mic-only utterance flow whose segments must not
@@ -1112,14 +1076,10 @@ export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
 export type LoginBeginResultDto = { saltMismatch: boolean }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
-export type ParakeetVariantDto = "TdtV3" |
 /**
- * int8-quantized variant — same model, smaller footprint, no
- * external `.onnx.data` so accelerators can load it. Used on
- * Apple Silicon by default; the FE migration coerces existing
- * `TdtV3` users on Apple Silicon to this variant on next launch.
+ * Parakeet model variant. int8 Parakeet TDT v3 is the only one.
  */
-"TdtV3Int8"
+export type ParakeetVariantDto = "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 /**
  * The workspace's sync capability levels as lane status shows them.

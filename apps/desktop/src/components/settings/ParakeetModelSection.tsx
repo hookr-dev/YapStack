@@ -10,9 +10,7 @@ import { formatBytes } from "@/lib/utils";
 
 /// Parakeet model row. The variant is resolved by the backend
 /// (`get_recommended_parakeet_variant`) and coerced into the store at
-/// `autoSetup` time, so this UI only ever shows one row — the model that
-/// can actually run on the host. int8 vs fp32 is an implementation
-/// detail the user never picks.
+/// `autoSetup` time, so this UI only ever shows one row.
 export function ParakeetModelSection() {
   const selectedVariant = useAppStore(
     (s) => s.settings.selectedParakeetVariant,

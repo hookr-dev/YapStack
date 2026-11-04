@@ -56,7 +56,6 @@ import type {
   EngineDescriptorDto,
   ParakeetModelInfoDto,
   SortformerModelInfoDto,
-  LegacyModelFileDto,
 } from "@/lib/tauri";
 import {
   createSession as dbCreateSession,
@@ -145,7 +144,6 @@ import {
   trackSessionMovedToFolder,
   setAnalyticsEnabled,
 } from "@/lib/analytics";
-import { formatBytes } from "@/lib/utils";
 
 export type ThemeMode = "light" | "dark" | "system";
 
@@ -327,10 +325,6 @@ export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
   selectedEngine: EngineKindDto;
-  /// Set by the v32 migration when it moved a Whisper user to Parakeet
-  /// (ADR 0005). autoSetup shows a one-time toast explaining the Parakeet
-  /// download, then clears it once the engine is ready.
-  whisperRemovedNotice: boolean;
   selectedParakeetVariant: ParakeetVariantDto;
   diarizationEnabled: boolean;
   /// `{ [sessionId]: { [speakerKey]: "Alice" } }`, keyed by `SpeakerKey`
@@ -589,9 +583,6 @@ interface AppState {
 
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
-  /// Model files left behind by earlier releases (today: Whisper GGML
-  /// weights). Settings offers to remove them; nothing deletes them silently.
-  legacyModelFiles: LegacyModelFileDto[];
   // Engine catalogue + Parakeet/Sortformer model state (loaded on autoSetup).
   // engineCatalogue is the static capability descriptor from the Rust side.
   // parakeetModels/sortformerStatus are the per-variant download status.
@@ -668,8 +659,6 @@ interface AppState {
    * direct IPC fetch.
    */
   applyDeviceList: (devices: AudioDeviceInfoDto[]) => void;
-  refreshLegacyModelFiles: () => Promise<void>;
-  deleteLegacyModelFiles: () => Promise<void>;
   updateSettings: (partial: Partial<Settings>) => void;
   clearAllSessions: () => Promise<void>;
 
@@ -902,28 +891,12 @@ async function deleteSessionAudio(
   }
 }
 
-/// Moves a persisted Whisper user onto Parakeet and drops the Whisper-only
-/// settings (ADR 0005). Idempotent: `merge` runs it on every rehydrate.
-export function coerceWhisperSettings(settings: Record<string, unknown>): void {
-  if (settings.selectedEngine === "Whisper") {
-    settings.selectedEngine = "Parakeet";
-    settings.whisperRemovedNotice = true;
-  }
-  delete settings.selectedModelSize;
-  delete settings.silenceDurationMs;
-  delete settings.maxChunkSeconds;
-  delete settings.promptContextChars;
-  delete settings.promptDecaySilenceSeconds;
-}
-
 const defaultSettings: Settings = {
   captureSource: "Mixed",
   selectedMicDeviceId: null,
-  // Parakeet is the only engine (ADR 0005). Persisted "Whisper" values are
-  // coerced in both `migrate` (v32) and `merge`.
+  // Parakeet is the only engine (ADR 0005).
   selectedEngine: "Parakeet",
-  whisperRemovedNotice: false,
-  selectedParakeetVariant: "TdtV3",
+  selectedParakeetVariant: "TdtV3Int8",
   diarizationEnabled: false,
   speakerNames: {},
   language: "en",
@@ -1183,7 +1156,6 @@ function createAppStore() {
       syncStatus: null,
       relayConn: { kind: "idle" },
       devices: [],
-      legacyModelFiles: [],
       engineCatalogue: [],
       parakeetModels: [],
       sortformerStatus: null,
@@ -2225,28 +2197,6 @@ function createAppStore() {
         );
       },
 
-      refreshLegacyModelFiles: async () => {
-        const result = await commands.listLegacyModelFiles();
-        if (result.status === "ok") {
-          set({ legacyModelFiles: result.data });
-        } else {
-          console.error(
-            "Failed to list legacy model files:",
-            commandErrorMessage(result.error),
-          );
-        }
-      },
-
-      deleteLegacyModelFiles: async () => {
-        const names = get().legacyModelFiles.map((f) => f.name);
-        if (names.length === 0) return;
-        const result = await commands.deleteLegacyModelFiles(names);
-        await get().refreshLegacyModelFiles();
-        if (result.status === "error") {
-          throw new Error(commandErrorMessage(result.error));
-        }
-      },
-
       autoSetup: () => {
         // One run at a time: Retry, a remount and the first launch can all
         // call this while a run is still awaiting its download, and a second
@@ -2302,17 +2252,6 @@ function createAppStore() {
               .loadEngineCatalogue()
               .catch((e) => console.error("Failed to load catalogue:", e));
 
-            // Variant resolution is driven by the backend's
-            // `recommended_for_host()` (cfg-driven, deterministic per
-            // machine). For the post-update upgrade case — Apple Silicon
-            // users sitting on `TdtV3` because that was the only variant
-            // pre-int8 — we want to download `TdtV3Int8` AND keep the old
-            // bundle as a safety net so an offline launch / dropped
-            // download doesn't strand the user with a working model on
-            // disk that we ignored.
-            //
-            // Order: refresh state first, then decide which variant to
-            // load this launch.
             await get().refreshParakeetModels();
             await get().refreshSortformerStatus();
 
@@ -2324,87 +2263,30 @@ function createAppStore() {
                 commandErrorMessage(recommendedRes.error),
               );
             }
-            const recommended =
-              recommendedRes.status === "ok" ? recommendedRes.data : null;
+            const variant =
+              recommendedRes.status === "ok"
+                ? recommendedRes.data
+                : settings.selectedParakeetVariant;
 
-            const downloadedVariants = get().parakeetModels.filter(
-              (m) => m.downloaded,
+            const downloaded = get().parakeetModels.some(
+              (m) => m.variant === variant && m.downloaded,
             );
-            const recommendedDownloaded =
-              recommended &&
-              downloadedVariants.some((m) => m.variant === recommended);
-            // Any non-recommended variant that's already on disk — the
-            // user's "previous bundle" if we're mid-upgrade. Used as the
-            // fallback target when a recommended-variant download fails.
-            const legacyFallback =
-              downloadedVariants.find((m) => m.variant !== recommended)
-                ?.variant ?? null;
-
-            let variant = settings.selectedParakeetVariant;
-
-            if (recommendedDownloaded) {
-              // Recommended is already on disk. Use it directly.
-              variant = recommended!;
-            } else if (recommended) {
-              // Need to download the recommended variant. If the user
-              // already has another variant downloaded (the upgrade
-              // case), surface a one-time toast so they know why a
-              // fresh download is happening right after the app update.
-              if (settings.whisperRemovedNotice) {
-                const size = get().parakeetModels.find(
-                  (m) => m.variant === recommended,
-                )?.approximate_size_bytes;
-                toast.info(
-                  size
-                    ? `Whisper has been removed. YapStack now uses Parakeet; downloading it once (${formatBytes(size)})…`
-                    : "Whisper has been removed. YapStack now uses Parakeet; downloading it once…",
-                  {
-                    id: "parakeet-variant-upgrade",
-                    duration: 10000,
-                  },
-                );
-              } else if (legacyFallback) {
-                toast.info(
-                  "Upgrading Parakeet to the optimized model for your Mac. Downloading…",
-                  {
-                    id: "parakeet-variant-upgrade",
-                    duration: 10000,
-                  },
-                );
-              }
+            if (!downloaded) {
               set({ enginePhase: "downloading", modelDownloadProgress: 0 });
-              const dl = await commands.downloadParakeetModel(recommended);
+              const dl = await commands.downloadParakeetModel(variant);
               set({ modelDownloadProgress: null });
-
               if (dl.status === "error") {
-                if (legacyFallback) {
-                  // Keep the user working on the bundle they already
-                  // have. Surface a warning so they know the upgrade
-                  // didn't take and can retry next launch.
-                  toast.warning(
-                    "Couldn't download the optimized Parakeet model. Continuing with the existing bundle.",
-                    {
-                      id: "parakeet-variant-upgrade",
-                      duration: 8000,
-                    },
-                  );
-                  variant = legacyFallback;
-                } else {
-                  // No fallback on disk → first-install error path.
-                  trackEngineError({
-                    error: commandErrorMessage(dl.error),
-                    phase: "downloading",
-                  });
-                  set({
-                    enginePhase: "error",
-                    engineError: commandErrorMessage(dl.error),
-                  });
-                  return;
-                }
-              } else {
-                await get().refreshParakeetModels();
-                variant = recommended;
+                trackEngineError({
+                  error: commandErrorMessage(dl.error),
+                  phase: "downloading",
+                });
+                set({
+                  enginePhase: "error",
+                  engineError: commandErrorMessage(dl.error),
+                });
+                return;
               }
+              await get().refreshParakeetModels();
             }
 
             // Persist whichever variant we ended up using so StatusPopover,
@@ -2443,9 +2325,6 @@ function createAppStore() {
               return;
             }
             set({ enginePhase: "ready", engineError: null });
-            if (settings.whisperRemovedNotice) {
-              get().updateSettings({ whisperRemovedNotice: false });
-            }
           } catch (e) {
             // console.error routes through the frontend log bridge, so the
             // failure lands in the unified log file — engine setup errors on
@@ -3299,7 +3178,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 32,
+      version: 33,
       partialize: (state) => ({
         settings: state.settings,
         // Non-secret sync handles only (server URL, enabled flag, cursor,
@@ -3331,11 +3210,6 @@ function createAppStore() {
             1 - persistedSettings.dictationDuckTarget;
         }
         delete persistedSettings.dictationDuckTarget;
-
-        // Whisper was removed (ADR 0005). Also coerced by the v32 migration;
-        // repeated here so a persist-version skew can never rehydrate an
-        // engine the backend no longer accepts.
-        coerceWhisperSettings(persistedSettings);
 
         return {
           ...current,
@@ -3675,8 +3549,12 @@ function createAppStore() {
           // this, DBs that ran that build keep re-persisting the duplicate.
           delete (state.settings as Record<string, unknown>)._legacyAi;
         }
-        if (version < 32 && state.settings) {
-          coerceWhisperSettings(state.settings);
+        if (version < 33 && state.settings) {
+          // Whisper (ADR 0005) and the fp32 Parakeet variant are gone.
+          const old = state.settings as Record<string, unknown>;
+          if (old.selectedEngine !== "Parakeet") old.selectedEngine = "Parakeet";
+          if (old.selectedParakeetVariant === "TdtV3")
+            old.selectedParakeetVariant = "TdtV3Int8";
         }
         return state as unknown as { settings: Settings };
       },

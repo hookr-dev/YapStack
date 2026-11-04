@@ -353,10 +353,9 @@ pub struct LiveTranscriptionPressureEvent {
     /// whether a slow chunk happened on GPU or CPU.
     pub accel: Option<String>,
     /// For Parakeet, the variant directory name (e.g.
-    /// `"parakeet-tdt-v3-int8"` or `"parakeet-tdt-v3"`) so we can tell
-    /// int8 vs fp32 sessions apart in logs without joining against
-    /// `live_engine_loaded`. None when the sidecar didn't report a
-    /// model_dir.
+    /// `"parakeet-tdt-v3-int8"`), so a log line names the model without
+    /// joining against `live_engine_loaded`. None when the sidecar didn't
+    /// report a model_dir.
     pub variant: Option<String>,
 }
 
@@ -1005,8 +1004,8 @@ struct EngineProfile {
     /// already logs that case).
     accel: Option<String>,
     /// For Parakeet, the variant directory name (e.g.
-    /// `"parakeet-tdt-v3-int8"`). Lets the pressure-event log tell
-    /// int8 from fp32 sessions without external joins.
+    /// `"parakeet-tdt-v3-int8"`). Lets the pressure-event log name the
+    /// model without external joins.
     variant: Option<String>,
 }
 
