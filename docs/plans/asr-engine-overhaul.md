@@ -116,7 +116,7 @@ All corpus data lives in a gitignored cache (`tools/asr-bench/.cache/`).
 | **G4** EP honesty (ratified 2026-10-31 at 100%) | Phase 1 | An accelerator EP is default only if 100% of heavy (MatMul/Conv) ops are placed on it. Any heavy op off the accelerator forces CPU as the default for that platform. |
 | **G3** Whisper drop (ratified 2026-10-31; passed, ADR 0005) | Phase 2 | The G1 winner's WER ≤ W2 (Whisper Medium) on the owner and chunk-replay slices. The owner explicitly accepts the loss of the languages outside the 25. |
 | **G2** Unified EN (not yet ratified) | Phase 4 | Unified (best variant) WER ≤ G1 winner − 0.3 pt on owner English and chunk-replay, *and* not worse on the quiet slice. Latency within 1.25× of the G1 winner. |
-| **AE-G1** Mac efficiency default (added 2026-11-03) | FluidAudio as Mac default | WER ≤ shipped int8 + 1.0 pt absolute on *every* gating slice, zero empty or truncated outputs, and word timestamps kept. |
+| **AE-G1** Mac efficiency default (added 2026-11-03) | FluidAudio as Mac default | WER ≤ shipped int8 + 1.0 pt absolute on *every* gating slice, zero empty or truncated outputs, and word timestamps kept. **Owner ruling 2026-11-04:** "zero empty or truncated" means no more than the shipped int8 on the same replayed chunks (ADR 0008). |
 
 Phase 0 also closes the pre-GA "in-house int8 WER sanity-check" (windows-support.md:221).
 
@@ -133,7 +133,7 @@ Battery energy per audio-minute, Apple Silicon:
 
 - **Burn rejected.** It needs our own patch to maintain, and its `panic=abort` kills the sidecar on any panic.
 - **ORT CoreML EP:** 0% of heavy ops placed on it. It is not an acceleration path.
-- **FluidAudio is the planned Mac default**, gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
+- **FluidAudio is the planned Mac default** ([ADR 0008](../adr/0008-fluidaudio-coreml-mac-default.md)), gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
 - **macOS 14 floor:** the minimum macOS version is raised to 14 directly, with no older-OS fallback path.
 
 ## Phase 1 — Fix quant and EP on the current stack (parakeet-rs 0.3.5)
