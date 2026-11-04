@@ -39,3 +39,10 @@ parakeet-rs = { version = "=0.3.5", optional = true, features = ["sortformer"] }
 # purpose: the ort features we need (webgpu) arrive via feature unification
 # from parakeet-rs/webgpu.
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false }
+
+# Physical core count for the Parakeet ORT intra-op thread default (engines/cpu_cores.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_SystemInformation"] }

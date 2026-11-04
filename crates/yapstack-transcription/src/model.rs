@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
@@ -31,6 +32,38 @@ pub struct LegacyModelFile {
 }
 
 // ----------- Parakeet TDT v3 -----------
+
+/// One file of a model bundle, pinned by content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelFile {
+    pub name: &'static str,
+    pub url: &'static str,
+    /// Exact size at the pinned revision; also the progress denominator
+    /// when the server sends no Content-Length.
+    pub bytes: u64,
+    /// Lowercase hex SHA-256; a download that doesn't match is discarded.
+    pub sha256: &'static str,
+}
+
+/// `istupakov/parakeet-tdt-0.6b-v3-onnx` at a fixed commit, so a later push
+/// to the repo can't change what installs download. The hashes in
+/// [`ParakeetVariant::files`] are the LFS SHA-256s at this revision.
+macro_rules! istupakov_v3_url {
+    ($file:literal) => {
+        concat!(
+            "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/",
+            "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/",
+            $file
+        )
+    };
+}
+
+const VOCAB_V3: ModelFile = ModelFile {
+    name: "vocab.txt",
+    url: istupakov_v3_url!("vocab.txt"),
+    bytes: 93_939,
+    sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParakeetVariant {
@@ -82,64 +115,52 @@ impl ParakeetVariant {
         }
     }
 
-    /// Files this variant requires on disk to load. Each tuple is
-    /// `(filename, download_url, approximate_size_bytes)`.
-    /// `parakeet-rs` expects these inside the variant directory.
-    pub fn files(&self) -> &'static [(&'static str, &'static str, u64)] {
+    /// Files this variant requires on disk to load. `parakeet-rs` expects
+    /// these inside the variant directory. It computes the mel features
+    /// itself, so the bundle's `nemo128.onnx` preprocessor is not fetched.
+    pub fn files(&self) -> &'static [ModelFile] {
         match self {
             ParakeetVariant::TdtV3 => &[
-                (
-                    "encoder-model.onnx",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx",
-                    41_770_866,
-                ),
-                (
-                    "encoder-model.onnx.data",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx.data",
-                    2_435_420_160,
-                ),
-                (
-                    "decoder_joint-model.onnx",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.onnx",
-                    72_520_893,
-                ),
-                (
-                    "vocab.txt",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-                    93_939,
-                ),
+                ModelFile {
+                    name: "encoder-model.onnx",
+                    url: istupakov_v3_url!("encoder-model.onnx"),
+                    bytes: 41_770_866,
+                    sha256: "98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1",
+                },
+                ModelFile {
+                    name: "encoder-model.onnx.data",
+                    url: istupakov_v3_url!("encoder-model.onnx.data"),
+                    bytes: 2_435_420_160,
+                    sha256: "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36",
+                },
+                ModelFile {
+                    name: "decoder_joint-model.onnx",
+                    url: istupakov_v3_url!("decoder_joint-model.onnx"),
+                    bytes: 72_520_893,
+                    sha256: "e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1",
+                },
+                VOCAB_V3,
             ],
-            // Sizes verified against the HF tree (2026-07-02): encoder ~652 MB,
-            // decoder ~18 MB, preprocessor ~140 KB, vocab ~94 KB. The
-            // sub-MB values double as Content-Length fallbacks; HF returns
-            // accurate Content-Length so they're rarely consulted.
             ParakeetVariant::TdtV3Int8 => &[
-                (
-                    "encoder-model.int8.onnx",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-                    652_183_999,
-                ),
-                (
-                    "decoder_joint-model.int8.onnx",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-                    18_202_004,
-                ),
-                (
-                    "nemo128.onnx",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/nemo128.onnx",
-                    150_000,
-                ),
-                (
-                    "vocab.txt",
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-                    96_000,
-                ),
+                ModelFile {
+                    name: "encoder-model.int8.onnx",
+                    url: istupakov_v3_url!("encoder-model.int8.onnx"),
+                    bytes: 652_183_999,
+                    sha256: "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09",
+                },
+                ModelFile {
+                    name: "decoder_joint-model.int8.onnx",
+                    url: istupakov_v3_url!("decoder_joint-model.int8.onnx"),
+                    bytes: 18_202_004,
+                    sha256: "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70",
+                },
+                VOCAB_V3,
             ],
         }
     }
 
     pub fn approximate_size_bytes(&self) -> u64 {
-        self.files().iter().map(|(_, _, s)| s).sum()
+        self.files().iter().map(|f| f.bytes).sum()
     }
 
     /// User-facing label. Both variants intentionally report the same
@@ -197,10 +218,13 @@ impl SortformerVariant {
 
 /// Download a file from `url` to `dest` via a temp file, with streaming progress.
 /// `fallback_size` is used when the server doesn't provide Content-Length.
+/// With `sha256`, a download whose content hashes differently is deleted
+/// and never reaches `dest`.
 async fn download_file(
     url: &str,
     dest: &Path,
     fallback_size: u64,
+    sha256: Option<&str>,
     on_progress: &(impl Fn(f32) + Send),
 ) -> Result<()> {
     let temp_dest = dest.with_extension("download");
@@ -221,17 +245,27 @@ async fn download_file(
     let mut file = tokio::fs::File::create(&temp_dest).await?;
     let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
+    let mut hasher = Sha256::new();
 
     let stream_result: Result<()> = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| TranscriptionError::DownloadFailed(e.to_string()))?;
             file.write_all(&chunk).await?;
+            hasher.update(&chunk);
             downloaded += chunk.len() as u64;
 
             let progress = (downloaded as f32 / total_size as f32).min(1.0);
             on_progress(progress);
         }
         file.flush().await?;
+        if let Some(expected) = sha256 {
+            let actual = hex_lower(&hasher.finalize());
+            if actual != expected {
+                return Err(TranscriptionError::DownloadFailed(format!(
+                    "SHA-256 mismatch for {url}: expected {expected}, got {actual}"
+                )));
+            }
+        }
         Ok(())
     }
     .await;
@@ -251,6 +285,16 @@ async fn download_file(
 
     on_progress(1.0);
     Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Destinations with a download in flight. Shared by every clone of a
@@ -360,10 +404,7 @@ impl ModelManager {
     /// True iff every required file for `variant` is present on disk.
     pub fn parakeet_is_available(&self, variant: ParakeetVariant) -> bool {
         let dir = self.parakeet_model_dir(variant);
-        variant
-            .files()
-            .iter()
-            .all(|(name, _, _)| dir.join(name).exists())
+        variant.files().iter().all(|f| dir.join(f.name).exists())
     }
 
     /// Download every missing file for `variant`, reporting overall progress
@@ -378,24 +419,30 @@ impl ModelManager {
         tokio::fs::create_dir_all(&dir).await?;
 
         let files = variant.files();
-        let total_size: u64 = files.iter().map(|(_, _, s)| *s).sum();
+        let total_size: u64 = files.iter().map(|f| f.bytes).sum();
         let mut completed: u64 = 0;
 
-        for (name, url, size) in files {
-            let dest = dir.join(name);
+        for file in files {
+            let dest = dir.join(file.name);
             if dest.exists() {
-                completed += *size;
+                completed += file.bytes;
                 on_progress((completed as f32 / total_size as f32).min(1.0));
                 continue;
             }
-            info!("downloading parakeet file {} from {}", name, url);
+            info!("downloading parakeet file {} from {}", file.name, file.url);
             let base = completed;
-            download_file(url, &dest, *size, &|file_progress| {
-                let bytes_so_far = base + (file_progress * *size as f32) as u64;
-                on_progress((bytes_so_far as f32 / total_size as f32).min(1.0));
-            })
+            download_file(
+                file.url,
+                &dest,
+                file.bytes,
+                Some(file.sha256),
+                &|file_progress| {
+                    let bytes_so_far = base + (file_progress * file.bytes as f32) as u64;
+                    on_progress((bytes_so_far as f32 / total_size as f32).min(1.0));
+                },
+            )
             .await?;
-            completed += *size;
+            completed += file.bytes;
         }
 
         on_progress(1.0);
@@ -449,7 +496,14 @@ impl ModelManager {
             variant.filename(),
             url
         );
-        download_file(&url, &dest, variant.approximate_size_bytes(), &on_progress).await?;
+        download_file(
+            &url,
+            &dest,
+            variant.approximate_size_bytes(),
+            None,
+            &on_progress,
+        )
+        .await?;
         info!(
             "sortformer model {} downloaded successfully",
             variant.filename()
@@ -502,7 +556,7 @@ mod tests {
         let int8_files = ParakeetVariant::TdtV3Int8.files();
         let has_external = int8_files
             .iter()
-            .any(|(name, _, _)| name.ends_with(".onnx.data") || name.ends_with(".onnx_data"));
+            .any(|f| f.name.ends_with(".onnx.data") || f.name.ends_with(".onnx_data"));
         assert!(
             !has_external,
             "int8 variant must not include any `.onnx.data` external initializer"
@@ -510,20 +564,103 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_variant_int8_includes_preprocessor() {
-        // The int8 bundle on HuggingFace ships a separate `nemo128.onnx`
-        // preprocessor file that the fp32 bundle does not have (fp32's
-        // preprocessor is baked into the encoder graph). Loading int8
-        // without this file would surface as a missing-input error at
-        // session-build time. Lock it in so a future trim doesn't drop it.
-        let int8_files = ParakeetVariant::TdtV3Int8.files();
-        let has_preprocessor = int8_files
+    fn parakeet_variant_int8_skips_unused_preprocessor() {
+        // parakeet-rs computes the mel features in Rust; nothing loads the
+        // bundle's `nemo128.onnx`, so new installs don't fetch it.
+        assert!(ParakeetVariant::TdtV3Int8
+            .files()
             .iter()
-            .any(|(name, _, _)| *name == "nemo128.onnx");
+            .all(|f| f.name != "nemo128.onnx"));
+    }
+
+    #[test]
+    fn existing_int8_install_with_preprocessor_stays_available() {
+        // Installs from before the trim have the extra file; they must not
+        // re-download anything.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let variant = ParakeetVariant::TdtV3Int8;
+        let v_dir = manager.parakeet_model_dir(variant);
+        std::fs::create_dir_all(&v_dir).unwrap();
+        for name in [
+            "encoder-model.int8.onnx",
+            "decoder_joint-model.int8.onnx",
+            "nemo128.onnx",
+            "vocab.txt",
+        ] {
+            std::fs::write(v_dir.join(name), b"placeholder").unwrap();
+        }
+        assert!(manager.parakeet_is_available(variant));
+    }
+
+    #[test]
+    fn parakeet_files_are_pinned_by_revision_and_hash() {
+        for variant in ParakeetVariant::all() {
+            for f in variant.files() {
+                assert!(
+                    f.url
+                        .contains("/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/")
+                        && f.url.ends_with(f.name),
+                    "{f:?}"
+                );
+                assert!(
+                    f.sha256.len() == 64
+                        && f.sha256
+                            .bytes()
+                            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                    "{f:?}"
+                );
+            }
+        }
+    }
+
+    /// Serves `body` once over plain HTTP and returns its URL.
+    async fn serve_once(body: &'static [u8]) -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+        });
+        format!("http://{addr}/file")
+    }
+
+    /// SHA-256 of `b"hello"`.
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[tokio::test]
+    async fn download_with_matching_hash_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.onnx");
+        let url = serve_once(b"hello").await;
+        download_file(&url, &dest, 5, Some(HELLO_SHA256), &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn download_with_wrong_hash_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.onnx");
+        let url = serve_once(b"tampered").await;
+        let err = download_file(&url, &dest, 8, Some(HELLO_SHA256), &|_| {})
+            .await
+            .unwrap_err();
         assert!(
-            has_preprocessor,
-            "int8 variant must include nemo128.onnx preprocessor"
+            matches!(&err, TranscriptionError::DownloadFailed(m) if m.contains("SHA-256 mismatch")),
+            "{err:?}"
         );
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("download").exists());
     }
 
     #[test]
@@ -695,7 +832,7 @@ mod tests {
         let files = v.files();
         assert!(!files.is_empty());
         // Required by parakeet-rs's ParakeetTDT::from_pretrained.
-        let names: Vec<&str> = files.iter().map(|(n, _, _)| *n).collect();
+        let names: Vec<&str> = files.iter().map(|f| f.name).collect();
         assert!(names.contains(&"vocab.txt"));
         assert!(names.iter().any(|n| n.contains("encoder")));
         assert!(names.iter().any(|n| n.contains("decoder")));
@@ -723,8 +860,8 @@ mod tests {
         let variant = ParakeetVariant::TdtV3;
         let v_dir = manager.parakeet_model_dir(variant);
         std::fs::create_dir_all(&v_dir).unwrap();
-        for (name, _, _) in variant.files() {
-            std::fs::write(v_dir.join(name), b"placeholder").unwrap();
+        for f in variant.files() {
+            std::fs::write(v_dir.join(f.name), b"placeholder").unwrap();
         }
         assert!(manager.parakeet_is_available(variant));
     }

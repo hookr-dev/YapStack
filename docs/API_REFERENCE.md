@@ -493,6 +493,7 @@ yapstack-transcription-sidecar
 
 **Env vars**:
 - `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = CoreML when no external `.onnx.data` files, else CPU)
+- `YAPSTACK_PARAKEET_THREADS=N` — ORT intra-op thread count for Parakeet (N >= 1). Default: physical cores capped at 8 (4 when the core count is unknown). Threads never spin.
 - `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
 **Feature flags**:

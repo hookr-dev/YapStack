@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use parakeet_rs::sortformer::{Sortformer, SpeakerSegment};
 use parakeet_rs::{ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 use tracing::{debug, info, warn};
+use yapstack_common::audio::MonoResampler;
 use yapstack_common::types::TranscriptSegment;
 
+use crate::engines::cpu_cores;
 use crate::engines::ort_placement::{self, PlacementRecorder, SessionPlacement};
 use crate::engines::{
     normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
@@ -29,6 +31,8 @@ pub struct ParakeetBackend {
     /// Set after each successful `load_model` so `engine_info()` can
     /// report what's actually running. Cleared if reload fails.
     last_engine_info: Option<EngineInfo>,
+    /// Kept across transcribes: live chunks all arrive at the device rate.
+    resampler: Option<MonoResampler>,
 }
 
 impl ParakeetBackend {
@@ -39,6 +43,7 @@ impl ParakeetBackend {
             sortformer: None,
             coreml_cache_dir,
             last_engine_info: None,
+            resampler: None,
         }
     }
 
@@ -97,7 +102,7 @@ impl ParakeetBackend {
         );
         let attempt = ParakeetTDT::from_pretrained(
             model_path,
-            build_exec_config(target, cache_dir, placement.as_ref()),
+            Some(build_exec_config(target, cache_dir, placement.as_ref())),
         );
         // `loaded` diverges from `target` only on the fallback path below.
         let (mut model, loaded, accel_fallback) = match attempt {
@@ -118,7 +123,11 @@ impl ParakeetBackend {
                 }
                 let m = ParakeetTDT::from_pretrained(
                     model_path,
-                    build_exec_config(AccelTarget::Cpu, cache_dir, placement.as_ref()),
+                    Some(build_exec_config(
+                        AccelTarget::Cpu,
+                        cache_dir,
+                        placement.as_ref(),
+                    )),
                 )
                 .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
                 let reason = format!("{} failed to load: {e}", target.label());
@@ -167,7 +176,7 @@ impl TranscriptionBackend for ParakeetBackend {
     ) -> Result<TranscriptionOutput, String> {
         let model = self.model.as_mut().ok_or("no model loaded")?;
 
-        let mono_16k = read_wav_as_mono_16k(audio_path)?;
+        let mono_16k = read_wav_as_mono_16k(audio_path, &mut self.resampler)?;
         let audio_seconds = mono_16k.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
         debug!(
             "parakeet transcribe: {} samples ({:.2}s) at 16kHz mono (diarization={})",
@@ -514,39 +523,87 @@ fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
     }
 }
 
-/// The parakeet-rs config for a target. `None` is parakeet-rs's default
-/// (CPU EP). A placement recorder, when given, is attached to every session
-/// on top of the target's own configuration.
+/// parakeet-rs's own intra-op default, used when the core count is unknown.
+const FALLBACK_INTRA_THREADS: usize = 4;
+/// Ceiling for the default. On an 18-core M5 Pro (6 + 12), int8 on CPU ran
+/// fastest at 8 threads in the quietest runs; 12 and 18 were no faster and
+/// cost 20-35% more CPU time, and 6 (the top performance level alone) was
+/// slower and erratic (asr-bench, LibriSpeech test-other + 30-48 s clips,
+/// 2026-11-03).
+const MAX_DEFAULT_INTRA_THREADS: usize = 8;
+
+/// Intra-op thread count for every Parakeet ORT session: the physical cores
+/// up to [`MAX_DEFAULT_INTRA_THREADS`]. `YAPSTACK_PARAKEET_THREADS=N`
+/// (N >= 1) overrides it for benching.
+fn intra_threads(env: Option<&str>, physical_cores: Option<usize>) -> usize {
+    if let Some(raw) = env.map(str::trim).filter(|raw| !raw.is_empty()) {
+        match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => return n,
+            _ => warn!("YAPSTACK_PARAKEET_THREADS={raw:?} is not a positive integer; ignored"),
+        }
+    }
+    physical_cores.map_or(FALLBACK_INTRA_THREADS, |n| n.min(MAX_DEFAULT_INTRA_THREADS))
+}
+
+/// The parakeet-rs config for a target. Every target gets the same CPU
+/// threading (the CPU EP also runs whatever a GPU EP doesn't take). A
+/// placement recorder, when given, is attached to every session on top of
+/// the target's own configuration.
 fn build_exec_config(
     target: AccelTarget,
     cache_dir: Option<&Path>,
     placement: Option<&PlacementRecorder>,
-) -> Option<parakeet_rs::ExecutionConfig> {
+) -> parakeet_rs::ExecutionConfig {
     info!("parakeet accelerator target: {:?}", target);
     let config = match target {
         AccelTarget::Cpu => {
             _ = cache_dir;
-            None
+            parakeet_rs::ExecutionConfig::default()
         }
         #[cfg(feature = "coreml")]
-        AccelTarget::CoreMl => Some(build_coreml_config(cache_dir)),
+        AccelTarget::CoreMl => build_coreml_config(cache_dir),
         #[cfg(feature = "webgpu")]
-        AccelTarget::WebGpu => Some(build_webgpu_config_strict()),
+        AccelTarget::WebGpu => build_webgpu_config_strict(),
     };
+    let threads = intra_threads(
+        std::env::var("YAPSTACK_PARAKEET_THREADS").ok().as_deref(),
+        cpu_cores::physical_cores(),
+    );
+    info!(intra_threads = threads, "parakeet ORT CPU threading");
+    let config = with_cpu_threading(config, threads);
     match placement {
         None => config,
-        Some(recorder) => Some(with_placement_recorder(
-            config.unwrap_or_default(),
-            recorder.clone(),
-        )),
+        Some(recorder) => {
+            let recorder = recorder.clone();
+            chain_configure(config, move |builder| recorder.attach(builder))
+        }
     }
 }
 
-/// Chains the recorder after any `configure` hook the config already has
-/// (parakeet-rs keeps a single hook, so setting a second would replace it).
-fn with_placement_recorder(
+/// `threads` intra-op threads that block instead of spinning between ops,
+/// and one inter-op thread (the graphs run sequentially). Spinning keeps
+/// every pool thread busy-waiting through the gaps of a transcribe, which
+/// burns CPU time without making the encoder faster.
+fn with_cpu_threading(
     config: parakeet_rs::ExecutionConfig,
-    recorder: PlacementRecorder,
+    threads: usize,
+) -> parakeet_rs::ExecutionConfig {
+    let config = config.with_intra_threads(threads).with_inter_threads(1);
+    chain_configure(config, |builder| {
+        Ok(builder
+            .with_intra_op_spinning(false)?
+            .with_inter_op_spinning(false)?)
+    })
+}
+
+/// Runs `next` after any `configure` hook the config already has
+/// (parakeet-rs keeps a single hook, so setting a second would replace it).
+fn chain_configure(
+    config: parakeet_rs::ExecutionConfig,
+    next: impl Fn(
+            ort::session::builder::SessionBuilder,
+        ) -> ort::Result<ort::session::builder::SessionBuilder>
+        + 'static,
 ) -> parakeet_rs::ExecutionConfig {
     let inner = config.configure.clone();
     config.with_custom_configure(move |builder| {
@@ -554,7 +611,7 @@ fn with_placement_recorder(
             Some(configure) => configure(builder)?,
             None => builder,
         };
-        recorder.attach(builder)
+        next(builder)
     })
 }
 
@@ -1004,18 +1061,59 @@ mod tests {
     #[cfg(feature = "webgpu")]
     #[test]
     fn webgpu_config_registers_the_ep_strictly() {
-        let cfg = build_exec_config(AccelTarget::WebGpu, None, None).expect("config");
+        let cfg = build_exec_config(AccelTarget::WebGpu, None, None);
         assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
         assert!(cfg.configure.is_some());
     }
 
+    // --- CPU threading ---
+
     #[test]
-    fn cpu_config_is_parakeet_default_unless_recording_placement() {
-        assert!(build_exec_config(AccelTarget::Cpu, None, None).is_none());
+    fn default_threads_are_physical_cores_capped() {
+        // M5 Pro: 18 cores → the measured best of 8.
+        assert_eq!(intra_threads(None, Some(18)), 8);
+        assert_eq!(intra_threads(None, Some(8)), 8);
+        assert_eq!(intra_threads(None, Some(4)), 4);
+        assert_eq!(intra_threads(None, Some(1)), 1);
+    }
+
+    #[test]
+    fn default_threads_fall_back_when_no_core_count_is_known() {
+        assert_eq!(intra_threads(None, None), FALLBACK_INTRA_THREADS);
+    }
+
+    #[test]
+    fn threads_env_overrides_the_default() {
+        assert_eq!(intra_threads(Some("12"), Some(18)), 12);
+        assert_eq!(intra_threads(Some(" 3 "), Some(16)), 3);
+        assert_eq!(intra_threads(Some("6"), None), 6);
+    }
+
+    #[test]
+    fn invalid_threads_env_keeps_the_default() {
+        for raw in ["", "0", "-2", "many"] {
+            assert_eq!(intra_threads(Some(raw), Some(18)), 8, "{raw:?}");
+        }
+    }
+
+    /// Every target carries the threading, and the hook (threading, then the
+    /// placement recorder when given) applies cleanly to a real ORT builder.
+    #[test]
+    fn every_config_sets_cpu_threading() {
         let recorder = PlacementRecorder::default();
-        let cfg = build_exec_config(AccelTarget::Cpu, None, Some(&recorder)).expect("config");
-        assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
-        assert!(cfg.configure.is_some());
+        for placement in [None, Some(&recorder)] {
+            let cfg = build_exec_config(AccelTarget::Cpu, None, placement);
+            assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
+            let env = std::env::var("YAPSTACK_PARAKEET_THREADS").ok();
+            assert_eq!(
+                cfg.intra_threads,
+                intra_threads(env.as_deref(), cpu_cores::physical_cores())
+            );
+            assert_eq!(cfg.inter_threads, 1);
+            let configure = cfg.configure.expect("threading hook");
+            let builder = ort::session::Session::builder().expect("ort builder");
+            configure(builder).expect("hook applies");
+        }
     }
 
     /// Gate G4 on a real model: the EP Auto reports must hold >= 90% of the

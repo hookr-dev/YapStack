@@ -6,11 +6,18 @@
 //! matching backend; the IPC dispatch loop in `main.rs` is engine-agnostic.
 
 #[cfg(feature = "parakeet")]
+use std::borrow::Cow;
+#[cfg(feature = "parakeet")]
 use std::path::Path;
+
+#[cfg(feature = "parakeet")]
+use yapstack_common::audio::MonoResampler;
 
 #[cfg(feature = "parakeet")]
 use yapstack_common::types::TranscriptSegment;
 
+#[cfg(feature = "parakeet")]
+pub mod cpu_cores;
 #[cfg(feature = "parakeet")]
 pub mod ort_placement;
 #[cfg(feature = "parakeet")]
@@ -36,9 +43,14 @@ pub struct TranscriptionOutput {
 }
 
 /// Read a WAV file, downmix to mono, and resample to 16 kHz. Parakeet
-/// requires this exact input shape.
+/// requires this exact input shape. A 16 kHz file is not resampled; any
+/// other rate goes through `resampler`, which is rebuilt only when the
+/// file's rate differs from the last one it served.
 #[cfg(feature = "parakeet")]
-pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String> {
+pub(crate) fn read_wav_as_mono_16k(
+    audio_path: &Path,
+    resampler: &mut Option<MonoResampler>,
+) -> Result<Vec<f32>, String> {
     let mut reader =
         hound::WavReader::open(audio_path).map_err(|e| format!("failed to open WAV: {e}"))?;
     let spec = reader.spec();
@@ -54,10 +66,32 @@ pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String
             .map(|s| s.map_err(|e| format!("sample read error: {e}")))
             .collect::<Result<Vec<f32>, String>>()?
     };
-    let mono = yapstack_common::audio::deinterleave_to_mono(&raw, spec.channels);
-    let resampled = yapstack_common::audio::resample(&mono, spec.sample_rate, 16_000)
-        .map_err(|e| format!("resample to 16kHz failed: {e}"))?;
-    Ok(resampled.into_owned())
+    let mono = match yapstack_common::audio::deinterleave_to_mono(&raw, spec.channels) {
+        Cow::Borrowed(_) => raw,
+        Cow::Owned(mono) => mono,
+    };
+    to_16k(mono, spec.sample_rate, resampler)
+}
+
+#[cfg(feature = "parakeet")]
+fn to_16k(
+    mono: Vec<f32>,
+    sample_rate: u32,
+    resampler: &mut Option<MonoResampler>,
+) -> Result<Vec<f32>, String> {
+    const TARGET: u32 = 16_000;
+    if sample_rate == TARGET || mono.is_empty() {
+        return Ok(mono);
+    }
+    let r = match resampler {
+        Some(r) if r.rates() == (sample_rate, TARGET) => r,
+        _ => resampler.insert(
+            MonoResampler::new(sample_rate, TARGET)
+                .map_err(|e| format!("resample to 16kHz failed: {e}"))?,
+        ),
+    };
+    r.process(&mono)
+        .map_err(|e| format!("resample to 16kHz failed: {e}"))
 }
 
 /// Information about the model that a backend has loaded, exposed back
@@ -565,5 +599,53 @@ mod tests {
     fn text_with_punctuation_still_included() {
         assert!(include_p("Hello, world.", 0.9));
         assert!(include_p("Wait, what?", 0.9));
+    }
+
+    // --- 16 kHz input ---
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn sixteen_khz_input_skips_the_resampler() {
+        let mut resampler = None;
+        let mono = vec![0.25_f32; 1600];
+        assert_eq!(to_16k(mono.clone(), 16_000, &mut resampler).unwrap(), mono);
+        assert!(resampler.is_none(), "no resampler built for 16 kHz");
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn resampler_is_kept_per_rate_and_rebuilt_on_change() {
+        let mut resampler = None;
+        let out = to_16k(vec![0.0; 4800], 48_000, &mut resampler).unwrap();
+        assert_eq!(out.len(), 1600);
+        assert_eq!(resampler.as_ref().unwrap().rates(), (48_000, 16_000));
+        to_16k(vec![0.0; 4410], 44_100, &mut resampler).unwrap();
+        assert_eq!(resampler.as_ref().unwrap().rates(), (44_100, 16_000));
+        // A 16 kHz file in between leaves the cached resampler alone.
+        to_16k(vec![0.0; 160], 16_000, &mut resampler).unwrap();
+        assert_eq!(resampler.as_ref().unwrap().rates(), (44_100, 16_000));
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn reads_a_16khz_mono_wav_unchanged() {
+        let path =
+            std::env::temp_dir().join(format!("yapstack-read-wav-16k-{}.wav", std::process::id()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for v in [0_i16, i16::MAX, -i16::MAX, 1234] {
+            writer.write_sample(v).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut resampler = None;
+        let samples = read_wav_as_mono_16k(&path, &mut resampler).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(samples, vec![0.0, 1.0, -1.0, 1234.0 / i16::MAX as f32]);
+        assert!(resampler.is_none());
     }
 }

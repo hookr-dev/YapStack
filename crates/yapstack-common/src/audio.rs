@@ -21,34 +21,25 @@ pub enum ResampleError {
 /// to avoid aliasing when downsampling (e.g. 48kHz → 16kHz for Parakeet).
 ///
 /// This is the single canonical resampler — both `yapstack-transcription-sidecar` and
-/// `yapstack-audio::mixer` call through here.
+/// `yapstack-audio::mixer` call through here. A caller that resamples many
+/// buffers at one rate pair keeps a [`MonoResampler`] instead.
 pub fn resample(
     samples: &[f32],
     from_rate: u32,
     to_rate: u32,
 ) -> Result<std::borrow::Cow<'_, [f32]>, ResampleError> {
-    use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    };
+    use rubato::{Resampler, SincFixedIn};
 
     if from_rate == 0 || to_rate == 0 || samples.is_empty() || from_rate == to_rate {
         return Ok(std::borrow::Cow::Borrowed(samples));
     }
-
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.98,
-        interpolation: SincInterpolationType::Cubic,
-        oversampling_factor: 128,
-        window: WindowFunction::BlackmanHarris2,
-    };
 
     let ratio = to_rate as f64 / from_rate as f64;
     // chunk_size: process in blocks; use full input length for single-shot
     let chunk_size = samples.len();
 
     let mut resampler =
-        SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_size, 1).map_err(|e| {
+        SincFixedIn::<f32>::new(ratio, 2.0, sinc_params(), chunk_size, 1).map_err(|e| {
             ResampleError::InitFailed {
                 ratio,
                 chunk_size,
@@ -74,6 +65,101 @@ pub fn resample(
     }
 
     Ok(std::borrow::Cow::Owned(output.into_iter().next().unwrap()))
+}
+
+fn sinc_params() -> rubato::SincInterpolationParameters {
+    use rubato::{SincInterpolationParameters, SincInterpolationType, WindowFunction};
+    SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.98,
+        interpolation: SincInterpolationType::Cubic,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    }
+}
+
+/// Input frames per `SincFixedIn` call. Fixed so one resampler serves
+/// buffers of any length, and so its scratch buffers stay small.
+const RESAMPLE_BLOCK_FRAMES: usize = 1024;
+
+/// [`resample`]'s filter for one rate pair, built once and reused: each
+/// [`MonoResampler::process`] call is independent (state is reset first).
+/// Unlike the single-shot [`resample`], which drops the filter tail, the
+/// output is exactly `round(len * to_rate / from_rate)` samples long.
+pub struct MonoResampler {
+    from_rate: u32,
+    to_rate: u32,
+    inner: rubato::SincFixedIn<f32>,
+    out_block: Vec<Vec<f32>>,
+}
+
+impl MonoResampler {
+    pub fn new(from_rate: u32, to_rate: u32) -> Result<Self, ResampleError> {
+        use rubato::{Resampler, SincFixedIn};
+        let ratio = to_rate as f64 / from_rate as f64;
+        let inner = SincFixedIn::<f32>::new(ratio, 1.0, sinc_params(), RESAMPLE_BLOCK_FRAMES, 1)
+            .map_err(|e| ResampleError::InitFailed {
+                ratio,
+                chunk_size: RESAMPLE_BLOCK_FRAMES,
+                reason: e.to_string(),
+            })?;
+        let out_block = inner.output_buffer_allocate(true);
+        Ok(Self {
+            from_rate,
+            to_rate,
+            inner,
+            out_block,
+        })
+    }
+
+    pub fn rates(&self) -> (u32, u32) {
+        (self.from_rate, self.to_rate)
+    }
+
+    pub fn process(&mut self, samples: &[f32]) -> Result<Vec<f32>, ResampleError> {
+        use rubato::Resampler;
+        let ratio = self.to_rate as f64 / self.from_rate as f64;
+        let fail = |e: rubato::ResampleError| ResampleError::ProcessFailed {
+            ratio,
+            sample_count: samples.len(),
+            reason: e.to_string(),
+        };
+        self.inner.reset();
+        let expected = (samples.len() as f64 * ratio).round() as usize;
+        let mut out = Vec::with_capacity(expected + self.inner.output_frames_max());
+
+        let (blocks, remainder) = samples.as_chunks::<RESAMPLE_BLOCK_FRAMES>();
+        for block in blocks {
+            let (_, n) = self
+                .inner
+                .process_into_buffer(&[block.as_slice()], &mut self.out_block, None)
+                .map_err(fail)?;
+            out.extend_from_slice(&self.out_block[0][..n]);
+        }
+        // rubato rejects an empty partial block, which a whole number of
+        // blocks would leave.
+        if !remainder.is_empty() {
+            let (_, n) = self
+                .inner
+                .process_partial_into_buffer(Some(&[remainder]), &mut self.out_block, None)
+                .map_err(fail)?;
+            out.extend_from_slice(&self.out_block[0][..n]);
+        }
+        // rubato starts its first output at input frame 0 (its initial index
+        // already offsets the filter), so only the tail needs flushing.
+        while out.len() < expected {
+            let (_, n) = self
+                .inner
+                .process_partial_into_buffer(None::<&[&[f32]]>, &mut self.out_block, None)
+                .map_err(fail)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&self.out_block[0][..n]);
+        }
+        out.truncate(expected);
+        Ok(out)
+    }
 }
 
 /// Converts interleaved multi-channel audio to mono by averaging channels per frame.
@@ -167,6 +253,66 @@ mod tests {
             "expected ~{expected} samples, got {}",
             result.len()
         );
+    }
+
+    fn sine(rate: u32, hz: f32, secs: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize)
+            .map(|i| (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn mono_resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
+        MonoResampler::new(from, to)
+            .unwrap()
+            .process(samples)
+            .unwrap()
+    }
+
+    #[test]
+    fn mono_resampler_length_is_exact() {
+        for (from, len) in [
+            (48_000, 48_000),
+            (44_100, 44_100),
+            (48_000, 1000),
+            (48_000, 3),
+        ] {
+            let out = mono_resample(&vec![0.1; len], from, 16_000);
+            let expected = (len as f64 * 16_000.0 / from as f64).round() as usize;
+            assert_eq!(out.len(), expected, "{from} Hz, {len} samples");
+        }
+    }
+
+    /// Same filter, same timeline as the single-shot [`resample`]: the
+    /// block-wise output matches it sample for sample, and only adds the
+    /// filter tail that [`resample`] drops.
+    #[test]
+    fn mono_resampler_matches_single_shot_resample() {
+        for (from, input) in [
+            (48_000, sine(48_000, 440.0, 0.5)),
+            (44_100, sine(44_100, 1000.0, 0.3)),
+        ] {
+            let single = resample(&input, from, 16_000).unwrap();
+            let blocks = mono_resample(&input, from, 16_000);
+            assert!(blocks.len() > single.len());
+            let max_diff = single
+                .iter()
+                .zip(&blocks)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_diff < 1e-4, "{from} Hz: max diff {max_diff}");
+        }
+    }
+
+    #[test]
+    fn reused_resampler_matches_a_fresh_one() {
+        let a = sine(48_000, 300.0, 0.7);
+        let b = sine(48_000, 1000.0, 0.2);
+        let mut reused = MonoResampler::new(48_000, 16_000).unwrap();
+        assert_eq!(reused.rates(), (48_000, 16_000));
+        let first = reused.process(&a).unwrap();
+        let second = reused.process(&b).unwrap();
+        assert_eq!(first, mono_resample(&a, 48_000, 16_000));
+        assert_eq!(second, mono_resample(&b, 48_000, 16_000));
     }
 
     #[test]
