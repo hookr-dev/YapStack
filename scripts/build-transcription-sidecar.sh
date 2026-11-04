@@ -78,11 +78,11 @@ echo ""
 for target in "${TARGETS[@]}"; do
     echo "=== Building for $target ==="
 
-    # Apple targets get CoreML + WebGPU for parakeet-rs (CPU fallback is
-    # automatic via parakeet-rs's `error_on_failure()` chain).
+    # Apple targets get WebGPU for parakeet-rs (an EP-init failure falls
+    # back to CPU, logged).
     FEATURES="parakeet"
     if [[ "$target" == *"apple"* ]]; then
-        FEATURES="parakeet,coreml,webgpu"
+        FEATURES="parakeet,webgpu"
     elif [[ "$target" == *"windows"* ]]; then
         # Parakeet WebGPU (Dawn -> D3D12/Vulkan). The feature adds a
         # load-time webgpu_dawn.dll import (ort-sys links Dawn dynamically);
@@ -183,7 +183,7 @@ for target in "${TARGETS[@]}"; do
     # lives in target/debug/, where any plain `cargo build` (e.g. via
     # `pnpm check`, `cargo test --all`, IDE rust-analyzer) rebuilds the
     # un-suffixed `yapstack-transcription-sidecar` with **default features only** —
-    # no webgpu / coreml / metal — silently clobbering the feature-rich
+    # no webgpu — silently clobbering the feature-rich
     # build the dev runtime needs. Mirror to the triple-suffixed name
     # instead: `find_sidecar_path` picks it up first, and cargo never
     # writes to that path, so the mirror survives workspace rebuilds.

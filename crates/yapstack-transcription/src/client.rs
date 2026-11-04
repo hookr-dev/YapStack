@@ -227,7 +227,6 @@ pub struct TranscriptionClient {
     engine: EngineKind,
     model_path: PathBuf,
     sortformer_model_path: Option<PathBuf>,
-    coreml_cache_dir: Option<PathBuf>,
 }
 
 /// Raw parts returned by sidecar spawn.
@@ -244,23 +243,14 @@ impl TranscriptionClient {
     /// `engine` selects which backend the sidecar instantiates.
     /// `sortformer_model_path`, when set, makes per-request
     /// `diarization: true` populate speaker IDs.
-    /// `coreml_cache_dir` is Parakeet+macOS only; persistent cache for compiled
-    /// CoreML graphs to avoid the ~5 s recompile on every spawn.
     pub async fn spawn(
         sidecar_path: &Path,
         engine: EngineKind,
         model_path: &Path,
         sortformer_model_path: Option<&Path>,
-        coreml_cache_dir: Option<&Path>,
     ) -> Result<Self> {
-        let parts = Self::spawn_sidecar(
-            sidecar_path,
-            engine,
-            model_path,
-            sortformer_model_path,
-            coreml_cache_dir,
-        )
-        .await?;
+        let parts =
+            Self::spawn_sidecar(sidecar_path, engine, model_path, sortformer_model_path).await?;
 
         Ok(Self {
             stdin: TokioMutex::new(parts.stdin),
@@ -273,7 +263,6 @@ impl TranscriptionClient {
             engine,
             model_path: model_path.to_path_buf(),
             sortformer_model_path: sortformer_model_path.map(|p| p.to_path_buf()),
-            coreml_cache_dir: coreml_cache_dir.map(|p| p.to_path_buf()),
         })
     }
 
@@ -283,15 +272,13 @@ impl TranscriptionClient {
         engine: EngineKind,
         model_path: &Path,
         sortformer_model_path: Option<&Path>,
-        coreml_cache_dir: Option<&Path>,
     ) -> Result<SidecarParts> {
         info!(
-            "spawning sidecar: {} engine={} model={} sortformer_model={:?} coreml_cache_dir={:?}",
+            "spawning sidecar: {} engine={} model={} sortformer_model={:?}",
             sidecar_path.display(),
             engine.as_str(),
             model_path.display(),
             sortformer_model_path.map(|p| p.display().to_string()),
-            coreml_cache_dir.map(|p| p.display().to_string()),
         );
 
         let mut cmd = tokio::process::Command::new(sidecar_path);
@@ -300,9 +287,6 @@ impl TranscriptionClient {
 
         if let Some(s_path) = sortformer_model_path {
             cmd.arg("--sortformer-model").arg(s_path);
-        }
-        if let Some(c_path) = coreml_cache_dir {
-            cmd.arg("--coreml-cache-dir").arg(c_path);
         }
 
         // On Windows, prevent the sidecar from creating a visible console window.
@@ -770,7 +754,6 @@ impl TranscriptionClient {
             self.engine,
             &self.model_path,
             self.sortformer_model_path.as_deref(),
-            self.coreml_cache_dir.as_deref(),
         )
         .await?;
 

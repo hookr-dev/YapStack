@@ -346,8 +346,7 @@ pub struct LiveTranscriptionPressureEvent {
     /// live chunk was dispatched. Non-zero means live transcription is
     /// draining preserved audio instead of dropping it.
     pub drain_backlog_seconds: f32,
-    /// Resolved accelerator (`"webgpu"`, `"coreml"`, `"cuda"`, `"cpu"`,
-    /// `"metal"`) for the active sidecar. Captured once at session start
+    /// Resolved accelerator (`"webgpu"` or `"cpu"`) for the active sidecar. Captured once at session start
     /// from the client's cached engine info — rises with the rest of the
     /// pressure payload so a single grep'd `live_pressure` line tells us
     /// whether a slow chunk happened on GPU or CPU.
@@ -6377,7 +6376,6 @@ mod tests {
             &sidecar,
             EngineKind::Parakeet,
             &model,
-            None,
             None,
         )
         .await

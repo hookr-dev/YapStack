@@ -22,7 +22,7 @@ def default_features() -> str:
     # Parakeet with the same EPs the app ships. Whisper is left out: it
     # needs cmake, and the bench rows are Parakeet variants.
     if sys.platform == "darwin":
-        return "parakeet,coreml,webgpu"
+        return "parakeet,webgpu"
     if sys.platform == "win32":
         return "parakeet,webgpu"
     return "parakeet"

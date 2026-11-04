@@ -177,7 +177,6 @@ fn parse_placed_on(line: &str) -> Option<(&str, usize)> {
 pub fn ort_ep_name(accel_label: &str) -> &'static str {
     match accel_label {
         "webgpu" => "WebGpuExecutionProvider",
-        "coreml" => "CoreMLExecutionProvider",
         _ => "CPUExecutionProvider",
     }
 }
@@ -247,7 +246,6 @@ mod tests {
     #[test]
     fn maps_accel_labels_to_ort_provider_names() {
         assert_eq!(ort_ep_name("webgpu"), "WebGpuExecutionProvider");
-        assert_eq!(ort_ep_name("coreml"), "CoreMLExecutionProvider");
         assert_eq!(ort_ep_name("cpu"), "CPUExecutionProvider");
     }
 }

@@ -27,7 +27,6 @@ pub struct ParakeetBackend {
     model: Option<ParakeetTDT>,
     sortformer_model_path: Option<PathBuf>,
     sortformer: Option<Sortformer>,
-    coreml_cache_dir: Option<PathBuf>,
     /// Set after each successful `load_model` so `engine_info()` can
     /// report what's actually running. Cleared if reload fails.
     last_engine_info: Option<EngineInfo>,
@@ -36,12 +35,11 @@ pub struct ParakeetBackend {
 }
 
 impl ParakeetBackend {
-    pub fn new(sortformer_model_path: Option<PathBuf>, coreml_cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(sortformer_model_path: Option<PathBuf>) -> Self {
         Self {
             model: None,
             sortformer_model_path,
             sortformer: None,
-            coreml_cache_dir,
             last_engine_info: None,
             resampler: None,
         }
@@ -83,13 +81,8 @@ impl ParakeetBackend {
             ));
         }
         let load_start = std::time::Instant::now();
-        info!(
-            "loading parakeet TDT model from {} (coreml_cache={:?})",
-            model_path.display(),
-            self.coreml_cache_dir.as_deref()
-        );
+        info!("loading parakeet TDT model from {}", model_path.display());
 
-        let cache_dir = self.coreml_cache_dir.as_deref();
         let traits = ModelDirTraits::inspect(model_path);
         let target = resolve_accel(choice, traits);
         info!(
@@ -102,7 +95,7 @@ impl ParakeetBackend {
         );
         let attempt = ParakeetTDT::from_pretrained(
             model_path,
-            Some(build_exec_config(target, cache_dir, placement.as_ref())),
+            Some(build_exec_config(target, placement.as_ref())),
         );
         // `loaded` diverges from `target` only on the fallback path below.
         let (mut model, loaded, accel_fallback) = match attempt {
@@ -123,11 +116,7 @@ impl ParakeetBackend {
                 }
                 let m = ParakeetTDT::from_pretrained(
                     model_path,
-                    Some(build_exec_config(
-                        AccelTarget::Cpu,
-                        cache_dir,
-                        placement.as_ref(),
-                    )),
+                    Some(build_exec_config(AccelTarget::Cpu, placement.as_ref())),
                 )
                 .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
                 let reason = format!("{} failed to load: {e}", target.label());
@@ -301,23 +290,10 @@ impl ParakeetBackend {
     }
 }
 
-fn has_external_data_file(model_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(model_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        name.ends_with(".onnx.data") || name.ends_with(".onnx_data")
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccelChoice {
     Auto,
     Cpu,
-    #[cfg(feature = "coreml")]
-    CoreMl,
     #[cfg(feature = "webgpu")]
     WebGpu,
 }
@@ -328,13 +304,6 @@ impl AccelChoice {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Self::Auto,
             "cpu" => Self::Cpu,
-            #[cfg(feature = "coreml")]
-            "coreml" => Self::CoreMl,
-            #[cfg(not(feature = "coreml"))]
-            "coreml" => {
-                warn!("YAPSTACK_PARAKEET_ACCEL=coreml ignored: feature not compiled in");
-                Self::Auto
-            }
             #[cfg(feature = "webgpu")]
             "webgpu" => Self::WebGpu,
             #[cfg(not(feature = "webgpu"))]
@@ -355,8 +324,6 @@ impl AccelChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccelTarget {
     Cpu,
-    #[cfg(feature = "coreml")]
-    CoreMl,
     #[cfg(feature = "webgpu")]
     WebGpu,
 }
@@ -367,8 +334,6 @@ impl AccelTarget {
     fn label(self) -> &'static str {
         match self {
             AccelTarget::Cpu => "cpu",
-            #[cfg(feature = "coreml")]
-            AccelTarget::CoreMl => "coreml",
             #[cfg(feature = "webgpu")]
             AccelTarget::WebGpu => "webgpu",
         }
@@ -378,8 +343,6 @@ impl AccelTarget {
 /// What the accelerator decision needs to know about a model directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModelDirTraits {
-    /// An external `.onnx.data` initializer is present.
-    has_external_data: bool,
     /// [`gpu_placement`] of the encoder graph parakeet-rs will load.
     gpu_placement: GpuPlacement,
 }
@@ -387,7 +350,6 @@ struct ModelDirTraits {
 impl ModelDirTraits {
     fn inspect(model_dir: &Path) -> Self {
         Self {
-            has_external_data: has_external_data_file(model_dir),
             gpu_placement: find_encoder_file_name(model_dir)
                 .map_or(GpuPlacement::Unmeasured, |name| gpu_placement(&name)),
         }
@@ -395,7 +357,8 @@ impl ModelDirTraits {
 }
 
 /// How much of an encoder graph's heavy (MatMul/Conv family) work the
-/// WebGPU EP takes. Gate G4 counts >= 90% as `Full`.
+/// WebGPU EP takes. `Full` means every one of them (Gate G4, ratified at 100%
+/// on 2026-10-31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GpuPlacement {
     Full,
@@ -432,8 +395,6 @@ fn heavy_ops_partial(loaded: AccelTarget, placement: GpuPlacement) -> bool {
             _ = placement;
             false
         }
-        #[cfg(feature = "coreml")]
-        AccelTarget::CoreMl => false,
         #[cfg(feature = "webgpu")]
         AccelTarget::WebGpu => placement == GpuPlacement::Partial,
     }
@@ -467,8 +428,6 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
     match choice {
         AccelChoice::Auto => resolve_auto(model),
         AccelChoice::Cpu => AccelTarget::Cpu,
-        #[cfg(feature = "coreml")]
-        AccelChoice::CoreMl => AccelTarget::CoreMl,
         #[cfg(feature = "webgpu")]
         AccelChoice::WebGpu => AccelTarget::WebGpu,
     }
@@ -485,12 +444,7 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 ///   correct and clearly faster than CPU on real Windows hardware, so the
 ///   partial placement still wins there. The label says it is partial.
 ///
-/// `Unmeasured` graphs run on CPU. CoreML is not the Auto path: parakeet-rs hardcodes
-/// `ComputeUnits::CPUAndGPU` and the dynamic input shapes leave the heavy
-/// ops on CPU anyway. The CoreML-only fallback build keeps skipping models
-/// with external `.onnx.data` (ORT's `model_path must not be empty` bug on
-/// CoreML partitioning; WebGPU doesn't serialize the partitioned subgraph,
-/// so it is safe with external data).
+/// `Unmeasured` graphs run on CPU.
 ///
 /// Every WebGPU registration is strict, so an EP-init failure surfaces
 /// through `load_model_with`'s explicit, logged CPU fallback (honest
@@ -504,7 +458,6 @@ fn resolve_accel(choice: AccelChoice, model: ModelDirTraits) -> AccelTarget {
 fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
     #[cfg(feature = "webgpu")]
     {
-        _ = model.has_external_data;
         let partial_wins = !cfg!(target_os = "macos");
         return match model.gpu_placement {
             GpuPlacement::Full => AccelTarget::WebGpu,
@@ -512,18 +465,9 @@ fn resolve_auto(model: ModelDirTraits) -> AccelTarget {
             GpuPlacement::Partial | GpuPlacement::Unmeasured => AccelTarget::Cpu,
         };
     }
-    #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
+    #[cfg(not(feature = "webgpu"))]
     {
         _ = model.gpu_placement;
-        return if model.has_external_data {
-            AccelTarget::Cpu
-        } else {
-            AccelTarget::CoreMl
-        };
-    }
-    #[cfg(not(any(feature = "webgpu", all(target_os = "macos", feature = "coreml"))))]
-    {
-        _ = (model.has_external_data, model.gpu_placement);
         AccelTarget::Cpu
     }
 }
@@ -556,17 +500,11 @@ fn intra_threads(env: Option<&str>, physical_cores: Option<usize>) -> usize {
 /// the target's own configuration.
 fn build_exec_config(
     target: AccelTarget,
-    cache_dir: Option<&Path>,
     placement: Option<&PlacementRecorder>,
 ) -> parakeet_rs::ExecutionConfig {
     info!("parakeet accelerator target: {:?}", target);
     let config = match target {
-        AccelTarget::Cpu => {
-            _ = cache_dir;
-            parakeet_rs::ExecutionConfig::default()
-        }
-        #[cfg(feature = "coreml")]
-        AccelTarget::CoreMl => build_coreml_config(cache_dir),
+        AccelTarget::Cpu => parakeet_rs::ExecutionConfig::default(),
         #[cfg(feature = "webgpu")]
         AccelTarget::WebGpu => build_webgpu_config_strict(),
     };
@@ -654,26 +592,6 @@ fn warm_up(model: &mut ParakeetTDT) {
         ),
         Err(e) => warn!("parakeet warmup inference failed: {e}"),
     }
-}
-
-#[cfg(feature = "coreml")]
-fn build_coreml_config(cache_dir: Option<&Path>) -> parakeet_rs::ExecutionConfig {
-    use parakeet_rs::{ExecutionConfig, ExecutionProvider};
-    let mut cfg = ExecutionConfig::default().with_execution_provider(ExecutionProvider::CoreML);
-    if let Some(dir) = cache_dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!(
-                "failed to create CoreML cache dir {} ({e}); proceeding without cache",
-                dir.display()
-            );
-        } else {
-            info!("CoreML cache dir: {}", dir.display());
-            cfg = cfg.with_coreml_cache_dir(dir);
-        }
-    } else {
-        info!("CoreML enabled, no cache dir provided — recompile cost on every spawn");
-    }
-    cfg
 }
 
 /// Strict WebGPU registration (Dawn → Metal on macOS, Vulkan/D3D12
@@ -893,13 +811,16 @@ mod tests {
             .collect()
     }
 
+    /// Sample count of each decode call.
+    type CallLog = std::rc::Rc<std::cell::RefCell<Vec<usize>>>;
+
     /// A decoder that returns nothing until its `succeed_on`-th call
     /// (1-based), then `result`. Records each call's sample count.
     fn fake_decoder(
         succeed_on: usize,
         result: Vec<TimedToken>,
     ) -> (
-        std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+        CallLog,
         impl FnMut(&[f32]) -> Result<Vec<TimedToken>, String>,
     ) {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1151,25 +1072,21 @@ mod tests {
         assert_eq!(
             ModelDirTraits::inspect(&model_dir("traits-int8", &INT8_FILES)),
             ModelDirTraits {
-                has_external_data: false,
                 gpu_placement: GpuPlacement::Partial,
             }
         );
         assert_eq!(
             ModelDirTraits::inspect(&model_dir("traits-fp32", &FP32_FILES)),
             ModelDirTraits {
-                has_external_data: true,
                 gpu_placement: GpuPlacement::Full,
             }
         );
     }
 
     const INT8: ModelDirTraits = ModelDirTraits {
-        has_external_data: false,
         gpu_placement: GpuPlacement::Partial,
     };
     const FP32: ModelDirTraits = ModelDirTraits {
-        has_external_data: true,
         gpu_placement: GpuPlacement::Full,
     };
 
@@ -1212,7 +1129,6 @@ mod tests {
     #[test]
     fn auto_never_attempts_the_gpu_for_unmeasured_graphs() {
         let unknown = ModelDirTraits {
-            has_external_data: false,
             gpu_placement: GpuPlacement::Unmeasured,
         };
         assert_eq!(auto(unknown), ("cpu", false));
@@ -1253,7 +1169,7 @@ mod tests {
     #[cfg(feature = "webgpu")]
     #[test]
     fn webgpu_config_registers_the_ep_strictly() {
-        let cfg = build_exec_config(AccelTarget::WebGpu, None, None);
+        let cfg = build_exec_config(AccelTarget::WebGpu, None);
         assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
         assert!(cfg.configure.is_some());
     }
@@ -1294,7 +1210,7 @@ mod tests {
     fn every_config_sets_cpu_threading() {
         let recorder = PlacementRecorder::default();
         for placement in [None, Some(&recorder)] {
-            let cfg = build_exec_config(AccelTarget::Cpu, None, placement);
+            let cfg = build_exec_config(AccelTarget::Cpu, placement);
             assert_eq!(cfg.execution_provider, parakeet_rs::ExecutionProvider::Cpu);
             let env = std::env::var("YAPSTACK_PARAKEET_THREADS").ok();
             assert_eq!(
@@ -1308,16 +1224,17 @@ mod tests {
         }
     }
 
-    /// Gate G4 on a real model: the EP Auto reports must hold >= 90% of the
-    /// encoder's MatMul/Conv-family nodes, unless the load reports
-    /// `accel_partial` — then the static table must agree that it doesn't.
+    /// Gate G4 on a real model (ratified at 100% on 2026-10-31): the EP Auto
+    /// reports must hold every one of the encoder's MatMul/Conv-family nodes,
+    /// unless the load reports `accel_partial`; any share below 100% must be
+    /// reported partial.
     /// Red for int8 under the old macOS Auto (`webgpu`, 19.7%, not flagged).
     #[test]
     #[ignore = "needs YAPSTACK_TEST_PARAKEET_DIR set to a downloaded Parakeet model dir"]
     fn auto_places_heavy_ops_on_the_reported_ep() {
         let dir =
             std::env::var("YAPSTACK_TEST_PARAKEET_DIR").expect("set YAPSTACK_TEST_PARAKEET_DIR");
-        let mut backend = ParakeetBackend::new(None, None);
+        let mut backend = ParakeetBackend::new(None);
         let sessions = backend
             .load_model_with(
                 Path::new(&dir),
@@ -1331,7 +1248,7 @@ mod tests {
         let encoder = sessions.first().expect("encoder placement recorded");
         let share = encoder.heavy_share(ep);
         assert_eq!(
-            share < 0.90,
+            share < 1.0,
             info.accel_partial,
             "reported {reported} (partial={}) with {:.1}% of MatMul/Conv nodes placed there: {:?}",
             info.accel_partial,

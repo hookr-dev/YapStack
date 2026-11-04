@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use yapstack_common::engines::engine_catalogue;
@@ -690,7 +690,7 @@ pub async fn init_transcription_client(
     };
     let sidecar_path = find_sidecar_path()?;
 
-    let (model_path, sortformer_model_path, coreml_cache_dir) = match engine {
+    let (model_path, sortformer_model_path) = match engine {
         EngineKindDto::Parakeet => {
             let variant: ParakeetVariant = parakeet_variant
                 .ok_or(CommandError::NotFound {
@@ -708,12 +708,7 @@ pub async fn init_transcription_client(
             } else {
                 None
             };
-            let cache_dir = app_handle
-                .path()
-                .app_data_dir()
-                .ok()
-                .map(|d| d.join("cache").join("coreml"));
-            (mp, sortformer, cache_dir)
+            (mp, sortformer)
         }
     };
 
@@ -723,7 +718,6 @@ pub async fn init_transcription_client(
         engine_kind,
         &model_path,
         sortformer_model_path.as_deref(),
-        coreml_cache_dir.as_deref(),
     )
     .await
     .map_err(|e| {

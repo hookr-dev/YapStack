@@ -115,7 +115,7 @@ pub struct EngineInfo {
 }
 
 /// What every transcription backend must implement. Engine-specific
-/// configuration (Parakeet's Sortformer model, CoreML cache, etc.) is
+/// configuration (Parakeet's Sortformer model) is
 /// passed to the backend's constructor — not through this trait.
 #[cfg(feature = "parakeet")]
 pub trait TranscriptionBackend: Send {

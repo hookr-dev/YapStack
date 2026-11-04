@@ -103,7 +103,7 @@ export type LiveTranscriptionPressureEvent = {
   lag_seconds: number | null;
   /** Source-local preserved audio backlog after this live chunk dispatch. */
   drain_backlog_seconds: number;
-  /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")
+  /** Resolved accelerator (e.g. "webgpu", "cpu")
    *  captured at session start. Null if the sidecar didn't report one. */
   accel: string | null;
   /** Variant directory name (e.g. "parakeet-tdt-v3-int8"). Null when the
