@@ -2114,11 +2114,39 @@ fn vad_chunk_historical_audio(
         return Vec::new();
     }
 
+    let chunks =
+        backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning);
     split_backfill_chunks(
-        backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning),
+        merge_short_trailing_chunk(chunks, samples.len(), sample_rate),
         &probabilities,
         sample_rate,
     )
+}
+
+/// Join the last chunk to the one before it when it ends the buffer, starts
+/// where that one ends (a length cut, not a pause), and is shorter than
+/// `MIN_SPLIT_PIECE_SECS`. A backfill buffer cut short at the rewind
+/// hand-over (`carry_open_tail_into_live`) ends at a point this buffer's own
+/// length cuts don't know about, so its last chunk can be any length.
+fn merge_short_trailing_chunk(
+    mut chunks: Vec<VadBackfillChunk>,
+    total_samples: usize,
+    sample_rate: u32,
+) -> Vec<VadBackfillChunk> {
+    let min_samples = (MIN_SPLIT_PIECE_SECS * sample_rate as f32) as usize;
+    if let [.., prev, last] = chunks.as_slice() {
+        if last.end == total_samples
+            && last.end - last.start < min_samples
+            && prev.end == last.start
+        {
+            let end = last.end;
+            chunks.pop();
+            if let Some(prev) = chunks.last_mut() {
+                prev.end = end;
+            }
+        }
+    }
+    chunks
 }
 
 fn pause_search_window_ms() -> f32 {
@@ -6361,6 +6389,67 @@ mod tests {
         }
     }
 
+    /// Backfill cut at the rewind hand-over (`carry_open_tail_into_live`) in
+    /// pause-free speech: the hand-over point came from a separate Silero
+    /// run over the last 15 s, so the whole-buffer run's forced cuts don't
+    /// line up with it and the last chunk before it could be any length up
+    /// to 10 s. Under 2 s it went out alone, below the quantum split's
+    /// reach. It now joins the chunk before it.
+    #[test]
+    fn short_last_chunk_cut_by_the_hand_over_joins_the_one_before() {
+        use yapstack_common::types::EngineKind;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let sr = 16_000u32;
+        let min = (MIN_SPLIT_PIECE_SECS * sr as f32) as usize;
+        let quantum = (BACKFILL_JOB_QUANTUM_SECS * sr as f32) as usize;
+        for secs in [10.6f32, 11.3, 20.4, 21.0, 31.2] {
+            let probs = uneven_speech((secs / FRAME_SECS) as usize);
+            let total = probs.len() * FRAME_16K;
+            let chunks = backfill_chunks_from_probabilities(&probs, total, sr, &tuning);
+
+            let pieces =
+                split_backfill_chunks(merge_short_trailing_chunk(chunks, total, sr), &probs, sr);
+
+            assert_tiles(&pieces, 0, total);
+            for p in &pieces {
+                assert!(
+                    (min..=quantum).contains(&(p.end - p.start)),
+                    "{secs}: {pieces:?}"
+                );
+            }
+        }
+
+        // Not contiguous (a pause before it), or long enough: left alone.
+        let apart = vec![
+            VadBackfillChunk {
+                start: 0,
+                end: 8 * sr as usize,
+            },
+            VadBackfillChunk {
+                start: 9 * sr as usize,
+                end: 10 * sr as usize,
+            },
+        ];
+        assert_eq!(
+            merge_short_trailing_chunk(apart.clone(), 10 * sr as usize, sr),
+            apart
+        );
+        let long_enough = vec![
+            VadBackfillChunk {
+                start: 0,
+                end: 8 * sr as usize,
+            },
+            VadBackfillChunk {
+                start: 8 * sr as usize,
+                end: 10 * sr as usize + 1,
+            },
+        ];
+        assert_eq!(
+            merge_short_trailing_chunk(long_enough.clone(), 10 * sr as usize + 1, sr),
+            long_enough
+        );
+    }
+
     /// A rewind started while someone is talking: the backfill buffer ends
     /// mid-utterance. Backfill used to send that utterance's start as its
     /// last chunk (often a fraction of a word) and live started a new chunk
@@ -6371,44 +6460,47 @@ mod tests {
     fn open_backfill_tail_is_carried_into_live() {
         use yapstack_common::types::EngineKind;
         let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
-        let (sr, ch) = (48_000u32, 2u16);
-        let frame = FRAME_16K * 3;
-        let backfill_len = 20 * sr as usize;
-        let tail_offset = 5 * sr as usize;
-        let (silent, speech) = (406, 62);
-        let mut probs = vec![0.1f32; silent];
-        probs.extend(std::iter::repeat_n(0.9, speech));
-        let cursor = 10_000_000usize;
-        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
+        // 48 kHz stereo (1536 samples a frame) and 44.1 kHz stereo (1411).
+        for (sr, ch) in [(48_000u32, 2u16), (44_100, 2)] {
+            let frame = (FRAME_SECS * sr as f32) as usize;
+            let backfill_len = 20 * sr as usize;
+            let tail_offset = 5 * sr as usize;
+            let (silent, speech) = (406, 62);
+            let mut probs = vec![0.1f32; silent];
+            probs.extend(std::iter::repeat_n(0.9, speech));
+            let cursor = 10_000_000usize;
+            let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
 
-        let keep =
-            carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &probs, sr, &tuning);
+            let keep =
+                carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &probs, sr, &tuning);
 
-        let pre_roll = (tuning.pre_roll.as_secs_f32() * sr as f32) as usize;
-        assert_eq!(keep, tail_offset + silent * frame - pre_roll);
-        assert!(vad.is_speaking);
-        assert_eq!(
-            vad.speech_start_pos,
-            cursor - (backfill_len - keep) * ch as usize
-        );
-        assert_eq!(vad.earliest_next_chunk_pos, vad.speech_start_pos);
-        assert!(vad.speech_start_time.unwrap().elapsed() >= Duration::from_secs(2));
-        assert!(!vad.silero.recent_frames.is_empty());
-        assert!(vad
-            .silero
-            .recent_frames
-            .iter()
-            .all(|&(pos, _)| pos >= vad.speech_start_pos && pos <= cursor));
+            let pre_roll = (tuning.pre_roll.as_secs_f32() * sr as f32) as usize;
+            assert_eq!(keep, tail_offset + silent * frame - pre_roll, "{sr}");
+            assert!(vad.is_speaking);
+            assert_eq!(
+                vad.speech_start_pos,
+                cursor - (backfill_len - keep) * ch as usize
+            );
+            assert_eq!(vad.speech_start_pos % ch as usize, cursor % ch as usize);
+            assert_eq!(vad.earliest_next_chunk_pos, vad.speech_start_pos);
+            assert!(vad.speech_start_time.unwrap().elapsed() >= Duration::from_secs(2));
+            assert!(!vad.silero.recent_frames.is_empty());
+            assert!(vad
+                .silero
+                .recent_frames
+                .iter()
+                .all(|&(pos, _)| pos >= vad.speech_start_pos && pos <= cursor));
 
-        // A backfill that ends in silence keeps everything.
-        let mut quiet = vec![0.9f32; speech];
-        quiet.extend(std::iter::repeat_n(0.1, silent));
-        let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
-        let keep =
-            carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &quiet, sr, &tuning);
-        assert_eq!(keep, backfill_len);
-        assert!(!vad.is_speaking);
-        assert_eq!(vad.speech_start_pos, cursor);
+            // A backfill that ends in silence keeps everything.
+            let mut quiet = vec![0.9f32; speech];
+            quiet.extend(std::iter::repeat_n(0.1, silent));
+            let mut vad = SourceVadState::new(AudioSourceLabel::Mic, cursor, 0, sr, ch, 0.0);
+            let keep =
+                carry_open_tail_into_live(&mut vad, backfill_len, tail_offset, &quiet, sr, &tuning);
+            assert_eq!(keep, backfill_len);
+            assert!(!vad.is_speaking);
+            assert_eq!(vad.speech_start_pos, cursor);
+        }
     }
 
     /// A minute of unbroken speech: forced chunks and then backfill quanta

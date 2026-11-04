@@ -207,6 +207,9 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            and the live source begins already speaking from there, with its
            max-duration clock backdated and those frames recorded for length
            cuts, so the word under the seam isn't cut in two.
+           A buffer cut short there ends at a point its own length cuts
+           don't know about, so a last chunk under 2 s that follows a length
+           cut joins the chunk before it before the quantum split.
         3. Run vad_chunk_historical_audio() over each source — same Silero
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam
