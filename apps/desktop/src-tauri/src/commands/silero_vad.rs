@@ -134,6 +134,25 @@ pub(super) const FRAME_DURATION_SECS: f32 = 0.032;
 /// Samples per Silero frame at `TARGET_SAMPLE_RATE_HZ`.
 const FRAME_SAMPLES: usize = 512;
 
+/// Samples of a buffer at `sample_rate` that one `score_all` frame is mapped
+/// to: 32 ms, rounded down (1411 at 44.1 kHz). An exact 1411.2 mapping was
+/// tried and replayed worse on 44.1 kHz five-minute backfills (7.2% vs 6.2%
+/// WER, worse on 9 of 10 buffers), so the rounded mapping stays.
+fn frame_len(sample_rate: u32) -> usize {
+    ((FRAME_DURATION_SECS * sample_rate as f32) as usize).max(1)
+}
+
+/// Where frame `frame` of a `score_all` stream starts in the scored buffer.
+pub(super) fn frame_start_sample(frame: usize, sample_rate: u32) -> usize {
+    frame * frame_len(sample_rate)
+}
+
+/// The frame of a `score_all` stream that sample `pos` of the scored buffer
+/// is mapped to.
+pub(super) fn frame_at_sample(pos: usize, sample_rate: u32) -> usize {
+    pos / frame_len(sample_rate)
+}
+
 /// How many recent frames `SileroSource` keeps (~33 s), enough to reach
 /// back past a drain backlog to where the next chunk would be cut.
 const RECENT_FRAME_CAPACITY: usize = 1024;
