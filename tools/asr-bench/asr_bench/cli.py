@@ -14,12 +14,14 @@ from pathlib import Path
 
 from . import build as build_mod
 from . import metrics
+from . import replay as replay_mod
 from .corpus import Corpus, parse_spec
 from .sidecar import Sidecar, probe_placement, supports_placement
 
 TOOL_DIR = Path(__file__).resolve().parent.parent
 REPO = TOOL_DIR.parent.parent
 CACHE = TOOL_DIR / ".cache"
+REPLAY_CORPUS = CACHE / "replay-corpus"
 STAGED_SIDECAR = CACHE / "bin" / (build_mod.SIDECAR + (".exe" if sys.platform == "win32" else ""))
 
 CSV_FIELDS = [
@@ -215,26 +217,46 @@ def markdown(rows, args, sidecar: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def cmd_run(args) -> int:
-    models = parse_kv(args.model, "model")
-    args.expect = parse_kv(args.expect, "expect")
-    accels = [a for spec in args.accel for a in spec.split(",") if a]
-    only = {o for spec in args.only for o in spec.split(",") if o}
+def resolve_sidecar(args) -> Path:
     sidecar = Path(args.sidecar).resolve() if args.sidecar else STAGED_SIDECAR
     if not sidecar.is_file():
         raise SystemExit(f"no sidecar at {sidecar}; run `uv run asr-bench build` or pass --sidecar")
     if "src-tauri/binaries" in sidecar.as_posix() or "/target/debug/" in sidecar.as_posix():
         print(f"warning: {sidecar} is not a fresh release build; timings will not be comparable", file=sys.stderr)
+    return sidecar
+
+
+def model_rows(args) -> list[tuple[str, Path, str]]:
+    """(name, model dir, accel) for every model × accel row `--only` keeps."""
+    models = parse_kv(args.model, "model")
+    accels = [a for spec in args.accel for a in spec.split(",") if a]
+    only = {o for spec in args.only for o in spec.split(",") if o}
     for name, d in models.items():
         if not Path(d).expanduser().is_dir():
             raise SystemExit(f"model {name}: not a directory: {d}")
+    return [(name, Path(d).expanduser().resolve(), accel) for name, d in models.items() for accel in accels
+            if not only or f"{name}:{accel}" in only]
 
-    corpora = [parse_spec(spec, CACHE) for spec in args.corpus]
+
+def check_load(args) -> None:
     args.loadavg = loadavg()
     cores = os.cpu_count() or 1
     if args.loadavg and float(args.loadavg.split()[0]) > cores / 4:
         print(f"warning: load average {args.loadavg} on {cores} cores; timings will be noisy", file=sys.stderr)
-    out = Path(args.out).resolve() if args.out else TOOL_DIR / "results" / datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def out_dir(args, suffix: str = "") -> Path:
+    return Path(args.out).resolve() if args.out else TOOL_DIR / "results" / (datetime.now().strftime("%Y%m%d-%H%M%S") + suffix)
+
+
+def cmd_run(args) -> int:
+    args.expect = parse_kv(args.expect, "expect")
+    sidecar = resolve_sidecar(args)
+    rows_to_run = model_rows(args)
+
+    corpora = [parse_spec(spec, CACHE) for spec in args.corpus]
+    check_load(args)
+    out = out_dir(args)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     placement_ok = supports_placement(sidecar)
@@ -242,13 +264,10 @@ def cmd_run(args) -> int:
         print("note: this sidecar has no YAPSTACK_ORT_PLACEMENT support; placement columns will read n/a", flush=True)
 
     rows, utterances = [], []
-    for name, d in models.items():
-        for accel in accels:
-            if only and f"{name}:{accel}" not in only:
-                continue
-            r, u = run_row(args, sidecar, name, Path(d).expanduser().resolve(), accel, corpora, logs, placement_ok)
-            rows += r
-            utterances += u
+    for name, model_dir, accel in rows_to_run:
+        r, u = run_row(args, sidecar, name, model_dir, accel, corpora, logs, placement_ok)
+        rows += r
+        utterances += u
 
     with open(out / "results.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
@@ -274,6 +293,86 @@ def cmd_run(args) -> int:
     for k in unmeasured:
         print(f"NO MEASUREMENT: --expect {k} has no steady RTFx to check", file=sys.stderr)
     return 1 if misses or failed or unmeasured else 0
+
+
+def cmd_replay_corpus(args) -> int:
+    out = Path(args.out).resolve() if args.out else REPLAY_CORPUS
+    info = replay_mod.build_corpus(CACHE, out)
+    print(f"{info['version']} in {out}: {info['clips']}")
+    return 0
+
+
+def split_list(specs: list[str], allowed: tuple[str, ...], what: str) -> list[str]:
+    items = [x for spec in specs for x in spec.split(",") if x]
+    for x in items:
+        if x not in allowed:
+            raise SystemExit(f"--{what} {x!r}: want one of {', '.join(allowed)}")
+    return list(dict.fromkeys(items))
+
+
+def cmd_replay(args) -> int:
+    sidecar = resolve_sidecar(args)
+    rows_to_run = model_rows(args)
+    if args.baseline and args.baseline not in {f"{n}:{a}" for n, _, a in rows_to_run}:
+        raise SystemExit(f"--baseline {args.baseline}: not one of the model rows (NAME:EP)")
+    slices = split_list(args.slice or [",".join(replay_mod.SLICES)], replay_mod.SLICES, "slice")
+    modes = split_list(args.mode or [",".join(replay_mod.GATE_MODES)], replay_mod.MODES, "mode")
+    corpus_dir = Path(args.corpus_dir).resolve() if args.corpus_dir else REPLAY_CORPUS
+    info = replay_mod.corpus_info(corpus_dir)
+    check_load(args)
+    out = out_dir(args, "-replay")
+    logs = out / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+
+    manifests = {}
+    for s in slices:
+        wavs = replay_mod.slice_wavs(corpus_dir, s, args.limit)
+        for m in modes:
+            print(f"== replay {s} {m}: {len(wavs)} clips", flush=True)
+            manifests[(s, m)] = replay_mod.replay(REPO, wavs, m, out / "chunks" / f"{s}-{m}")
+
+    rows, chunks = [], []
+    for name, model_dir, accel in rows_to_run:
+        key = f"{name}:{accel}"
+        print(f"== {key}: {model_dir}", flush=True)
+        sc = Sidecar(sidecar, model_dir, accel, logs / f"{name}-{accel}.stderr")
+        for (s, m), manifest in manifests.items():
+            scored = replay_mod.score(sc, manifest, args.normalizer)
+            rows.append({"slice": s, "mode": m, "key": key, "model": name, "accel_requested": accel,
+                         "accel_loaded": sc.stats.accel or "", **scored.row})
+            chunks += [{"slice": s, "mode": m, "key": key, **c} for c in scored.chunks]
+            print(f"   {s} {m}: WER {scored.row['wer']}%, {scored.row['empty']} empty, {scored.row['truncated']} truncated", flush=True)
+        sc.close()
+
+    checks = replay_mod.gate(rows, args.baseline, args.wer_margin) if args.baseline else None
+    corpus_label = info["version"] + (f", first {args.limit} clips per slice" if args.limit else "")
+    header = [
+        f"# ASR replay, {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"- Corpus: `{corpus_label}` ({', '.join(info['source'])}). Only numbers from the same corpus compare.",
+        f"- Host: {host_description()}; load average at start: {args.loadavg}",
+        f"- Sidecar: {sidecar_description(sidecar)}",
+        f"- Chunks under {replay_mod.MIN_CHUNK_SECS} s are skipped, as the app skips them. Empty: a sent chunk came back with no text. "
+        f"Truncated: a clip missing {replay_mod.TRUNCATION_RUN}+ consecutive reference words. "
+        f"Timestamp bad: a chunk with text whose segments are missing, out of order, or end over {replay_mod.TIMESTAMP_SLACK_MS} ms past the chunk.",
+    ]
+    md = replay_mod.markdown(rows, checks, header, args.baseline, args.wer_margin)
+    (out / "replay.md").write_text(md)
+    (out / "replay.json").write_text(json.dumps({"corpus": info, "limit": args.limit, "rows": rows, "gate": checks}, indent=1) + "\n")
+    with open(out / "chunks.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(chunks[0]) if chunks else ["slice"])
+        w.writeheader()
+        w.writerows(chunks)
+    print("\n" + md)
+    print(f"wrote {out}/replay.md, replay.json, chunks.csv, chunks/, logs/")
+
+    failed = [r for r in rows if r["errors"]]
+    for r in failed:
+        print(f"INCOMPLETE: {r['key']} on {r['slice']} {r['mode']}: {r['errors']} failed transcriptions", file=sys.stderr)
+    misses = [c for c in checks or [] if not c["pass"]]
+    for c in misses:
+        print(f"AE-G1 FAIL: {c['key']} on {c['slice']} {c['mode']}: {c['why']}", file=sys.stderr)
+    return 1 if failed or misses else 0
 
 
 def cmd_build(args) -> int:
@@ -315,9 +414,30 @@ def main(argv=None) -> int:
     r.add_argument("--out", help="output dir (default: results/<timestamp>, gitignored)")
     r.set_defaults(fn=cmd_run)
 
+    c = sub.add_parser("replay-corpus", help="build the replay slices (long, long44, mono, drift) from cached LibriSpeech")
+    c.add_argument("--out", help=f"corpus dir (default: {REPLAY_CORPUS})")
+    c.set_defaults(fn=cmd_replay_corpus)
+
+    y = sub.add_parser("replay", help="cut the replay corpus with the app's chunking and score each model on the chunks")
+    y.add_argument("--model", action="append", required=True, metavar="NAME=DIR", help="a Parakeet model dir (ONNX or CoreML); repeatable")
+    y.add_argument("--accel", action="append", default=[], metavar="EP[,EP]", help="YAPSTACK_PARAKEET_ACCEL values (default: auto, as the app runs)")
+    y.add_argument("--only", action="append", default=[], metavar="NAME:EP[,..]", help="restrict the model × accel product to these rows")
+    y.add_argument("--slice", action="append", default=[], metavar="S[,S]", help=f"slices: {', '.join(replay_mod.SLICES)} (default: all)")
+    y.add_argument("--mode", action="append", default=[], metavar="M[,M]", help=f"chunking: {', '.join(replay_mod.MODES)} (default: {', '.join(replay_mod.GATE_MODES)})")
+    y.add_argument("--limit", type=int, help="first N clips of each slice (a smoke run; not comparable with full-corpus numbers)")
+    y.add_argument("--corpus-dir", help=f"replay corpus (default: {REPLAY_CORPUS})")
+    y.add_argument("--sidecar", help=f"sidecar binary (default: {STAGED_SIDECAR})")
+    y.add_argument("--normalizer", choices=sorted(metrics.NORMALIZERS), default="english")
+    y.add_argument("--baseline", metavar="NAME:EP", help="check AE-G1 against this row; exit 1 on failure")
+    y.add_argument("--wer-margin", type=float, default=1.0, help="AE-G1 WER allowance in points (default 1.0)")
+    y.add_argument("--out", help="output dir (default: results/<timestamp>-replay, gitignored)")
+    y.set_defaults(fn=cmd_replay)
+
     args = p.parse_args(argv)
     if args.cmd == "run" and not args.accel:
         args.accel = ["cpu"]
+    if args.cmd == "replay" and not args.accel:
+        args.accel = ["auto"]
     return args.fn(args)
 
 

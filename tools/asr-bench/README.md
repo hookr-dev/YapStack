@@ -28,13 +28,29 @@ uv run asr-bench build     # cargo build --release the sidecar, stage it in .cac
 
 Always bench a fresh release build. The copy in `apps/desktop/src-tauri/binaries/` can be months old (it matches `target/debug`) and runs about 1.7× slower. The tool warns if you point `--sidecar` at it.
 
+The default features match what the app ships: `parakeet,webgpu,fluidaudio` on Apple silicon (the same as `scripts/build-transcription-sidecar.sh`; `fluidaudio` needs Xcode 26), `parakeet,webgpu` on Intel macOS and Windows, `parakeet` elsewhere.
+
 ## Models
 
-Every variant is a directory in the layout parakeet-rs loads: `encoder*.onnx`, `decoder_joint-model*.onnx`, `vocab.txt`. Keep them outside the repo. The shipped int8 bundle is already in the app's data dir, `~/Library/Application Support/dev.yapstack.app/models/parakeet-tdt-v3-int8`. The others come from Hugging Face at pinned commits:
+Every variant is a directory. The sidecar picks the runtime from the folder's format: `*.mlmodelc` bundles run on CoreML through FluidAudio (ADR 0008), ONNX files on ORT. Keep them outside the repo.
+
+- **ONNX** (the layout parakeet-rs loads: `encoder*.onnx`, `decoder_joint-model*.onnx`, `vocab.txt`). The shipped int8 bundle is in the app's data dir, `~/Library/Application Support/dev.yapstack.app/models/parakeet-tdt-v3-int8`, on hosts that still run it. On Apple silicon the app replaces it with the CoreML folder, so fetch it below.
+- **CoreML** (the Apple silicon default). The app's install is `~/Library/Application Support/dev.yapstack.app/models/parakeet-tdt-v3-coreml`. Load it with `--accel auto`: `cpu` means CPU-only compute units on CoreML.
+
+The others come from Hugging Face at pinned commits:
 
 ```bash
 hf() { uvx --from 'huggingface_hub[cli]==0.35.3' hf download "$@"; }
 M=~/asr-models
+
+# int8 (the shipped ONNX bundle, same revision as the app's catalog)
+hf istupakov/parakeet-tdt-0.6b-v3-onnx --revision 8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce \
+  --include 'encoder-model.int8.onnx' 'decoder_joint-model.int8.onnx' 'vocab.txt' --local-dir $M/int8
+
+# CoreML (FluidAudio, the files the app installs)
+hf FluidInference/parakeet-tdt-0.6b-v3-coreml --revision 7dd20fe6b1797d35f5e3307e8b1732d9a178edfe \
+  --include 'Preprocessor.mlmodelc/*' 'Encoder_v2.mlmodelc/*' 'Decoder.mlmodelc/*' 'JointDecisionv3.mlmodelc/*' \
+  'parakeet_vocab.json' --local-dir $M/coreml
 
 # fp32 (reference): encoder with 2.4 GB external data
 hf istupakov/parakeet-tdt-0.6b-v3-onnx --revision 8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce \
@@ -105,6 +121,38 @@ uv run asr-bench run --model int8=… --model fp16=… --model int4=… --accel 
 ```
 
 `int4:webgpu` was noisy in the probe (20–26×).
+
+## App-style replay (AE-G1)
+
+`run` sends whole files. `replay` scores engines on the chunks the app actually cuts: re-run it before changing VAD chunking, backfill, or the default engine.
+
+```bash
+uv run asr-bench replay-corpus     # once: builds .cache/replay-corpus from LibriSpeech test-clean:400 + test-other:200
+uv run asr-bench replay \
+  --model int8=~/asr-models/int8 \
+  --model fa="$HOME/Library/Application Support/dev.yapstack.app/models/parakeet-tdt-v3-coreml" \
+  --baseline int8:auto
+```
+
+- **Slices** (`--slice`, default all): `long` (3 consecutive utterances of one chapter, natural gaps, 16 kHz mono, 105 clips), `mono` (the same with the silence trimmed and the utterances butted together: a monologue with no pause), `long44` (`long` at 44.1 kHz stereo), `drift` (5-minute 44.1 kHz stereo buffers, the size of a "Last 300 s" backfill, 10 clips).
+- **Modes** (`--mode`, default `live,backfill`): the cutting is the desktop crate's own code, run by the `#[ignore]`d test `commands::live_transcription::replay_harness::replay_chunk_boundaries` (`cargo test -p yapstack-desktop --lib`, so it needs the staged dev sidecar from `./scripts/build-sidecars.sh --dev`). `live` is the VAD state machine, `backfill` adds the job-quantum split, and `rewind` starts a session mid-speech at each clip's midpoint and hands the open tail to live. Every model is scored on the same chunks.
+- **Columns**, per slice × mode × model: corpus WER, empty chunks (sent, no text back), truncated clips (4+ consecutive reference words missing), timestamp-bad chunks (text but segments missing, out of order, or ending over 50 ms past the chunk), sidecar errors. Chunks under 0.35 s are skipped, as the app skips them.
+- **`--baseline NAME:EP`** checks AE-G1 for every other row: WER ≤ baseline + `--wer-margin` (1.0 pt) on every slice × mode, and empty, truncated and timestamp-bad counts no higher than the baseline's (owner ruling 2026-11-04, ADR 0008). A failure, or any failed transcription, exits 1.
+- `--accel` defaults to `auto`, which is what the app runs (int8 resolves to CPU on macOS, a CoreML folder to the Neural Engine).
+- Cutting runs in the debug test build: about 15 s per 16 kHz slice and 5–6 min per 44.1 kHz one (`long44`, `drift`; Silero resamples in debug code), so a full 8-slice replay spends about 25 min cutting before any scoring.
+- `--limit N` takes the first N clips per slice. Use it to check the plumbing; its numbers don't compare with full runs.
+- Output goes to `results/<timestamp>-replay/`: `replay.md`, `replay.json`, `chunks.csv` (every chunk's text per model), and the chunk WAVs under `chunks/`.
+
+The committed baseline is in [`docs/plans/asr-engine-overhaul.md`](../../docs/plans/asr-engine-overhaul.md) (AE results).
+
+## Methodology
+
+- **One bench at a time, on a quiet machine.** A concurrent bench or build skews RTFx and power. The report records the load average.
+- **Record the corpus with every number.** Numbers from different corpora don't compare. The original gate corpus was lost; the current baseline is the 105-clip LibriSpeech replay corpus, `librispeech-replay-v1` (its `corpus.json`). Bump `CORPUS_VERSION` in `asr_bench/replay.py` if the slices are ever built differently.
+- **CoreML loads.** The first (cold) load compiles the models for the Neural Engine, about 23 s on an M5 Pro; a cached load takes about 0.4 s. The cache is `~/Library/Caches/<key>/com.apple.e5rt.e5bundlecache/<OS build>/`, keyed by the bundle id (`dev.yapstack.app`) for the app and by the process name for an unbundled sidecar (ADR 0008). Delete it to measure a cold load.
+- **Energy** is battery joules per audio-minute, net of an idle baseline. macOS refreshes the battery's `InstantAmperage` only every 40–60 s, so a power row needs at least 5 minutes of steady work, with the first 60 s discarded.
+- **Accelerator use.** ORT EPs are checked by the placement pass (Gate G4). A native engine has to show it with `sudo powermetrics` (ANE and GPU power) during the run, per ADR 0008.
+- **Reference energy numbers** (M5 Pro, 2026-11-03; the script that took them is lost, the method above is what it did): int8 ORT CPU 24.2, fp16 ORT WebGPU 21.4, FluidAudio `Encoder_v2` on the ANE 6.5 J per audio-minute, at 193× RTFx.
 
 ## Tests
 

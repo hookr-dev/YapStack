@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -20,9 +22,11 @@ SIDECAR = "yapstack-transcription-sidecar"
 
 def default_features() -> str:
     # Parakeet with the same EPs the app ships. Whisper is left out: it
-    # needs cmake, and the bench rows are Parakeet variants.
+    # needs cmake, and the bench rows are Parakeet variants. Apple silicon
+    # also links FluidAudio (CoreML / Neural Engine, ADR 0008), as
+    # scripts/build-transcription-sidecar.sh does.
     if sys.platform == "darwin":
-        return "parakeet,webgpu"
+        return "parakeet,webgpu,fluidaudio" if platform.machine() == "arm64" else "parakeet,webgpu"
     if sys.platform == "win32":
         return "parakeet,webgpu"
     return "parakeet"
@@ -37,9 +41,14 @@ def sha256(path: Path) -> str:
 
 
 def build(repo: Path, dest: Path, features: str) -> Path:
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        # The app's floor, as the app's own sidecar build sets it (ADR 0008).
+        env["MACOSX_DEPLOYMENT_TARGET"] = "14.0"
     subprocess.run(
         ["cargo", "build", "--release", "-p", SIDECAR, "--features", features],
         cwd=repo,
+        env=env,
         check=True,
     )
     exe = SIDECAR + (".exe" if sys.platform == "win32" else "")

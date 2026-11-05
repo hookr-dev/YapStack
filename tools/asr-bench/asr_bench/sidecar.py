@@ -25,6 +25,8 @@ class Transcribed:
     infer_s: float
     wall_s: float
     error: str | None = None
+    # `TranscriptSegment`s: start_ms, end_ms, text, confidence.
+    segments: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -146,7 +148,7 @@ class Sidecar:
         if resp.get("type") == "error":
             return Transcribed("", 0.0, wall, error=resp.get("message", "error"))
         # duration_ms is the sidecar's own inference time (WAV decode excluded).
-        return Transcribed(resp.get("text", ""), resp["duration_ms"] / 1000.0, wall)
+        return Transcribed(resp.get("text", ""), resp["duration_ms"] / 1000.0, wall, segments=resp.get("segments") or [])
 
     def close(self) -> ProcessStats:
         try:

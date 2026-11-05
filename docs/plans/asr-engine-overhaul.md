@@ -136,6 +136,36 @@ Battery energy per audio-minute, Apple Silicon:
 - **FluidAudio is the planned Mac default** ([ADR 0008](../adr/0008-fluidaudio-coreml-mac-default.md)), gated on AE-G1 (see Gates) in an app-style re-score (live chunking, not whole files) after #138 (forced cuts at a pause) and #139 (empty-decode retry).
 - **macOS 14 floor:** the minimum macOS version is raised to 14 directly, with no older-OS fallback path.
 
+### AE-G1 replay baseline (2026-11-04)
+
+Corpus `librispeech-replay-v1`: 105 clips per slice (10 for drift) built from LibriSpeech test-clean:400 + test-other:200. Only numbers from this corpus compare with these. Reproduce with `tools/asr-bench`: `replay-corpus`, then `replay --baseline int8:auto` ([README](../../tools/asr-bench/README.md#app-style-replay-ae-g1)). These numbers were taken with the scratch harness that became `replay`. The corpus `replay-corpus` builds is byte-identical to it, and `replay` cuts identical `live` and `rewind` chunks. Its `backfill` cut differs slightly: it calls the app's `vad_chunk_historical_audio`, which also joins a sub-2 s last piece to the one before it (#144), and the scratch harness skipped that step. 1–12 clips per slice end differently (long 937 → 932 chunks, long44 933 → 928, mono 890 → 881, drift 932 → 932), so a fresh backfill run won't match these rows exactly; re-baseline both engines in one run. int8 ran on ORT CPU, FluidAudio (`Encoder_v2`) on CoreML with Auto. Both scored the same replayed chunks; zero sidecar errors.
+
+| Slice | Mode | Chunks | int8 WER % | FA WER % | Δ pt | int8 empty / truncated | FA empty / truncated |
+|---|---|---|---|---|---|---|---|
+| long | live | 555 | 4.11 | 3.74 | −0.37 | 4 / 6 | 2 / 1 |
+| long44 | live | 554 | 4.46 | 3.97 | −0.49 | 7 / 7 | 3 / 2 |
+| mono | live | 486 | 5.97 | 5.77 | −0.20 | 7 / 17 | 0 / 10 |
+| drift | live | 543 | 4.35 | 3.98 | −0.38 | 8 / 7 | 1 / 4 |
+| long | backfill | 937 | 5.94 | 6.42 | +0.48 | 8 / 13 | 2 / 5 |
+| long44 | backfill | 933 | 6.40 | 6.70 | +0.30 | 16 / 20 | 3 / 5 |
+| mono | backfill | 890 | 10.01 | 8.01 | −2.00 | 27 / 39 | 0 / 12 |
+| drift | backfill | 932 | 6.20 | 6.50 | +0.30 | 13 / 8 | 1 / 4 |
+
+FA is within +0.5 pt on every slice, and 2.0 pt better on monologue backfill. It has fewer empty chunks and truncated clips on all 8 slices: AE-G1 passes on WER and empty/truncated. The word-timestamp check from that run wasn't kept; `replay` now reports it per slice (timestamp-bad column).
+
+Backfill edge fixes (#144: no split piece under 2 s, the rewind's open tail handed to live), int8 on ORT CPU, same corpus:
+
+| Slice | Mode | Before (WER % / empty / truncated) | After |
+|---|---|---|---|
+| long | backfill | 6.57 / 60 / 17 | 5.94 / 8 / 13 |
+| long44 | backfill | 7.03 / 63 / 23 | 6.40 / 16 / 20 |
+| mono | backfill | 10.42 / 63 / 38 | 10.01 / 27 / 39 |
+| drift | backfill | 6.89 / 68 / 9 | 6.20 / 13 / 8 |
+| long | rewind | 7.94 / 53 / 17 | 5.46 / 9 / 9 |
+| mono | rewind | 11.46 / 54 / 35 | 7.73 / 10 / 17 |
+
+"Before" is the chunking before #144, which no longer exists in the code; only the "After" column reproduces from `main` (`--mode backfill,rewind`).
+
 ## Phase 1 — Fix quant and EP on the current stack (parakeet-rs 0.3.5)
 
 Driven by G1/G4. No dependency upgrade.

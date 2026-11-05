@@ -6017,6 +6017,9 @@ pub async fn get_live_transcription_status(
 }
 
 #[cfg(test)]
+mod replay_harness;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
