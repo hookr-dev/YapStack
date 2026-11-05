@@ -223,8 +223,8 @@ impl ParakeetVariant {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 (~700 MB)",
-            ParakeetVariant::TdtV3CoreMl => "Parakeet TDT v3 (~630 MB)",
+            ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 · CPU/GPU",
+            ParakeetVariant::TdtV3CoreMl => "Parakeet TDT v3 · Neural Engine",
         }
     }
 
@@ -667,6 +667,18 @@ mod tests {
         expected.push("parakeet_vocab.json");
         expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn display_names_say_where_each_variant_runs_and_leave_the_size_to_the_badge() {
+        assert_eq!(
+            ParakeetVariant::TdtV3CoreMl.display_name(),
+            "Parakeet TDT v3 · Neural Engine"
+        );
+        assert_eq!(
+            ParakeetVariant::TdtV3Int8.display_name(),
+            "Parakeet TDT v3 · CPU/GPU"
+        );
     }
 
     #[test]

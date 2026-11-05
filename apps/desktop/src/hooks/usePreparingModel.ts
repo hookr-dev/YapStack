@@ -5,10 +5,11 @@ import { useAppStore } from "@/stores/appStore";
 /// A load from the OS compile cache takes well under a second.
 export const PREPARING_MODEL_AFTER_MS = 3_000;
 
-/// Shown while the model is being prepared, in the status popover and
-/// Settings.
+/// Shown while the model is being prepared: the title in the title bar and
+/// the status popover header, the detail in the popover and Settings.
+export const PREPARING_MODEL_TITLE = "Preparing model…";
 export const PREPARING_MODEL_DETAIL =
-  "Setting up for the Neural Engine. This happens once.";
+  "Optimizing for the Neural Engine. The first time can take a minute.";
 
 /// True once a CoreML model load has run past `PREPARING_MODEL_AFTER_MS`,
 /// counted from when the load started, so a view opened mid-load agrees with

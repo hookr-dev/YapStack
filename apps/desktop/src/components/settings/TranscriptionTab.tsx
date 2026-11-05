@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useAppStore } from "@/stores/appStore";
+import { COREML_SWITCH_FAILED, useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -174,8 +174,7 @@ export function TranscriptionTab() {
         {coreMlSwitchFailed && enginePhase === "ready" && (
           <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-2">
             <p className="text-[11px] text-muted-foreground">
-              The Neural Engine model couldn't be set up, so the previous
-              model is in use.
+              {COREML_SWITCH_FAILED}
             </p>
             <Button
               size="sm"
@@ -192,7 +191,7 @@ export function TranscriptionTab() {
               }}
             >
               <RotateCw className="mr-1 h-3 w-3" />
-              Try the Neural Engine model again
+              Try again
             </Button>
           </div>
         )}

@@ -6,13 +6,6 @@ import { Progress } from "@/components/ui/progress";
 import { Download, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import type { ParakeetVariantDto } from "@/lib/tauri";
-import { formatBytes } from "@/lib/utils";
-
-/// Where each variant runs, told apart when more than one row shows.
-const RUNS_ON: Record<ParakeetVariantDto, string> = {
-  TdtV3Int8: "Runs on the CPU or GPU",
-  TdtV3CoreMl: "Runs on the Neural Engine",
-};
 
 /// Parakeet model rows: the model this host should run, plus any other
 /// model on disk. The backend lists the CoreML model only where it's the
@@ -74,34 +67,32 @@ export function ParakeetModelSection() {
           enginePhase === "ready";
         const showProgress =
           isDownloading && model.variant === progressVariant;
-        // The selected model is in use or being set up, unless setup failed.
+        // Mirrors the store's guard: while autoSetup downloads or loads a
+        // model it may fall back to any row. The selected model is in use
+        // unless its setup failed.
         const canDelete =
-          model.variant !== selectedVariant || enginePhase === "error";
+          enginePhase !== "downloading" &&
+          enginePhase !== "initializing" &&
+          (model.variant !== selectedVariant || enginePhase === "error");
         return (
           <div
             key={model.variant}
             className="flex items-center justify-between rounded-md px-2 py-1.5 hover:bg-muted/50"
           >
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <span
-                  className={
-                    isActive
-                      ? "text-sm font-medium text-foreground"
-                      : "text-sm text-muted-foreground"
-                  }
-                >
-                  {model.display_name}
-                </span>
-                <Badge variant="secondary" className="text-xs">
-                  {formatBytes(model.approximate_size_bytes)}
-                </Badge>
-              </div>
-              {models.length > 1 && (
-                <p className="text-[10px] text-muted-foreground/60">
-                  {RUNS_ON[model.variant]}
-                </p>
-              )}
+            <div className="flex items-center gap-2">
+              <span
+                className={
+                  isActive
+                    ? "text-sm font-medium text-foreground"
+                    : "text-sm text-muted-foreground"
+                }
+              >
+                {model.display_name}
+              </span>
+              {/* Decimal MB, like the download. */}
+              <Badge variant="secondary" className="text-xs">
+                {Math.round(model.approximate_size_bytes / 1_000_000)} MB
+              </Badge>
             </div>
 
             <div className="flex items-center gap-1">
@@ -124,7 +115,7 @@ export function ParakeetModelSection() {
                   <Button
                     variant="ghost"
                     size="icon-xs"
-                    aria-label="Delete model"
+                    aria-label={`Delete ${model.display_name}`}
                     disabled={isDownloading}
                     onClick={() => handleDelete(model.variant)}
                   >
@@ -135,7 +126,7 @@ export function ParakeetModelSection() {
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label="Download model"
+                  aria-label={`Download ${model.display_name}`}
                   disabled={isDownloading}
                   onClick={() => handleDownload(model.variant)}
                 >

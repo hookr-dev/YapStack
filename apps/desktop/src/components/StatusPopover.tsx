@@ -15,6 +15,7 @@ import { formatBytes, formatElapsed, SOURCE_LABELS_FULL } from "@/lib/utils";
 import { accelDisplayLabel } from "@/lib/accel";
 import {
   PREPARING_MODEL_DETAIL,
+  PREPARING_MODEL_TITLE,
   usePreparingModel,
 } from "@/hooks/usePreparingModel";
 import { commands } from "@/lib/tauri";
@@ -253,7 +254,7 @@ export function StatusPopover() {
     headerSub = `${Math.round(modelDownloadProgress ?? 0)}%`;
     tone = "amber";
   } else if (enginePhase === "initializing") {
-    headerTitle = preparingModel ? "Preparing model" : "Loading engine";
+    headerTitle = preparingModel ? PREPARING_MODEL_TITLE : "Loading engine";
     headerSub = preparingModel
       ? PREPARING_MODEL_DETAIL
       : "Preparing transcription runtime";

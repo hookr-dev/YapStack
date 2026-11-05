@@ -368,6 +368,11 @@ export interface Settings {
   onboarding: OnboardingState;
 }
 
+/// A switch to the recommended Parakeet model failed and the previous one
+/// stays: the warning toast's title and the Settings line.
+export const COREML_SWITCH_FAILED =
+  "Couldn't set up the Neural Engine model. Using the previous model.";
+
 export type EnginePhase =
   | "idle"
   | "downloading"
@@ -2401,7 +2406,7 @@ function createAppStore() {
                 switchFailure,
               );
               toast.warning(
-                "Couldn't switch to the new transcription model, so the previous one is still in use",
+                COREML_SWITCH_FAILED,
                 {
                   id: "parakeet-model-switch",
                   description: switchFailure,
@@ -2521,7 +2526,16 @@ function createAppStore() {
         // autoSetup returns early while an engine is ready.
         const shutdown = await commands.shutdownTranscriptionClient();
         if (shutdown.status === "error") {
-          throw new Error(commandErrorMessage(shutdown.error));
+          // InvalidInput: live transcription is running, so the engine stays.
+          // Any other failure has already detached the engine from shared
+          // state, so setup can go ahead.
+          if (shutdown.error.kind === "InvalidInput") {
+            throw new Error(commandErrorMessage(shutdown.error));
+          }
+          console.warn(
+            "engine shutdown failed before the CoreML retry:",
+            commandErrorMessage(shutdown.error),
+          );
         }
         get().updateSettings({ coreMlSwitchFailure: null });
         set({ enginePhase: "idle", engineError: null, loadedEngineInfo: null });

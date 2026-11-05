@@ -137,7 +137,12 @@ describe("switching an int8 Mac to the CoreML model (ADR 0008)", () => {
     expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
     expect(disk.has("TdtV3Int8")).toBe(true);
     expect(warning).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(warning.mock.calls[0])).toContain("network unreachable");
+    expect(warning.mock.calls[0][0]).toBe(
+      "Couldn't set up the Neural Engine model. Using the previous model.",
+    );
+    expect(warning.mock.calls[0][1]).toMatchObject({
+      description: "network unreachable",
+    });
     const state = useAppStore.getState();
     expect(state.settings.selectedParakeetVariant).toBe("TdtV3Int8");
     expect(state.enginePhase).toBe("ready");
@@ -387,7 +392,7 @@ describe("Try the Neural Engine model again", () => {
     vi.clearAllMocks();
     commands.shutdownTranscriptionClient.mockResolvedValueOnce({
       status: "error",
-      error: { type: "InvalidInput", message: "live transcription is running" },
+      error: { kind: "InvalidInput", message: "live transcription is running" },
     });
 
     await expect(useAppStore.getState().retryCoreMlSwitch()).rejects.toThrow(
@@ -396,6 +401,32 @@ describe("Try the Neural Engine model again", () => {
     expect(commands.initTranscriptionClient).not.toHaveBeenCalled();
     const state = useAppStore.getState();
     expect(state.settings.coreMlSwitchFailure).toEqual(recorded.coreMlSwitchFailure);
+    expect(state.enginePhase).toBe("ready");
+  });
+});
+
+describe("Try the Neural Engine model again, when shutdown fails for another reason", () => {
+  it("still clears the record and retries the switch", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(
+      ["TdtV3Int8", "TdtV3CoreMl"],
+      { coreMlSwitchFailure: { variant: "TdtV3CoreMl", appVersion: APP_VERSION } },
+    );
+    await useAppStore.getState().autoSetup();
+    vi.clearAllMocks();
+    commands.shutdownTranscriptionClient.mockResolvedValueOnce({
+      status: "error",
+      error: { kind: "Internal", message: "scheduler shutdown timed out" },
+    });
+
+    await useAppStore.getState().retryCoreMlSwitch();
+
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3CoreMl",
+      false,
+    );
+    const state = useAppStore.getState();
+    expect(state.settings.coreMlSwitchFailure).toBeNull();
     expect(state.enginePhase).toBe("ready");
   });
 });

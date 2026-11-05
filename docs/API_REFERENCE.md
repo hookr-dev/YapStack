@@ -393,7 +393,7 @@ impl ParakeetVariant {
     pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3-int8" / "parakeet-tdt-v3-coreml"
     pub fn files(&self) -> &'static [ModelFile];                               // name (may contain '/'), pinned url, bytes, sha256
     pub fn approximate_size_bytes(&self) -> u64;
-    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~700 MB)" / "(~630 MB)"
+    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 · CPU/GPU" / "· Neural Engine"
     pub fn all() -> &'static [ParakeetVariant];                                // TdtV3CoreMl only on Apple silicon
 }
 impl SortformerVariant { /* filename, download_url, approximate_size_bytes, display_name */ }

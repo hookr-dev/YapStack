@@ -28,13 +28,13 @@ describe("accelDisplayLabel", () => {
 
   it("says when the Neural Engine holds only part of the model's heavy work", () => {
     expect(accelDisplayLabel("ane", null, true)).toBe(
-      "Neural Engine (partial)",
+      "Neural Engine + CPU",
     );
   });
 
   it("doesn't claim the Neural Engine for a CoreML load with no compute plan", () => {
     expect(accelDisplayLabel("coreml", null, false)).toBe(
-      "Neural Engine or CPU",
+      "Core ML",
     );
   });
 

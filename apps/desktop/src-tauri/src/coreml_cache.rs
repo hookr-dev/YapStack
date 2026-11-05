@@ -27,9 +27,13 @@ pub fn sidecar_cache_dirs(caches_dir: &Path, bundle_id: &str, sidecar: &Path) ->
 }
 
 /// Delete every subdirectory of `cache_dir` except `os_build`'s. Files and
-/// symlinks are left alone, and a missing `cache_dir` is a no-op. Each
-/// removal is logged; one that fails is logged and skipped.
+/// symlinks are left alone. It does nothing unless `os_build` already has a
+/// subdirectory, the evidence that CoreML names them by `kern.osversion`.
+/// Each removal is logged; one that fails is logged and skipped.
 pub fn remove_other_os_builds(cache_dir: &Path, os_build: &str) {
+    if !cache_dir.join(os_build).is_dir() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return;
     };
@@ -116,11 +120,27 @@ mod tests {
         assert!(cache.join("26A434/EF0C16E3/model.bin").exists());
     }
 
+    /// Without a subdirectory for this build, nothing shows CoreML names
+    /// them by `kern.osversion`, so nothing is pruned.
+    #[test]
+    fn prunes_nothing_unless_the_current_build_has_a_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join(E5_BUNDLE_CACHE);
+        mkdir(&cache.join("25B78/110D8BC6"));
+        mkdir(&cache.join("24G90"));
+        std::fs::write(cache.join("26A434"), b"not a dir").unwrap();
+
+        remove_other_os_builds(&cache, "26A434");
+
+        assert!(cache.join("25B78/110D8BC6").is_dir());
+        assert!(cache.join("24G90").is_dir());
+    }
+
     #[test]
     fn leaves_files_symlinks_and_everything_outside_the_cache_alone() {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join(E5_BUNDLE_CACHE);
-        mkdir(&cache);
+        mkdir(&cache.join("26A434"));
         std::fs::write(cache.join("index"), b"x").unwrap();
         let outside = root.path().join("outside/25B78");
         mkdir(&outside);

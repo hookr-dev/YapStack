@@ -19,10 +19,10 @@ export function accelDisplayLabel(
     case "webgpu":
       return gpu("WebGPU");
     case "ane":
-      return partial ? "Neural Engine (partial)" : "Neural Engine";
+      return partial ? "Neural Engine + CPU" : "Neural Engine";
     // CoreML with no compute plan to say where the encoder runs.
     case "coreml":
-      return "Neural Engine or CPU";
+      return "Core ML";
     case "cpu":
       return fallback ? "CPU (GPU unavailable)" : "CPU";
     default:

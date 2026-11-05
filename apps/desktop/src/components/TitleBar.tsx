@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { useCreateSession } from "@/hooks/useCreateSession";
-import { usePreparingModel } from "@/hooks/usePreparingModel";
+import {
+  PREPARING_MODEL_TITLE,
+  usePreparingModel,
+} from "@/hooks/usePreparingModel";
 import {
   Popover,
   PopoverContent,
@@ -81,7 +84,7 @@ export function TitleBar() {
     dotPulse = true;
   } else if (enginePhase === "initializing") {
     dotColor = "bg-amber-500";
-    statusText = preparingModel ? "Preparing model..." : "Loading engine...";
+    statusText = preparingModel ? PREPARING_MODEL_TITLE : "Loading engine...";
     dotPulse = true;
   } else if (enginePhase === "error") {
     dotColor = "bg-red-500";

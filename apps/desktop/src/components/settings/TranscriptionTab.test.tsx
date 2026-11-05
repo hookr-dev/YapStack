@@ -148,14 +148,15 @@ describe("TranscriptionTab — Parakeet only", () => {
 const INT8 = {
   variant: "TdtV3Int8" as const,
   downloaded: true,
-  display_name: "Parakeet TDT v3 (~700 MB)",
-  approximate_size_bytes: 700_000_000,
+  display_name: "Parakeet TDT v3 · CPU/GPU",
+  // The catalog's per-file byte counts, summed.
+  approximate_size_bytes: 670_386_003,
 };
 const COREML = {
   variant: "TdtV3CoreMl" as const,
   downloaded: true,
-  display_name: "Parakeet TDT v3 (~630 MB)",
-  approximate_size_bytes: 630_000_000,
+  display_name: "Parakeet TDT v3 · Neural Engine",
+  approximate_size_bytes: 632_159_036,
 };
 
 function settingsWith(overrides: Record<string, unknown>) {
@@ -172,8 +173,8 @@ describe("TranscriptionTab — Parakeet models", () => {
 
     expect(screen.getByText(INT8.display_name)).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
-    expect(screen.queryByText(/Runs on/)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Delete model" })).toBeNull();
+    expect(screen.queryByText(COREML.display_name)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: `Delete ${INT8.display_name}` })).toBeNull();
   });
 
   it("shows the CoreML row next to the int8 model in use, and deletes it", async () => {
@@ -186,22 +187,41 @@ describe("TranscriptionTab — Parakeet models", () => {
     render(<TranscriptionTab />);
 
     expect(screen.getByText(COREML.display_name)).toBeInTheDocument();
-    expect(screen.getByText("Runs on the Neural Engine")).toBeInTheDocument();
-    expect(screen.getByText("Runs on the CPU or GPU")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    expect(screen.getByText(INT8.display_name)).toBeInTheDocument();
+    // The names say where each runs; no extra subtitle.
+    expect(screen.queryByText(/Runs on/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: `Delete ${COREML.display_name}` }));
     expect(deleteParakeetModel).toHaveBeenCalledExactlyOnceWith("TdtV3CoreMl");
   });
 
-  it("offers no Delete for the model being set up, only once its setup failed", () => {
+  it("shows each model's size once, in decimal MB like the download", () => {
     setup({
-      enginePhase: "initializing",
-      parakeetModels: [COREML],
-      settings: settingsWith({ selectedParakeetVariant: "TdtV3CoreMl" }),
+      parakeetModels: [INT8, COREML],
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3Int8" }),
     });
-    const { unmount } = render(<TranscriptionTab />);
-    expect(screen.queryByRole("button", { name: "Delete model" })).toBeNull();
-    unmount();
+    render(<TranscriptionTab />);
 
+    expect(screen.getByText("670 MB")).toBeInTheDocument();
+    expect(screen.getByText("632 MB")).toBeInTheDocument();
+  });
+
+  it.each(["downloading", "initializing"] as const)(
+    "offers no Delete on any row while the engine is %s (the first CoreML compile)",
+    (phase) => {
+      // autoSetup persists the variant only after the load, so int8 is
+      // still selected while the CoreML model compiles.
+      setup({
+        enginePhase: phase,
+        initializingParakeet: { variant: "TdtV3CoreMl", startedAt: Date.now() },
+        parakeetModels: [INT8, COREML],
+        settings: settingsWith({ selectedParakeetVariant: "TdtV3Int8" }),
+      });
+      render(<TranscriptionTab />);
+      expect(screen.queryByRole("button", { name: /^Delete / })).toBeNull();
+    },
+  );
+
+  it("offers Delete on the selected model once its setup failed", () => {
     setup({
       enginePhase: "error",
       engineError: "request timed out after 190s",
@@ -209,7 +229,7 @@ describe("TranscriptionTab — Parakeet models", () => {
       settings: settingsWith({ selectedParakeetVariant: "TdtV3CoreMl" }),
     });
     render(<TranscriptionTab />);
-    expect(screen.getByRole("button", { name: "Delete model" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Delete ${COREML.display_name}` })).toBeInTheDocument();
   });
 
   it("shows why a delete was refused", async () => {
@@ -224,7 +244,7 @@ describe("TranscriptionTab — Parakeet models", () => {
     });
     render(<TranscriptionTab />);
 
-    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    await userEvent.click(screen.getByRole("button", { name: `Delete ${COREML.display_name}` }));
     expect(error).toHaveBeenCalledWith("Cannot delete the active model");
   });
 
@@ -240,8 +260,13 @@ describe("TranscriptionTab — Parakeet models", () => {
     });
     render(<TranscriptionTab />);
 
+    expect(
+      screen.getByText(
+        "Couldn't set up the Neural Engine model. Using the previous model.",
+      ),
+    ).toBeInTheDocument();
     await userEvent.click(
-      screen.getByRole("button", { name: /Try the Neural Engine model again/ }),
+      screen.getByRole("button", { name: "Try again" }),
     );
     expect(retryCoreMlSwitch).toHaveBeenCalledTimes(1);
   });
@@ -256,7 +281,7 @@ describe("TranscriptionTab — Parakeet models", () => {
     });
     render(<TranscriptionTab />);
     expect(
-      screen.queryByRole("button", { name: /Try the Neural Engine model again/ }),
+      screen.queryByRole("button", { name: "Try again" }),
     ).toBeNull();
   });
 
@@ -272,7 +297,7 @@ describe("TranscriptionTab — Parakeet models", () => {
       expect(screen.queryByRole("status")).toBeNull();
       act(() => vi.advanceTimersByTime(3_000));
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Setting up for the Neural Engine. This happens once.",
+        "Optimizing for the Neural Engine. The first time can take a minute.",
       );
     } finally {
       vi.useRealTimers();
