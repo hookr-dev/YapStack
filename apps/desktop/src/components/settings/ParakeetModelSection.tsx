@@ -41,13 +41,6 @@ export function ParakeetModelSection() {
   };
 
   const handleDelete = async (variant: ParakeetVariantDto) => {
-    if (
-      variant === selectedVariant &&
-      enginePhase === "ready"
-    ) {
-      toast.error("Cannot delete the active model");
-      return;
-    }
     try {
       await deleteParakeet(variant);
     } catch (e) {

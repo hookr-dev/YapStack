@@ -209,3 +209,39 @@ describe("switching an int8 Mac to the CoreML model (ADR 0008)", () => {
     expect(warning).not.toHaveBeenCalled();
   });
 });
+
+describe("deleting a Parakeet model", () => {
+  it.each(["downloading", "initializing"] as const)(
+    "is refused while the engine is %s",
+    async (phase) => {
+      const { useAppStore, commands, disk } = await launchOnAppleSilicon([
+        "TdtV3Int8",
+      ]);
+      useAppStore.setState({ enginePhase: phase });
+
+      await expect(
+        useAppStore.getState().deleteParakeetModel("TdtV3Int8"),
+      ).rejects.toThrow("Cannot delete the active model");
+      expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
+      expect(disk.has("TdtV3Int8")).toBe(true);
+    },
+  );
+
+  it("is refused for the selected model while it is ready", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(["TdtV3Int8"]);
+    useAppStore.setState({ enginePhase: "ready" });
+
+    await expect(
+      useAppStore.getState().deleteParakeetModel("TdtV3Int8"),
+    ).rejects.toThrow("Cannot delete the active model");
+    expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
+  });
+
+  it("deletes a model that isn't in use", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(["TdtV3Int8"]);
+    useAppStore.setState({ enginePhase: "error" });
+
+    await useAppStore.getState().deleteParakeetModel("TdtV3Int8");
+    expect(commands.deleteParakeetModel).toHaveBeenCalledWith("TdtV3Int8");
+  });
+});

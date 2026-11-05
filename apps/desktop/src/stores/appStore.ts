@@ -2461,6 +2461,17 @@ function createAppStore() {
 
 
       deleteParakeetModel: async (variant: ParakeetVariantDto) => {
+        // The running model, or any model while autoSetup is downloading or
+        // loading one (it may be about to fall back to it).
+        const { enginePhase, settings } = get();
+        if (
+          enginePhase === "downloading" ||
+          enginePhase === "initializing" ||
+          (enginePhase === "ready" &&
+            variant === settings.selectedParakeetVariant)
+        ) {
+          throw new Error("Cannot delete the active model");
+        }
         const result = await commands.deleteParakeetModel(variant);
         if (result.status === "error") {
           throw new Error(commandErrorMessage(result.error));
