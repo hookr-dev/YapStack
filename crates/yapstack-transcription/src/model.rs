@@ -60,6 +60,30 @@ const VOCAB_V3: ModelFile = ModelFile {
     sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
 };
 
+/// `FluidInference/parakeet-tdt-0.6b-v3-coreml` at a fixed commit (ADR 0008).
+/// The hashes in [`ParakeetVariant::files`] are the SHA-256s of the files at
+/// this revision.
+macro_rules! fluidinference_v3_coreml_url {
+    ($file:literal) => {
+        concat!(
+            "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/",
+            "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe/",
+            $file
+        )
+    };
+}
+
+macro_rules! coreml_file {
+    ($file:literal, $bytes:literal, $sha256:literal) => {
+        ModelFile {
+            name: $file,
+            url: fluidinference_v3_coreml_url!($file),
+            bytes: $bytes,
+            sha256: $sha256,
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParakeetVariant {
     /// int8-quantized `nvidia/parakeet-tdt-0.6b-v3` (multilingual, 25
@@ -69,25 +93,43 @@ pub enum ParakeetVariant {
     /// INT8/FP16/FP32 hit identical accuracy on LibriSpeech (97.84%) and
     /// indistinguishable WER on the leaderboard (15.72–15.77%).
     TdtV3Int8,
+    /// The same model compiled to CoreML by FluidInference, with the int8
+    /// per-channel `Encoder_v2`. The sidecar runs a folder of `.mlmodelc`
+    /// bundles on FluidAudio (the Neural Engine). Apple silicon only
+    /// (ADR 0008).
+    TdtV3CoreMl,
 }
 
 impl ParakeetVariant {
-    /// The variant to install on this host. Every target runs the int8
-    /// bundle.
+    /// The variant to install on this host: CoreML on Apple silicon, the
+    /// int8 ONNX bundle everywhere else.
     pub fn recommended_for_host() -> Self {
-        ParakeetVariant::TdtV3Int8
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            ParakeetVariant::TdtV3CoreMl
+        } else {
+            ParakeetVariant::TdtV3Int8
+        }
     }
 
     /// Subdirectory under `$APP_DATA_DIR/models/` where this variant's files live.
     pub fn dir_name(&self) -> &'static str {
         match self {
             ParakeetVariant::TdtV3Int8 => "parakeet-tdt-v3-int8",
+            ParakeetVariant::TdtV3CoreMl => "parakeet-tdt-v3-coreml",
         }
     }
 
-    /// Files this variant requires on disk to load. `parakeet-rs` expects
-    /// these inside the variant directory. It computes the mel features
-    /// itself, so the bundle's `nemo128.onnx` preprocessor is not fetched.
+    /// Files this variant requires on disk to load, relative to the
+    /// variant directory.
+    ///
+    /// int8: `parakeet-rs` computes the mel features itself, so the
+    /// bundle's `nemo128.onnx` preprocessor is not fetched.
+    ///
+    /// CoreML: what FluidAudio's `AsrModels.loadLocal(version: .v3,
+    /// encoderPrecision: .int8V2)` opens (preprocessor, `Encoder_v2`,
+    /// decoder, `JointDecisionv3`, vocabulary). Each `.mlmodelc` needs only
+    /// `coremldata.bin`, `model.mil` and its weights; the repo's
+    /// `analytics/` and `metadata.json` files are not read.
     pub fn files(&self) -> &'static [ModelFile] {
         match self {
             ParakeetVariant::TdtV3Int8 => &[
@@ -105,6 +147,73 @@ impl ParakeetVariant {
                 },
                 VOCAB_V3,
             ],
+            ParakeetVariant::TdtV3CoreMl => &[
+                coreml_file!(
+                    "Preprocessor.mlmodelc/coremldata.bin",
+                    486,
+                    "dbde3f2300842c1fd51ef3ff948a0bcffe65ffd2dca10707f2509f32c1d65b1d"
+                ),
+                coreml_file!(
+                    "Preprocessor.mlmodelc/model.mil",
+                    28_181,
+                    "4b8518a956450fec57f06c2a21bdffc26973f7f1fa6842fb38fe917f896b6b93"
+                ),
+                coreml_file!(
+                    "Preprocessor.mlmodelc/weights/weight.bin",
+                    491_072,
+                    "129b76e3aeafa8afa3ea76d995b964b145fe83700d579f6ff42c4c38fa0968ea"
+                ),
+                coreml_file!(
+                    "Encoder_v2.mlmodelc/coremldata.bin",
+                    478,
+                    "70628bd4fd25fb554cc0cebc31356723930c885480132bf3ecd1b5dbe71dd0a2"
+                ),
+                coreml_file!(
+                    "Encoder_v2.mlmodelc/model.mil",
+                    1_002_653,
+                    "abc621390840dd064e6833dc098101706621e47e17119ead904f8c383211dd1d"
+                ),
+                coreml_file!(
+                    "Encoder_v2.mlmodelc/weights/weight.bin",
+                    594_211_328,
+                    "8d2c79e15a4545e08fe3a21fe741e42b8bf24329db81de8fdfacd92388ea5a66"
+                ),
+                coreml_file!(
+                    "Decoder.mlmodelc/coremldata.bin",
+                    554,
+                    "18647af085d87bd8f3121c8a9b4d4564c1ede038dab63d295b4e745cf2d7fb99"
+                ),
+                coreml_file!(
+                    "Decoder.mlmodelc/model.mil",
+                    13_110,
+                    "ef2a0a281695398a62fde86ac269c68f73d5b578d7ed3b31f2ba91a2d1ea1f35"
+                ),
+                coreml_file!(
+                    "Decoder.mlmodelc/weights/weight.bin",
+                    23_604_992,
+                    "48adf0f0d47c406c8253d4f7fef967436a39da14f5a65e66d5a4b407be355d41"
+                ),
+                coreml_file!(
+                    "JointDecisionv3.mlmodelc/coremldata.bin",
+                    521,
+                    "f5fc08b741400f0088492c9e839418b1e18522f19cba28d361dd030c5f398342"
+                ),
+                coreml_file!(
+                    "JointDecisionv3.mlmodelc/model.mil",
+                    11_775,
+                    "be60732943389a047175111a83f8839f3eb39d4803adafa828a0871b2f39818d"
+                ),
+                coreml_file!(
+                    "JointDecisionv3.mlmodelc/weights/weight.bin",
+                    12_642_764,
+                    "4e0e63d840032f7f07ddb1d64446051166281e5491bf22da8a945c41f6eedb3e"
+                ),
+                coreml_file!(
+                    "parakeet_vocab.json",
+                    151_122,
+                    "7ec60e05f1b24480736ec0eed40900f4626bce1fa9a60fd700ec7e2a59198735"
+                ),
+            ],
         }
     }
 
@@ -115,11 +224,17 @@ impl ParakeetVariant {
     pub fn display_name(&self) -> &'static str {
         match self {
             ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 (~700 MB)",
+            ParakeetVariant::TdtV3CoreMl => "Parakeet TDT v3 (~630 MB)",
         }
     }
 
+    /// The variants this host can run. CoreML needs Apple silicon.
     pub fn all() -> &'static [ParakeetVariant] {
-        &[ParakeetVariant::TdtV3Int8]
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            &[ParakeetVariant::TdtV3Int8, ParakeetVariant::TdtV3CoreMl]
+        } else {
+            &[ParakeetVariant::TdtV3Int8]
+        }
     }
 }
 
@@ -185,6 +300,9 @@ async fn download_file(
 
     let total_size = response.content_length().unwrap_or(fallback_size);
 
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let mut file = tokio::fs::File::create(&temp_dest).await?;
     let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
@@ -485,11 +603,21 @@ mod tests {
 
     #[test]
     fn parakeet_files_are_pinned_by_revision_and_hash() {
-        for variant in ParakeetVariant::all() {
+        let pinned = |v: ParakeetVariant| {
+            match v {
+            ParakeetVariant::TdtV3Int8 => {
+                "istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/"
+            }
+            ParakeetVariant::TdtV3CoreMl => {
+                "FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/7dd20fe6b1797d35f5e3307e8b1732d9a178edfe/"
+            }
+        }
+        };
+        for variant in [ParakeetVariant::TdtV3Int8, ParakeetVariant::TdtV3CoreMl] {
             for f in variant.files() {
                 assert!(
                     f.url
-                        .contains("/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/")
+                        .starts_with(&format!("https://huggingface.co/{}", pinned(variant)))
                         && f.url.ends_with(f.name),
                     "{f:?}"
                 );
@@ -502,6 +630,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Exactly the components `AsrModels.loadLocal(version: .v3,
+    /// encoderPrecision: .int8V2)` opens, each `.mlmodelc` reduced to the
+    /// three files `MLModel` reads; never the palettized `Encoder`.
+    #[test]
+    fn coreml_bundle_holds_what_the_int8v2_load_opens() {
+        let mut names: Vec<&str> = ParakeetVariant::TdtV3CoreMl
+            .files()
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        names.sort_unstable();
+        let parts: Vec<String> = ["Preprocessor", "Encoder_v2", "Decoder", "JointDecisionv3"]
+            .iter()
+            .flat_map(|m| {
+                ["coremldata.bin", "model.mil", "weights/weight.bin"]
+                    .map(|f| format!("{m}.mlmodelc/{f}"))
+            })
+            .collect();
+        let mut expected: Vec<&str> = parts.iter().map(String::as_str).collect();
+        expected.push("parakeet_vocab.json");
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn coreml_variant_is_offered_and_recommended_only_on_apple_silicon() {
+        let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        assert_eq!(
+            ParakeetVariant::all().contains(&ParakeetVariant::TdtV3CoreMl),
+            apple_silicon
+        );
+        assert!(ParakeetVariant::all().contains(&ParakeetVariant::TdtV3Int8));
+        let expected = if apple_silicon {
+            ParakeetVariant::TdtV3CoreMl
+        } else {
+            ParakeetVariant::TdtV3Int8
+        };
+        assert_eq!(ParakeetVariant::recommended_for_host(), expected);
     }
 
     /// Serves `body` once over plain HTTP and returns its URL.
@@ -530,6 +698,19 @@ mod tests {
     async fn download_with_matching_hash_lands() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("f.onnx");
+        let url = serve_once(b"hello").await;
+        download_file(&url, &dest, 5, Some(HELLO_SHA256), &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    /// CoreML bundles are directories, so a file can sit below a folder
+    /// that doesn't exist yet.
+    #[tokio::test]
+    async fn download_into_a_missing_subdirectory_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Encoder_v2.mlmodelc/weights/weight.bin");
         let url = serve_once(b"hello").await;
         download_file(&url, &dest, 5, Some(HELLO_SHA256), &|_| {})
             .await

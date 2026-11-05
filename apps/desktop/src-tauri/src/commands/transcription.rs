@@ -34,10 +34,12 @@ pub enum EngineKindDto {
     Parakeet,
 }
 
-/// Parakeet model variant. int8 Parakeet TDT v3 is the only one.
+/// Parakeet model variant: the int8 ONNX bundle, or the CoreML build that
+/// Apple silicon runs on the Neural Engine (ADR 0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum ParakeetVariantDto {
     TdtV3Int8,
+    TdtV3CoreMl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -112,6 +114,7 @@ impl From<ParakeetVariantDto> for ParakeetVariant {
     fn from(v: ParakeetVariantDto) -> Self {
         match v {
             ParakeetVariantDto::TdtV3Int8 => ParakeetVariant::TdtV3Int8,
+            ParakeetVariantDto::TdtV3CoreMl => ParakeetVariant::TdtV3CoreMl,
         }
     }
 }
@@ -120,6 +123,7 @@ impl From<ParakeetVariant> for ParakeetVariantDto {
     fn from(v: ParakeetVariant) -> Self {
         match v {
             ParakeetVariant::TdtV3Int8 => ParakeetVariantDto::TdtV3Int8,
+            ParakeetVariant::TdtV3CoreMl => ParakeetVariantDto::TdtV3CoreMl,
         }
     }
 }
@@ -713,7 +717,9 @@ pub async fn init_transcription_client(
     };
 
     let engine_kind: EngineKind = engine.into();
-    let client = TranscriptionClient::spawn(
+    // Success means the model loaded and warmed up: the frontend deletes
+    // the int8 bundle only after a good CoreML load (ADR 0008).
+    let (client, info) = TranscriptionClient::spawn_loaded(
         &sidecar_path,
         engine_kind,
         &model_path,
@@ -721,23 +727,9 @@ pub async fn init_transcription_client(
     )
     .await
     .map_err(|e| {
-        error!("failed to spawn transcription client: {}", e);
+        error!("transcription engine failed to load: {}", e);
         CommandError::from(e)
     })?;
-
-    // Probe the sidecar for the model it just loaded (CLI-arg path
-    // doesn't emit `model_loaded` over IPC) so we can surface accel +
-    // variant to the FE. Best-effort: if the query fails, log and
-    // continue — the client is still usable.
-    let engine_info = match client.query_engine_info().await {
-        Ok(info) => Some(info),
-        Err(e) => {
-            tracing::warn!(
-                "query_engine_info failed after spawn ({e}); continuing without engine_loaded event"
-            );
-            None
-        }
-    };
 
     // Hand the client to a long-lived scheduler. The scheduler is the
     // single source of truth for engine readiness from this point on.
@@ -793,27 +785,25 @@ pub async fn init_transcription_client(
         engine_kind.as_str()
     );
 
-    if let Some(info) = engine_info {
-        info!(
-            marker = "live_engine_loaded",
-            engine = engine_kind.as_str(),
-            accel = info.accel.as_deref(),
-            model_dir = info.model_dir.as_deref(),
-            accel_fallback = info.accel_fallback.as_deref(),
-            accel_partial = info.accel_partial,
-            "transcription engine loaded"
-        );
-        let _ = app_handle.emit(
-            "transcription-engine-loaded",
-            TranscriptionEngineLoadedEvent {
-                engine: engine_kind.into(),
-                accel: info.accel,
-                model_dir: info.model_dir,
-                accel_fallback: info.accel_fallback,
-                accel_partial: info.accel_partial,
-            },
-        );
-    }
+    info!(
+        marker = "live_engine_loaded",
+        engine = engine_kind.as_str(),
+        accel = info.accel.as_deref(),
+        model_dir = info.model_dir.as_deref(),
+        accel_fallback = info.accel_fallback.as_deref(),
+        accel_partial = info.accel_partial,
+        "transcription engine loaded"
+    );
+    let _ = app_handle.emit(
+        "transcription-engine-loaded",
+        TranscriptionEngineLoadedEvent {
+            engine: engine_kind.into(),
+            accel: info.accel,
+            model_dir: info.model_dir,
+            accel_fallback: info.accel_fallback,
+            accel_partial: info.accel_partial,
+        },
+    );
     Ok(())
 }
 

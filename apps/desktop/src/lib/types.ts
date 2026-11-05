@@ -1077,9 +1077,10 @@ export type LoginBeginResultDto = { saltMismatch: boolean }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 /**
- * Parakeet model variant. int8 Parakeet TDT v3 is the only one.
+ * Parakeet model variant: the int8 ONNX bundle, or the CoreML build that
+ * Apple silicon runs on the Neural Engine (ADR 0008).
  */
-export type ParakeetVariantDto = "TdtV3Int8"
+export type ParakeetVariantDto = "TdtV3Int8" | "TdtV3CoreMl"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 /**
  * The workspace's sync capability levels as lane status shows them.

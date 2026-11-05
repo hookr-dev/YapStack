@@ -278,6 +278,21 @@ impl TranscriptionClient {
         })
     }
 
+    /// [`Self::spawn`], then waits out the sidecar's startup model load with
+    /// the first engine query. A sidecar that exits during the load (a
+    /// failed load or warm-up) or doesn't answer within the load budget is
+    /// an error, and the dropped client kills it.
+    pub async fn spawn_loaded(
+        sidecar_path: &Path,
+        engine: EngineKind,
+        model_path: &Path,
+        sortformer_model_path: Option<&Path>,
+    ) -> Result<(Self, EngineInfo)> {
+        let client = Self::spawn(sidecar_path, engine, model_path, sortformer_model_path).await?;
+        let info = client.query_engine_info().await?;
+        Ok((client, info))
+    }
+
     /// Internal: spawn the sidecar process and return raw parts.
     async fn spawn_sidecar(
         sidecar_path: &Path,
@@ -895,6 +910,39 @@ mod response_budget_tests {
             .query_engine_info()
             .await
             .expect("first query outlasts the startup load");
+        assert_eq!(info.accel.as_deref(), Some("cpu"));
+    }
+
+    /// The sidecar exits when its `--model` load or warm-up fails. That has
+    /// to fail the spawn: the host deletes the int8 bundle only after a good
+    /// CoreML load (ADR 0008).
+    #[tokio::test]
+    async fn spawn_loaded_fails_when_the_startup_load_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failing-sidecar");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = TranscriptionClient::spawn_loaded(
+            &path,
+            EngineKind::Parakeet,
+            Path::new("/model"),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_loaded_returns_the_loaded_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_client, info) = TranscriptionClient::spawn_loaded(
+            &fake_sidecar(dir.path(), 0),
+            EngineKind::Parakeet,
+            Path::new("/model"),
+            None,
+        )
+        .await
+        .expect("loads");
         assert_eq!(info.accel.as_deref(), Some("cpu"));
     }
 

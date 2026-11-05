@@ -2263,10 +2263,22 @@ function createAppStore() {
                 commandErrorMessage(recommendedRes.error),
               );
             }
-            const variant =
+            const recommended =
               recommendedRes.status === "ok"
                 ? recommendedRes.data
                 : settings.selectedParakeetVariant;
+            // The model this host ran before `recommended` (int8, on a Mac
+            // moving to CoreML). It stays the engine until `recommended` has
+            // loaded once, and is deleted after that (ADR 0008).
+            const previous =
+              recommendedRes.status === "ok"
+                ? (get().parakeetModels.find(
+                    (m) => m.downloaded && m.variant !== recommended,
+                  )?.variant ?? null)
+                : null;
+            let variant = recommended;
+            // Why `recommended` couldn't be set up, when `previous` stays.
+            let switchFailure: string | null = null;
 
             const downloaded = get().parakeetModels.some(
               (m) => m.variant === variant && m.downloaded,
@@ -2280,20 +2292,17 @@ function createAppStore() {
                   error: commandErrorMessage(dl.error),
                   phase: "downloading",
                 });
-                set({
-                  enginePhase: "error",
-                  engineError: commandErrorMessage(dl.error),
-                });
-                return;
+                if (previous === null) {
+                  set({
+                    enginePhase: "error",
+                    engineError: commandErrorMessage(dl.error),
+                  });
+                  return;
+                }
+                switchFailure = commandErrorMessage(dl.error);
+                variant = previous;
               }
               await get().refreshParakeetModels();
-            }
-
-            // Persist whichever variant we ended up using so StatusPopover,
-            // pressure-event tagging, and the next autoSetup pass all see
-            // a coherent view.
-            if (variant !== settings.selectedParakeetVariant) {
-              get().updateSettings({ selectedParakeetVariant: variant });
             }
 
             // Sortformer download is lazy — only when diarization is on.
@@ -2314,17 +2323,64 @@ function createAppStore() {
             }
 
             set({ enginePhase: "initializing" });
-            const initResult = await commands.initTranscriptionClient(
+            let initResult = await commands.initTranscriptionClient(
               "Parakeet",
               variant,
               settings.diarizationEnabled,
             );
+            if (
+              initResult.status === "error" &&
+              previous !== null &&
+              variant !== previous
+            ) {
+              trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
+              switchFailure = commandErrorMessage(initResult.error);
+              variant = previous;
+              initResult = await commands.initTranscriptionClient(
+                "Parakeet",
+                variant,
+                settings.diarizationEnabled,
+              );
+            }
+
+            // Persist whichever variant we ended up using so StatusPopover,
+            // pressure-event tagging, and the next autoSetup pass all see
+            // a coherent view.
+            if (variant !== settings.selectedParakeetVariant) {
+              get().updateSettings({ selectedParakeetVariant: variant });
+            }
+
             if (initResult.status === "error") {
               trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
               set({ enginePhase: "error", engineError: commandErrorMessage(initResult.error) });
               return;
             }
             set({ enginePhase: "ready", engineError: null });
+
+            if (switchFailure !== null) {
+              console.warn(
+                `couldn't switch to Parakeet ${recommended}; staying on ${variant}:`,
+                switchFailure,
+              );
+              toast.warning(
+                "Couldn't switch to the new transcription model, so the previous one is still in use",
+                {
+                  id: "parakeet-model-switch",
+                  description: switchFailure,
+                  duration: Infinity,
+                },
+              );
+            } else if (previous !== null) {
+              // `recommended` loaded and warmed up: `previous` is dead weight.
+              const del = await commands.deleteParakeetModel(previous);
+              if (del.status === "error") {
+                console.error(
+                  `couldn't delete the replaced Parakeet ${previous} model:`,
+                  commandErrorMessage(del.error),
+                );
+              }
+              await get().refreshParakeetModels();
+            }
           } catch (e) {
             // console.error routes through the frontend log bridge, so the
             // failure lands in the unified log file — engine setup errors on
