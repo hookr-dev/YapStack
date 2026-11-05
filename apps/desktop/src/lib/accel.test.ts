@@ -22,6 +22,22 @@ describe("accelDisplayLabel", () => {
     ).toBe("CPU (GPU unavailable)");
   });
 
+  it("names a CoreML load the compute plan puts on the Neural Engine", () => {
+    expect(accelDisplayLabel("ane", null, false)).toBe("Neural Engine");
+  });
+
+  it("says when the Neural Engine holds only part of the model's heavy work", () => {
+    expect(accelDisplayLabel("ane", null, true)).toBe(
+      "Neural Engine (partial)",
+    );
+  });
+
+  it("doesn't claim the Neural Engine for a CoreML load with no compute plan", () => {
+    expect(accelDisplayLabel("coreml", null, false)).toBe(
+      "Neural Engine or CPU",
+    );
+  });
+
   it("falls back to the raw label for an unknown accelerator", () => {
     expect(accelDisplayLabel("cuda", null, false)).toBe("CUDA");
   });

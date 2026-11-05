@@ -1,4 +1,4 @@
-import { render, screen, cleanup } from "@testing-library/react";
+import { act, render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -125,5 +125,157 @@ describe("TranscriptionTab — Parakeet only", () => {
     expect(screen.getByText("network unreachable")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
     expect(autoSetup).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a hung load's init error with Retry, and no Active model", async () => {
+    const autoSetup = vi.fn().mockResolvedValue(undefined);
+    setup({
+      enginePhase: "error",
+      engineError: "request timed out after 190s",
+      autoSetup,
+      parakeetModels: [COREML],
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3CoreMl" }),
+    });
+    render(<TranscriptionTab />);
+
+    expect(screen.getByText("request timed out after 190s")).toBeInTheDocument();
+    expect(screen.queryByText("Active")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    expect(autoSetup).toHaveBeenCalledExactlyOnceWith({ retry: true });
+  });
+});
+
+const INT8 = {
+  variant: "TdtV3Int8" as const,
+  downloaded: true,
+  display_name: "Parakeet TDT v3 (~700 MB)",
+  approximate_size_bytes: 700_000_000,
+};
+const COREML = {
+  variant: "TdtV3CoreMl" as const,
+  downloaded: true,
+  display_name: "Parakeet TDT v3 (~630 MB)",
+  approximate_size_bytes: 630_000_000,
+};
+
+function settingsWith(overrides: Record<string, unknown>) {
+  return { ...useAppStore.getState().settings, language: "en", ...overrides };
+}
+
+describe("TranscriptionTab — Parakeet models", () => {
+  it("shows one int8 row where the CoreML model isn't offered (Windows, Intel)", () => {
+    setup({
+      parakeetModels: [INT8],
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3Int8" }),
+    });
+    render(<TranscriptionTab />);
+
+    expect(screen.getByText(INT8.display_name)).toBeInTheDocument();
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.queryByText(/Runs on/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete model" })).toBeNull();
+  });
+
+  it("shows the CoreML row next to the int8 model in use, and deletes it", async () => {
+    const deleteParakeetModel = vi.fn().mockResolvedValue(undefined);
+    setup({
+      parakeetModels: [INT8, COREML],
+      deleteParakeetModel,
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3Int8" }),
+    });
+    render(<TranscriptionTab />);
+
+    expect(screen.getByText(COREML.display_name)).toBeInTheDocument();
+    expect(screen.getByText("Runs on the Neural Engine")).toBeInTheDocument();
+    expect(screen.getByText("Runs on the CPU or GPU")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    expect(deleteParakeetModel).toHaveBeenCalledExactlyOnceWith("TdtV3CoreMl");
+  });
+
+  it("offers no Delete for the model being set up, only once its setup failed", () => {
+    setup({
+      enginePhase: "initializing",
+      parakeetModels: [COREML],
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3CoreMl" }),
+    });
+    const { unmount } = render(<TranscriptionTab />);
+    expect(screen.queryByRole("button", { name: "Delete model" })).toBeNull();
+    unmount();
+
+    setup({
+      enginePhase: "error",
+      engineError: "request timed out after 190s",
+      parakeetModels: [COREML],
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3CoreMl" }),
+    });
+    render(<TranscriptionTab />);
+    expect(screen.getByRole("button", { name: "Delete model" })).toBeInTheDocument();
+  });
+
+  it("shows why a delete was refused", async () => {
+    const { toast } = await import("sonner");
+    const error = vi.spyOn(toast, "error");
+    setup({
+      parakeetModels: [INT8, COREML],
+      deleteParakeetModel: vi
+        .fn()
+        .mockRejectedValue(new Error("Cannot delete the active model")),
+      settings: settingsWith({ selectedParakeetVariant: "TdtV3Int8" }),
+    });
+    render(<TranscriptionTab />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    expect(error).toHaveBeenCalledWith("Cannot delete the active model");
+  });
+
+  it("offers to try the Neural Engine model again after a failed switch", async () => {
+    const retryCoreMlSwitch = vi.fn().mockResolvedValue(undefined);
+    setup({
+      parakeetModels: [INT8, COREML],
+      retryCoreMlSwitch,
+      settings: settingsWith({
+        selectedParakeetVariant: "TdtV3Int8",
+        coreMlSwitchFailure: { variant: "TdtV3CoreMl", appVersion: "1.0.0" },
+      }),
+    });
+    render(<TranscriptionTab />);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Try the Neural Engine model again/ }),
+    );
+    expect(retryCoreMlSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it("doesn't offer it without a recorded failure", () => {
+    setup({
+      parakeetModels: [COREML],
+      settings: settingsWith({
+        selectedParakeetVariant: "TdtV3CoreMl",
+        coreMlSwitchFailure: null,
+      }),
+    });
+    render(<TranscriptionTab />);
+    expect(
+      screen.queryByRole("button", { name: /Try the Neural Engine model again/ }),
+    ).toBeNull();
+  });
+
+  it("says the model is being prepared once a CoreML load runs past 3 s", () => {
+    vi.useFakeTimers();
+    try {
+      setup({
+        enginePhase: "initializing",
+        initializingParakeet: { variant: "TdtV3CoreMl", startedAt: Date.now() },
+        parakeetModels: [COREML],
+      });
+      render(<TranscriptionTab />);
+      expect(screen.queryByRole("status")).toBeNull();
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Setting up for the Neural Engine. This happens once.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

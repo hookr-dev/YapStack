@@ -13,6 +13,10 @@ import {
 import { LogsPanel } from "@/components/LogsPanel";
 import { formatBytes, formatElapsed, SOURCE_LABELS_FULL } from "@/lib/utils";
 import { accelDisplayLabel } from "@/lib/accel";
+import {
+  PREPARING_MODEL_DETAIL,
+  usePreparingModel,
+} from "@/hooks/usePreparingModel";
 import { commands } from "@/lib/tauri";
 import type {
   LiveTranscriptionStatus,
@@ -168,6 +172,7 @@ function Section({
 
 export function StatusPopover() {
   const enginePhase = useAppStore((s) => s.enginePhase);
+  const preparingModel = usePreparingModel();
   const engineError = useAppStore((s) => s.engineError);
   const modelDownloadProgress = useAppStore((s) => s.modelDownloadProgress);
   const bufferInfo = useAppStore((s) => s.bufferInfo);
@@ -248,8 +253,10 @@ export function StatusPopover() {
     headerSub = `${Math.round(modelDownloadProgress ?? 0)}%`;
     tone = "amber";
   } else if (enginePhase === "initializing") {
-    headerTitle = "Loading engine";
-    headerSub = "Preparing transcription runtime";
+    headerTitle = preparingModel ? "Preparing model" : "Loading engine";
+    headerSub = preparingModel
+      ? PREPARING_MODEL_DETAIL
+      : "Preparing transcription runtime";
     tone = "amber";
   } else if (enginePhase === "error") {
     headerTitle = "Engine error";

@@ -385,6 +385,11 @@ interface AppState {
   enginePhase: EnginePhase;
   engineError: string | null;
   modelDownloadProgress: number | null;
+  /// The Parakeet variant `initTranscriptionClient` is loading while
+  /// `enginePhase` is `"initializing"`, and when that load started
+  /// (`Date.now()`). A CoreML model's first load compiles it for the Neural
+  /// Engine, which is slow once (ADR 0008).
+  initializingParakeet: { variant: ParakeetVariantDto; startedAt: number } | null;
 
   // Capture (pushed from backend events)
   captureStatus: CaptureStatusDto | null;
@@ -674,6 +679,11 @@ interface AppState {
   refreshSortformerStatus: () => Promise<void>;
   downloadParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
   deleteParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
+  /// Clear `coreMlSwitchFailure` and set the engine up again with
+  /// `autoSetup({ retry: true })`, which tries the switch once more. Throws,
+  /// keeping the record, when the running engine can't be shut down (live
+  /// transcription is running).
+  retryCoreMlSwitch: () => Promise<void>;
   /// Toggle speaker diarization. When flipped on for the first time and
   /// Sortformer is missing, downloads it. Re-inits the client so the new
   /// flag takes effect on the next transcribe call.
@@ -1099,6 +1109,7 @@ function createAppStore() {
       enginePhase: "idle",
       engineError: null,
       modelDownloadProgress: null,
+      initializingParakeet: null,
       captureStatus: null,
       bufferInfo: null,
       currentView: "note-list",
@@ -2337,7 +2348,10 @@ function createAppStore() {
               await get().refreshSortformerStatus();
             }
 
-            set({ enginePhase: "initializing" });
+            set({
+              enginePhase: "initializing",
+              initializingParakeet: { variant, startedAt: Date.now() },
+            });
             let initResult = await commands.initTranscriptionClient(
               "Parakeet",
               variant,
@@ -2351,6 +2365,7 @@ function createAppStore() {
               trackEngineError({ error: commandErrorMessage(initResult.error), phase: "initializing" });
               switchFailure = commandErrorMessage(initResult.error);
               variant = previous;
+              set({ initializingParakeet: { variant, startedAt: Date.now() } });
               initResult = await commands.initTranscriptionClient(
                 "Parakeet",
                 variant,
@@ -2502,6 +2517,17 @@ function createAppStore() {
         await get().refreshParakeetModels();
       },
 
+      retryCoreMlSwitch: async () => {
+        // autoSetup returns early while an engine is ready.
+        const shutdown = await commands.shutdownTranscriptionClient();
+        if (shutdown.status === "error") {
+          throw new Error(commandErrorMessage(shutdown.error));
+        }
+        get().updateSettings({ coreMlSwitchFailure: null });
+        set({ enginePhase: "idle", engineError: null, loadedEngineInfo: null });
+        await get().autoSetup({ retry: true });
+      },
+
       setDiarizationEnabled: async (enabled: boolean) => {
         // Diarization is intentionally locked off pending session-stable
         // speaker IDs. Sortformer::diarize() resets state per call, so the
@@ -2529,8 +2555,14 @@ function createAppStore() {
         get().updateSettings({ diarizationEnabled: false });
 
         if (settings.selectedEngine === "Parakeet") {
-          set({ enginePhase: "initializing" });
-          set({ loadedEngineInfo: null });
+          set({
+            enginePhase: "initializing",
+            initializingParakeet: {
+              variant: settings.selectedParakeetVariant,
+              startedAt: Date.now(),
+            },
+            loadedEngineInfo: null,
+          });
           await commands.shutdownTranscriptionClient();
           const r = await commands.initTranscriptionClient(
             "Parakeet",

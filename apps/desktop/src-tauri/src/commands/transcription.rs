@@ -808,7 +808,7 @@ pub async fn init_transcription_client(
 }
 
 /// Locates the sidecar binary relative to the current executable.
-fn find_sidecar_path() -> Result<PathBuf, CommandError> {
+pub(crate) fn find_sidecar_path() -> Result<PathBuf, CommandError> {
     let exe_dir = std::env::current_exe()
         .map_err(|e| CommandError::Internal {
             message: format!("failed to get current exe: {e}"),

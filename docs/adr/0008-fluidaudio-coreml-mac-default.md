@@ -144,3 +144,20 @@ only `Encoder_v2` is acceptable. FluidAudio needs macOS 14.
   and the release notes say so.
 - **parakeet-rs and ORT stay in the Mac build** for Sortformer, so the Mac
   bundle doesn't shrink by the size of ORT.
+
+## Amendments
+
+### 2026-11-04: where the ANE compile cache lives, and its pruning
+
+Checked on macOS 27 (build 26A434). The cache directory isn't always named
+after the process. When the sidecar runs inside the app bundle
+(`YapStack.app/Contents/MacOS/`), CoreML keys the cache by the app's bundle
+identifier: `~/Library/Caches/dev.yapstack.app/com.apple.e5rt.e5bundlecache/<OS build>/`.
+When it runs unbundled (`pnpm tauri dev`), CoreML keys it by the sidecar's
+executable name. A first load from a bundle with a fresh identifier compiled
+for 22 s and wrote only the identifier's directory.
+
+At startup the host (`coreml_cache.rs`, Apple silicon only) reads the OS build from
+`sysctlbyname("kern.osversion")`. In both of those directories it deletes
+every subdirectory named for another OS build. It doesn't touch files,
+symlinks or anything outside them, and it logs each removal.

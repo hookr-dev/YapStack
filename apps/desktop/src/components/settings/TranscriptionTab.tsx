@@ -15,8 +15,12 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronsUpDown, Info, RotateCw } from "lucide-react";
+import { ChevronsUpDown, Info, Loader2, RotateCw } from "lucide-react";
 import { toast } from "sonner";
+import {
+  PREPARING_MODEL_DETAIL,
+  usePreparingModel,
+} from "@/hooks/usePreparingModel";
 import { ParakeetModelSection } from "./ParakeetModelSection";
 
 /// Friendly display labels for the language codes the engine catalogue
@@ -78,6 +82,11 @@ export function TranscriptionTab() {
   const enginePhase = useAppStore((s) => s.enginePhase);
   const engineError = useAppStore((s) => s.engineError);
   const autoSetup = useAppStore((s) => s.autoSetup);
+  const coreMlSwitchFailed = useAppStore(
+    (s) => s.settings.coreMlSwitchFailure !== null,
+  );
+  const retryCoreMlSwitch = useAppStore((s) => s.retryCoreMlSwitch);
+  const preparingModel = usePreparingModel();
   const setDiarizationEnabled = useAppStore((s) => s.setDiarizationEnabled);
   const [showLanguages, setShowLanguages] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -151,6 +160,42 @@ export function TranscriptionTab() {
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">Model</Label>
         <ParakeetModelSection />
+        {preparingModel && (
+          <div
+            role="status"
+            className="flex gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-2"
+          >
+            <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+            <p className="text-[11px] text-muted-foreground">
+              {PREPARING_MODEL_DETAIL}
+            </p>
+          </div>
+        )}
+        {coreMlSwitchFailed && enginePhase === "ready" && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-2">
+            <p className="text-[11px] text-muted-foreground">
+              The Neural Engine model couldn't be set up, so the previous
+              model is in use.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 shrink-0 text-xs"
+              disabled={retrying}
+              onClick={() => {
+                setRetrying(true);
+                retryCoreMlSwitch()
+                  .catch((e) =>
+                    toast.error(e instanceof Error ? e.message : String(e)),
+                  )
+                  .finally(() => setRetrying(false));
+              }}
+            >
+              <RotateCw className="mr-1 h-3 w-3" />
+              Try the Neural Engine model again
+            </Button>
+          </div>
+        )}
         {enginePhase === "error" && (
           <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 px-2.5 py-2">
             <p className="text-[11px] text-destructive">
