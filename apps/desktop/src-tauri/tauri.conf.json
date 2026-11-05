@@ -4,7 +4,7 @@
   "version": "1.0.0-alpha.12",
   "identifier": "dev.yapstack.app",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm build:sidecars:dev && pnpm dev",
     "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"

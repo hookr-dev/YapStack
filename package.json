@@ -7,7 +7,8 @@
     "url": "git+https://github.com/hookr-dev/YapStack.git"
   },
   "scripts": {
-    "dev": "pnpm --filter @yapstack/desktop build:sidecars:dev && pnpm --filter @yapstack/desktop dev:tauri",
+    "dev": "pnpm --filter @yapstack/desktop dev:tauri",
+    "tauri": "pnpm --filter @yapstack/desktop tauri",
     "dev:frontend": "pnpm --filter @yapstack/desktop dev",
     "build": "pnpm --filter @yapstack/desktop build:all",
     "build:sidecars": "pnpm --filter @yapstack/desktop build:sidecars",
