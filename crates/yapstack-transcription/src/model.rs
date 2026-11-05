@@ -274,6 +274,16 @@ impl SortformerVariant {
     }
 }
 
+/// How long a model download may wait to connect, and then between body
+/// reads, before it fails. A stalled download is an error, so setup moves
+/// on (to the previous model, or the error state) instead of hanging.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(30)
+};
+
 /// Download a file from `url` to `dest` via a temp file, with streaming progress.
 /// `fallback_size` is used when the server doesn't provide Content-Length.
 /// With `sha256`, a download whose content hashes differently is deleted
@@ -287,7 +297,10 @@ async fn download_file(
 ) -> Result<()> {
     let temp_dest = dest.with_extension("download");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()?;
     let response = client.get(url).send().await?;
 
     if !response.status().is_success() {
@@ -703,6 +716,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    /// A server that stops sending mid-body must fail the download (and so
+    /// keep the previous model, ADR 0008), not hang setup forever.
+    #[tokio::test]
+    async fn a_stalled_download_fails() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello")
+                .await
+                .unwrap();
+            // Hold the connection open without sending the rest.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(sock);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.onnx");
+        let result = tokio::time::timeout(
+            DOWNLOAD_READ_TIMEOUT * 4,
+            download_file(&format!("http://{addr}/file"), &dest, 10, None, &|_| {}),
+        )
+        .await
+        .expect("a stall ends the download instead of hanging");
+        assert!(result.is_err(), "{result:?}");
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("download").exists());
     }
 
     /// CoreML bundles are directories, so a file can sit below a folder
