@@ -20,9 +20,12 @@ pnpm install
 
 ### Development
 ```bash
-pnpm tauri dev                    # Run the full app (frontend + backend)
+pnpm dev                          # Run the full app (= pnpm tauri dev)
+pnpm tauri dev -f sync            # Full app with the desktop sync feature
 pnpm dev:frontend                 # Vite dev server only (no Tauri)
 ```
+
+Every `tauri dev` runs `beforeDevCommand`, which rebuilds the dev sidecar (`./scripts/build-sidecars.sh --dev`, a no-op cargo build when nothing changed) and then starts vite. `tauri dev` gives the dev server 180 s to come up, so on a cold `target/` run `./scripts/build-sidecars.sh --dev` once first. On Windows, `tauri.windows.conf.json` keeps `beforeDevCommand` at plain `pnpm dev` (the script is bash), so build the sidecar yourself there.
 
 ### Build
 ```bash
@@ -73,7 +76,7 @@ cargo build -p yapstack-transcription-sidecar --features parakeet               
 
 # Add accelerators
 cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on Intel macOS and Windows)
-cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio      # + the CoreML runtime (what the script builds on Apple silicon; Swift 6.2+ / Xcode 26)
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu,fluidaudio # + the CoreML runtime (what the script builds on Apple silicon; Swift 6.2+ / Xcode 26)
 
 # Default features
 cargo build -p yapstack-transcription-sidecar                                   # = parakeet
@@ -107,7 +110,11 @@ The sidecar is a standalone binary that must be built separately and placed in `
 ./scripts/build-transcription-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-This builds with `--release` and the per-target features (`parakeet,webgpu,fluidaudio` on Apple silicon, `parakeet,webgpu` on Intel macOS and Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
+This builds with `--release` and the per-target features (`parakeet,webgpu,fluidaudio` on Apple silicon, `parakeet,webgpu` on Intel macOS and Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`. `--dev` builds debug and also mirrors the binary and Dawn dylib to `target/debug/`, where `tauri dev` looks for them.
+
+Every copy goes to a temp name and is renamed into place. A plain `cp` over an existing Mach-O keeps its inode, and macOS keeps the old code signature cached for it (always while the old binary is running), so the new one is SIGKILLed at exec (exit 137, no output). On macOS the script then smoke-launches each staged binary with `--model /nonexistent` and fails if it died from a signal.
+
+The CoreML compile cache (ADR [0008](adr/0008-fluidaudio-coreml-mac-default.md)) lives under `~/Library/Caches/dev.yapstack.app/` for the installed app but under the process name (`~/Library/Caches/yapstack-transcription-sidecar-<triple>/`) for an unbundled dev sidecar, so dev and installed builds each compile a model once. Delete that directory to force a cold first load.
 
 The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 

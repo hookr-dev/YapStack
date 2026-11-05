@@ -55,9 +55,10 @@ pnpm typecheck                             # tsc
 # Feature-flag transcription sidecar builds
 cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
 cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP (what ships on Windows)
-cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio                      # + CoreML/ANE via FluidAudio (what ships on Apple silicon; Xcode 26, ADR 0008)
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu,fluidaudio             # + CoreML/ANE via FluidAudio (what ships on Apple silicon; Xcode 26, ADR 0008)
 
-# Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
+# Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/,
+# then smoke-launches the staged copies on macOS)
 ./scripts/build-sidecars.sh
 ./scripts/build-sidecars.sh --dev
 
@@ -67,8 +68,9 @@ YAPSTACK_PARAKEET_ACCEL=cpu|webgpu pnpm tauri dev
 # Frontend only
 pnpm --filter @yapstack/desktop dev
 
-# Full app
-pnpm tauri dev
+# Full app. Every `tauri dev` rebuilds the dev sidecar first (beforeDevCommand), then starts vite.
+pnpm dev                                   # = pnpm tauri dev
+pnpm tauri dev -f sync                     # with the desktop sync feature
 pnpm tauri build
 
 # DMG packaging
@@ -168,6 +170,7 @@ Run through this before declaring a task done.
 - **Intel Mac** is best-effort: don't break it, don't optimize for it.
 - **Windows (x64)** is supported: CI runs clippy and tests on Windows, and releases ship a Windows installer. Parakeet GPU is WebGPU/Dawn, shipping on both macOS and Windows — non-macOS `Auto` attempts WebGPU since Gate C passed (2026-07-05, ADR 0004), with an explicit logged CPU fallback on EP-init failure and `YAPSTACK_PARAKEET_ACCEL=cpu` as the escape hatch. Don't delete platform-specific branches without an ADR.
 - **Linux** is not a target yet (the relay server is the exception: it is deployed on Linux).
+- **Worktrees**: a fresh worktree needs `pnpm install` and the sidecar staged in `apps/desktop/src-tauri/binaries/` (`./scripts/build-sidecars.sh --dev`) before `pnpm check`. Each worktree's `target/` grows to 10–20 GB, so delete it after merge. A worktree nested inside the main checkout (e.g. `.claude/worktrees/`) can't build `yapstack-sync` (so `pnpm check` and `--features sync` both fail): cargo walks up from `vendor/cr-sqlite/core/rs/bundle_static` to the outer checkout's workspace. Append a temporary empty `[workspace]` to `vendor/cr-sqlite/core/rs/bundle_static/Cargo.toml` and revert it before committing.
 - **Tauri secret signing**: the `tauri.conf.json` `pubkey` is the **public** half of an Ed25519 minisign keypair. The private key lives in GitHub Actions Secrets. Do not regenerate without user direction — rotation invalidates auto-update for every existing install.
 
 ## Keeping CI green
@@ -186,6 +189,8 @@ CI (`.github/workflows/ci-checks.yml`) runs more than `pnpm check` does on one m
 - **Windows-only code compiles only in CI.** Anything behind `#[cfg(windows)]` / `cfg(target_os = "windows")` is never built on a Mac. Review those paths by reading them, keep them small, and expect the Windows leg to be the first to catch mistakes.
 - **The Rust toolchain is pinned** in `rust-toolchain.toml`. Bump it in its own PR; new releases routinely add clippy lints, and CI runs clippy with `-D warnings`.
 - **The desktop `sync` feature has its own CI job** ("Rust sync feature (macos-latest)"); `pnpm check` doesn't build it. If you touch sync integration in the desktop crate, run `cargo test -p yapstack-desktop --features sync` locally first (it needs `rustup toolchain install nightly-2023-10-05` for the vendored cr-sqlite bundle).
+- **Tauri npm/Rust versions must align.** `scripts/check-tauri-versions.mjs` (run in the Rust Format job) fails when an `@tauri-apps/*` npm package and its Rust crate resolve to different major.minor versions in the lockfiles, which `tauri build` rejects. Run `node scripts/check-tauri-versions.mjs` locally after bumping a Tauri plugin on either side.
+- **Only Server Integration is path-filtered.** `server-integration.yml` runs when the server/sync/crypto crates, Cargo files, `deploy/` or the workflow change; `ci.yml` runs on every PR push and push to `main`, and a new PR push cancels that PR's in-flight run.
 - **Tests must be deterministic.** Don't assert on thread timing or lock races; SQLite's busy handler isn't fair, so a race that passes locally can starve on a slower runner. Use hooks, channels, or explicit ordering instead.
 - **Never make CI green by retrying, sleeping, or `#[ignore]`-ing a failing test.** Find the cause. If a test is genuinely flaky and blocking, say so and ask before quarantining it.
 - **Dependabot PRs fail for real reasons too.** Check whether the failure reproduces on `main` before blaming the bump, and vice versa.

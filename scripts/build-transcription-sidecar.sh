@@ -61,6 +61,33 @@ fi
 
 mkdir -p "$BINARIES_DIR"
 
+# Copy to a temp name and rename into place, so the destination is always a
+# new inode. A plain `cp` over an existing Mach-O rewrites the same inode, and
+# macOS keeps the old code signature cached for it (especially while the old
+# binary is still running, e.g. in an open `tauri dev`), so the new binary is
+# SIGKILLed at exec.
+install_file() {
+    local src="$1" dest="$2" mode="$3"
+    cp "$src" "$dest.tmp.$$"
+    chmod "$mode" "$dest.tmp.$$"
+    mv -f "$dest.tmp.$$" "$dest"
+}
+
+# Launch a staged binary with a model path that can't exist: it exits right
+# away with an error (non-zero is expected). Dying from a signal (exit >= 128)
+# means it never ran, e.g. macOS SIGKILLing a binary whose code signature
+# doesn't match the one cached for that inode. Run it where it's staged so
+# @executable_path resolves the Dawn dylib next to it.
+smoke_launch() {
+    local bin="$1" status=0
+    "$bin" --engine parakeet --model /nonexistent </dev/null >/dev/null 2>&1 || status=$?
+    if [ "$status" -ge 128 ]; then
+        echo "ERROR: $bin died from signal $((status - 128)) at launch (exit $status)"
+        exit 1
+    fi
+    echo "Smoke launch ok: $bin (exit $status)"
+}
+
 if $RELEASE; then
     PROFILE_LABEL="release"
     CARGO_FLAGS="--release"
@@ -126,8 +153,7 @@ for target in "${TARGETS[@]}"; do
         exit 1
     fi
 
-    cp "$src" "$dest"
-    chmod +x "$dest"
+    install_file "$src" "$dest" 755
     # Strip is also set in Cargo profile.release, but belt-and-suspenders
     if command -v strip &>/dev/null && [[ "$target" != *"windows"* ]]; then
         strip "$dest" 2>/dev/null || true
@@ -154,8 +180,7 @@ for target in "${TARGETS[@]}"; do
                  "(expected because webgpu feature is enabled)"
             exit 1
         fi
-        cp "$dawn_src" "$dawn_dest"
-        chmod 644 "$dawn_dest"
+        install_file "$dawn_src" "$dawn_dest" 644
         echo "Copied Dawn dylib to $dawn_dest"
 
         # install_name_tool errors if the rpath already exists; tolerate.
@@ -165,6 +190,10 @@ for target in "${TARGETS[@]}"; do
                 echo "Added rpath $rp to $dest"
             fi
         done
+    fi
+
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ "$target" == *"apple"* ]]; then
+        smoke_launch "$dest"
     fi
 
     # Windows: ort-sys links Dawn dynamically (webgpu_dawn.dll load-time
@@ -182,7 +211,7 @@ for target in "${TARGETS[@]}"; do
         fi
         shopt -s nullglob
         for dll in "$PROJECT_ROOT/target/$target/$PROFILE_DIR"/*.dll; do
-            cp "$dll" "$BINARIES_DIR/$(basename "$dll")"
+            install_file "$dll" "$BINARIES_DIR/$(basename "$dll")" 755
             echo "Copied $(basename "$dll") to $BINARIES_DIR"
         done
         shopt -u nullglob
@@ -201,16 +230,18 @@ for target in "${TARGETS[@]}"; do
     if ! $RELEASE && [[ "$target" != *"windows"* ]]; then
         dev_runtime_dest="$PROJECT_ROOT/target/debug/yapstack-transcription-sidecar-${target}"
         if [ -d "$PROJECT_ROOT/target/debug" ]; then
-            cp "$dest" "$dev_runtime_dest"
-            chmod +x "$dev_runtime_dest"
+            install_file "$dest" "$dev_runtime_dest" 755
             echo "Mirrored to $dev_runtime_dest (dev runtime path)"
             # Mirror the Dawn dylib next to it so the @executable_path
             # rpath resolves in dev (cargo --target puts it under
             # target/<triple>/debug/, not target/debug/).
             if [[ "$target" == *"apple"* ]] && [[ "$FEATURES" == *"webgpu"* ]]; then
-                cp "$BINARIES_DIR/libwebgpu_dawn.dylib" \
-                   "$PROJECT_ROOT/target/debug/libwebgpu_dawn.dylib"
+                install_file "$BINARIES_DIR/libwebgpu_dawn.dylib" \
+                   "$PROJECT_ROOT/target/debug/libwebgpu_dawn.dylib" 644
                 echo "Mirrored Dawn dylib to target/debug/ (dev runtime path)"
+            fi
+            if [[ "$(uname -s)" == "Darwin" ]] && [[ "$target" == *"apple"* ]]; then
+                smoke_launch "$dev_runtime_dest"
             fi
         fi
     fi
