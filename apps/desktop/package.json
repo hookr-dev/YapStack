@@ -68,7 +68,7 @@
     "dompurify": "^3.4.17",
     "lucide-react": "^1.63.0",
     "marked": "^18.1.2",
-    "openai": "^6.36.0",
+    "openai": "^7.47.0",
     "react": "^19.3.1",
     "react-audio-visualize": "^1.2.0",
     "react-dom": "^19.3.1",
