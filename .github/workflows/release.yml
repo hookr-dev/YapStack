@@ -64,6 +64,7 @@ jobs:
             "Quality Checks / Rust Format"
             "Quality Checks / Rust (macos-latest)"
             "Quality Checks / Rust (windows-latest)"
+            "Quality Checks / Rust fluidaudio feature (macos-26)"
             "Quality Checks / Frontend"
           )
           for _ in $(seq 1 85); do
@@ -95,13 +96,17 @@ jobs:
     # Windows artifact; skipping macOS avoids a wasted sign+notarize pass.
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     needs: [verify-ci]
-    runs-on: macos-latest
+    # The Apple-silicon sidecar links FluidAudio (ADR 0008), whose Swift
+    # package needs Swift 6.2+. Same runner and pinned Xcode as ci-checks.yml's
+    # rust-fluidaudio job, so a release builds the Swift code CI tested.
+    runs-on: macos-26
     timeout-minutes: 120
     environment: release
     permissions:
       contents: read
     env:
       APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -126,7 +131,10 @@ jobs:
         # images can share it while shipping different clang majors, and the
         # clang RESOURCE DIR is the exact absolute path cached build-script
         # output goes stale against. Fingerprint that path directly.
-        run: echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        run: |
+          xcodebuild -version
+          swift --version
+          echo "version=$(xcodebuild -version | head -1 | tr ' ' '-')-$(xcrun clang --print-resource-dir | shasum -a 256 | cut -c1-8)" >> "$GITHUB_OUTPUT"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -134,6 +142,19 @@ jobs:
           shared-key: release-macos
           key: ${{ steps.xcode.outputs.version }}
           cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: SwiftPM cache
+        # As in ci-checks.yml's rust-fluidaudio job. build.rs puts the Swift
+        # build dir at target/<triple>/swift-yfa for a --target build.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            target/aarch64-apple-darwin/swift-yfa
+          key: release-swiftpm-${{ steps.xcode.outputs.version }}-${{ hashFiles('crates/yapstack-transcription-sidecar/swift/YapFluidAudio/**') }}
+          restore-keys: |
+            release-swiftpm-${{ steps.xcode.outputs.version }}-
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -160,9 +181,18 @@ jobs:
         run: pnpm install
 
       - name: Build sidecars
+        # Apple silicon: parakeet,webgpu,fluidaudio (build-transcription-sidecar.sh).
         env:
           SOURCE_DATE_EPOCH: "1"
         run: ./scripts/build-sidecars.sh
+
+      - name: Assert the sidecar links FluidAudio
+        # A build without the feature still runs (int8 on ORT) but can never
+        # load a CoreML model, so check the link rather than trust the flags.
+        run: |
+          bin=apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
+          otool -L "$bin" | grep -q '/CoreML.framework/' \
+            || { echo "::error::$bin does not link CoreML (fluidaudio feature off?)"; exit 1; }
 
       - name: Import code signing certificate
         env:

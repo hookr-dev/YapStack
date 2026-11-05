@@ -19,6 +19,12 @@ type Result<T> = std::result::Result<T, TranscriptionError>;
 type ResponseWaiter = oneshot::Sender<SidecarResponse>;
 type PendingMap = Arc<StdMutex<HashMap<u64, ResponseWaiter>>>;
 
+/// Response budget for a model load. A CoreML model's first load compiles
+/// it for the Neural Engine, which can take a minute or more (ADR 0008).
+const MODEL_LOAD_TIMEOUT_SECS: u64 = 180;
+/// Response budget for an engine query (a cached-state read sidecar-side).
+const ENGINE_QUERY_TIMEOUT_SECS: u64 = 10;
+
 /// Remove ANSI CSI / OSC escape sequences. Tiny state machine — avoids pulling
 /// in a dependency for one place that needs it. Single-pass over the chars().
 fn strip_ansi(input: &str) -> String {
@@ -216,6 +222,10 @@ pub struct TranscriptionClient {
     /// yet. The old mpsc-based design could check `response_rx.is_closed()`;
     /// with per-id oneshot routing we need an explicit liveness flag.
     reader_alive: Arc<AtomicBool>,
+    /// Set by the reader task on the first response since spawn. The
+    /// sidecar loads its `--model` before it reads stdin, so until then a
+    /// request also waits out that load.
+    answered_since_spawn: Arc<AtomicBool>,
     /// Most recent engine info from the sidecar's last successful
     /// `model_loaded` response. `Mutex` (not RwLock) because reads are
     /// rare (status surface, telemetry tagging) and writes are even
@@ -235,6 +245,7 @@ struct SidecarParts {
     pending: PendingMap,
     child: Child,
     reader_alive: Arc<AtomicBool>,
+    answered_since_spawn: Arc<AtomicBool>,
 }
 
 impl TranscriptionClient {
@@ -258,6 +269,7 @@ impl TranscriptionClient {
             next_id: AtomicU64::new(1),
             child: StdMutex::new(parts.child),
             reader_alive: parts.reader_alive,
+            answered_since_spawn: parts.answered_since_spawn,
             last_engine_info: Arc::new(StdMutex::new(None)),
             sidecar_path: sidecar_path.to_path_buf(),
             engine,
@@ -314,6 +326,7 @@ impl TranscriptionClient {
 
         let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let reader_alive = Arc::new(AtomicBool::new(true));
+        let answered_since_spawn = Arc::new(AtomicBool::new(false));
 
         // Spawn reader task with clones of the pending map + liveness flag
         // so it can route per-id responses and signal exit when stdout closes.
@@ -321,6 +334,7 @@ impl TranscriptionClient {
             stdout,
             pending.clone(),
             reader_alive.clone(),
+            answered_since_spawn.clone(),
         ));
 
         // Spawn stderr reader task to forward sidecar logs to tracing
@@ -333,6 +347,7 @@ impl TranscriptionClient {
             pending,
             child,
             reader_alive,
+            answered_since_spawn,
         })
     }
 
@@ -345,7 +360,12 @@ impl TranscriptionClient {
     /// Clears `reader_alive` on exit (EOF or I/O error) so `is_running()` can
     /// detect a dead IPC pipeline even when the child process hasn't reported
     /// its exit status yet.
-    async fn reader_task(stdout: ChildStdout, pending: PendingMap, reader_alive: Arc<AtomicBool>) {
+    async fn reader_task(
+        stdout: ChildStdout,
+        pending: PendingMap,
+        reader_alive: Arc<AtomicBool>,
+        answered_since_spawn: Arc<AtomicBool>,
+    ) {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
 
@@ -357,6 +377,7 @@ impl TranscriptionClient {
                     }
                     match serde_json::from_str::<SidecarResponse>(&line) {
                         Ok(response) => {
+                            answered_since_spawn.store(true, Ordering::Release);
                             log_sidecar_response(&response);
                             // Skip Progress — it is informational and doesn't
                             // terminate the waiter's oneshot.
@@ -597,8 +618,7 @@ impl TranscriptionClient {
             .dispatch_request(|id| SidecarRequest::LoadModel { id, model_path })
             .await?;
 
-        // 60 seconds timeout for model loading
-        let response = self.await_response(id, rx, 60).await?;
+        let response = self.await_response(id, rx, MODEL_LOAD_TIMEOUT_SECS).await?;
 
         match response {
             SidecarResponse::ModelLoaded {
@@ -632,13 +652,17 @@ impl TranscriptionClient {
     /// Asks the sidecar what model it currently has loaded — used at
     /// initial spawn time when the model was loaded from the `--model`
     /// CLI arg before the IPC loop started, so no `model_loaded` was
-    /// ever emitted. Cheap on the sidecar side (cached state read).
+    /// ever emitted. Cheap on the sidecar side (cached state read), but
+    /// the first call after spawn waits out that startup load
+    /// ([`Self::engine_query_budget_secs`]).
     /// Caches the result for later retrieval via [`Self::engine_info`].
     pub async fn query_engine_info(&self) -> Result<EngineInfo> {
         let (id, rx) = self
             .dispatch_request(|id| SidecarRequest::QueryEngineInfo { id })
             .await?;
-        let response = self.await_response(id, rx, 10).await?;
+        let response = self
+            .await_response(id, rx, self.engine_query_budget_secs())
+            .await?;
         match response {
             SidecarResponse::EngineInfo {
                 accel,
@@ -665,6 +689,16 @@ impl TranscriptionClient {
             _ => Err(TranscriptionError::SidecarError(
                 "unexpected response type for query_engine_info".to_string(),
             )),
+        }
+    }
+
+    /// An engine query sent before the sidecar's first answer queues
+    /// behind its startup model load, so it gets the load budget too.
+    fn engine_query_budget_secs(&self) -> u64 {
+        if self.answered_since_spawn.load(Ordering::Acquire) {
+            ENGINE_QUERY_TIMEOUT_SECS
+        } else {
+            MODEL_LOAD_TIMEOUT_SECS + ENGINE_QUERY_TIMEOUT_SECS
         }
     }
 
@@ -760,6 +794,7 @@ impl TranscriptionClient {
         self.stdin = TokioMutex::new(parts.stdin);
         self.pending = parts.pending;
         self.reader_alive = parts.reader_alive;
+        self.answered_since_spawn = parts.answered_since_spawn;
         *self.child.lock().expect("child mutex poisoned") = parts.child;
         // Reset cached engine info — the new sidecar hasn't loaded yet,
         // so the previous values would be stale.
@@ -814,5 +849,64 @@ impl Drop for TranscriptionClient {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.start_kill();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod response_budget_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stand-in sidecar: sleeps `startup_secs` (its `--model` load), then
+    /// answers every request line with an `engine_info` carrying its id.
+    fn fake_sidecar(dir: &Path, startup_secs: u64) -> PathBuf {
+        let path = dir.join("fake-sidecar");
+        let script = format!(
+            "#!/bin/sh\nsleep {startup_secs}\nwhile read -r line; do\n  \
+             id=$(printf '%s' \"$line\" | sed 's/.*\"id\":\\([0-9]*\\).*/\\1/')\n  \
+             printf '{{\"type\":\"engine_info\",\"id\":%s,\"accel\":\"cpu\"}}\\n' \"$id\"\n\
+             done\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn spawn_fake(dir: &Path, startup_secs: u64) -> TranscriptionClient {
+        TranscriptionClient::spawn(
+            &fake_sidecar(dir, startup_secs),
+            EngineKind::Parakeet,
+            Path::new("/model"),
+            None,
+        )
+        .await
+        .expect("spawn fake sidecar")
+    }
+
+    /// The sidecar loads its `--model` before it reads stdin, so the first
+    /// engine query after spawn waits out that load. A first CoreML load
+    /// compiles for the Neural Engine and can run well past the query's own
+    /// budget (ADR 0008).
+    #[tokio::test]
+    async fn first_engine_query_waits_out_a_slow_startup_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = spawn_fake(dir.path(), ENGINE_QUERY_TIMEOUT_SECS + 1).await;
+        let info = client
+            .query_engine_info()
+            .await
+            .expect("first query outlasts the startup load");
+        assert_eq!(info.accel.as_deref(), Some("cpu"));
+    }
+
+    #[tokio::test]
+    async fn engine_query_budget_drops_to_its_own_once_the_sidecar_has_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = spawn_fake(dir.path(), 0).await;
+        assert_eq!(
+            client.engine_query_budget_secs(),
+            MODEL_LOAD_TIMEOUT_SECS + ENGINE_QUERY_TIMEOUT_SECS
+        );
+        client.query_engine_info().await.expect("query");
+        assert_eq!(client.engine_query_budget_secs(), ENGINE_QUERY_TIMEOUT_SECS);
     }
 }

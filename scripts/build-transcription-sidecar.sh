@@ -83,6 +83,13 @@ for target in "${TARGETS[@]}"; do
     FEATURES="parakeet"
     if [[ "$target" == *"apple"* ]]; then
         FEATURES="parakeet,webgpu"
+        # Apple silicon also links FluidAudio (Parakeet on CoreML / the
+        # Neural Engine, ADR 0008). build.rs runs `swift build`, which needs
+        # Swift 6.2+ (Xcode 26). It is only used for a model folder of
+        # `.mlmodelc` bundles; an ONNX folder still loads on ORT.
+        if [[ "$target" == "aarch64-apple-darwin" ]]; then
+            FEATURES="parakeet,webgpu,fluidaudio"
+        fi
         # The app's floor (tauri.conf.json bundle.macOS.minimumSystemVersion,
         # ADR 0008). tauri-build sets it for the app binary; the sidecar is
         # built here, outside the Tauri build, so it needs it explicitly.

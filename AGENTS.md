@@ -54,8 +54,8 @@ pnpm typecheck                             # tsc
 
 # Feature-flag transcription sidecar builds
 cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
-cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP (what ships)
-cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio                      # + CoreML/ANE via FluidAudio (Apple silicon, Xcode 26; ADR 0008, not shipped yet)
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP (what ships on Windows)
+cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio                      # + CoreML/ANE via FluidAudio (what ships on Apple silicon; Xcode 26, ADR 0008)
 
 # Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
 ./scripts/build-sidecars.sh

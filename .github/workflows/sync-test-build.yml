@@ -91,7 +91,9 @@ jobs:
     # Dispatch-only, and NOT gated on refs/tags (unlike release.yml build-macos):
     # any ref is buildable. Untick `mac` to skip this job.
     if: ${{ inputs.mac }}
-    runs-on: macos-latest
+    # Same runner and pinned Xcode as release.yml's build-macos: the
+    # Apple-silicon sidecar links FluidAudio, which needs Swift 6.2+.
+    runs-on: macos-26
     timeout-minutes: 120
     # Only a signed build needs the `release` environment (Apple secrets). Every build
     # here disables updater artifacts, so the Tauri updater signing key is never needed.
@@ -100,6 +102,7 @@ jobs:
       contents: read
     env:
       APTABASE_KEY: ${{ secrets.APTABASE_KEY }}
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -123,6 +126,18 @@ jobs:
           shared-key: sync-test-macos
           key: ${{ steps.xcode.outputs.version }}
           cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: SwiftPM cache
+        # As in release.yml's build-macos.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            target/aarch64-apple-darwin/swift-yfa
+          key: sync-test-swiftpm-${{ steps.xcode.outputs.version }}-${{ hashFiles('crates/yapstack-transcription-sidecar/swift/YapFluidAudio/**') }}
+          restore-keys: |
+            sync-test-swiftpm-${{ steps.xcode.outputs.version }}-
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -151,9 +166,9 @@ jobs:
       - name: Build sidecars
         # Real transcription sidecar + libwebgpu_dawn.dylib, staged exactly as
         # release.yml's build-macos does. No target arg: build-sidecars.sh's
-        # detect_host_triple resolves the arm64 macos-latest runner to
+        # detect_host_triple resolves the arm64 macos-26 runner to
         # aarch64-apple-darwin, builds -p yapstack-transcription-sidecar with
-        # parakeet,webgpu, copies the binary into
+        # parakeet,webgpu,fluidaudio, copies the binary into
         # apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin,
         # and stages libwebgpu_dawn.dylib (which tauri.conf.json bundles as a macOS
         # framework). Uses no secrets — pure unsigned build. SOURCE_DATE_EPOCH matches
