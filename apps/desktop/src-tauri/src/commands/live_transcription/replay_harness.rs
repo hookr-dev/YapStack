@@ -7,15 +7,22 @@
 //!   float, any rate and channel count; mixed down to mono as capture is).
 //! - `YAPSTACK_REPLAY_OUT`: where the chunk WAVs and `manifest.jsonl` go.
 //! - `YAPSTACK_REPLAY_MODE`:
-//!   - `live`: the VAD state machine over the whole clip, as the live loop
-//!     cuts it.
+//!   - `live`: `backfill_chunks_from_probabilities` over the whole clip: the
+//!     frame-based state machine backfill uses to match live segmentation
+//!     (same tuning, hysteresis, pre-roll and pause-search cuts). It is not
+//!     the polled live loop (`poll_vad`) itself, which times silence and
+//!     chunk length by wall clock.
 //!   - `backfill`: `vad_chunk_historical_audio`, the backfill path (VAD
 //!     chunks, then the job-quantum split).
 //!   - `rewind`: a session started with a rewind while someone was talking.
 //!     The backfill buffer ends at the first confident speech frame after
-//!     the clip's midpoint; the seam is handed over as
-//!     `carry_open_tail_into_live` does, and the live side is the VAD state
-//!     machine from the seam on, its first chunk opened at the carried start.
+//!     the clip's midpoint. `carry_open_tail_into_live` runs on a real
+//!     `SourceVadState` and decides how much backfill keeps; the live side
+//!     is the same frame-based state machine from the seam on, started
+//!     speaking at the carried start with the carried audio already counted
+//!     towards the max chunk length. One difference from the app: a length
+//!     cut in the first live chunk searches only frames after the seam,
+//!     where the app's `recent_frames` also holds the carried ones.
 
 use super::*;
 use std::io::Write as _;
@@ -53,6 +60,36 @@ fn offset(chunks: Vec<VadBackfillChunk>, by: usize) -> Vec<VadBackfillChunk> {
         .collect()
 }
 
+/// Live chunks from `seam` on, for a mono source whose cursor is at `seam`
+/// and which `carry_open_tail_into_live` may have left speaking: the walk
+/// then starts mid-utterance at the carried start, with the carried audio
+/// already counted towards the max chunk length.
+fn live_chunks_after_carry(
+    source: &SourceVadState,
+    seam: usize,
+    live_probs: &[f32],
+    live_len: usize,
+    sr: u32,
+    tuning: &VadTuning,
+) -> Vec<VadBackfillChunk> {
+    let open = source.is_speaking.then(|| OpenSpeech {
+        start: 0,
+        frames: ((seam - source.speech_start_pos) as f32
+            / sr as f32
+            / super::super::silero_vad::FRAME_DURATION_SECS) as usize,
+    });
+    let mut live = offset(
+        vad_chunks_and_open_tail(live_probs, live_len, sr, tuning, open).0,
+        seam,
+    );
+    if open.is_some() {
+        if let Some(first) = live.first_mut() {
+            first.start = source.speech_start_pos;
+        }
+    }
+    live
+}
+
 fn rewind_chunks(mono: &[f32], sr: u32, tuning: &VadTuning) -> Vec<VadBackfillChunk> {
     use super::super::silero_vad::frame_start_sample;
     let mut silero = SileroVad::new().expect("silero");
@@ -64,13 +101,12 @@ fn rewind_chunks(mono: &[f32], sr: u32, tuning: &VadTuning) -> Vec<VadBackfillCh
     // A few samples into the speech frame, so the seam lands mid-speech.
     let seam = (frame_start_sample(onset, sr) + 300).min(mono.len());
 
+    // As session start does it: score the backfill's tail, hand an open
+    // utterance to the live source, and truncate the backfill there.
     let tail_offset = seam.saturating_sub((BACKFILL_SEAM_SCORE_SECS * sr as f32) as usize);
     let tail_probs = silero.score_all(&mono[tail_offset..seam], sr);
-    let (tail, open) = vad_chunks_and_open_tail(&tail_probs, seam - tail_offset, sr, tuning);
-    let keep = match tail.last() {
-        Some(c) if open => tail_offset + c.start,
-        _ => seam,
-    };
+    let mut source = SourceVadState::new(AudioSourceLabel::Mic, seam, 0, sr, 1, 0.0);
+    let keep = carry_open_tail_into_live(&mut source, seam, tail_offset, &tail_probs, sr, tuning);
 
     let mut chunks = if keep > 0 {
         vad_chunk_historical_audio(&mono[..keep], sr, tuning)
@@ -78,23 +114,14 @@ fn rewind_chunks(mono: &[f32], sr: u32, tuning: &VadTuning) -> Vec<VadBackfillCh
         Vec::new()
     };
     let live_probs = silero.score_all(&mono[seam..], sr);
-    let mut live = offset(
-        backfill_chunks_from_probabilities(&live_probs, mono.len() - seam, sr, tuning),
+    chunks.extend(live_chunks_after_carry(
+        &source,
         seam,
-    );
-    if keep < seam {
-        // The live source starts speaking at `keep`.
-        if live.first().is_some_and(|c| c.start == seam) {
-            live[0].start = keep;
-        } else {
-            let end = live
-                .first()
-                .map_or(mono.len(), |c| c.start)
-                .min(seam + sr as usize / 2);
-            live.insert(0, VadBackfillChunk { start: keep, end });
-        }
-    }
-    chunks.extend(live);
+        &live_probs,
+        mono.len() - seam,
+        sr,
+        tuning,
+    ));
     chunks
 }
 
@@ -144,5 +171,75 @@ fn replay_chunk_boundaries() {
             });
             writeln!(manifest, "{row}").expect("write manifest");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rewind seam 8 s into an utterance, then 6 s of speech the live
+    /// Silero stream scores between the offset and onset thresholds, then
+    /// silence. The live source the carry leaves is already speaking, so
+    /// the app keeps that speech, cuts the carried chunk for length about
+    /// 10 s after its start, and makes no chunk boundary at the seam.
+    #[test]
+    fn live_after_a_carry_continues_the_open_utterance() {
+        let sr = 16_000u32;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let frame = 512usize;
+        let tail_offset = 5 * sr as usize;
+        let seam = 20 * sr as usize;
+        let (silent, speech) = (218usize, 250usize);
+        let mut tail_probs = vec![0.1f32; silent];
+        tail_probs.extend(std::iter::repeat_n(0.9, speech));
+        let mut source = SourceVadState::new(AudioSourceLabel::Mic, seam, 0, sr, 1, 0.0);
+        let keep =
+            carry_open_tail_into_live(&mut source, seam, tail_offset, &tail_probs, sr, &tuning);
+        assert!(keep < seam && source.is_speaking);
+
+        let mut live_probs = vec![0.4f32; 6 * 1000 / 32];
+        live_probs.extend(std::iter::repeat_n(0.1, 2 * 1000 / 32));
+        let live_len = live_probs.len() * frame;
+        let chunks = live_chunks_after_carry(&source, seam, &live_probs, live_len, sr, &tuning);
+
+        let max = tuning.max_chunk_duration.as_secs_f32() * sr as f32;
+        let first = chunks[0];
+        assert_eq!(first.start, keep);
+        assert!(
+            (first.end - first.start) as f32 <= max + frame as f32,
+            "{chunks:?}"
+        );
+        assert!(first.end > seam + sr as usize, "{chunks:?}");
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "{chunks:?}");
+        }
+        assert!(
+            chunks.last().unwrap().end >= seam + 6 * sr as usize,
+            "{chunks:?}"
+        );
+    }
+
+    #[test]
+    fn open_speech_seed_starts_the_walk_speaking() {
+        let sr = 16_000u32;
+        let tuning = profile_for(EngineKind::Parakeet).vad_tuning;
+        let probs = vec![0.4f32; 40];
+        let (none, still_open) = vad_chunks_and_open_tail(&probs, 40 * 512, sr, &tuning, None);
+        assert!(none.is_empty() && !still_open);
+        let seed = OpenSpeech {
+            start: 0,
+            frames: 0,
+        };
+        let (seeded, still_open) =
+            vad_chunks_and_open_tail(&probs, 40 * 512, sr, &tuning, Some(seed));
+        assert!(still_open);
+        assert_eq!(
+            seeded,
+            vec![VadBackfillChunk {
+                start: 0,
+                end: 40 * 512
+            }]
+        );
     }
 }

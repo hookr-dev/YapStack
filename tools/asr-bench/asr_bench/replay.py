@@ -159,7 +159,7 @@ def replay(repo: Path, wavs: list[Path], mode: str, out: Path) -> list[dict]:
     return [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
 
 
-def timestamps_ok(segments: list[dict], chunk_ms: float) -> bool:
+def segment_ts_ok(segments: list[dict], chunk_ms: float) -> bool:
     """Every segment in order and inside the chunk."""
     if not segments:
         return False
@@ -178,17 +178,19 @@ class Scored:
     chunks: list[dict]
 
 
-def score(sc: Sidecar, manifest: list[dict], normalizer: str) -> Scored:
+def score(sc: Sidecar, clips: list[Path], manifest: list[dict], normalizer: str) -> Scored:
     """Transcribe each chunk the app would send and score per clip.
 
     - empty: a chunk sent to the sidecar came back with no text (an error
       counts as empty too, and is also counted under errors).
     - truncated: a clip whose transcript drops `TRUNCATION_RUN` or more
       consecutive reference words.
-    - timestamp_bad: a chunk with text whose segments are missing, out of
+    - segment_ts_bad: a chunk with text whose segments are missing, out of
       order, or end past the chunk.
     """
-    by_clip: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    # Every input clip is scored, so one the chunker cut nothing from counts
+    # as fully deleted rather than dropping out of the WER.
+    by_clip: dict[str, list[tuple[int, str]]] = {str(c.resolve()): [] for c in clips}
     chunks = []
     empty = errors = skipped = ts_bad = 0
     for r in manifest:
@@ -203,11 +205,11 @@ def score(sc: Sidecar, manifest: list[dict], normalizer: str) -> Scored:
             if not text:
                 empty += 1
             else:
-                ts = timestamps_ok(t.segments, secs * 1000)
+                ts = segment_ts_ok(t.segments, secs * 1000)
                 ts_bad += not ts
-        by_clip[r["clip"]].append((r["idx"], text))
+        by_clip.setdefault(r["clip"], []).append((r["idx"], text))
         chunks.append({"clip": r["clip"], "idx": r["idx"], "secs": round(secs, 3), "skipped": secs < MIN_CHUNK_SECS,
-                       "text": text, "error": error or "", "timestamps_ok": ts})
+                       "text": text, "error": error or "", "segment_ts_ok": ts})
 
     pairs, truncated = [], 0
     for clip, parts in by_clip.items():
@@ -223,7 +225,7 @@ def score(sc: Sidecar, manifest: list[dict], normalizer: str) -> Scored:
         "wer": None if e.wer is None else round(e.wer * 100, 2),
         "empty": empty,
         "truncated": truncated,
-        "timestamp_bad": ts_bad,
+        "segment_ts_bad": ts_bad,
         "errors": errors,
     }
     return Scored(row, chunks)
@@ -232,7 +234,7 @@ def score(sc: Sidecar, manifest: list[dict], normalizer: str) -> Scored:
 def gate(rows: list[dict], baseline: str, wer_margin: float) -> list[dict]:
     """AE-G1 against `baseline` (a row key, NAME:EP): on every slice x mode
     the baseline ran, each other model's WER is within `wer_margin` points
-    of it, and its empty, truncated and bad-timestamp counts are no higher
+    of it, and its empty, truncated and bad segment-timestamp counts are no higher
     (same replayed chunks; owner ruling 2026-11-04, ADR 0008)."""
     base = {(r["slice"], r["mode"]): r for r in rows if r["key"] == baseline}
     if not base:
@@ -250,7 +252,7 @@ def gate(rows: list[dict], baseline: str, wer_margin: float) -> list[dict]:
             fails = []
             if delta > wer_margin:
                 fails.append(f"WER {delta:+.2f} pt")
-            for k in ("empty", "truncated", "timestamp_bad"):
+            for k in ("empty", "truncated", "segment_ts_bad"):
                 if r[k] > b[k]:
                     fails.append(f"{k} {r[k]} > {b[k]}")
             out.append({**check, "wer_delta": delta, "pass": not fails, "why": "; ".join(fails)})
@@ -260,17 +262,17 @@ def gate(rows: list[dict], baseline: str, wer_margin: float) -> list[dict]:
 def markdown(rows: list[dict], checks: list[dict] | None, header: list[str], baseline: str | None, wer_margin: float) -> str:
     lines = header + [
         "",
-        "| Slice | Mode | Model | Loaded | Clips | Chunks | WER % | Empty | Truncated | Timestamp bad | Errors |",
+        "| Slice | Mode | Model | Loaded | Clips | Chunks | WER % | Empty | Truncated | Segment timestamps bad | Errors |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         wer = "" if r["wer"] is None else f"{r['wer']:.2f}"
         lines.append(f"| {r['slice']} | {r['mode']} | {r['key']} | {r['accel_loaded']} | {r['clips']} | {r['chunks']} | "
-                     f"{wer} | {r['empty']} | {r['truncated']} | {r['timestamp_bad']} | {r['errors']} |")
+                     f"{wer} | {r['empty']} | {r['truncated']} | {r['segment_ts_bad']} | {r['errors']} |")
     if checks is not None:
         lines += [
             "",
-            f"AE-G1 vs `{baseline}`: WER ≤ baseline + {wer_margin:g} pt, empty / truncated / timestamp-bad ≤ baseline, on every slice x mode.",
+            f"AE-G1 vs `{baseline}`: WER ≤ baseline + {wer_margin:g} pt, empty / truncated / segment-timestamp-bad ≤ baseline, on every slice x mode.",
             "",
             "| Slice | Mode | Model | Δ WER pt | Pass | Why |",
             "|---|---|---|---|---|---|",

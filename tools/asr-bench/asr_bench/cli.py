@@ -329,15 +329,15 @@ def cmd_replay(args) -> int:
         wavs = replay_mod.slice_wavs(corpus_dir, s, args.limit)
         for m in modes:
             print(f"== replay {s} {m}: {len(wavs)} clips", flush=True)
-            manifests[(s, m)] = replay_mod.replay(REPO, wavs, m, out / "chunks" / f"{s}-{m}")
+            manifests[(s, m)] = (wavs, replay_mod.replay(REPO, wavs, m, out / "chunks" / f"{s}-{m}"))
 
     rows, chunks = [], []
     for name, model_dir, accel in rows_to_run:
         key = f"{name}:{accel}"
         print(f"== {key}: {model_dir}", flush=True)
         sc = Sidecar(sidecar, model_dir, accel, logs / f"{name}-{accel}.stderr")
-        for (s, m), manifest in manifests.items():
-            scored = replay_mod.score(sc, manifest, args.normalizer)
+        for (s, m), (wavs, manifest) in manifests.items():
+            scored = replay_mod.score(sc, wavs, manifest, args.normalizer)
             rows.append({"slice": s, "mode": m, "key": key, "model": name, "accel_requested": accel,
                          "accel_loaded": sc.stats.accel or "", **scored.row})
             chunks += [{"slice": s, "mode": m, "key": key, **c} for c in scored.chunks]
@@ -354,7 +354,7 @@ def cmd_replay(args) -> int:
         f"- Sidecar: {sidecar_description(sidecar)}",
         f"- Chunks under {replay_mod.MIN_CHUNK_SECS} s are skipped, as the app skips them. Empty: a sent chunk came back with no text. "
         f"Truncated: a clip missing {replay_mod.TRUNCATION_RUN}+ consecutive reference words. "
-        f"Timestamp bad: a chunk with text whose segments are missing, out of order, or end over {replay_mod.TIMESTAMP_SLACK_MS} ms past the chunk.",
+        f"Segment timestamps bad: a chunk with text whose segments are missing, out of order, or end over {replay_mod.TIMESTAMP_SLACK_MS} ms past the chunk.",
     ]
     md = replay_mod.markdown(rows, checks, header, args.baseline, args.wer_margin)
     (out / "replay.md").write_text(md)

@@ -2269,16 +2269,27 @@ fn backfill_chunks_from_probabilities(
     sample_rate: u32,
     tuning: &VadTuning,
 ) -> Vec<VadBackfillChunk> {
-    vad_chunks_and_open_tail(probabilities, total_samples, sample_rate, tuning).0
+    vad_chunks_and_open_tail(probabilities, total_samples, sample_rate, tuning, None).0
+}
+
+/// Speech already running when the buffer begins: the state machine starts
+/// speaking, with its chunk opened at sample `start` and `frames` frames
+/// already counted towards `max_chunk_duration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenSpeech {
+    start: usize,
+    frames: usize,
 }
 
 /// `backfill_chunks_from_probabilities`, plus whether the last chunk is
-/// still open: speech that hadn't ended when the buffer did.
+/// still open: speech that hadn't ended when the buffer did. `open` starts
+/// the walk mid-utterance instead of in silence.
 fn vad_chunks_and_open_tail(
     probabilities: &[f32],
     total_samples: usize,
     sample_rate: u32,
     tuning: &VadTuning,
+    open: Option<OpenSpeech>,
 ) -> (Vec<VadBackfillChunk>, bool) {
     if probabilities.is_empty() || total_samples == 0 {
         return (Vec::new(), false);
@@ -2303,13 +2314,13 @@ fn vad_chunks_and_open_tail(
     let pre_roll_samples = (tuning.pre_roll.as_secs_f32() * sample_rate as f32) as usize;
 
     let mut chunks: Vec<VadBackfillChunk> = Vec::new();
-    let mut is_speaking = false;
-    let mut speech_start: usize = 0;
+    let mut is_speaking = open.is_some();
+    let mut speech_start: usize = open.map_or(0, |o| o.start);
     let mut silence_run: usize = 0;
-    let mut speech_run: usize = 0;
+    let mut speech_run: usize = open.map_or(0, |o| o.frames);
     // Pre-roll must not rewind past the last emitted chunk's end, or the
     // next chunk would re-transcribe the tail of the previous one.
-    let mut prev_chunk_end: usize = 0;
+    let mut prev_chunk_end: usize = speech_start;
 
     for (frame_idx, &prob) in probabilities.iter().enumerate() {
         let w_start = frame_start_sample(frame_idx, sample_rate);
@@ -2396,8 +2407,13 @@ fn carry_open_tail_into_live(
     tuning: &VadTuning,
 ) -> usize {
     use super::silero_vad::frame_start_sample;
-    let (chunks, open) =
-        vad_chunks_and_open_tail(tail_probs, backfill_len - tail_offset, sample_rate, tuning);
+    let (chunks, open) = vad_chunks_and_open_tail(
+        tail_probs,
+        backfill_len - tail_offset,
+        sample_rate,
+        tuning,
+        None,
+    );
     let Some(last) = chunks.last().filter(|_| open) else {
         return backfill_len;
     };

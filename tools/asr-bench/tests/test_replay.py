@@ -20,7 +20,7 @@ def tone(seconds: float, rate: int = 16000) -> np.ndarray:
 
 
 def row(key, wer, empty=0, truncated=0, ts=0, slice_="long", mode="live"):
-    return {"key": key, "slice": slice_, "mode": mode, "wer": wer, "empty": empty, "truncated": truncated, "timestamp_bad": ts}
+    return {"key": key, "slice": slice_, "mode": mode, "wer": wer, "empty": empty, "truncated": truncated, "segment_ts_bad": ts}
 
 
 class Truncation(unittest.TestCase):
@@ -37,10 +37,10 @@ class Truncation(unittest.TestCase):
 class Timestamps(unittest.TestCase):
     def test_segments_must_be_present_ordered_and_inside_the_chunk(self):
         seg = lambda s, e: {"start_ms": s, "end_ms": e}
-        self.assertTrue(replay.timestamps_ok([seg(0, 500), seg(500, 1040)], 1000))  # within the 50 ms slack
-        self.assertFalse(replay.timestamps_ok([seg(0, 1100)], 1000))
-        self.assertFalse(replay.timestamps_ok([seg(500, 900), seg(100, 200)], 1000))
-        self.assertFalse(replay.timestamps_ok([], 1000))
+        self.assertTrue(replay.segment_ts_ok([seg(0, 500), seg(500, 1040)], 1000))  # within the 50 ms slack
+        self.assertFalse(replay.segment_ts_ok([seg(0, 1100)], 1000))
+        self.assertFalse(replay.segment_ts_ok([seg(500, 900), seg(100, 200)], 1000))
+        self.assertFalse(replay.segment_ts_ok([], 1000))
 
 
 class Gate(unittest.TestCase):
@@ -58,7 +58,7 @@ class Gate(unittest.TestCase):
                 row("int8:auto", 5.0, 1, 1, 0, mode="backfill"), row("fa:auto", 4.0, 2, 2, 1, mode="backfill")]
         checks = replay.gate(rows, "int8:auto", 1.0)
         self.assertEqual([c["pass"] for c in checks], [True, False])
-        self.assertEqual(checks[1]["why"], "empty 2 > 1; truncated 2 > 1; timestamp_bad 1 > 0")
+        self.assertEqual(checks[1]["why"], "empty 2 > 1; truncated 2 > 1; segment_ts_bad 1 > 0")
 
     def test_a_slice_the_candidate_did_not_run_fails(self):
         rows = [row("int8:auto", 5.0), row("int8:auto", 5.0, mode="backfill"), row("fa:auto", 5.0)]
@@ -95,19 +95,35 @@ class BuildCorpus(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    def corpus(self, root: Path) -> Path:
+    def corpus(self, root: Path, names=("a", "b", "c")) -> Path:
         corpus = root / "corpus"
         (corpus / "long").mkdir(parents=True)
         (corpus / "corpus.json").write_text(json.dumps({"version": "test-v1", "source": ["fake"], "clips": {"long": 3}}))
-        for name in ("a", "b", "c"):
+        for name in names:
             soundfile.write(str(corpus / "long" / f"{name}.wav"), tone(2.0), 16000, subtype="PCM_16")
             (corpus / "long" / f"{name}.txt").write_text("hello world hello world")
         return corpus
 
-    def run_replay(self, root: Path, *extra: str) -> int:
+    def run_replay(self, root: Path, *extra: str, names=("a", "b", "c")) -> int:
         with mock.patch.object(replay, "harness_command", return_value=[sys.executable, str(FAKE_HARNESS)]):
-            return cli.main(["replay", "--sidecar", str(FAKE), "--corpus-dir", str(self.corpus(root)), "--slice", "long",
+            return cli.main(["replay", "--sidecar", str(FAKE), "--corpus-dir", str(self.corpus(root, names)), "--slice", "long",
                              "--mode", "live,backfill", "--limit", "2", "--out", str(root / "out"), *extra])
+
+    def test_a_clip_with_no_chunks_scores_as_fully_deleted(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            code = self.run_replay(root, "--model", f"m={root}", names=("a", "b_nochunks"))
+            self.assertEqual(code, 0)
+            r = json.loads((root / "out" / "replay.json").read_text())["rows"][0]
+            self.assertEqual((r["clips"], r["chunks"], r["truncated"], r["wer"]), (2, 3, 1, 50.0))
+
+    def test_a_sidecar_error_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            code = self.run_replay(root, "--model", f"m={root}", names=("a", "b_fail"))
+            self.assertEqual(code, 1)
+            r = json.loads((root / "out" / "replay.json").read_text())["rows"][0]
+            self.assertEqual((r["errors"], r["empty"]), (2, 2))
 
     def test_scores_every_model_on_the_same_chunks_and_passes_the_gate(self):
         with tempfile.TemporaryDirectory() as d:
@@ -122,7 +138,7 @@ class EndToEnd(unittest.TestCase):
             r = result["rows"][0]
             self.assertEqual((r["slice"], r["mode"], r["key"], r["accel_loaded"]), ("long", "live", "int8:auto", "auto"))
             self.assertEqual((r["clips"], r["chunks"], r["skipped"], r["wer"]), (2, 6, 2, 0.0))
-            self.assertEqual((r["empty"], r["truncated"], r["timestamp_bad"], r["errors"]), (0, 0, 0, 0))
+            self.assertEqual((r["empty"], r["truncated"], r["segment_ts_bad"], r["errors"]), (0, 0, 0, 0))
             self.assertTrue(all(c["pass"] for c in result["gate"]))
             md = (root / "out" / "replay.md").read_text()
             self.assertIn("`test-v1, first 2 clips per slice`", md)
