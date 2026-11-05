@@ -382,19 +382,19 @@ pub use model::{ModelManager, ParakeetVariant, SortformerVariant};
 
 ### ModelManager (`model.rs`)
 
-Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. Parakeet files are pinned to a fixed HuggingFace revision and checked against their SHA-256; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. At startup `remove_unused_model_files` deletes what earlier releases left in `models/` that no current model reads (ADR 0005 amendment).
+Manages **two** model families: Parakeet TDT (multi-file ONNX bundle in a per-variant subdirectory) and Sortformer (single ONNX file for diarization). Both download from HuggingFace through a `.download` temp file that is renamed into place. Parakeet files are pinned to a fixed HuggingFace revision and checked against their SHA-256; availability means the files exist. A concurrent second download of the same variant (or the Sortformer file) returns `TranscriptionError::DownloadInProgress`. At startup `remove_unused_model_files` deletes what earlier releases left in `models/` that no current model reads (ADR 0005 amendment). The CoreML variant's files sit inside `.mlmodelc` bundle directories, which a download creates. On Apple silicon the frontend's `autoSetup` deletes the int8 bundle only after the CoreML variant has loaded and warmed up once; a failed CoreML download, checksum or load keeps int8 running and shows a warning (ADR 0008).
 
 ```rust
-pub enum ParakeetVariant { TdtV3Int8 }            // multilingual, 25 European languages
+pub enum ParakeetVariant { TdtV3Int8, TdtV3CoreMl } // same model: int8 ONNX, or CoreML (ADR 0008)
 pub enum SortformerVariant { V2_1 }               // up to 4 speakers
 
 impl ParakeetVariant {
-    pub fn recommended_for_host() -> Self;                                     // TdtV3Int8 on every target
-    pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3-int8"
-    pub fn files(&self) -> &'static [(&'static str, &'static str, u64)];       // (name, url, size) per file
+    pub fn recommended_for_host() -> Self;                                     // TdtV3CoreMl on Apple silicon, else TdtV3Int8
+    pub fn dir_name(&self) -> &'static str;                                    // "parakeet-tdt-v3-int8" / "parakeet-tdt-v3-coreml"
+    pub fn files(&self) -> &'static [ModelFile];                               // name (may contain '/'), pinned url, bytes, sha256
     pub fn approximate_size_bytes(&self) -> u64;
-    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~700 MB)" for int8
-    pub fn all() -> &'static [ParakeetVariant];
+    pub fn display_name(&self) -> &'static str;                                // "Parakeet TDT v3 (~700 MB)" / "(~630 MB)"
+    pub fn all() -> &'static [ParakeetVariant];                                // TdtV3CoreMl only on Apple silicon
 }
 impl SortformerVariant { /* filename, download_url, approximate_size_bytes, display_name */ }
 
@@ -584,7 +584,7 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 | `download_sortformer_model` | `variant: SortformerVariantDto` | `String` (path) |
 | `delete_sortformer_model` | `variant: SortformerVariantDto` | `()` |
 
-`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths and constructs the long-lived `TranscriptionScheduler`.
+`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths (`TranscriptionClient::spawn_loaded`, which waits out the startup model load and warm-up; a sidecar that exits or doesn't answer within the load budget fails the command) and constructs the long-lived `TranscriptionScheduler`.
 
 Re-init semantics are precise:
 - If the engine is uninitialized: build client + scheduler, OK.

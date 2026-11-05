@@ -163,7 +163,7 @@ export function TranscriptionTab() {
               disabled={retrying}
               onClick={() => {
                 setRetrying(true);
-                autoSetup()
+                autoSetup({ retry: true })
                   .catch(() => {})
                   .finally(() => setRetrying(false));
               }}
