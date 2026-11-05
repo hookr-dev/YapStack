@@ -8,6 +8,7 @@
 
 ### macOS-specific
 - Xcode Command Line Tools (provides clang/clang++)
+- On Apple silicon, Swift 6.2+ (Xcode 26 or its Command Line Tools): the sidecar build script turns on the `fluidaudio` feature there, and its `build.rs` runs `swift build`. CI and release builds pin Xcode 26.6.
 
 ## Setup
 
@@ -71,8 +72,8 @@ pnpm check
 cargo build -p yapstack-transcription-sidecar --features parakeet               # Parakeet (pulls ort + parakeet-rs)
 
 # Add accelerators
-cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on macOS and Windows)
-cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio      # + the CoreML runtime (Apple silicon, Swift 6.2+ / Xcode 26; not shipped yet)
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP (what the script builds on Intel macOS and Windows)
+cargo build -p yapstack-transcription-sidecar --features webgpu,fluidaudio      # + the CoreML runtime (what the script builds on Apple silicon; Swift 6.2+ / Xcode 26)
 
 # Default features
 cargo build -p yapstack-transcription-sidecar                                   # = parakeet
@@ -82,7 +83,7 @@ cargo build -p yapstack-transcription-sidecar                                   
 |---------|---------|
 | `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
 | `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Dawn → D3D12 on Windows). Compiled into both the macOS and Windows sidecars, and selected by `Auto` on both since Gate C passed (ADR 0004); EP-init failure falls back to CPU with an honest `accel` label. Set `YAPSTACK_PARAKEET_ACCEL=cpu` to force CPU. |
-| `fluidaudio` | Parakeet on CoreML / the Neural Engine through FluidAudio (ADR 0008). On Apple silicon `build.rs` builds `swift/YapFluidAudio` at the versions in its `Package.resolved` (`--force-resolved-versions`), links it statically for macOS 14.0 and sets `cfg(fluidaudio_linked)`; on any other target it does nothing. The runtime is picked from the model folder: `*.mlmodelc` bundles load on CoreML (always `Encoder_v2`), ONNX files on ORT. A CoreML folder on a build without it is a load error. The label is `ane` only when the encoder's `MLComputePlan` puts its conv/matmul/linear ops on the Neural Engine (`accel_partial` if some aren't), `cpu` when none are, `coreml` when there's no plan (macOS before 14.4). Not in the shipped build yet. Real-model tests: `YAPSTACK_TEST_FLUIDAUDIO_DIR=<dir> cargo test -p yapstack-transcription-sidecar --features fluidaudio -- --ignored a_coreml`. |
+| `fluidaudio` | Parakeet on CoreML / the Neural Engine through FluidAudio (ADR 0008). On Apple silicon `build.rs` builds `swift/YapFluidAudio` at the versions in its `Package.resolved` (`--force-resolved-versions`), links it statically for macOS 14.0 and sets `cfg(fluidaudio_linked)`; on any other target it does nothing. The runtime is picked from the model folder: `*.mlmodelc` bundles load on CoreML (always `Encoder_v2`), ONNX files on ORT. A CoreML folder on a build without it is a load error. The label is `ane` only when the encoder's `MLComputePlan` puts its conv/matmul/linear ops on the Neural Engine (`accel_partial` if some aren't), `cpu` when none are, `coreml` when there's no plan (macOS before 14.4). Shipped in the Apple-silicon sidecar; the int8 ONNX bundle keeps loading on ORT, so nothing changes until a CoreML model folder is installed. A CoreML model's first load compiles it for the Neural Engine and can take a minute or more, so the host gives a model load 180 s, and the first engine query after spawn that load budget on top of its own. Real-model tests: `YAPSTACK_TEST_FLUIDAUDIO_DIR=<dir> cargo test -p yapstack-transcription-sidecar --features fluidaudio -- --ignored a_coreml`. |
 
 Parakeet is the only engine (ADR 0005). A `--no-default-features` build has no engine compiled in, and every IPC request returns `no transcription engine compiled in`. The sidecar defaults to `--engine parakeet`; an unknown `--engine` value is a startup error (exit code 2). The dispatcher in `main.rs` is engine-agnostic.
 
@@ -106,7 +107,7 @@ The sidecar is a standalone binary that must be built separately and placed in `
 ./scripts/build-transcription-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-This builds with `--release` and the per-target features (`parakeet,webgpu` on Apple and Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
+This builds with `--release` and the per-target features (`parakeet,webgpu,fluidaudio` on Apple silicon, `parakeet,webgpu` on Intel macOS and Windows, `parakeet` otherwise) and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
 
 The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 
