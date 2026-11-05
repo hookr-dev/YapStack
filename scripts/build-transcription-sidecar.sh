@@ -65,24 +65,39 @@ mkdir -p "$BINARIES_DIR"
 # new inode. A plain `cp` over an existing Mach-O rewrites the same inode, and
 # macOS keeps the old code signature cached for it (especially while the old
 # binary is still running, e.g. in an open `tauri dev`), so the new binary is
-# SIGKILLed at exec.
+# SIGKILLed at exec. The EXIT trap removes a half-written temp file if the
+# script fails or is interrupted mid-copy.
+staging_tmp=""
+trap 'if [ -n "$staging_tmp" ]; then rm -f "$staging_tmp"; fi' EXIT
 install_file() {
     local src="$1" dest="$2" mode="$3"
-    cp "$src" "$dest.tmp.$$"
-    chmod "$mode" "$dest.tmp.$$"
-    mv -f "$dest.tmp.$$" "$dest"
+    staging_tmp="$dest.tmp.$$"
+    cp "$src" "$staging_tmp"
+    chmod "$mode" "$staging_tmp"
+    mv -f "$staging_tmp" "$dest"
+    staging_tmp=""
 }
 
 # Launch a staged binary with a model path that can't exist: it exits right
-# away with an error (non-zero is expected). Dying from a signal (exit >= 128)
-# means it never ran, e.g. macOS SIGKILLing a binary whose code signature
-# doesn't match the one cached for that inode. Run it where it's staged so
-# @executable_path resolves the Dawn dylib next to it.
+# away with an error (exit 1 is expected). 126/127 mean it couldn't be
+# executed or loaded (e.g. a truncated Mach-O or a missing dylib), and
+# >= 128 means it died from a signal, e.g. macOS SIGKILLing a binary whose
+# code signature doesn't match the one cached for that inode. Run it where
+# it's staged so @executable_path resolves the Dawn dylib next to it.
+# errexit is off around the launch because macOS's bash 3.2 reports a failed
+# exec as 1, not 126, inside `cmd || status=$?` under `set -e`.
 smoke_launch() {
-    local bin="$1" status=0
-    "$bin" --engine parakeet --model /nonexistent </dev/null >/dev/null 2>&1 || status=$?
+    local bin="$1" status
+    set +e
+    "$bin" --engine parakeet --model /nonexistent </dev/null >/dev/null 2>&1
+    status=$?
+    set -e
     if [ "$status" -ge 128 ]; then
         echo "ERROR: $bin died from signal $((status - 128)) at launch (exit $status)"
+        exit 1
+    fi
+    if [ "$status" -ge 126 ]; then
+        echo "ERROR: $bin could not be executed (exit $status)"
         exit 1
     fi
     echo "Smoke launch ok: $bin (exit $status)"

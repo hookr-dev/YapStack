@@ -25,7 +25,7 @@ pnpm tauri dev -f sync            # Full app with the desktop sync feature
 pnpm dev:frontend                 # Vite dev server only (no Tauri)
 ```
 
-Every `tauri dev` runs `beforeDevCommand`, which rebuilds the dev sidecar (`./scripts/build-sidecars.sh --dev`, a no-op cargo build when nothing changed) and then starts vite. `tauri dev` gives the dev server 180 s to come up, so on a cold `target/` run `./scripts/build-sidecars.sh --dev` once first. On Windows, `tauri.windows.conf.json` keeps `beforeDevCommand` at plain `pnpm dev` (the script is bash), so build the sidecar yourself there.
+Every `tauri dev` runs `beforeDevCommand`, which rebuilds the dev sidecar (`./scripts/build-sidecars.sh --dev`, a no-op cargo build when nothing changed) and then starts vite. `tauri dev` gives the dev server 180 s to come up, so on a cold `target/` run `./scripts/build-sidecars.sh --dev` once first. On macOS this means `tauri dev` needs a working sidecar toolchain (on Apple silicon, Swift 6.2+ / Xcode 26 for `fluidaudio`); there is no env var to skip the rebuild. On Windows, `tauri.windows.conf.json` keeps `beforeDevCommand` at plain `pnpm dev` (the script is bash), so build the sidecar yourself there.
 
 ### Build
 ```bash
@@ -114,7 +114,7 @@ This builds with `--release` and the per-target features (`parakeet,webgpu,fluid
 
 Every copy goes to a temp name and is renamed into place. A plain `cp` over an existing Mach-O keeps its inode, and macOS keeps the old code signature cached for it (always while the old binary is running), so the new one is SIGKILLed at exec (exit 137, no output). On macOS the script then smoke-launches each staged binary with `--model /nonexistent` and fails if it died from a signal.
 
-The CoreML compile cache (ADR [0008](adr/0008-fluidaudio-coreml-mac-default.md)) lives under `~/Library/Caches/dev.yapstack.app/` for the installed app but under the process name (`~/Library/Caches/yapstack-transcription-sidecar-<triple>/`) for an unbundled dev sidecar, so dev and installed builds each compile a model once. Delete that directory to force a cold first load.
+The CoreML compile cache (ADR [0008](adr/0008-fluidaudio-coreml-mac-default.md)) is `~/Library/Caches/dev.yapstack.app/com.apple.e5rt.e5bundlecache/` for the installed app but `~/Library/Caches/yapstack-transcription-sidecar-<triple>/com.apple.e5rt.e5bundlecache/` (keyed by process name) for an unbundled dev sidecar, so dev and installed builds each compile a model once. Delete that `com.apple.e5rt.e5bundlecache/` directory (or its parent) to force a cold first load.
 
 The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 
