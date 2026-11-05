@@ -60,6 +60,12 @@ class Gate(unittest.TestCase):
         self.assertEqual([c["pass"] for c in checks], [True, False])
         self.assertEqual(checks[1]["why"], "empty 2 > 1; truncated 2 > 1; segment_ts_bad 1 > 0")
 
+    def test_any_bad_segment_timestamp_fails_even_if_the_baseline_has_more(self):
+        # Owner ruling 2026-11-05: zero, not relative to the baseline.
+        [c] = replay.gate([row("int8:auto", 5.0, ts=3), row("fa:auto", 5.0, ts=1)], "int8:auto", 1.0)
+        self.assertFalse(c["pass"])
+        self.assertEqual(c["why"], "segment_ts_bad 1 > 0")
+
     def test_a_slice_the_candidate_did_not_run_fails(self):
         rows = [row("int8:auto", 5.0), row("int8:auto", 5.0, mode="backfill"), row("fa:auto", 5.0)]
         self.assertEqual([c["pass"] for c in replay.gate(rows, "int8:auto", 1.0)], [True, False])

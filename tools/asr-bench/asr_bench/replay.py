@@ -234,8 +234,9 @@ def score(sc: Sidecar, clips: list[Path], manifest: list[dict], normalizer: str)
 def gate(rows: list[dict], baseline: str, wer_margin: float) -> list[dict]:
     """AE-G1 against `baseline` (a row key, NAME:EP): on every slice x mode
     the baseline ran, each other model's WER is within `wer_margin` points
-    of it, and its empty, truncated and bad segment-timestamp counts are no higher
-    (same replayed chunks; owner ruling 2026-11-04, ADR 0008)."""
+    of it, its empty and truncated counts are no higher (same replayed
+    chunks; owner ruling 2026-11-04), and it has no bad segment timestamps
+    at all (owner ruling 2026-11-05; both in ADR 0008)."""
     base = {(r["slice"], r["mode"]): r for r in rows if r["key"] == baseline}
     if not base:
         return [{"key": baseline, "slice": "", "mode": "", "pass": False, "why": f"no rows for baseline {baseline}"}]
@@ -252,9 +253,11 @@ def gate(rows: list[dict], baseline: str, wer_margin: float) -> list[dict]:
             fails = []
             if delta > wer_margin:
                 fails.append(f"WER {delta:+.2f} pt")
-            for k in ("empty", "truncated", "segment_ts_bad"):
+            for k in ("empty", "truncated"):
                 if r[k] > b[k]:
                     fails.append(f"{k} {r[k]} > {b[k]}")
+            if r["segment_ts_bad"]:
+                fails.append(f"segment_ts_bad {r['segment_ts_bad']} > 0")
             out.append({**check, "wer_delta": delta, "pass": not fails, "why": "; ".join(fails)})
     return out
 
@@ -272,7 +275,7 @@ def markdown(rows: list[dict], checks: list[dict] | None, header: list[str], bas
     if checks is not None:
         lines += [
             "",
-            f"AE-G1 vs `{baseline}`: WER ≤ baseline + {wer_margin:g} pt, empty / truncated / segment-timestamp-bad ≤ baseline, on every slice x mode.",
+            f"AE-G1 vs `{baseline}`: WER ≤ baseline + {wer_margin:g} pt, empty / truncated ≤ baseline and zero bad segment timestamps, on every slice x mode.",
             "",
             "| Slice | Mode | Model | Δ WER pt | Pass | Why |",
             "|---|---|---|---|---|---|",
