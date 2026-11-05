@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/tauri";
 import { commandErrorMessage } from "@/lib/command-error";
 import { log } from "@/lib/logger";
@@ -326,6 +327,10 @@ export interface Settings {
   selectedMicDeviceId: string | null;
   selectedEngine: EngineKindDto;
   selectedParakeetVariant: ParakeetVariantDto;
+  /// The recommended Parakeet variant whose download or load last failed,
+  /// and the app version it failed on. While it matches, autoSetup stays on
+  /// the installed variant without retrying (ADR 0008).
+  coreMlSwitchFailure: { variant: ParakeetVariantDto; appVersion: string } | null;
   diarizationEnabled: boolean;
   /// `{ [sessionId]: { [speakerKey]: "Alice" } }`, keyed by `SpeakerKey`
   /// (`lib/speakers.ts`, e.g. `"mic:c0"`). Older builds keyed by the bare
@@ -619,7 +624,8 @@ interface AppState {
   recoverActiveSession: (sessionId: string, effectiveStartEpochMs?: number) => Promise<void>;
 
   // Actions
-  autoSetup: () => Promise<void>;
+  /// `retry`: an explicit user Retry, which ignores `coreMlSwitchFailure`.
+  autoSetup: (opts?: { retry?: boolean }) => Promise<void>;
   loadSessions: () => Promise<void>;
   loadFolders: () => Promise<void>;
   /**
@@ -897,6 +903,7 @@ const defaultSettings: Settings = {
   // Parakeet is the only engine (ADR 0005).
   selectedEngine: "Parakeet",
   selectedParakeetVariant: "TdtV3Int8",
+  coreMlSwitchFailure: null,
   diarizationEnabled: false,
   speakerNames: {},
   language: "en",
@@ -2197,7 +2204,7 @@ function createAppStore() {
         );
       },
 
-      autoSetup: () => {
+      autoSetup: (opts) => {
         // One run at a time: Retry, a remount and the first launch can all
         // call this while a run is still awaiting its download, and a second
         // run would start a second download of the same model.
@@ -2276,7 +2283,15 @@ function createAppStore() {
                     (m) => m.downloaded && m.variant !== recommended,
                   )?.variant ?? null)
                 : null;
-            let variant = recommended;
+            // A switch that failed on this app version isn't retried
+            // until the next version, or an explicit Retry.
+            const appVersion = previous !== null ? await getVersion() : null;
+            const failed = settings.coreMlSwitchFailure;
+            const skipSwitch =
+              !opts?.retry &&
+              failed?.variant === recommended &&
+              failed.appVersion === appVersion;
+            let variant = skipSwitch && previous !== null ? previous : recommended;
             // Why `recommended` couldn't be set up, when `previous` stays.
             let switchFailure: string | null = null;
 
@@ -2357,6 +2372,14 @@ function createAppStore() {
             }
             set({ enginePhase: "ready", engineError: null });
 
+            if (switchFailure !== null && appVersion !== null) {
+              get().updateSettings({
+                coreMlSwitchFailure: { variant: recommended, appVersion },
+              });
+            } else if (variant === recommended && settings.coreMlSwitchFailure) {
+              get().updateSettings({ coreMlSwitchFailure: null });
+            }
+
             if (switchFailure !== null) {
               console.warn(
                 `couldn't switch to Parakeet ${recommended}; staying on ${variant}:`,
@@ -2370,7 +2393,7 @@ function createAppStore() {
                   duration: Infinity,
                 },
               );
-            } else if (previous !== null) {
+            } else if (previous !== null && variant === recommended) {
               // `recommended` loaded and warmed up: `previous` is dead weight.
               const del = await commands.deleteParakeetModel(previous);
               if (del.status === "error") {

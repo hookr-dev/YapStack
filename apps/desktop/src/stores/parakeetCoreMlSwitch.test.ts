@@ -19,6 +19,10 @@ vi.mock("@/lib/tauri", () => tauriCommandsMock());
 vi.mock("sonner", () => ({
   toast: { info: vi.fn(), error: vi.fn(), warning: vi.fn(), success: vi.fn() },
 }));
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn().mockResolvedValue("1.0.0-alpha.13"),
+}));
+const APP_VERSION = "1.0.0-alpha.13";
 
 type Variant = "TdtV3Int8" | "TdtV3CoreMl";
 
@@ -27,7 +31,10 @@ type Variant = "TdtV3Int8" | "TdtV3CoreMl";
  * already downloaded. Downloads and deletes update what
  * `getParakeetModels` reports, like the real ModelManager.
  */
-async function launchOnAppleSilicon(onDisk: Variant[]) {
+async function launchOnAppleSilicon(
+  onDisk: Variant[],
+  persisted: Record<string, unknown> = {},
+) {
   localStorage.setItem(
     "yapstack-settings",
     JSON.stringify({
@@ -35,6 +42,7 @@ async function launchOnAppleSilicon(onDisk: Variant[]) {
         settings: {
           selectedEngine: "Parakeet",
           selectedParakeetVariant: onDisk[0] ?? "TdtV3Int8",
+          ...persisted,
         },
       },
       version: 33,
@@ -207,6 +215,111 @@ describe("switching an int8 Mac to the CoreML model (ADR 0008)", () => {
     );
     expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
     expect(warning).not.toHaveBeenCalled();
+  });
+});
+
+describe("a failed switch is remembered for this app version", () => {
+  const recorded = (appVersion: string) => ({
+    coreMlSwitchFailure: { variant: "TdtV3CoreMl", appVersion },
+  });
+
+  it("records the failure, then the re-run after an engine drop stays on int8 quietly", async () => {
+    const { useAppStore, commands, warning } = await launchOnAppleSilicon([
+      "TdtV3Int8",
+    ]);
+    commands.downloadParakeetModel.mockResolvedValueOnce(
+      failure("network unreachable"),
+    );
+    await useAppStore.getState().autoSetup();
+    expect(useAppStore.getState().settings.coreMlSwitchFailure).toEqual({
+      variant: "TdtV3CoreMl",
+      appVersion: APP_VERSION,
+    });
+    expect(warning).toHaveBeenCalledTimes(1);
+
+    // What the TRANSCRIPTION_ENGINE_DROPPED listener does.
+    vi.clearAllMocks();
+    useAppStore.setState({ enginePhase: "idle", engineError: null });
+    await useAppStore.getState().autoSetup();
+
+    expect(commands.downloadParakeetModel).not.toHaveBeenCalled();
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3Int8",
+      false,
+    );
+    expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
+    expect(warning).not.toHaveBeenCalled();
+    expect(useAppStore.getState().enginePhase).toBe("ready");
+  });
+
+  it("a launch on the same app version skips the switch quietly", async () => {
+    const { useAppStore, commands, warning, disk } = await launchOnAppleSilicon(
+      ["TdtV3Int8"],
+      recorded(APP_VERSION),
+    );
+
+    await useAppStore.getState().autoSetup();
+
+    expect(commands.downloadParakeetModel).not.toHaveBeenCalled();
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3Int8",
+      false,
+    );
+    expect(disk.has("TdtV3Int8")).toBe(true);
+    expect(warning).not.toHaveBeenCalled();
+    expect(useAppStore.getState().settings.selectedParakeetVariant).toBe("TdtV3Int8");
+  });
+
+  it("a new app version tries the switch again, and success clears the record", async () => {
+    const { useAppStore, commands, disk } = await launchOnAppleSilicon(
+      ["TdtV3Int8"],
+      recorded("1.0.0-alpha.12"),
+    );
+
+    await useAppStore.getState().autoSetup();
+
+    expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3CoreMl");
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3CoreMl",
+      false,
+    );
+    expect([...disk]).toEqual(["TdtV3CoreMl"]);
+    expect(useAppStore.getState().settings.coreMlSwitchFailure).toBeNull();
+  });
+
+  it("Retry ignores the record", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(
+      ["TdtV3Int8"],
+      recorded(APP_VERSION),
+    );
+
+    await useAppStore.getState().autoSetup({ retry: true });
+
+    expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3CoreMl");
+    expect(commands.initTranscriptionClient).toHaveBeenCalledWith(
+      "Parakeet",
+      "TdtV3CoreMl",
+      false,
+    );
+  });
+
+  it("a fresh install with a record still tries CoreML and errors on failure", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(
+      [],
+      recorded(APP_VERSION),
+    );
+    commands.downloadParakeetModel.mockResolvedValueOnce(
+      failure("network unreachable"),
+    );
+
+    await useAppStore.getState().autoSetup();
+
+    expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3CoreMl");
+    expect(commands.initTranscriptionClient).not.toHaveBeenCalled();
+    expect(useAppStore.getState().enginePhase).toBe("error");
   });
 });
 
