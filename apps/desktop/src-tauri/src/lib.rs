@@ -1,4 +1,6 @@
 mod commands;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod coreml_cache;
 mod db;
 mod db_service;
 mod device_broker;
@@ -773,6 +775,19 @@ pub fn run() {
 
             let model_manager = ModelManager::new(app_data_dir.clone());
             model_manager.remove_unused_model_files();
+            // CoreML never reads another OS build's compile cache again.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let (Ok(caches), Ok(sidecar), Some(os_build)) = (
+                app.path().cache_dir(),
+                commands::transcription::find_sidecar_path(),
+                coreml_cache::current_os_build(),
+            ) {
+                for dir in
+                    coreml_cache::sidecar_cache_dirs(&caches, &app.config().identifier, &sidecar)
+                {
+                    coreml_cache::remove_other_os_builds(&dir, &os_build);
+                }
+            }
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );

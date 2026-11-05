@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { useCreateSession } from "@/hooks/useCreateSession";
 import {
+  PREPARING_MODEL_TITLE,
+  usePreparingModel,
+} from "@/hooks/usePreparingModel";
+import {
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -34,6 +38,7 @@ export function TitleBar() {
   const engineError = useAppStore((s) => s.engineError);
   const captureStatus = useAppStore((s) => s.captureStatus);
   const modelDownloadProgress = useAppStore((s) => s.modelDownloadProgress);
+  const preparingModel = usePreparingModel();
 
   const sidebarCollapsed = useAppStore((s) => s.settings.sidebarCollapsed);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
@@ -79,7 +84,7 @@ export function TitleBar() {
     dotPulse = true;
   } else if (enginePhase === "initializing") {
     dotColor = "bg-amber-500";
-    statusText = "Loading engine...";
+    statusText = preparingModel ? PREPARING_MODEL_TITLE : "Loading engine...";
     dotPulse = true;
   } else if (enginePhase === "error") {
     dotColor = "bg-red-500";

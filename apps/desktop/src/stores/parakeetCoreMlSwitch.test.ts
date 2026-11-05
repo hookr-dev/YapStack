@@ -137,7 +137,12 @@ describe("switching an int8 Mac to the CoreML model (ADR 0008)", () => {
     expect(commands.deleteParakeetModel).not.toHaveBeenCalled();
     expect(disk.has("TdtV3Int8")).toBe(true);
     expect(warning).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(warning.mock.calls[0])).toContain("network unreachable");
+    expect(warning.mock.calls[0][0]).toBe(
+      "Couldn't set up the Neural Engine model. Using the previous model.",
+    );
+    expect(warning.mock.calls[0][1]).toMatchObject({
+      description: "network unreachable",
+    });
     const state = useAppStore.getState();
     expect(state.settings.selectedParakeetVariant).toBe("TdtV3Int8");
     expect(state.enginePhase).toBe("ready");
@@ -320,6 +325,147 @@ describe("a failed switch is remembered for this app version", () => {
     expect(commands.downloadParakeetModel).toHaveBeenCalledWith("TdtV3CoreMl");
     expect(commands.initTranscriptionClient).not.toHaveBeenCalled();
     expect(useAppStore.getState().enginePhase).toBe("error");
+  });
+});
+
+describe("Try the Neural Engine model again", () => {
+  const recorded = {
+    coreMlSwitchFailure: { variant: "TdtV3CoreMl", appVersion: APP_VERSION },
+  };
+
+  it("restarts the engine on the CoreML model and clears the record", async () => {
+    const { useAppStore, commands, disk } = await launchOnAppleSilicon(
+      ["TdtV3Int8", "TdtV3CoreMl"],
+      recorded,
+    );
+    await useAppStore.getState().autoSetup();
+    expect(commands.initTranscriptionClient).toHaveBeenLastCalledWith(
+      "Parakeet",
+      "TdtV3Int8",
+      false,
+    );
+    vi.clearAllMocks();
+
+    await useAppStore.getState().retryCoreMlSwitch();
+
+    expect(commands.shutdownTranscriptionClient).toHaveBeenCalledTimes(1);
+    expect(
+      commands.shutdownTranscriptionClient.mock.invocationCallOrder[0],
+    ).toBeLessThan(commands.initTranscriptionClient.mock.invocationCallOrder[0]);
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3CoreMl",
+      false,
+    );
+    expect([...disk]).toEqual(["TdtV3CoreMl"]);
+    const state = useAppStore.getState();
+    expect(state.settings.coreMlSwitchFailure).toBeNull();
+    expect(state.settings.selectedParakeetVariant).toBe("TdtV3CoreMl");
+    expect(state.enginePhase).toBe("ready");
+  });
+
+  it("records the failure again when the CoreML model still won't load", async () => {
+    const { useAppStore, commands, disk } = await launchOnAppleSilicon(
+      ["TdtV3Int8", "TdtV3CoreMl"],
+      recorded,
+    );
+    await useAppStore.getState().autoSetup();
+    commands.initTranscriptionClient.mockResolvedValueOnce(
+      failure("sidecar exited during the model load"),
+    );
+
+    await useAppStore.getState().retryCoreMlSwitch();
+
+    expect(disk.has("TdtV3Int8")).toBe(true);
+    const state = useAppStore.getState();
+    expect(state.settings.selectedParakeetVariant).toBe("TdtV3Int8");
+    expect(state.settings.coreMlSwitchFailure).toEqual(recorded.coreMlSwitchFailure);
+    expect(state.enginePhase).toBe("ready");
+  });
+
+  it("keeps the running engine and the record when shutdown is refused", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(
+      ["TdtV3Int8", "TdtV3CoreMl"],
+      recorded,
+    );
+    await useAppStore.getState().autoSetup();
+    vi.clearAllMocks();
+    commands.shutdownTranscriptionClient.mockResolvedValueOnce({
+      status: "error",
+      error: { kind: "InvalidInput", message: "live transcription is running" },
+    });
+
+    await expect(useAppStore.getState().retryCoreMlSwitch()).rejects.toThrow(
+      "live transcription is running",
+    );
+    expect(commands.initTranscriptionClient).not.toHaveBeenCalled();
+    const state = useAppStore.getState();
+    expect(state.settings.coreMlSwitchFailure).toEqual(recorded.coreMlSwitchFailure);
+    expect(state.enginePhase).toBe("ready");
+  });
+});
+
+describe("Try the Neural Engine model again, when shutdown fails for another reason", () => {
+  it("still clears the record and retries the switch", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(
+      ["TdtV3Int8", "TdtV3CoreMl"],
+      { coreMlSwitchFailure: { variant: "TdtV3CoreMl", appVersion: APP_VERSION } },
+    );
+    await useAppStore.getState().autoSetup();
+    vi.clearAllMocks();
+    commands.shutdownTranscriptionClient.mockResolvedValueOnce({
+      status: "error",
+      error: { kind: "Internal", message: "scheduler shutdown timed out" },
+    });
+
+    await useAppStore.getState().retryCoreMlSwitch();
+
+    expect(commands.initTranscriptionClient).toHaveBeenCalledExactlyOnceWith(
+      "Parakeet",
+      "TdtV3CoreMl",
+      false,
+    );
+    const state = useAppStore.getState();
+    expect(state.settings.coreMlSwitchFailure).toBeNull();
+    expect(state.enginePhase).toBe("ready");
+  });
+});
+
+describe("a CoreML load that hangs", () => {
+  // The backend gives the first load its budget, then fails init.
+  const hung = () => failure("request timed out after 190s");
+
+  it("surfaces the init error on a Mac with nothing to fall back to, and never reports ready", async () => {
+    const { useAppStore, commands } = await launchOnAppleSilicon(["TdtV3CoreMl"]);
+    commands.initTranscriptionClient.mockResolvedValueOnce(hung());
+    const phases: string[] = [];
+    const unsubscribe = useAppStore.subscribe((s) => phases.push(s.enginePhase));
+
+    await useAppStore.getState().autoSetup();
+    unsubscribe();
+
+    expect(phases).toContain("initializing");
+    expect(phases).not.toContain("ready");
+    const state = useAppStore.getState();
+    expect(state.enginePhase).toBe("error");
+    expect(state.engineError).toBe("request timed out after 190s");
+  });
+
+  it("falls back to int8 when it's still on disk", async () => {
+    const { useAppStore, commands, warning } = await launchOnAppleSilicon([
+      "TdtV3Int8",
+    ]);
+    commands.initTranscriptionClient.mockResolvedValueOnce(hung());
+
+    await useAppStore.getState().autoSetup();
+
+    expect(commands.initTranscriptionClient).toHaveBeenLastCalledWith(
+      "Parakeet",
+      "TdtV3Int8",
+      false,
+    );
+    expect(JSON.stringify(warning.mock.calls[0])).toContain("timed out");
+    expect(useAppStore.getState().enginePhase).toBe("ready");
   });
 });
 
