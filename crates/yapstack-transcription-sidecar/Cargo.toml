@@ -44,4 +44,4 @@ ort = { version = "=2.0.0-rc.12", optional = true, default-features = false }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
