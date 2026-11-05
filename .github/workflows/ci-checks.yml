@@ -25,6 +25,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Tauri npm/Rust version alignment
+        # `tauri build` rejects npm/Rust plugin pairs whose major.minor differ.
+        run: node scripts/check-tauri-versions.mjs
+
   rust:
     name: Rust (macos-latest)
     runs-on: macos-latest
