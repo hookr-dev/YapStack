@@ -112,6 +112,12 @@ only `Encoder_v2` is acceptable. FluidAudio needs macOS 14.
    engine recovers, so an absolute zero would fail int8 itself. The other
    two conditions are unchanged.
 
+   **Owner ruling, 2026-11-05, on "word timestamps are kept":** the
+   candidate has zero bad segment timestamps on every slice, an absolute
+   bound rather than one relative to int8. A chunk with text has bad
+   segment timestamps when its segments are missing, out of order, or end
+   more than 50 ms past the chunk (`tools/asr-bench replay`).
+
 ## Consequences
 
 - **The work ships as a PR series**, each passing `pnpm check`:

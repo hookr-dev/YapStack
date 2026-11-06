@@ -47,6 +47,18 @@ def error_rates(pairs: list[tuple[str, str]], kind: str) -> ErrorRates:
     return ErrorRates(jiwer.wer(refs, hyps), jiwer.cer(refs, hyps), len(refs), skipped)
 
 
+def longest_deletion_run(ref: str, hyp: str, kind: str) -> int:
+    """The most consecutive reference words the hypothesis drops, after
+    normalising both. An empty hypothesis drops the whole reference."""
+    r, h = normalize(ref, kind), normalize(hyp, kind)
+    if not r:
+        return 0
+    if not h:
+        return len(r.split())
+    alignment = jiwer.process_words(r, h).alignments[0]
+    return max((a.ref_end_idx - a.ref_start_idx for a in alignment if a.type == "delete"), default=0)
+
+
 @dataclass
 class Rtfx:
     steady: float | None

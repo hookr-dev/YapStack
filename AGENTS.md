@@ -30,6 +30,7 @@ If you have one question, the answer is probably here. If not, follow the doc ro
 - [`docs/LINEAR_TICKETS.md`](docs/LINEAR_TICKETS.md) — ticket structure for agent pickup.
 - [`docs/RELEASE.md`](docs/RELEASE.md) — release runbook (version-bump locations, CHANGELOG roll, tag/push, signing, hotfix path).
 - [`docs/adr/`](docs/adr/) — architecture decision records (append-only).
+- [`tools/asr-bench/README.md`](tools/asr-bench/README.md) — engine benchmarks and the app-style replay gate. Re-run the replay gate before changing VAD chunking, backfill, or the default engine.
 
 ## Build & test commands
 
