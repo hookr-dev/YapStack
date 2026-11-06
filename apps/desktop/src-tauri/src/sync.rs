@@ -3085,10 +3085,18 @@ fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHan
             // `fetch_add` already publishes this thread's ownership (KICK_GEN == prev + 1 ==
             // my_gen); a follow-up `store(my_gen)` would clobber a newer debouncer that raced
             // in between, so it is deliberately omitted.
-            let my_gen = KICK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-            // Drop any stale deadline a prior drain left behind, then arm.
-            *ch.deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            KICK_ARMED.store(true, Ordering::Release);
+            //
+            // Claim + arm happen under the channel mutex, as does the exit's owner-check +
+            // disarm below, so the two are mutually atomic. Otherwise a stale debouncer could
+            // read itself as owner, a new one claim and arm, and the stale store =false land
+            // last, disarming the live debouncer for good.
+            let my_gen = {
+                let mut g = ch.deadline.lock().unwrap_or_else(|e| e.into_inner());
+                // Drop any stale deadline a prior drain left behind, then arm.
+                *g = None;
+                KICK_ARMED.store(true, Ordering::Release);
+                KICK_GEN.fetch_add(1, Ordering::SeqCst) + 1
+            };
             let poll_cap = Duration::from_secs(1);
             while !stop.load(Ordering::SeqCst) {
                 let mut g = ch.deadline.lock().unwrap_or_else(|e| e.into_inner());
@@ -3117,6 +3125,7 @@ fn spawn_write_kick_debouncer() -> Result<(Arc<AtomicBool>, std::thread::JoinHan
             }
             // Item 2: only the CURRENT owner disarms. If a newer debouncer has since claimed
             // KICK_GEN, this stale thread leaves KICK_ARMED alone so the live one stays armed.
+            let _g = ch.deadline.lock().unwrap_or_else(|e| e.into_inner());
             if KICK_GEN.load(Ordering::SeqCst) == my_gen {
                 KICK_ARMED.store(false, Ordering::Release);
             }
@@ -10918,15 +10927,22 @@ mod tests {
         /// so they never race under cargo's in-binary parallel test execution.
         static KICK_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        /// Spin (bounded) until `KICK_ARMED` reads `want`, so the debouncer's entry-store is
-        /// observed before we proceed.
-        fn wait_kick_armed(want: bool) {
+        /// Spawn a debouncer and return once it has claimed `KICK_GEN` (and so armed: both
+        /// happen in one critical section). Waiting on `KICK_ARMED` instead is vacuous when an
+        /// earlier debouncer already set it, which let the test race the new thread's start.
+        fn spawn_debouncer_and_await_claim() -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+            use std::sync::atomic::Ordering;
+            let claimed = KICK_GEN.load(Ordering::SeqCst) + 1;
+            let handle = spawn_write_kick_debouncer().unwrap();
             let t0 = Instant::now();
-            while KICK_ARMED.load(std::sync::atomic::Ordering::Acquire) != want
-                && t0.elapsed() < Duration::from_secs(2)
-            {
+            while KICK_GEN.load(Ordering::SeqCst) < claimed {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(30),
+                    "debouncer thread never claimed its generation"
+                );
                 std::thread::yield_now();
             }
+            handle
         }
 
         /// Regression guard for the re-enable disarm bug: `sync_enable` spawns the NEW
@@ -10945,12 +10961,10 @@ mod tests {
 
             // The OLD drain's debouncer — still alive in SyncRuntimeState (e.g. after a
             // terminal refresh `break`). This is the thread `prev.stop()` will join.
-            let (old_shutdown, old_join) = spawn_write_kick_debouncer().unwrap();
-            wait_kick_armed(true);
+            let (old_shutdown, old_join) = spawn_debouncer_and_await_claim();
 
             // sync_enable runs `spawn_drain` FIRST → a NEW debouncer is spawned and arms.
-            let (new_shutdown, new_join) = spawn_write_kick_debouncer().unwrap();
-            wait_kick_armed(true);
+            let (new_shutdown, new_join) = spawn_debouncer_and_await_claim();
 
             // ...THEN `prev.stop()` joins the OLD debouncer, whose final statement stores
             // KICK_ARMED = false.
