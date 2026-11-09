@@ -46,6 +46,7 @@ import { NoteEditor } from "./NoteEditor";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { log } from "@/lib/logger";
+import type { Editor } from "@tiptap/core";
 
 function renderEditor(sessionId = "s1") {
   return render(
@@ -338,5 +339,50 @@ describe("NoteEditor — save guards (A1a/A1d)", () => {
 
     await waitFor(() => expect(saveNoteMock).toHaveBeenCalled());
     expect(toast.info).not.toHaveBeenCalled();
+  });
+});
+
+// Enter at the end of a block splits with an explicit "type after", which
+// throws when two copies of prosemirror-model are installed (the transform's
+// empty Fragment isn't an instance of the schema's Fragment class).
+describe("NoteEditor — Enter at the end of a block", () => {
+  /** Caret at the end of the note's first textblock, then Enter. */
+  function pressEnterAtEndOfFirstBlock() {
+    const editor = (editorDom() as HTMLElement & { editor: Editor }).editor;
+    let end = -1;
+    editor.state.doc.descendants((node, pos) => {
+      if (end < 0 && node.isTextblock) end = pos + node.nodeSize - 1;
+      return end < 0;
+    });
+    editor.commands.setTextSelection(end);
+    const handled = editor.view.someProp("handleKeyDown", (f) =>
+      f(editor.view, new KeyboardEvent("keydown", { key: "Enter" })),
+    );
+    return { handled, html: editor.getHTML() };
+  }
+
+  it.each([
+    ["paragraph", "<p>first line</p>", "<p>first line</p><p></p>"],
+    ["heading", "<h2>Title</h2>", "<h2>Title</h2><p></p>"],
+    ["bullet item", "<ul><li><p>one</p></li></ul>", "<ul><li><p>one</p></li><li><p></p></li></ul>"],
+    [
+      "task item",
+      '<ul data-type="taskList"><li data-type="taskItem" data-checked="false"><p>todo</p></li></ul>',
+      '<li data-checked="false" data-type="taskItem"><label><input type="checkbox"><span></span></label><div><p></p></div></li></ul>',
+    ],
+    [
+      "segment-reference pill",
+      '<p>See <span data-segment-ref="" data-segment-id="seg-1" data-timestamp="1:00" data-offset="60"></span></p>',
+      'data-offset="60">1:00</span></p><p></p>',
+    ],
+  ])("starts a new block after a %s", async (_label, content, expected) => {
+    getNoteMock.mockResolvedValue({ content });
+    renderEditor();
+    await waitFor(() => expect(editorDom()?.textContent).not.toBe(""));
+
+    const { handled, html } = pressEnterAtEndOfFirstBlock();
+
+    expect(handled).toBe(true);
+    expect(html).toContain(expected);
   });
 });
