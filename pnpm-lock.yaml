@@ -255,7 +255,7 @@ packages:
     resolution: {integrity: sha512-Elp+iwUx5rN5+Y8xLt5/GRoG20WGoDCQ/1Fb+1LiGtvwbDavuSk0jhD/eZdckHAuzcDzccnkv+rEjyWfRx18gg==}
 
   '@aptabase/tauri@https://codeload.github.com/Claytonn/tauri-plugin-aptabase/tar.gz/4cc41a6516f42159579189136e3bb532834f11d3':
-    resolution: {tarball: https://codeload.github.com/Claytonn/tauri-plugin-aptabase/tar.gz/4cc41a6516f42159579189136e3bb532834f11d3}
+    resolution: {gitHosted: true, integrity: sha512-y4Z3kbEI+XaESpd8fkemKCebihojG9SK5K55X+iEkToDsWF55CDi8mcUvNB4JTslI/7qAialcNCQ8NP1/ihOxQ==, tarball: https://codeload.github.com/Claytonn/tauri-plugin-aptabase/tar.gz/4cc41a6516f42159579189136e3bb532834f11d3}
     version: 0.4.2
 
   '@asamuzakjp/css-color@4.1.1':
