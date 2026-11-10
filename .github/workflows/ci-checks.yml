@@ -29,6 +29,10 @@ jobs:
         # `tauri build` rejects npm/Rust plugin pairs whose major.minor differ.
         run: node scripts/check-tauri-versions.mjs
 
+      - name: Check lockfile singleton packages
+        # ProseMirror and React break at runtime when two versions are loaded.
+        run: node scripts/check-lockfile-singletons.mjs
+
   rust:
     name: Rust (macos-latest)
     runs-on: macos-latest
