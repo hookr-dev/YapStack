@@ -386,3 +386,54 @@ describe("NoteEditor — Enter at the end of a block", () => {
     expect(html).toContain(expected);
   });
 });
+
+// StarterKit bundles Link and Underline in tiptap 3. Registering them again
+// adds a second Link with default options, whose click handler calls
+// `window.open` on a plain click while you edit.
+describe("NoteEditor — Link and Underline are registered once", () => {
+  async function mountedEditor(content: string): Promise<Editor> {
+    getNoteMock.mockResolvedValue({ content });
+    renderEditor();
+    await waitFor(() => expect(editorDom()?.textContent).not.toBe(""));
+    return (editorDom() as HTMLElement & { editor: Editor }).editor;
+  }
+
+  it("has exactly one link and one underline extension, configured as ours", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const editor = await mountedEditor("<p>hello</p>");
+    const names = editor.extensionManager.extensions.map((e) => e.name);
+
+    expect(names.filter((n) => n === "link")).toHaveLength(1);
+    expect(names.filter((n) => n === "underline")).toHaveLength(1);
+    const link = editor.extensionManager.extensions.find((e) => e.name === "link");
+    expect(link?.options).toMatchObject({
+      openOnClick: false,
+      autolink: true,
+      HTMLAttributes: { class: "text-primary underline" },
+    });
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("Duplicate extension names"),
+    );
+    warn.mockRestore();
+  });
+
+  it("does not open a link when it is clicked in the editor", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const editor = await mountedEditor('<p><a href="https://example.com">site</a></p>');
+    const anchor = editorDom().querySelector("a") as HTMLAnchorElement;
+    expect(anchor.className).toBe("text-primary underline");
+
+    const click = new MouseEvent("click", { button: 0 });
+    Object.defineProperty(click, "target", { value: anchor });
+    editor.view.someProp("handleClick", (f) => f(editor.view, 2, click));
+
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("still toggles underline", async () => {
+    const editor = await mountedEditor("<p>word</p>");
+    editor.chain().selectAll().toggleUnderline().run();
+    expect(editor.getHTML()).toContain("<u>word</u>");
+  });
+});

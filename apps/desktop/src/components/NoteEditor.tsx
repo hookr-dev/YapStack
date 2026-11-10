@@ -9,8 +9,6 @@ import Placeholder from "@tiptap/extension-placeholder";
 import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import Highlight from "@tiptap/extension-highlight";
-import Underline from "@tiptap/extension-underline";
-import Link from "@tiptap/extension-link";
 import Typography from "@tiptap/extension-typography";
 import {
   Bold,
@@ -456,7 +454,15 @@ export function NoteEditor({
   const editor: Editor | null = useEditor({
     autofocus: "end",
     extensions: [
-      StarterKit,
+      // StarterKit already includes Link and Underline; configure them here
+      // rather than registering second copies.
+      StarterKit.configure({
+        link: {
+          openOnClick: false,
+          autolink: true,
+          HTMLAttributes: { class: "text-primary underline" },
+        },
+      }),
       Markdown,
       Placeholder.configure({
         placeholder: "Write your notes here...",
@@ -464,12 +470,6 @@ export function NoteEditor({
       TaskList,
       TaskItem.configure({ nested: true }),
       Highlight.configure({ multicolor: true }),
-      Underline,
-      Link.configure({
-        openOnClick: false,
-        autolink: true,
-        HTMLAttributes: { class: "text-primary underline" },
-      }),
       Typography,
       SegmentReference,
     ],
