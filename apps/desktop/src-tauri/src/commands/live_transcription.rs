@@ -883,9 +883,11 @@ impl SourceVadState {
     /// Only a watchdog (`PreserveBinding`) same-device rebind is unsettled:
     /// the stream died on that device and may still be dead. A broker
     /// (`FollowDefault`) restart probes the current default first, so
-    /// landing on the device already bound means that device *is* the
-    /// current default, typically after Bluetooth headphones flap and
-    /// macOS fires several default-change events in a few seconds.
+    /// landing on the device already bound means the Source is already on
+    /// the current default, or (Mic only) the default couldn't start and
+    /// the still-working prior device was kept. The common case is
+    /// Bluetooth headphones flapping, with macOS firing several
+    /// default-change events in a few seconds.
     /// Counting those ended Mixed captures on a working device. Nothing
     /// re-polls a broker restart anyway; the next default change arrives
     /// as a new intent.

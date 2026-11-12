@@ -54,8 +54,9 @@ pub enum RestartTarget {
 /// reverts momentarily during an AirPods/Bluetooth handshake). After a
 /// `PreserveBinding` restart, a true `same_device` can mean the stream is
 /// still dead and the caller should retry. After a `FollowDefault`
-/// restart it means the bound device is already the current default,
-/// which is a completed restart.
+/// restart it means the stream is already on the current default, or
+/// (`restart_mic` only) the default couldn't start and the still-working
+/// prior device was kept. Either way the restart completed.
 ///
 /// `PartialEq`/`Eq` are not derived because `previous_buffer` is an `Arc`
 /// to a ring buffer whose interior atomics aren't comparable. No production
