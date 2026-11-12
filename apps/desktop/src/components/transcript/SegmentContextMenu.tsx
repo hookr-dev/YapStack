@@ -41,23 +41,42 @@ export function SegmentContextMenu({
     ? segments.find((s) => s.id === targetId)
     : undefined;
 
-  const handleContextMenu = (e: React.MouseEvent) => {
+  // Resolves and records the row under the event; null off a row, so a menu
+  // opened there renders nothing rather than the previous target's items.
+  const resolveTarget = (e: React.SyntheticEvent): string | null => {
     const row = (e.target as Element).closest(`[${SEGMENT_ROW_ATTR}]`);
-    if (!row || !e.currentTarget.contains(row)) {
+    const id =
+      row && e.currentTarget.contains(row)
+        ? row.getAttribute(SEGMENT_ROW_ATTR)
+        : null;
+    setTargetId(id);
+    return id;
+  };
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    if (resolveTarget(e) === null) {
       // Not on a row: preventDefault is how Radix's trigger is told not to
       // open. The window-level handler in main.tsx suppresses the native
       // menu here anyway.
       e.preventDefault();
-      return;
     }
-    setTargetId(row.getAttribute(SEGMENT_ROW_ATTR));
+  };
+
+  // Radix also opens on a touch/pen long-press timed from pointerdown, which
+  // never passes through handleContextMenu.
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.pointerType === "touch" || e.pointerType === "pen") resolveTarget(e);
   };
 
   const isHidden = target?.hidden === 1;
 
   return (
     <ContextMenu>
-      <ContextMenuTrigger asChild onContextMenu={handleContextMenu}>
+      <ContextMenuTrigger
+        asChild
+        onContextMenu={handleContextMenu}
+        onPointerDown={handlePointerDown}
+      >
         {children}
       </ContextMenuTrigger>
       {target && (

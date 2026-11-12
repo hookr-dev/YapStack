@@ -192,7 +192,7 @@ function TranscriptSegmentsInner({
                 isSelected={isSelected}
                 selectionActive={selectionActive}
                 readOnly={!isEditable}
-                      onTimestampClick={onTimestampClick}
+                onTimestampClick={onTimestampClick}
                 ref={isActive ? activeRef : undefined}
               />
             );

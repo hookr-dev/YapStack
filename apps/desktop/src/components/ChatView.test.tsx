@@ -7,7 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   tauriCoreMock,
   tauriEventMock,
@@ -243,5 +243,79 @@ describe("ChatView segment context menu", () => {
       "false",
     );
     expect(useAppStore.getState().editingSegmentId).toBe("seg-1");
+  });
+
+  it("does not start an edit when the menu is dismissed with Escape", async () => {
+    render(view([seg(0), seg(1)]));
+    openMenuOn("Segment 1");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryAllByRole("menuitem")).toHaveLength(0),
+    );
+    // Let the close's deferred focus restore run.
+    await act(() => new Promise((r) => setTimeout(r, 0)));
+    expect(screen.getByText("Segment 1")).toHaveAttribute(
+      "contenteditable",
+      "false",
+    );
+    expect(useAppStore.getState().editingSegmentId).toBeNull();
+  });
+
+  describe("touch long-press", () => {
+    // Radix's trigger opens on a 700 ms touch/pen hold.
+    const LONG_PRESS_MS = 700;
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    function longPress(el: Element) {
+      fireEvent.pointerDown(el, { pointerType: "touch", button: 0 });
+      act(() => {
+        vi.advanceTimersByTime(LONG_PRESS_MS + 100);
+      });
+    }
+
+    it("opens the menu for the pressed row", () => {
+      render(view([seg(0), seg(1)]));
+      longPress(screen.getByText("Segment 1"));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      expect(useAppStore.getState().deleteSegment).toHaveBeenCalledWith(
+        "seg-1",
+      );
+    });
+
+    it("opens nothing on blank space after a right-click on a row", () => {
+      const { container } = render(view([seg(0), seg(1)]));
+      openMenuOn("Segment 1");
+      fireEvent.keyDown(screen.getAllByRole("menuitem")[0], { key: "Escape" });
+      act(() => {
+        vi.runOnlyPendingTimers();
+      });
+      expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+
+      const list = container.querySelector(
+        "[data-segment-row-id]",
+      )!.parentElement!;
+      longPress(list);
+      fireEvent.contextMenu(list);
+      expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+    });
+  });
+});
+
+describe("ChatView range selection across the backfill split", () => {
+  it("ranges across backfill and live rows after a prepend", () => {
+    const live = [seg(4), seg(5)];
+    const extra = { backfillActive: true, backfillBoundarySeconds: 20 };
+    const r = render(view(live, extra));
+    r.rerender(view([seg(2), seg(3), ...live], extra));
+    fireEvent.click(screen.getByText("Segment 2"), { metaKey: true });
+    fireEvent.click(screen.getByText("Segment 5"), { shiftKey: true });
+    expect([...useAppStore.getState().selectedSegmentIds].sort()).toEqual([
+      "seg-2",
+      "seg-3",
+      "seg-4",
+      "seg-5",
+    ]);
   });
 });
