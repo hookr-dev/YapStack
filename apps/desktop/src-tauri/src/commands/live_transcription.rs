@@ -875,6 +875,44 @@ impl SourceVadState {
         }
     }
 
+    /// Retry-budget bookkeeping after a restart call returned `Ok`.
+    /// Returns `true` when the rebind is treated as unsettled (counted
+    /// against the budget, cooldown cleared so the watchdog can retry on
+    /// the next tick).
+    ///
+    /// Only a watchdog (`PreserveBinding`) same-device rebind is unsettled:
+    /// the stream died on that device and may still be dead. A broker
+    /// (`FollowDefault`) restart probes the current default first, so
+    /// landing on the device already bound means the Source is already on
+    /// the current default, or (Mic only) the default couldn't start and
+    /// the still-working prior device was kept. The common case is
+    /// Bluetooth headphones flapping, with macOS firing several
+    /// default-change events in a few seconds.
+    /// Counting those ended Mixed captures on a working device. Nothing
+    /// re-polls a broker restart anyway; the next default change arrives
+    /// as a new intent.
+    fn record_restart_success(
+        &mut self,
+        target: yapstack_audio::manager::RestartTarget,
+        same_device: bool,
+    ) -> bool {
+        let unsettled =
+            same_device && target == yapstack_audio::manager::RestartTarget::PreserveBinding;
+        if unsettled {
+            self.restart_attempts += 1;
+            self.last_restart_at = None;
+            true
+        } else {
+            self.restart_attempts = 0;
+            self.last_write_pos_advance = Instant::now();
+            false
+        }
+    }
+
+    fn restart_budget_exhausted(&self) -> bool {
+        self.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS
+    }
+
     /// Rewinds VAD progress past `new_pos`. Used when a contiguous range
     /// up to `new_pos` should be excluded from any future session
     /// transcription decision (today: closing a dictation mic-ownership
@@ -2591,7 +2629,7 @@ async fn check_stream_health(
     is_mixed: bool,
 ) -> bool {
     for source in sources.iter_mut() {
-        if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
+        if source.restart_budget_exhausted() {
             continue;
         }
 
@@ -2651,10 +2689,7 @@ async fn check_stream_health(
     // terminal restart failure on either side ends the whole Capture.
     // The per-source `restart_abandoned` toast was already emitted from
     // inside `attempt_source_restart`; no extra event needed here.
-    is_mixed
-        && sources
-            .iter()
-            .any(|s| s.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS)
+    is_mixed && sources.iter().any(SourceVadState::restart_budget_exhausted)
 }
 
 /// Symptom-based stream-failure detection, gated by the speculative-restart
@@ -2697,10 +2732,10 @@ async fn evaluate_speculative_signals(
 /// Run a single restart attempt for `source`. Records the attempt timestamp,
 /// invokes the engine's restart entry point, and on success handles the
 /// buffer-replacement bookkeeping (cursor reset + WAV flush-position reset).
-/// On a same-device rebind, treats the attempt as partial — increments the
-/// retry counter and clears the cooldown so the next tick can try again
-/// immediately instead of waiting 5 s. Emits a `stream-health` event in
-/// every outcome.
+/// On a watchdog same-device rebind, treats the attempt as partial —
+/// increments the retry counter and clears the cooldown so the next tick
+/// can try again immediately instead of waiting 5 s. Emits a
+/// `stream-health` event in every outcome.
 /// Run a single stream-restart attempt and update `source.restart_attempts`
 /// / `last_restart_at` bookkeeping. **Does not** handle buffer replacement —
 /// the caller inspects the returned `RestartReport` and, if
@@ -2753,27 +2788,20 @@ async fn attempt_source_restart(
                 source_name, report.outcome, report.same_device, report.new_device_id
             );
 
-            // Same-device rebind likely means macOS was still settling after
-            // a Bluetooth handshake (cpal#1175). Treat it like a partial
-            // failure: keep counting attempts and clear the cooldown so the
-            // next tick can retry immediately. Do NOT reset
-            // last_write_pos_advance — the stream hasn't actually recovered,
-            // and Layer 2 should fire on the next tick if write_pos isn't
-            // advancing.
-            if report.same_device {
+            // A watchdog same-device rebind counts as a partial failure:
+            // keep counting attempts and clear the cooldown so the next
+            // tick can retry immediately, and leave last_write_pos_advance
+            // alone so Layer 2 fires if write_pos still isn't advancing.
+            // See `record_restart_success` for why broker restarts differ.
+            if source.record_restart_success(target, report.same_device) {
                 warn!(
-                    "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
+                    "{} restart rebound to the same device ({:?}) — stream may still be dead; \
                      retrying on next poll (attempt {}/{})",
                     source_name,
                     report.new_device_id,
-                    source.restart_attempts + 1,
+                    source.restart_attempts,
                     STREAM_RESTART_MAX_ATTEMPTS
                 );
-                source.restart_attempts += 1;
-                source.last_restart_at = None;
-            } else {
-                source.restart_attempts = 0;
-                source.last_write_pos_advance = Instant::now();
             }
 
             let _ = app_handle.emit(
@@ -6047,6 +6075,54 @@ mod tests {
         assert_eq!(source, CaptureSource::SystemOnly);
         let source: CaptureSource = CaptureSourceDto::Mixed.into();
         assert_eq!(source, CaptureSource::Mixed);
+    }
+
+    // --- Restart retry budget ---
+
+    /// Replays the restart outcomes from a Mixed session that ended when
+    /// Bluetooth headphones disconnected and flapped for ~6 s. Every
+    /// restart call succeeded; the broker routed three System failovers
+    /// whose new default was the built-in speakers the loopback was
+    /// already bound to, so each reported `same_device: true`.
+    #[test]
+    fn follow_default_restarts_onto_current_device_do_not_exhaust_budget() {
+        use yapstack_audio::manager::RestartTarget::FollowDefault;
+        let mut mic = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 24000, 1, 0.0);
+        let mut system = SourceVadState::new(AudioSourceLabel::System, 0, 0, 24000, 2, 0.0);
+
+        mic.record_restart_success(FollowDefault, false); // headphones -> built-in mic
+        system.record_restart_success(FollowDefault, false); // headphones -> built-in speakers
+        mic.record_restart_success(FollowDefault, false); // headphones reconnect
+        system.record_restart_success(FollowDefault, true); // already on built-in speakers
+        mic.record_restart_success(FollowDefault, false); // headphones drop again
+        system.record_restart_success(FollowDefault, true);
+        mic.record_restart_success(FollowDefault, true); // already on built-in mic
+        system.record_restart_success(FollowDefault, true);
+
+        assert!(!mic.restart_budget_exhausted());
+        assert!(!system.restart_budget_exhausted());
+        assert_eq!(system.restart_attempts, 0);
+    }
+
+    #[test]
+    fn follow_default_restart_onto_current_device_resets_budget() {
+        use yapstack_audio::manager::RestartTarget::FollowDefault;
+        let mut system = SourceVadState::new(AudioSourceLabel::System, 0, 0, 48000, 2, 0.0);
+        system.restart_attempts = 2;
+        assert!(!system.record_restart_success(FollowDefault, true));
+        assert_eq!(system.restart_attempts, 0);
+    }
+
+    /// Watchdog restarts keep the bound device by design, so a same-device
+    /// rebind there can mean the stream is still dead; it keeps counting.
+    #[test]
+    fn preserve_binding_same_device_restarts_still_count() {
+        use yapstack_audio::manager::RestartTarget::PreserveBinding;
+        let mut mic = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
+        for _ in 0..STREAM_RESTART_MAX_ATTEMPTS {
+            assert!(mic.record_restart_success(PreserveBinding, true));
+        }
+        assert!(mic.restart_budget_exhausted());
     }
 
     // --- VAD state machine tests ---
