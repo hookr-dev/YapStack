@@ -52,6 +52,10 @@ function SpeakerHeader({ sessionId, segment, speakerId, speakers }: SpeakerHeade
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
+          // Keep the native text menu: stop the event before the list's
+          // shared segment context menu (and main.tsx's window-level
+          // suppressor) sees it.
+          onContextMenu={(e) => e.stopPropagation()}
           onKeyDown={(e) => {
             if (e.key === "Enter") commit();
             if (e.key === "Escape") {
@@ -90,7 +94,6 @@ interface TranscriptSegmentsProps {
   activeSegmentId: string | null;
   activeRef?: RefObject<HTMLDivElement | null>;
   selectedSegmentIds?: Set<string>;
-  orderedIds?: string[];
   onTimestampClick?: (time: number) => void;
 }
 
@@ -107,7 +110,6 @@ function TranscriptSegmentsInner({
   activeSegmentId,
   activeRef,
   selectedSegmentIds,
-  orderedIds,
   onTimestampClick,
 }: TranscriptSegmentsProps) {
   const selectionActive = (selectedSegmentIds?.size ?? 0) > 0;
@@ -160,7 +162,6 @@ function TranscriptSegmentsInner({
           isSelected={isSelected}
           selectionActive={selectionActive}
           readOnly={!isEditable}
-          orderedIds={orderedIds}
           onTimestampClick={onTimestampClick}
           ref={isActive ? activeRef : undefined}
         />
@@ -191,7 +192,6 @@ function TranscriptSegmentsInner({
                 isSelected={isSelected}
                 selectionActive={selectionActive}
                 readOnly={!isEditable}
-                orderedIds={orderedIds}
                 onTimestampClick={onTimestampClick}
                 ref={isActive ? activeRef : undefined}
               />

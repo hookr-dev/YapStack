@@ -9,6 +9,12 @@ import {
   type MarqueeRect,
 } from "@/components/MarqueeOverlay";
 import { BulkActionsBar } from "@/components/transcript/BulkActionsBar";
+import { SegmentContextMenu } from "@/components/transcript/SegmentContextMenu";
+import {
+  SegmentListContext,
+  useSegmentListHandle,
+} from "@/components/transcript/segmentList";
+import { findLastSegmentStartingAtOrBefore } from "@/lib/segment-search";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
 
@@ -99,7 +105,7 @@ export function ChatView({
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedSegmentIds, clearSegmentSelection, deleteSegments, isEditable]);
 
-  const orderedIds = useMemo(() => segments.map((s) => s.id), [segments]);
+  const segmentList = useSegmentListHandle(segments);
 
   // Split segments at the backfill→live boundary so the "Processing prior
   // audio" indicator sits between old and new audio. Backfill segments
@@ -519,12 +525,10 @@ export function ChatView({
   // playing — `currentPlaybackTime` alone is unreliable (see above).
   const activeSegmentId = useMemo(() => {
     if (!isPlaying || currentPlaybackTime == null) return null;
-    for (let i = segments.length - 1; i >= 0; i--) {
-      if (segments[i].audio_offset_seconds <= currentPlaybackTime) {
-        return segments[i].id;
-      }
-    }
-    return null;
+    return (
+      findLastSegmentStartingAtOrBefore(segments, currentPlaybackTime)?.id ??
+      null
+    );
   }, [segments, currentPlaybackTime, isPlaying]);
 
   if (segments.length === 0 && !backfillActive) {
@@ -540,56 +544,58 @@ export function ChatView({
   return (
     <div className="relative min-h-0 flex-1 select-text">
       <ScrollArea ref={scrollAreaRef} className="h-full">
-        <div
-          className="relative min-h-full space-y-2 px-3 py-2 select-none"
-          onPointerDown={handleContainerPointerDown}
-          onPointerMove={handleContainerPointerMove}
-          onPointerUp={handleContainerPointerUp}
-          onPointerCancel={handleContainerPointerCancel}
-          onClickCapture={(e) => {
-            if (suppressNextClickRef.current) {
-              suppressNextClickRef.current = false;
-              e.preventDefault();
-              e.stopPropagation();
-            }
-          }}
-        >
-          <TranscriptSegments
-            sessionId={sessionId ?? ""}
-            segments={backfillSegments}
-            isEditable={!!isEditable}
-            activeSegmentId={activeSegmentId}
-            activeRef={activeRef}
-            selectedSegmentIds={selectedSegmentIds}
-            orderedIds={orderedIds}
-            onTimestampClick={handleTimestampClick}
-          />
-          {backfillActive && (
-            <div className="flex items-center gap-4 py-2 text-muted-foreground">
-              <div className="h-px flex-1 border-t border-dashed" />
-              <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-              </span>
-              <span className="text-[11px] font-medium">Processing prior audio</span>
-              <div className="h-px flex-1 border-t border-dashed" />
+        <SegmentListContext.Provider value={segmentList}>
+          <SegmentContextMenu segments={segments} readOnly={!isEditable}>
+            <div
+              className="relative min-h-full space-y-2 px-3 py-2 select-none"
+              onPointerDown={handleContainerPointerDown}
+              onPointerMove={handleContainerPointerMove}
+              onPointerUp={handleContainerPointerUp}
+              onPointerCancel={handleContainerPointerCancel}
+              onClickCapture={(e) => {
+                if (suppressNextClickRef.current) {
+                  suppressNextClickRef.current = false;
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
+              }}
+            >
+              <TranscriptSegments
+                sessionId={sessionId ?? ""}
+                segments={backfillSegments}
+                isEditable={!!isEditable}
+                activeSegmentId={activeSegmentId}
+                activeRef={activeRef}
+                selectedSegmentIds={selectedSegmentIds}
+                onTimestampClick={handleTimestampClick}
+              />
+              {backfillActive && (
+                <div className="flex items-center gap-4 py-2 text-muted-foreground">
+                  <div className="h-px flex-1 border-t border-dashed" />
+                  <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+                  </span>
+                  <span className="text-[11px] font-medium">Processing prior audio</span>
+                  <div className="h-px flex-1 border-t border-dashed" />
+                </div>
+              )}
+              {liveSegments.length > 0 && (
+                <TranscriptSegments
+                  sessionId={sessionId ?? ""}
+                  segments={liveSegments}
+                  isEditable={!!isEditable}
+                  activeSegmentId={activeSegmentId}
+                  activeRef={activeRef}
+                  selectedSegmentIds={selectedSegmentIds}
+                  onTimestampClick={handleTimestampClick}
+                />
+              )}
+              <MarqueeOverlay ref={marqueeOverlayRef} />
+              <div ref={bottomRef} />
             </div>
-          )}
-          {liveSegments.length > 0 && (
-            <TranscriptSegments
-              sessionId={sessionId ?? ""}
-              segments={liveSegments}
-              isEditable={!!isEditable}
-              activeSegmentId={activeSegmentId}
-              activeRef={activeRef}
-              selectedSegmentIds={selectedSegmentIds}
-              orderedIds={orderedIds}
-              onTimestampClick={handleTimestampClick}
-            />
-          )}
-          <MarqueeOverlay ref={marqueeOverlayRef} />
-          <div ref={bottomRef} />
-        </div>
+          </SegmentContextMenu>
+        </SegmentListContext.Provider>
       </ScrollArea>
       <BulkActionsBar segments={segments} readOnly={!isEditable} />
       {userScrolled && isPlaying && (
