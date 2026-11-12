@@ -67,7 +67,7 @@ Prerequisites:
 
 **Setup.** Plug a USB mic. Start a `Mixed` Capture using that mic. Confirm both Mic and System audio are flowing.
 
-**Action.** Force the Mic restart attempts to exhaust. Easiest reproduction: rapidly unplug and replug the USB mic several times in quick succession (faster than the broker can settle), so the restart counter reaches `STREAM_RESTART_MAX_ATTEMPTS` (3).
+**Action.** Force the Mic restart attempts to exhaust. Only restarts that fail, or watchdog restarts that rebind the same device while its stream stays dead, count toward `STREAM_RESTART_MAX_ATTEMPTS` (3). A device-change restart that lands on the device already in use counts as a success, so rapid unplug/replug no longer exhausts the budget. Reproduce with a Mic whose restarts fail (each `restart failed (attempt N)` log line counts) or whose stream keeps dying on the same device after the watchdog rebinds it (each `rebound to the same device — stream may still be dead` line counts), until the log shows attempt 3/3.
 
 **Expect.**
 - A `restart_abandoned` error toast appears for the Mic.

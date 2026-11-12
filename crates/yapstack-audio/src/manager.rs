@@ -51,10 +51,12 @@ pub enum RestartTarget {
 /// Extended report from a stream restart (mic or system). Callers use
 /// `same_device` to decide whether the restart actually moved to a new
 /// device or rebound to the same one (which happens when the OS default
-/// reverts momentarily during an AirPods/Bluetooth handshake). A true
-/// `same_device` means the rebind was effectively a no-op and the caller
-/// should retry after letting macOS settle, rather than treating the
-/// restart as complete.
+/// reverts momentarily during an AirPods/Bluetooth handshake). After a
+/// `PreserveBinding` restart, a true `same_device` can mean the stream is
+/// still dead and the caller should retry. After a `FollowDefault`
+/// restart it means the stream is already on the current default, or
+/// (`restart_mic` only) the default couldn't start and the still-working
+/// prior device was kept. Either way the restart completed.
 ///
 /// `PartialEq`/`Eq` are not derived because `previous_buffer` is an `Arc`
 /// to a ring buffer whose interior atomics aren't comparable. No production
@@ -954,14 +956,11 @@ impl AudioManager {
     /// reset source positions / VAD state when `RestartOutcome::BufferReplaced`
     /// is returned — the old positions reference a different buffer.
     ///
-    /// The returned `SystemRestartReport` includes `same_device`, which is
-    /// `true` when the post-restart bound device ID matches the pre-restart
-    /// ID. Under a normal AirPods handshake macOS may briefly report the
-    /// *old* device as default (a "revert" window) before committing to the
-    /// new one; a restart during that window produces `same_device=true`
-    /// and the caller should retry after a short delay instead of accepting
-    /// the bind. See `yapstack-audio` tests and the cpal #1175 discussion
-    /// for background.
+    /// The returned `RestartReport` includes `same_device`, which is `true`
+    /// when the post-restart bound device ID matches the pre-restart ID.
+    /// This always binds the current default output, so `same_device=true`
+    /// means the loopback was already on the default. How a caller weighs
+    /// that is described on `RestartReport`.
     pub fn restart_system_audio(&mut self) -> Result<RestartReport> {
         let existing = self
             .system_buffer
