@@ -879,12 +879,24 @@ impl SourceVadState {
     /// Returns `true` when the rebind is treated as unsettled (counted
     /// against the budget, cooldown cleared so the watchdog can retry on
     /// the next tick).
+    ///
+    /// Only a watchdog (`PreserveBinding`) same-device rebind is unsettled:
+    /// the stream died on that device and may still be dead. A broker
+    /// (`FollowDefault`) restart probes the current default first, so
+    /// landing on the device already bound means that device *is* the
+    /// current default, typically after Bluetooth headphones flap and
+    /// macOS fires several default-change events in a few seconds.
+    /// Counting those ended Mixed captures on a working device. Nothing
+    /// re-polls a broker restart anyway; the next default change arrives
+    /// as a new intent.
     fn record_restart_success(
         &mut self,
-        _target: yapstack_audio::manager::RestartTarget,
+        target: yapstack_audio::manager::RestartTarget,
         same_device: bool,
     ) -> bool {
-        if same_device {
+        let unsettled =
+            same_device && target == yapstack_audio::manager::RestartTarget::PreserveBinding;
+        if unsettled {
             self.restart_attempts += 1;
             self.last_restart_at = None;
             true
@@ -2718,10 +2730,10 @@ async fn evaluate_speculative_signals(
 /// Run a single restart attempt for `source`. Records the attempt timestamp,
 /// invokes the engine's restart entry point, and on success handles the
 /// buffer-replacement bookkeeping (cursor reset + WAV flush-position reset).
-/// On a same-device rebind, treats the attempt as partial — increments the
-/// retry counter and clears the cooldown so the next tick can try again
-/// immediately instead of waiting 5 s. Emits a `stream-health` event in
-/// every outcome.
+/// On a watchdog same-device rebind, treats the attempt as partial —
+/// increments the retry counter and clears the cooldown so the next tick
+/// can try again immediately instead of waiting 5 s. Emits a
+/// `stream-health` event in every outcome.
 /// Run a single stream-restart attempt and update `source.restart_attempts`
 /// / `last_restart_at` bookkeeping. **Does not** handle buffer replacement —
 /// the caller inspects the returned `RestartReport` and, if
@@ -2774,16 +2786,14 @@ async fn attempt_source_restart(
                 source_name, report.outcome, report.same_device, report.new_device_id
             );
 
-            // Same-device rebind likely means macOS was still settling after
-            // a Bluetooth handshake (cpal#1175). Treat it like a partial
-            // failure: keep counting attempts and clear the cooldown so the
-            // next tick can retry immediately. Do NOT reset
-            // last_write_pos_advance — the stream hasn't actually recovered,
-            // and Layer 2 should fire on the next tick if write_pos isn't
-            // advancing.
+            // A watchdog same-device rebind counts as a partial failure:
+            // keep counting attempts and clear the cooldown so the next
+            // tick can retry immediately, and leave last_write_pos_advance
+            // alone so Layer 2 fires if write_pos still isn't advancing.
+            // See `record_restart_success` for why broker restarts differ.
             if source.record_restart_success(target, report.same_device) {
                 warn!(
-                    "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
+                    "{} restart rebound to the same device ({:?}) — stream may still be dead; \
                      retrying on next poll (attempt {}/{})",
                     source_name,
                     report.new_device_id,
