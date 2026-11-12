@@ -4953,6 +4953,20 @@ async fn flush_session_wav_to_limit(
     }
 }
 
+/// Runs a part-finalize step on tokio's blocking pool. The MP3 encode of a
+/// multi-hour recording takes a minute or more of CPU; run inline it pins an
+/// async worker (and any task parked in its LIFO slot) for that whole time.
+async fn run_blocking_finalize<T, F>(finalize: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, yapstack_audio::AudioError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(finalize).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(join) => Err(format!("finalize task failed: {join}")),
+    }
+}
+
 /// Finalize the session-WAV writer in the user's chosen export format and
 /// persist the resulting part row to the DB before emitting
 /// `session-part-ready`. The caller must perform the final bounded/unbounded
@@ -4981,13 +4995,17 @@ async fn finalize_session_wav(ws: SessionWavState, ctx: &TranscriptionContext) {
         .config
         .audio_export_format
         .unwrap_or(AudioExportFormatDto::Mp3);
-    let result = if format.is_mp3() {
-        ws.writer
-            .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
-    } else {
-        ws.writer.finalize_wav_only()
-    };
-    let (path, duration) = match result {
+    let bitrate = ctx.config.mp3_bitrate.unwrap_or(64);
+    let writer = ws.writer;
+    let (path, duration) = match run_blocking_finalize(move || {
+        if format.is_mp3() {
+            writer.finalize_as_mp3(bitrate)
+        } else {
+            writer.finalize_wav_only()
+        }
+    })
+    .await
+    {
         Ok(out) => out,
         Err(e) => {
             error!("session WAV finalize failed: {}", e);
@@ -6066,6 +6084,47 @@ mod replay_harness;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-minute MP3 encode at session stop must not occupy an async
+    /// worker. On a single-worker runtime, the fake encoder can only see the
+    /// signal if the spawned task gets polled while the encode is running.
+    #[test]
+    fn blocking_finalize_leaves_the_async_runtime_free() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let other_task = tokio::spawn(async move {
+                tx.send(()).unwrap();
+            });
+            let saw_other_task = run_blocking_finalize(move || {
+                Ok::<_, yapstack_audio::AudioError>(rx.recv_timeout(Duration::from_secs(5)).is_ok())
+            })
+            .await
+            .unwrap();
+            assert!(
+                saw_other_task,
+                "finalize ran on the async worker and starved other tasks"
+            );
+            other_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn blocking_finalize_surfaces_encoder_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(run_blocking_finalize(|| {
+                Err::<(), _>(yapstack_audio::AudioError::Mp3Encode("boom".into()))
+            }))
+            .unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+    }
 
     #[test]
     fn test_capture_source_dto_into() {

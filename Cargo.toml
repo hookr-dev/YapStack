@@ -27,6 +27,16 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 
+# The MP3 encode when a recording stops runs LAME (C, built by mp3lame-sys at
+# that package's opt-level) fed by hound's WAV reader. At the dev profile's
+# opt-level 0 a 5.6 h recording took 6.4 min to encode (1 min in release);
+# optimizing these two packages brings `tauri dev` down to about 2 min.
+[profile.dev.package.mp3lame-sys]
+opt-level = 3
+
+[profile.dev.package.hound]
+opt-level = 3
+
 [workspace.dependencies]
 cpal = "0.17"
 serde = { version = "1", features = ["derive"] }
