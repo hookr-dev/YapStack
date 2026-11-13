@@ -58,6 +58,15 @@ const DEFAULT_LIST_WIDTH_PX = 400;
 // Longest a playback scroll may take before scroll events count as the
 // user's again.
 const AUTO_SCROLL_MAX_MS = 1000;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 export function ChatView({
   sessionId,
@@ -253,8 +262,9 @@ export function ChatView({
   // Until the row has come fully into view, scroll events are ours, not the
   // user's: reading them as the user would flag the row as scrolled away
   // mid-animation, and the follow that fires when it reappears would replace
-  // a centring scroll with a "nearest" one. Capped in case a gesture cuts
-  // the scroll short.
+  // a centring scroll with a "nearest" one. Real user input on the scroll
+  // area ends the window early (see the effect below); the cap covers
+  // anything else that stops the scroll short.
   const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revealRow = useCallback(
     (index: number, block: "nearest" | "center") => {
@@ -348,8 +358,41 @@ export function ChatView({
       }
     };
 
+    // A gesture or scroll key during a playback follow is the user taking
+    // over: stop the follow and read the scroll that follows as theirs, so
+    // a flick that ends inside the follow's window still shows Jump to
+    // current instead of being pulled back on the next line.
+    const root = scrollAreaRef.current;
+    const takeOver = () => {
+      if (!autoScrollingRef.current) return;
+      autoScrollingRef.current = false;
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+        autoScrollTimerRef.current = null;
+      }
+      virtualizer.cancelScroll();
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!SCROLL_KEYS.has(e.key)) return;
+      const target = e.target as HTMLElement;
+      if (target.closest('[contenteditable="true"], input, textarea')) return;
+      takeOver();
+    };
+
     viewport.addEventListener("scroll", handleScroll, { passive: true });
-    return () => viewport.removeEventListener("scroll", handleScroll);
+    // On the ScrollArea root so the Radix scrollbar (a sibling of the
+    // viewport) counts too.
+    root?.addEventListener("wheel", takeOver, { passive: true });
+    root?.addEventListener("touchstart", takeOver, { passive: true });
+    root?.addEventListener("pointerdown", takeOver);
+    root?.addEventListener("keydown", handleKeyDown);
+    return () => {
+      viewport.removeEventListener("scroll", handleScroll);
+      root?.removeEventListener("wheel", takeOver);
+      root?.removeEventListener("touchstart", takeOver);
+      root?.removeEventListener("pointerdown", takeOver);
+      root?.removeEventListener("keydown", handleKeyDown);
+    };
     // `hasRows`: the viewport mounts with the first row.
   }, [isPlaying, getViewport, virtualizer, hasRows]);
 

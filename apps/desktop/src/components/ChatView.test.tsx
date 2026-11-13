@@ -465,6 +465,38 @@ describe("ChatView virtualized transcript", () => {
     expectFullyVisible("seg-5");
   });
 
+  it.each([
+    ["wheels", (vp: HTMLElement) => fireEvent.wheel(vp, { deltaY: -400 })],
+    ["touches", (vp: HTMLElement) => fireEvent.touchStart(vp)],
+    ["presses PageUp", (vp: HTMLElement) => fireEvent.keyDown(vp, { key: "PageUp" })],
+  ] as const)(
+    "hands the scroll back when the user %s during a playback follow",
+    async (_label, takeOver) => {
+      const segments = range(0, 300);
+      const r = await startPlayback(segments, 100 * 5);
+      await layout.settle(200);
+      expectFullyVisible("seg-100");
+
+      // The follow to row 130 writes its scroll; before that scroll is
+      // reported, the user takes over and moves far up.
+      act(() => {
+        r.rerender(view(segments, { currentPlaybackTime: 130 * 5, onTimestampClick }));
+      });
+      const vp = layout.viewport();
+      takeOver(vp);
+      vp.scrollTop = 1000;
+      await layout.settle(100);
+
+      expect(screen.getByRole("button", { name: /jump to current/i })).toBeInTheDocument();
+      expect(vp.scrollTop).toBe(1000);
+
+      // The next line doesn't pull the reader back.
+      r.rerender(view(segments, { currentPlaybackTime: 131 * 5, onTimestampClick }));
+      await layout.settle(100);
+      expect(vp.scrollTop).toBe(1000);
+    },
+  );
+
   it("centres an unmounted active segment on Jump to current", async () => {
     await startPlayback(range(0, 300), 5 * 5);
     // Past the follow's own scroll, so the next one reads as the user's.
