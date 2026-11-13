@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useScrollAnchor } from "@/hooks/useScrollAnchor";
-import { TranscriptSegments } from "@/components/TranscriptSegments";
+import { TranscriptRowView } from "@/components/transcript/TranscriptRowView";
+import { buildTranscriptRows } from "@/components/transcript/rows";
 import {
   MarqueeOverlay,
   type MarqueeOverlayHandle,
@@ -107,27 +108,11 @@ export function ChatView({
 
   const segmentList = useSegmentListHandle(segments);
 
-  // Split segments at the backfill→live boundary so the "Processing prior
-  // audio" indicator sits between old and new audio. Backfill segments
-  // occupy offsets `0..backfillBoundarySeconds`; live audio comes after.
-  // Until the first backfill chunk lands, boundary is null and every
-  // received segment is live (rendered below the indicator).
-  const { backfillSegments, liveSegments } = useMemo(() => {
-    if (!backfillActive) {
-      return { backfillSegments: segments, liveSegments: [] as DbSegment[] };
-    }
-    const boundary = backfillBoundarySeconds ?? 0;
-    const splitIndex = segments.findIndex(
-      (s) => s.audio_offset_seconds >= boundary,
-    );
-    if (splitIndex === -1) {
-      return { backfillSegments: segments, liveSegments: [] as DbSegment[] };
-    }
-    return {
-      backfillSegments: segments.slice(0, splitIndex),
-      liveSegments: segments.slice(splitIndex),
-    };
-  }, [segments, backfillActive, backfillBoundarySeconds]);
+  const rows = useMemo(
+    () => buildTranscriptRows(segments, !!backfillActive, backfillBoundarySeconds),
+    [segments, backfillActive, backfillBoundarySeconds],
+  );
+  const selectionActive = selectedSegmentIds.size > 0;
 
   // Marquee selection state — drag-select across the transcript. Any
   // pointerdown in the container records a pending start; we commit to
@@ -560,37 +545,22 @@ export function ChatView({
                 }
               }}
             >
-              <TranscriptSegments
-                sessionId={sessionId ?? ""}
-                segments={backfillSegments}
-                isEditable={!!isEditable}
-                activeSegmentId={activeSegmentId}
-                activeRef={activeRef}
-                selectedSegmentIds={selectedSegmentIds}
-                onTimestampClick={handleTimestampClick}
-              />
-              {backfillActive && (
-                <div className="flex items-center gap-4 py-2 text-muted-foreground">
-                  <div className="h-px flex-1 border-t border-dashed" />
-                  <span className="relative flex h-2 w-2">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-                  </span>
-                  <span className="text-[11px] font-medium">Processing prior audio</span>
-                  <div className="h-px flex-1 border-t border-dashed" />
-                </div>
-              )}
-              {liveSegments.length > 0 && (
-                <TranscriptSegments
-                  sessionId={sessionId ?? ""}
-                  segments={liveSegments}
-                  isEditable={!!isEditable}
-                  activeSegmentId={activeSegmentId}
-                  activeRef={activeRef}
-                  selectedSegmentIds={selectedSegmentIds}
-                  onTimestampClick={handleTimestampClick}
-                />
-              )}
+              {rows.map((row) => {
+                const segmentId = row.kind === "segment" ? row.segment.id : null;
+                return (
+                  <TranscriptRowView
+                    key={row.key}
+                    row={row}
+                    sessionId={sessionId ?? ""}
+                    isEditable={!!isEditable}
+                    isActive={segmentId !== null && segmentId === activeSegmentId}
+                    isSelected={segmentId !== null && selectedSegmentIds.has(segmentId)}
+                    selectionActive={selectionActive}
+                    onTimestampClick={handleTimestampClick}
+                    activeRef={activeRef}
+                  />
+                );
+              })}
               <MarqueeOverlay ref={marqueeOverlayRef} />
               <div ref={bottomRef} />
             </div>
