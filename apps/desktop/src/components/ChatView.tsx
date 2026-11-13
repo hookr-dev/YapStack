@@ -55,6 +55,9 @@ const OVERSCAN_ROWS = 8;
 const PINNED_THRESHOLD_PX = 4;
 // Width assumed for size estimates until the viewport has been measured.
 const DEFAULT_LIST_WIDTH_PX = 400;
+// Longest a playback scroll may take before scroll events count as the
+// user's again.
+const AUTO_SCROLL_MAX_MS = 1000;
 
 export function ChatView({
   sessionId,
@@ -243,40 +246,63 @@ export function ChatView({
 
   // A mounted row scrolls smoothly; an unmounted one is far away, so jump
   // straight to it rather than animate through rows that aren't measured.
+  // Both go through the virtualizer: a native smooth scrollIntoView is cut
+  // short when rows mounting on the way are measured and the virtualizer
+  // corrects scrollTop for them.
+  //
+  // Until the row has come fully into view, scroll events are ours, not the
+  // user's: reading them as the user would flag the row as scrolled away
+  // mid-animation, and the follow that fires when it reappears would replace
+  // a centring scroll with a "nearest" one. Capped in case a gesture cuts
+  // the scroll short.
+  const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revealRow = useCallback(
     (index: number, block: "nearest" | "center") => {
-      const el = virtualizer.elementsCache.get(rows[index].key) as
-        | HTMLElement
-        | undefined;
+      const viewport = getViewport();
+      const item = virtualizer.measurementsCache[index];
+      if (
+        block === "nearest" &&
+        viewport &&
+        item &&
+        classifyRowVisibility(item, viewport.scrollTop, viewport.clientHeight) ===
+          "visible"
+      ) {
+        // Already in view: nothing scrolls, so no scroll event would end
+        // the auto-scroll window below.
+        return;
+      }
+      autoScrollingRef.current = true;
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+      }
+      autoScrollTimerRef.current = setTimeout(() => {
+        autoScrollingRef.current = false;
+      }, AUTO_SCROLL_MAX_MS);
+      const el = virtualizer.elementsCache.get(rows[index].key);
       if (el?.isConnected) {
-        el.scrollIntoView({ behavior: "smooth", block });
+        virtualizer.scrollToIndex(index, {
+          align: block === "nearest" ? "auto" : "center",
+          behavior: "smooth",
+        });
       } else {
         virtualizer.scrollToIndex(index, { align: "center" });
       }
     },
-    [virtualizer, rows],
+    [virtualizer, rows, getViewport],
   );
 
   // Auto-scroll to the active segment during playback (unless the user is freed).
   useEffect(() => {
     if (!isPlaying || activeIndex == null || userScrolled) return;
-    autoScrollingRef.current = true;
     revealRow(activeIndex, "nearest");
-    const t = setTimeout(() => {
-      autoScrollingRef.current = false;
-    }, 150);
-    return () => {
-      clearTimeout(t);
-      autoScrollingRef.current = false;
-    };
     // `revealRow` changes with every rows change; following is keyed on
     // the active row, not on the list.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeIndex, userScrolled, isPlaying]);
 
-  // Disengage stick-to-bottom on user scroll. Programmatic moves either go
-  // down (follow, prepend anchoring) or stay at the bottom (a row above
-  // shrinking while pinned), so moving up away from the bottom is the user.
+  // Track whether the viewport is at the bottom (which drives following new
+  // rows) and, during playback, whether the active row is still in view
+  // (which drives following playback and the Jump to current pill).
   const hasRows = rows.length > 0;
   useEffect(() => {
     const viewport = getViewport();
@@ -294,7 +320,6 @@ export function ChatView({
 
       const active = activeIndexRef.current;
       if (isPlaying && active != null) {
-        if (autoScrollingRef.current) return;
         const item = virtualizer.measurementsCache[active];
         if (!item) return;
         const where = classifyRowVisibility(
@@ -302,14 +327,20 @@ export function ChatView({
           newScrollTop,
           viewport.clientHeight,
         );
+        if (autoScrollingRef.current) {
+          if (where === "visible") autoScrollingRef.current = false;
+          return;
+        }
         setUserScrolled(where !== "visible");
         if (where !== "visible") {
           setScrollDirection(where === "above" ? "up" : "down");
         }
         return;
       }
+      // Playback stopped (or lost its row) before its scroll was seen.
+      autoScrollingRef.current = false;
 
-      if (wentUp && distFromBottom >= PINNED_THRESHOLD_PX) {
+      if (wentUp) {
         setUserScrolled(true);
         setScrollDirection("down");
       } else if (distFromBottom < PINNED_THRESHOLD_PX) {
@@ -488,9 +519,15 @@ export function ChatView({
     scrollRafRef.current = requestAnimationFrame(tickAutoScroll);
   };
 
-  // Cancel any in-flight RAF when the component unmounts mid-drag.
+  // Cancel any in-flight RAF when the component unmounts mid-drag, and the
+  // playback auto-scroll cap.
   useEffect(() => {
-    return () => stopAutoScroll();
+    return () => {
+      stopAutoScroll();
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+      }
+    };
   }, []);
 
   const handleContainerPointerDown = (e: React.PointerEvent) => {

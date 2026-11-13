@@ -115,6 +115,7 @@ beforeEach(() => {
     selectedSegmentIds: new Set(),
     lastSelectedSegmentId: null,
     editingSegmentId: null,
+    isPlaying: false,
     deleteSegment: vi.fn(),
     toggleSegmentHidden: vi.fn(),
     editSegmentText: vi.fn(),
