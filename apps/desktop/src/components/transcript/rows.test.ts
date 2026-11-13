@@ -78,6 +78,19 @@ describe("buildTranscriptRows", () => {
     expect(keys(rows)).toEqual(["hdr:b", "b"]);
   });
 
+  it("merges one speaker's runs around a blank-only run of another speaker", () => {
+    const rows = buildTranscriptRows(
+      [
+        seg("a", { speaker_id: 0 }),
+        seg("b", { speaker_id: 1, text: "" }),
+        seg("c", { speaker_id: 0 }),
+      ],
+      false,
+      null,
+    );
+    expect(keys(rows)).toEqual(["hdr:a", "a", "c"]);
+  });
+
   it("splits at the backfill boundary with the divider between halves", () => {
     const rows = buildTranscriptRows(
       [

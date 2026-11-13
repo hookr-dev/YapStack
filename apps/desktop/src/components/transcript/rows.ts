@@ -40,40 +40,26 @@ export function buildTranscriptRows(
   return rows;
 }
 
-function isVisible(segment: DbSegment): boolean {
-  return segment.text.trim() !== "";
-}
-
-function pushSegment(rows: TranscriptRow[], segment: DbSegment) {
-  rows.push({ kind: "segment", key: segment.id, segment });
-}
-
-function pushHalf(rows: TranscriptRow[], segments: DbSegment[]) {
+function pushHalf(rows: TranscriptRow[], half: DbSegment[]) {
+  // Blank segments go before grouping, so they can't split one speaker's
+  // run into two runs with identical headers.
+  const segments = half.filter((s) => s.text.trim() !== "");
   if (!segments.some((s) => s.speaker_id != null)) {
-    for (const s of segments) if (isVisible(s)) pushSegment(rows, s);
+    for (const s of segments) rows.push({ kind: "segment", key: s.id, segment: s });
     return;
   }
   // Speaker keys are channel-qualified, so two adjacent same-id segments
   // from different sources don't merge under one header.
-  let i = 0;
-  while (i < segments.length) {
-    const speakerKey = speakerKeyOf(segments[i]);
-    let end = i + 1;
-    while (end < segments.length && speakerKeyOf(segments[end]) === speakerKey) {
-      end++;
+  let runKey: string | null = null;
+  for (const s of segments) {
+    const speakerKey = speakerKeyOf(s);
+    if (speakerKey !== runKey) {
+      runKey = speakerKey;
+      if (s.speaker_id != null) {
+        rows.push({ kind: "speaker", key: `hdr:${s.id}`, segment: s, speakerId: s.speaker_id });
+      }
     }
-    const run = segments.slice(i, end).filter(isVisible);
-    const speakerId = segments[i].speaker_id;
-    if (run.length > 0 && speakerId != null) {
-      rows.push({
-        kind: "speaker",
-        key: `hdr:${run[0].id}`,
-        segment: run[0],
-        speakerId,
-      });
-    }
-    for (const s of run) pushSegment(rows, s);
-    i = end;
+    rows.push({ kind: "segment", key: s.id, segment: s });
   }
 }
 
