@@ -904,7 +904,6 @@ export function NoteDetailView() {
                   isActiveSession ? backfillBoundarySeconds : null
                 }
                 isEditable={isEditable}
-                initialScrollToBottom={isActiveSession}
               />
             </div>
           </ResizablePanel>
@@ -1031,7 +1030,6 @@ export function NoteDetailView() {
           <ChatView
             sessionId={selectedSessionId ?? undefined}
             segments={segments}
-            initialScrollToBottom
           />
         ) : (
           <div className="flex flex-1 items-center justify-center">

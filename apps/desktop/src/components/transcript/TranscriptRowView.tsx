@@ -1,4 +1,4 @@
-import { memo, useMemo, useState, type Ref } from "react";
+import { memo, useMemo, useState } from "react";
 import { EditableSegment } from "@/components/EditableSegment";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
@@ -109,7 +109,6 @@ interface TranscriptRowViewProps {
   isSelected: boolean;
   selectionActive: boolean;
   onTimestampClick?: (time: number) => void;
-  activeRef?: Ref<HTMLDivElement>;
 }
 
 // Row objects are rebuilt whenever the segment list changes, so rows compare
@@ -133,8 +132,7 @@ function samePropsAsBefore(
     prev.isActive === next.isActive &&
     prev.isSelected === next.isSelected &&
     prev.selectionActive === next.selectionActive &&
-    prev.onTimestampClick === next.onTimestampClick &&
-    prev.activeRef === next.activeRef
+    prev.onTimestampClick === next.onTimestampClick
   );
 }
 
@@ -148,7 +146,6 @@ export const TranscriptRowView = memo(function TranscriptRowView({
   isSelected,
   selectionActive,
   onTimestampClick,
-  activeRef,
 }: TranscriptRowViewProps) {
   switch (row.kind) {
     case "divider":
@@ -170,7 +167,6 @@ export const TranscriptRowView = memo(function TranscriptRowView({
           selectionActive={selectionActive}
           readOnly={!isEditable}
           onTimestampClick={onTimestampClick}
-          ref={isActive ? activeRef : undefined}
         />
       );
   }
