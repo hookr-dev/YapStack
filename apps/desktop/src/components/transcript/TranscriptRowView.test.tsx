@@ -11,7 +11,8 @@ import {
   tauriCommandsMock,
 } from "@/test/tauri-mocks";
 import { useAppStore } from "@/stores/appStore";
-import { TranscriptSegments } from "./TranscriptSegments";
+import { TranscriptRowView } from "./TranscriptRowView";
+import { buildTranscriptRows } from "./rows";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { DbSegment } from "@/lib/db";
 
@@ -51,12 +52,17 @@ const segments = [
 function renderTranscript() {
   return render(
     <TooltipProvider>
-      <TranscriptSegments
-        sessionId="s1"
-        segments={segments}
-        isEditable={false}
-        activeSegmentId={null}
-      />
+      {buildTranscriptRows(segments, false, null).map((row) => (
+        <TranscriptRowView
+          key={row.key}
+          row={row}
+          sessionId="s1"
+          isEditable={false}
+          isActive={false}
+          isSelected={false}
+          selectionActive={false}
+        />
+      ))}
     </TooltipProvider>,
   );
 }
@@ -65,7 +71,7 @@ beforeEach(() => {
   useAppStore.setState((s) => ({ settings: { ...s.settings, speakerNames: {} } }));
 });
 
-describe("TranscriptSegments speaker headers", () => {
+describe("SpeakerHeader", () => {
   it("renaming mic Speaker 1 does not rename system Speaker 1", async () => {
     renderTranscript();
     const headers = screen.getAllByRole("button", { name: "Speaker 1" });
