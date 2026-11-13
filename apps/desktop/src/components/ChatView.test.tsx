@@ -49,8 +49,10 @@ vi.mock("@/components/EditableSegment", async (importOriginal) => {
 import { useAppStore } from "@/stores/appStore";
 import { ChatView } from "./ChatView";
 import { TooltipProvider } from "@/components/ui/tooltip";
-
-Element.prototype.scrollIntoView = () => {};
+import {
+  installVirtualLayout,
+  type VirtualLayout,
+} from "@/test/virtual-layout";
 
 function seg(i: number, overrides?: Partial<DbSegment>): DbSegment {
   return {
@@ -83,6 +85,29 @@ function view(
     </TooltipProvider>
   );
 }
+
+// Rows are ROW_PX tall unless a test overrides one by segment id. That is
+// a little taller than the estimate, so rows shift as they get measured.
+const ROW_PX = 50;
+const VIEWPORT_PX = 600;
+const heights = new Map<string, number>();
+let layout: VirtualLayout;
+
+beforeEach(() => {
+  heights.clear();
+  layout = installVirtualLayout({
+    viewportHeight: VIEWPORT_PX,
+    viewportWidth: 400,
+    heightOf: (row) => {
+      const id = row
+        .querySelector("[data-segment-row-id]")
+        ?.getAttribute("data-segment-row-id");
+      return (id && heights.get(id)) || ROW_PX;
+    },
+  });
+});
+
+afterEach(() => layout.uninstall());
 
 beforeEach(() => {
   rowRenders.clear();
@@ -317,5 +342,233 @@ describe("ChatView range selection across the backfill split", () => {
       "seg-4",
       "seg-5",
     ]);
+  });
+});
+
+const range = (from: number, to: number) =>
+  Array.from({ length: to - from }, (_, k) => seg(from + k));
+const maxScrollTop = () =>
+  layout.viewport().scrollHeight - layout.viewport().clientHeight;
+const rowEl = (id: string) =>
+  document.querySelector<HTMLElement>(`[data-segment-row-id="${id}"]`);
+
+async function mount(
+  segments: DbSegment[],
+  extra?: Partial<ComponentProps<typeof ChatView>>,
+) {
+  const r = render(view(segments, extra));
+  await layout.settle();
+  return r;
+}
+
+function expectFullyVisible(id: string) {
+  const el = rowEl(id);
+  expect(el, `${id} is mounted`).not.toBeNull();
+  expect(el!.closest("[data-index]"), `${id} is a virtual row`).not.toBeNull();
+  const rect = el!.getBoundingClientRect();
+  expect(rect.top).toBeGreaterThanOrEqual(0);
+  expect(rect.bottom).toBeLessThanOrEqual(VIEWPORT_PX);
+}
+
+describe("ChatView virtualized transcript", () => {
+  it.each([100, 4554, 10000])(
+    "mounts a bounded number of rows for %i segments",
+    async (n) => {
+      const { container } = await mount(range(0, n));
+      const mounted = layout.mountedIndexes();
+      expect(mounted.length).toBeGreaterThan(0);
+      expect(mounted.length).toBeLessThanOrEqual(50);
+      expect(container.querySelectorAll("*").length).toBeLessThan(500);
+    },
+  );
+
+  it("opens at the latest line", async () => {
+    await mount(range(0, 200));
+    expect(maxScrollTop()).toBeGreaterThan(0);
+    expect(layout.viewport().scrollTop).toBe(maxScrollTop());
+    expectFullyVisible("seg-199");
+  });
+
+  it("rides the bottom on a pinned append, also when the new row remeasures taller", async () => {
+    const base = range(0, 100);
+    const r = await mount(base);
+    r.rerender(view([...base, seg(100)]));
+    await layout.settle();
+    expect(layout.viewport().scrollTop).toBe(maxScrollTop());
+    expectFullyVisible("seg-100");
+
+    heights.set("seg-100", 140);
+    act(() => layout.resize());
+    await layout.settle();
+    expect(layout.viewport().scrollTop).toBe(maxScrollTop());
+    expectFullyVisible("seg-100");
+  });
+
+  it("leaves a scrolled-up reader in place on append", async () => {
+    const base = range(0, 100);
+    const r = await mount(base);
+    await layout.scrollTo(1000);
+    r.rerender(view([...base, seg(100)]));
+    await layout.settle();
+    expect(layout.viewport().scrollTop).toBe(1000);
+  });
+
+  it.each([
+    ["at the top", {}],
+    [
+      "above the backfill divider",
+      { backfillActive: true, backfillBoundarySeconds: 50 * 5 },
+    ],
+  ] as const)(
+    "keeps the row being read in place when 50 rows land %s",
+    async (_label, extra) => {
+      const r = await mount(range(50, 150), extra);
+      await layout.scrollTo(2000);
+      const before = rowEl("seg-90")!.getBoundingClientRect().top;
+      r.rerender(view(range(0, 150), extra));
+      await layout.settle();
+      expect(rowEl("seg-90")!.closest("[data-index]")).not.toBeNull();
+      const after = rowEl("seg-90")!.getBoundingClientRect().top;
+      expect(Math.abs(after - before)).toBeLessThanOrEqual(0.5);
+    },
+  );
+
+  it("keeps following when a row above the viewport shrinks while pinned", async () => {
+    const base = range(0, 100);
+    const r = await mount(base);
+    const above = [...document.querySelectorAll("[data-segment-row-id]")].find(
+      (el) => el.getBoundingClientRect().bottom < 0,
+    );
+    expect(above).toBeDefined();
+    heights.set(above!.getAttribute("data-segment-row-id")!, 20);
+    act(() => layout.resize());
+    await layout.settle();
+    expect(layout.viewport().scrollTop).toBe(maxScrollTop());
+
+    r.rerender(view([...base, seg(100)]));
+    await layout.settle();
+    expect(layout.viewport().scrollTop).toBe(maxScrollTop());
+    expectFullyVisible("seg-100");
+  });
+
+  async function startPlayback(segments: DbSegment[], time: number) {
+    const r = await mount(segments, { currentPlaybackTime: 0, onTimestampClick });
+    act(() => useAppStore.setState({ isPlaying: true }));
+    r.rerender(view(segments, { currentPlaybackTime: time, onTimestampClick }));
+    await layout.settle();
+    return r;
+  }
+
+  it("scrolls a far-away active segment into view on a playback seek", async () => {
+    await startPlayback(range(0, 300), 5 * 5);
+    expectFullyVisible("seg-5");
+  });
+
+  it("centres an unmounted active segment on Jump to current", async () => {
+    await startPlayback(range(0, 300), 5 * 5);
+    // Past the follow's own scroll, so the next one reads as the user's.
+    await layout.settle(200);
+    await layout.scrollTo(maxScrollTop());
+    expect(rowEl("seg-5")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /jump to current/i }));
+    await layout.settle();
+    expectFullyVisible("seg-5");
+    const rect = rowEl("seg-5")!.getBoundingClientRect();
+    expect(
+      Math.abs((rect.top + rect.bottom) / 2 - VIEWPORT_PX / 2),
+    ).toBeLessThanOrEqual(30);
+  });
+
+  // 10,000px up from the bottom of a 500-row list: seg-495 is far outside
+  // the rendered range there.
+  async function scrollFarAway() {
+    await layout.scrollTo(maxScrollTop() - 10_000);
+    const mounted = layout.mountedIndexes();
+    expect(mounted.filter((i) => i < 400).length).toBeGreaterThan(10);
+  }
+
+  it("keeps an edited row mounted, and its edit guard, after scrolling 10,000px away", async () => {
+    await mount(range(0, 500));
+    await userEvent.click(screen.getByText("Segment 495"));
+    expect(screen.getByText("Segment 495")).toHaveAttribute("contenteditable", "true");
+
+    await scrollFarAway();
+    expect(screen.getByText("Segment 495")).toHaveAttribute("contenteditable", "true");
+    expect(useAppStore.getState().editingSegmentId).toBe("seg-495");
+  });
+
+  it("keeps the edit guard while a committed edit is still saving after scrolling away", async () => {
+    let finishSave!: () => void;
+    useAppStore.setState({
+      editSegmentText: vi.fn((segmentId: string) => {
+        useAppStore.setState({ editingSegmentId: segmentId });
+        return new Promise<void>((resolve) => {
+          finishSave = () => {
+            useAppStore.setState({ editingSegmentId: null });
+            resolve();
+          };
+        });
+      }),
+    });
+    await mount(range(0, 500));
+    const bubble = screen.getByText("Segment 495");
+    await userEvent.click(bubble);
+    bubble.textContent = "Segment 495 edited";
+    fireEvent.blur(bubble);
+    expect(useAppStore.getState().editSegmentText).toHaveBeenCalledWith(
+      "seg-495",
+      "Segment 495 edited",
+    );
+
+    await scrollFarAway();
+    expect(rowEl("seg-495")).not.toBeNull();
+    expect(useAppStore.getState().editingSegmentId).toBe("seg-495");
+
+    await act(async () => finishSave());
+    await layout.settle();
+    expect(rowEl("seg-495")).toBeNull();
+    expect(useAppStore.getState().editingSegmentId).toBeNull();
+  });
+
+  it("selects every row between the drag's top and bottom, including rows scrolled out during the drag", async () => {
+    await mount(range(0, 100));
+    const list = screen.getByRole("list").parentElement!;
+    list.setPointerCapture ??= () => {};
+    list.hasPointerCapture ??= () => false;
+    list.releasePointerCapture ??= () => {};
+
+    const startTop = layout.viewport().scrollTop;
+    const startY = rowEl("seg-95")!.getBoundingClientRect().top + 10;
+    fireEvent.pointerDown(screen.getByText("Segment 95"), {
+      button: 0,
+      clientX: 300,
+      clientY: startY,
+      pointerId: 1,
+    });
+    fireEvent.pointerMove(list, { clientX: 300, clientY: startY - 40, pointerId: 1 });
+
+    await layout.scrollTo(startTop - 3000);
+    expect(rowEl("seg-95")).toBeNull();
+    fireEvent.pointerMove(list, { clientX: 300, clientY: 200, pointerId: 1 });
+    // The row under the pointer at release (or, in a gap, the one below it).
+    const endIndex = Math.min(
+      ...[...document.querySelectorAll<HTMLElement>("[data-index]")]
+        .filter((el) => el.getBoundingClientRect().bottom > 200)
+        .map((el) => Number(el.getAttribute("data-index"))),
+    );
+    fireEvent.pointerUp(list, { clientX: 300, clientY: 200, pointerId: 1 });
+
+    const expected = range(endIndex, 96).map((s) => s.id).sort();
+    expect(expected.length).toBeGreaterThan(50);
+    expect([...useAppStore.getState().selectedSegmentIds].sort()).toEqual(expected);
+  });
+
+  it("exposes rows as a list with each row's place in the whole transcript", async () => {
+    await mount(range(0, 100));
+    const items = screen.getAllByRole("listitem");
+    const last = items[items.length - 1];
+    expect(last).toHaveAttribute("aria-setsize", "100");
+    expect(last).toHaveAttribute("aria-posinset", "100");
   });
 });
