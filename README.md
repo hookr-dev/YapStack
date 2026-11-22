@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/hookr-dev/YapStack/releases"><strong>⬇️ Download for macOS &amp; Windows</strong></a><br/>
-  <sub>Free · open source · <a href="#install">install guide</a></sub>
+  <sub>Free · open source · <a href="https://yapstack.app">yapstack.app</a> · <a href="#install">install guide</a></sub>
 </p>
 
 <p align="center">
