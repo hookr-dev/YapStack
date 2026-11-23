@@ -120,7 +120,7 @@ tempfile = { workspace = true }
 # macOS `apple-native` path. Same `windows-sys` 0.60 + feature set `keyring` already pulls
 # (keyring-3.6.3/Cargo.toml:200), so cargo deduplicates — no new distinct crate build. Optional
 # and gated into the `sync` feature; absent on non-Windows targets.
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
     # GetDiskFreeSpaceExW for the audio-fetch disk precheck (S3 auto-fetch). Feature-add on
