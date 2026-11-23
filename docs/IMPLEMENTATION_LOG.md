@@ -1655,14 +1655,65 @@ The first slice of the Windows-first cross-platform rollout (ADR 0004, `docs/pla
 | `apps/desktop/src-tauri/src/commands/{permissions,system_volume}.rs` | Scoped lint allows for macOS-only-constructed variants / off-macOS-unreachable match arms. |
 | `docs/adr/0004-*.md`, `docs/plans/{windows,linux}-support.md` | ADR + active Windows plan (incl. review items #18–#32) + deferred Linux gap list. |
 
+## Phase 40 — Release 1.0.0-alpha.13: encrypted sync, Parakeet-only, Neural Engine on Mac
+
+### What was built
+
+Everything merged between `v1.0.0-alpha.12` (2026-07-04) and the alpha.13 cut, about 385 commits. The user-facing list is the `[Unreleased]` section of `CHANGELOG.md`; this entry groups the work by workstream.
+
+- **End-to-end encrypted sync and the self-hosted blind relay** (#92, then #97, #102, #115, #117, #118, #119, #133, #134, #135). Optional multi-device sync through a relay (`deploy/` Docker stack: server + Postgres + MinIO) that stores only ciphertext; CRDT merge on device, audio as encrypted blobs, device approval, key-proof sign-in, device removal, password change and recovery-code enrolment (relay migrations 0010–0013). After the cutover, the FP fix series hardened it: unknown-table changes are held instead of stopping sync (#115), secondary indexes survive the CRR rebuild and migration v18 restores them (#117, FP2a), the relay tracks a per-account sync capability floor (#118) and the client checks the relay enforces it before sending gated batches (#119, #134, FP2b-1), and the new `CreateSyncTable` migration kind adds synced tables with a boot heal for part-finished setup (#135, FP2b-2). Release builds now include the `sync` feature; it stays off at runtime by default.
+- **Whisper removed; Parakeet TDT v3 is the only engine** (ADR 0005; #120, #131, #132, #141). The `whisper`/`metal` features, `whisper-rs`, the cmake requirement and the Whisper Tauri commands are gone; old model files are removed at startup. The ORT CoreML provider was also dropped (#142).
+- **Parakeet CPU tuning and a replay gate** (#110, #112, #137, #154). The accelerator shown in the status popover is now the one actually used (int8 on CPU on macOS, about 2x faster than the WebGPU path it replaced); the CPU thread pool sizes to physical cores (up to 8), about 20% faster on an M5 Pro. `tools/asr-bench` scores engines by WER, and #154 moved the app-style replay gate (live chunking, the real rewind hand-over) into it, with a recorded AE-G1 baseline.
+- **FluidAudio CoreML on the Neural Engine as the Mac default** (ADR 0008; #146, #147, #148, #149, #151, #152). Apple-silicon Macs download the CoreML build of Parakeet TDT v3 (about 630 MB, SHA-256 checked) and run it on the Neural Engine. Raising the floor to macOS 14 Sonoma (#147) was a precondition.
+- **Transcription accuracy fixes** (#138, #139, #144, #145). Forced cuts after ~10 s of speech land at the quietest point of the last 2 s; an empty decode of a ≥2 s audible chunk retries with up to three shorter windows; backfill jobs never leave pieces under 2 s; stop and rewind no longer drop or invent words at the boundary.
+- **Citations** (#109). Citations are parsed in the shapes models actually write; shortened IDs and timestamps resolve only when the match is certain.
+- **Speaker resolver** (#111). Speakers identified on the mic keep their own labels in chat, insights, search snippets and exports instead of being labelled as the user.
+- **Transcript performance** (#166, #169, #170). Rows are stable across updates, so a new segment redraws only itself; a row model separates data from rendering; the transcript is virtualized, so long sessions open and scroll like short ones.
+- **Recording robustness** (#165, #167). Bluetooth device flapping no longer counts as failed restarts and ends the session; the stop-time MP3 encode runs off the async runtime.
+- **CI guards** (#98, #101, #150, #162). Server integration tests and CI hardening; `scripts/check-tauri-versions.mjs` fails CI when Rust and npm Tauri plugin versions disagree; `scripts/check-lockfile-singletons.mjs` fails it when a must-be-singleton npm package has two versions (the cause of the note-editor Enter bug, #160, #163).
+- Smaller fixes: chat-bar model override applies to actions (#108), analytics carry no identifiers (#95), Windows WebGPU on by default after Gate C.
+
+### Bugs / gaps being addressed
+
+- A newer device's changes for an unknown table stopped all incoming sync; turning sync on dropped most lookup indexes; old relays would accept data older clients can't apply. See `docs/SYNC_SPEC.md` §14 rows D26–D29.
+- The status popover reported `WEBGPU` while most int8 compute ran on CPU at half the speed of plain CPU.
+- Words lost at forced cuts, backfill job boundaries, rewind points and empty decodes; stray "Yeah."/"Okay." from room noise at stop.
+- Long transcripts redrew every segment per update; device failover ended recordings; the stop encode blocked other async work.
+
+### Key decisions
+
+- **Schema evolution after cutover is explicit and gated** (ADR 0006, ADR 0007). New synced tables go through `CreateSyncTable` and a capability floor; the client never sends gated data to a relay that hasn't proven it enforces the floor. Constructions stay in `docs/CRYPTO_SPEC.md`; behaviour is in `docs/SYNC_SPEC.md`.
+- **One engine, Parakeet** (ADR 0005). Whisper, its model catalogue and its prompt-shaped IPC knobs are removed outright; `EngineKind` and the backend trait stay as the extension point for later models. Languages outside Parakeet's 25 European ones are unsupported for now.
+- **Runtime, not model, changes on Mac** (ADR 0008). FluidAudio became the default only after passing AE-G1 on an app-style replay; macOS 13 support was dropped to get it.
+- **Repo-level CI guards over reviewer vigilance** for version drift and duplicate packages.
+
+### What was learned
+
+- An empty decode is often a chunking artifact, not silence; fixing the cut points and adding a bounded retry recovered most of the lost words (see the changelog's replay numbers).
+- Accelerator labels must be measured, not inferred from the requested provider.
+- A duplicated npm package can break behaviour silently with no type or build error; only a lockfile check catches it.
+
+### Files Changed
+
+| Area | Change |
+|------|--------|
+| `crates/yapstack-{sync,server,crypto}`, `deploy/` | Sync runtime, blind relay and its migrations 0010–0013, Docker stack. |
+| `apps/desktop/src-tauri/src/{db,db_service,sync}.rs`, migrations | CRR cutover index preservation, v18 `SyncIndex`, `CreateSyncTable`, backfill bookkeeping (#133). |
+| `crates/yapstack-transcription*`, sidecar engines | Whisper removal, Parakeet CPU tuning, FluidAudio engine, VAD cut placement, empty-decode retry. |
+| `tools/asr-bench` | WER harness and app-style AE-G1 replay gate. |
+| `apps/desktop/src/components/transcript/` (`rows.ts`, `TranscriptRowView.tsx`) | Row stability, row model, virtualization; citations; speaker labels. |
+| `crates/yapstack-audio/src/manager.rs`, `src-tauri/src/commands/live_transcription.rs` | Device-failover counting; off-runtime stop encode. |
+| `scripts/check-{tauri-versions,lockfile-singletons}.mjs`, `.github/workflows/` | CI guards, server integration tests, macOS 14 floor. |
+| `docs/adr/0005`–`0008`, `docs/SYNC_SPEC.md`, `docs/plans/asr-engine-overhaul.md` | Decisions and specs for the above. |
+
 ---
 
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
-- **CI/CD pipeline** — macOS + Windows builds land in alpha.12 (rust-windows CI leg, build-windows release job); Linux builds not yet (see `docs/plans/linux-support.md`)
+- **CI/CD pipeline** — macOS + Windows CI and release builds are in place (since alpha.12); Linux builds not yet (see `docs/plans/linux-support.md`)
 - **Temp file cleanup** — WAV files from capture accumulate; needs cleanup after transcription
-- **Progress events during sidecar inference** — the sidecar emits `Progress` responses and the client handles them (skipping to wait for final result), but whisper-rs doesn't provide a progress callback during inference itself
+- **Progress events during sidecar inference** — the sidecar emits `Progress` responses and the client handles them (skipping to wait for final result), but no engine reports progress during inference itself
 - **Memory system** — Three-layer knowledge model (permanent facts, project context, daily logs) with SQLite storage, tag-based retrieval, and AI tools (`create_memory`, `update_memory`). Planned as Phase 4 of knowledge management.
 - **Daily digest & knowledge gardening** — AI-driven end-of-day summarization with full knowledge gardening (extract, update, merge, promote, archive). Manual trigger with smart nudge.
 - **Memory UI & vault sync** — Memory browser, backlinks panel, action item tracker, optional markdown vault sync for Obsidian interop.
