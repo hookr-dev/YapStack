@@ -130,7 +130,7 @@ windows-sys = { version = "0.61", features = [
 # WASAPI FFI for the dictation volume duck (IAudioEndpointVolume on the
 # default render endpoint). Same crate/version tauri and yapstack-audio
 # already pull on Windows, so Cargo deduplicates the build.
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
