@@ -1,9 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  defaultRangeExtractor,
+  useVirtualizer,
+  type Range,
+} from "@tanstack/react-virtual";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useScrollAnchor } from "@/hooks/useScrollAnchor";
 import { TranscriptRowView } from "@/components/transcript/TranscriptRowView";
-import { buildTranscriptRows } from "@/components/transcript/rows";
+import {
+  buildTranscriptRows,
+  estimateRowHeight,
+} from "@/components/transcript/rows";
+import {
+  anchorAt,
+  classifyRowVisibility,
+  pickSegmentsInBand,
+  type RowAnchor,
+} from "@/components/transcript/rowGeometry";
 import {
   MarqueeOverlay,
   type MarqueeOverlayHandle,
@@ -27,6 +47,26 @@ const DRAG_THRESHOLD_PX = 6;
 // from the viewport edge to SCROLL_MAX_VELOCITY px/frame at the edge.
 const SCROLL_HOT_ZONE = 30;
 const SCROLL_MAX_VELOCITY = 12;
+// The list's former `space-y-2 py-2`, now owned by the virtualizer.
+const ROW_GAP_PX = 8;
+const LIST_PADDING_Y_PX = 8;
+const OVERSCAN_ROWS = 8;
+// Distance from the bottom under which the viewport counts as pinned.
+const PINNED_THRESHOLD_PX = 4;
+// Width assumed for size estimates until the viewport has been measured.
+const DEFAULT_LIST_WIDTH_PX = 400;
+// Longest a playback scroll may take before scroll events count as the
+// user's again.
+const AUTO_SCROLL_MAX_MS = 1000;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 export function ChatView({
   sessionId,
@@ -36,7 +76,6 @@ export function ChatView({
   isEditable,
   currentPlaybackTime,
   onTimestampClick,
-  initialScrollToBottom,
 }: {
   /// Required for speaker-name rename persistence; falls back to "" when
   /// rendering ad-hoc segment lists outside a session.
@@ -50,13 +89,14 @@ export function ChatView({
   isEditable?: boolean;
   currentPlaybackTime?: number;
   onTimestampClick?: (time: number) => void;
-  initialScrollToBottom?: boolean;
 }) {
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const activeRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollingRef = useRef(false);
   const lastScrollTopRef = useRef(0);
+  // Whether the viewport was at the bottom at its last scroll event. A new
+  // session (and the first render) counts as at the bottom: transcripts open
+  // at their latest line.
+  const atBottomRef = useRef(true);
   const [userScrolled, setUserScrolled] = useState(false);
   const [scrollDirection, setScrollDirection] = useState<"up" | "down">("down");
 
@@ -64,6 +104,7 @@ export function ChatView({
   const setSegmentSelection = useAppStore((s) => s.setSegmentSelection);
   const clearSegmentSelection = useAppStore((s) => s.clearSegmentSelection);
   const deleteSegments = useAppStore((s) => s.deleteSegments);
+  const editingSegmentId = useAppStore((s) => s.editingSegmentId);
   // `currentPlaybackTime` persists across sessions and is `0` even
   // when no audio has played, so it isn't a reliable "audio active"
   // signal — gate playback UI on `isPlaying` instead.
@@ -112,7 +153,278 @@ export function ChatView({
     () => buildTranscriptRows(segments, !!backfillActive, backfillBoundarySeconds),
     [segments, backfillActive, backfillBoundarySeconds],
   );
+  const indexByKey = useMemo(
+    () => new Map(rows.map((row, i) => [row.key, i])),
+    [rows],
+  );
   const selectionActive = selectedSegmentIds.size > 0;
+
+  // Rows that must stay mounted wherever the viewport is: the segment being
+  // edited (its contentEditable and the D4 edit guard live in the row, and
+  // the guard outlives the blur while the save is in flight) and the row
+  // holding focus (e.g. a speaker rename input).
+  const [focusedRowKey, setFocusedRowKey] = useState<string | null>(null);
+  const pinnedIndexes = useMemo(() => {
+    const out: number[] = [];
+    for (const key of [editingSegmentId, focusedRowKey]) {
+      const i = key == null ? undefined : indexByKey.get(key);
+      if (i !== undefined && !out.includes(i)) out.push(i);
+    }
+    return out;
+  }, [editingSegmentId, focusedRowKey, indexByKey]);
+  const rangeExtractor = useCallback(
+    (range: Range) => {
+      const indexes = defaultRangeExtractor(range);
+      const extra = pinnedIndexes.filter((i) => !indexes.includes(i));
+      return extra.length === 0
+        ? indexes
+        : [...indexes, ...extra].sort((a, b) => a - b);
+    },
+    [pinnedIndexes],
+  );
+
+  const getViewport = useCallback(
+    () =>
+      (scrollAreaRef.current?.querySelector(
+        "[data-slot='scroll-area-viewport']",
+      ) as HTMLElement | null) ?? null,
+    [],
+  );
+  const listWidthRef = useRef(DEFAULT_LIST_WIDTH_PX);
+  const getItemKey = useCallback((i: number) => rows[i].key, [rows]);
+  const estimateSize = useCallback(
+    (i: number) => estimateRowHeight(rows[i], listWidthRef.current),
+    [rows],
+  );
+  // `anchorTo: "end"` makes the virtualizer anchor by key: when rows are
+  // inserted or removed, the row at the top of the viewport keeps its screen
+  // position, and a row resizing while the viewport is at the bottom keeps
+  // it there.
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: getViewport,
+    estimateSize,
+    getItemKey,
+    rangeExtractor,
+    overscan: OVERSCAN_ROWS,
+    gap: ROW_GAP_PX,
+    paddingStart: LIST_PADDING_Y_PX,
+    paddingEnd: LIST_PADDING_Y_PX,
+    anchorTo: "end",
+    scrollEndThreshold: PINNED_THRESHOLD_PX,
+  });
+  const measuredWidth = virtualizer.scrollRect?.width;
+  useLayoutEffect(() => {
+    if (measuredWidth) listWidthRef.current = measuredWidth;
+  }, [measuredWidth]);
+
+  useLayoutEffect(() => {
+    atBottomRef.current = true;
+  }, [sessionId]);
+
+  // Follow the bottom when the viewport was there before the rows changed:
+  // opening a transcript, a live append, and backfill landing above the
+  // divider (which the virtualizer reads as a mid-list insert, not an
+  // append). Instant, so a long transcript doesn't animate on open.
+  useLayoutEffect(() => {
+    if (atBottomRef.current && rows.length > 0) virtualizer.scrollToEnd();
+  }, [rows, virtualizer]);
+
+  // When playback stops, resume following so the next session sticks again.
+  useEffect(() => {
+    if (!isPlaying) {
+      setUserScrolled(false);
+    }
+  }, [isPlaying]);
+
+  // Find the active segment based on playback time. Null when not
+  // playing — `currentPlaybackTime` alone is unreliable (see above).
+  const activeSegmentId = useMemo(() => {
+    if (!isPlaying || currentPlaybackTime == null) return null;
+    return (
+      findLastSegmentStartingAtOrBefore(segments, currentPlaybackTime)?.id ??
+      null
+    );
+  }, [segments, currentPlaybackTime, isPlaying]);
+  const activeIndex =
+    activeSegmentId == null ? null : (indexByKey.get(activeSegmentId) ?? null);
+  const activeIndexRef = useRef(activeIndex);
+  useLayoutEffect(() => {
+    activeIndexRef.current = activeIndex;
+  }, [activeIndex]);
+
+  // A mounted row scrolls smoothly; an unmounted one is far away, so jump
+  // straight to it rather than animate through rows that aren't measured.
+  // Both go through the virtualizer: a native smooth scrollIntoView is cut
+  // short when rows mounting on the way are measured and the virtualizer
+  // corrects scrollTop for them.
+  //
+  // Until the row has come fully into view, scroll events are ours, not the
+  // user's: reading them as the user would flag the row as scrolled away
+  // mid-animation, and the follow that fires when it reappears would replace
+  // a centring scroll with a "nearest" one. Real user input on the scroll
+  // area ends the window early (see the effect below); the cap covers
+  // anything else that stops the scroll short.
+  const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revealRow = useCallback(
+    (index: number, block: "nearest" | "center") => {
+      const viewport = getViewport();
+      const item = virtualizer.measurementsCache[index];
+      if (
+        block === "nearest" &&
+        viewport &&
+        item &&
+        classifyRowVisibility(item, viewport.scrollTop, viewport.clientHeight) ===
+          "visible"
+      ) {
+        // Already in view: nothing scrolls, so no scroll event would end
+        // the auto-scroll window below.
+        return;
+      }
+      autoScrollingRef.current = true;
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+      }
+      autoScrollTimerRef.current = setTimeout(() => {
+        autoScrollingRef.current = false;
+      }, AUTO_SCROLL_MAX_MS);
+      const el = virtualizer.elementsCache.get(rows[index].key);
+      if (el?.isConnected) {
+        virtualizer.scrollToIndex(index, {
+          align: block === "nearest" ? "auto" : "center",
+          behavior: "smooth",
+        });
+      } else {
+        virtualizer.scrollToIndex(index, { align: "center" });
+      }
+    },
+    [virtualizer, rows, getViewport],
+  );
+
+  // Auto-scroll to the active segment during playback (unless the user is freed).
+  useEffect(() => {
+    if (!isPlaying || activeIndex == null || userScrolled) return;
+    revealRow(activeIndex, "nearest");
+    // `revealRow` changes with every rows change; following is keyed on
+    // the active row, not on the list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIndex, userScrolled, isPlaying]);
+
+  // Track whether the viewport is at the bottom (which drives following new
+  // rows) and, during playback, whether the active row is still in view
+  // (which drives following playback and the Jump to current pill).
+  const hasRows = rows.length > 0;
+  useEffect(() => {
+    const viewport = getViewport();
+    if (!viewport) return;
+
+    lastScrollTopRef.current = viewport.scrollTop;
+
+    const handleScroll = () => {
+      const newScrollTop = viewport.scrollTop;
+      const wentUp = newScrollTop < lastScrollTopRef.current - 1;
+      lastScrollTopRef.current = newScrollTop;
+      const distFromBottom =
+        viewport.scrollHeight - newScrollTop - viewport.clientHeight;
+      atBottomRef.current = distFromBottom < PINNED_THRESHOLD_PX;
+
+      const active = activeIndexRef.current;
+      if (isPlaying && active != null) {
+        const item = virtualizer.measurementsCache[active];
+        if (!item) return;
+        const where = classifyRowVisibility(
+          item,
+          newScrollTop,
+          viewport.clientHeight,
+        );
+        if (autoScrollingRef.current) {
+          if (where === "visible") autoScrollingRef.current = false;
+          return;
+        }
+        setUserScrolled(where !== "visible");
+        if (where !== "visible") {
+          setScrollDirection(where === "above" ? "up" : "down");
+        }
+        return;
+      }
+      // Playback stopped (or lost its row) before its scroll was seen.
+      autoScrollingRef.current = false;
+
+      if (wentUp) {
+        setUserScrolled(true);
+        setScrollDirection("down");
+      } else if (distFromBottom < PINNED_THRESHOLD_PX) {
+        setUserScrolled(false);
+      }
+    };
+
+    // A gesture or scroll key during a playback follow is the user taking
+    // over: stop the follow and read the scroll that follows as theirs, so
+    // a flick that ends inside the follow's window still shows Jump to
+    // current instead of being pulled back on the next line.
+    const root = scrollAreaRef.current;
+    const takeOver = () => {
+      if (!autoScrollingRef.current) return;
+      autoScrollingRef.current = false;
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+        autoScrollTimerRef.current = null;
+      }
+      virtualizer.cancelScroll();
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!SCROLL_KEYS.has(e.key)) return;
+      const target = e.target as HTMLElement;
+      if (target.closest('[contenteditable="true"], input, textarea')) return;
+      takeOver();
+    };
+
+    viewport.addEventListener("scroll", handleScroll, { passive: true });
+    // On the ScrollArea root so the Radix scrollbar (a sibling of the
+    // viewport) counts too.
+    root?.addEventListener("wheel", takeOver, { passive: true });
+    root?.addEventListener("touchstart", takeOver, { passive: true });
+    root?.addEventListener("pointerdown", takeOver);
+    root?.addEventListener("keydown", handleKeyDown);
+    return () => {
+      viewport.removeEventListener("scroll", handleScroll);
+      root?.removeEventListener("wheel", takeOver);
+      root?.removeEventListener("touchstart", takeOver);
+      root?.removeEventListener("pointerdown", takeOver);
+      root?.removeEventListener("keydown", handleKeyDown);
+    };
+    // `hasRows`: the viewport mounts with the first row.
+  }, [isPlaying, getViewport, virtualizer, hasRows]);
+
+  const handleJumpToCurrent = useCallback(() => {
+    setUserScrolled(false);
+    requestAnimationFrame(() => {
+      const index = activeIndexRef.current;
+      if (index != null) revealRow(index, "center");
+    });
+  }, [revealRow]);
+
+  const handleTimestampClick = useCallback(
+    (time: number) => {
+      setUserScrolled(false);
+      onTimestampClick?.(time);
+    },
+    [onTimestampClick]
+  );
+
+  const rowKeyOf = (target: EventTarget | null): string | null => {
+    const el = (target as Element | null)?.closest?.("[data-index]");
+    if (!el) return null;
+    return rows[Number(el.getAttribute("data-index"))]?.key ?? null;
+  };
+
+  const handleFocusCapture = (e: React.FocusEvent) => {
+    setFocusedRowKey(rowKeyOf(e.target));
+  };
+
+  const handleBlurCapture = (e: React.FocusEvent) => {
+    if (rowKeyOf(e.relatedTarget) === null) setFocusedRowKey(null);
+  };
 
   // Marquee selection state — drag-select across the transcript. Any
   // pointerdown in the container records a pending start; we commit to
@@ -121,7 +433,11 @@ export function ChatView({
   // (toggle / shift-range / cmd-toggle / enter-edit). Active editing
   // controls (contenteditable, input, textarea) are exempt from the
   // pending-pointer path so in-edit text selection still works.
-  const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
+  //
+  // The drag's start is held relative to a row, not as a content offset:
+  // rows above it are measured (and resized) as the drag auto-scrolls, which
+  // moves every row below them.
+  const marqueeStartRef = useRef<{ x: number; anchor: RowAnchor } | null>(null);
   const pendingDownRef = useRef<{
     clientX: number;
     clientY: number;
@@ -136,7 +452,7 @@ export function ChatView({
   // setState per pointermove forces ChatView and its subtree to reconcile
   // and the drag visibly stutters. Instead we keep the rect in a ref and
   // mutate the overlay div's style imperatively via marqueeOverlayRef.
-  // The ref is read on pointerup to compute the intersection.
+  // The ref is read on pointerup to pick the rows in its band.
   const marqueeRectRef = useRef<MarqueeRect | null>(null);
   const marqueeOverlayRef = useRef<MarqueeOverlayHandle | null>(null);
   // Edge auto-scroll: 30 px hot zones at top + bottom, linear velocity
@@ -148,127 +464,12 @@ export function ChatView({
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
 
-  // Backfill prepends older segments mid-stream; anchoring keeps visible
-  // content fixed on prepend and follows the bottom only when pinned.
-  const getViewport = useCallback(
-    () =>
-      (scrollAreaRef.current?.querySelector(
-        "[data-slot='scroll-area-viewport']",
-      ) as HTMLElement | null) ?? null,
-    [],
-  );
-  const { isAdjustingRef } = useScrollAnchor({
-    getViewport,
-    dep: segments.length,
-    topKey: segments[0]?.id ?? null,
-    userScrolled,
-    scrollToBottom: () => {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    },
-  });
-
-  // Resume following when userScrolled clears, even without a new segment.
-  useEffect(() => {
-    if (!userScrolled) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [userScrolled]);
-
-  useEffect(() => {
-    if (initialScrollToBottom) {
-      requestAnimationFrame(() => {
-        bottomRef.current?.scrollIntoView({ behavior: "instant" });
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // When playback stops, resume following so the next session sticks again.
-  useEffect(() => {
-    if (!isPlaying) {
-      setUserScrolled(false);
-    }
-  }, [isPlaying]);
-
-  // Auto-scroll to the active segment during playback (unless the user is freed).
-  useEffect(() => {
-    if (!isPlaying || !activeRef.current || userScrolled) return;
-    autoScrollingRef.current = true;
-    activeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    // Cleanup matters here — the effect re-runs on every timeupdate
-    // tick, so without it stale timers race with subsequent legit
-    // scrolls and flip autoScrollingRef.current mid-gesture.
-    const t = setTimeout(() => {
-      autoScrollingRef.current = false;
-    }, 150);
-    return () => clearTimeout(t);
-  }, [currentPlaybackTime, userScrolled, isPlaying]);
-
-  // Disengage stick-to-bottom on user scroll. Programmatic autoscroll only
-  // moves the viewport *down*, so any decrease in scrollTop is unambiguously
-  // the user — robust against rapid segment arrival.
-  useEffect(() => {
-    const viewport = scrollAreaRef.current?.querySelector(
-      "[data-slot='scroll-area-viewport']"
-    ) as HTMLElement | null;
-    if (!viewport) return;
-
-    lastScrollTopRef.current = viewport.scrollTop;
-
-    const handleScroll = () => {
-      const newScrollTop = viewport.scrollTop;
-      // Programmatic compensation: update the baseline without flipping
-      // userScrolled or scrollDirection.
-      if (isAdjustingRef.current) {
-        lastScrollTopRef.current = newScrollTop;
-        return;
-      }
-      const wentUp = newScrollTop < lastScrollTopRef.current - 1;
-      lastScrollTopRef.current = newScrollTop;
-
-      if (isPlaying && activeRef.current) {
-        if (autoScrollingRef.current) return;
-        const rect = activeRef.current.getBoundingClientRect();
-        const vpRect = viewport.getBoundingClientRect();
-        const visible = rect.top >= vpRect.top && rect.bottom <= vpRect.bottom;
-        setUserScrolled(!visible);
-        if (!visible) {
-          setScrollDirection(rect.top < vpRect.top ? "up" : "down");
-        }
-        return;
-      }
-
-      const distFromBottom =
-        viewport.scrollHeight - newScrollTop - viewport.clientHeight;
-      if (wentUp) {
-        setUserScrolled(true);
-        setScrollDirection("down");
-      } else if (distFromBottom < 4) {
-        setUserScrolled(false);
-      }
-    };
-
-    viewport.addEventListener("scroll", handleScroll, { passive: true });
-    return () => viewport.removeEventListener("scroll", handleScroll);
-  }, [isPlaying, isAdjustingRef]);
-
-  const handleJumpToCurrent = useCallback(() => {
-    setUserScrolled(false);
-    requestAnimationFrame(() => {
-      activeRef.current?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
-    });
-  }, []);
-
-  const handleTimestampClick = useCallback(
-    (time: number) => {
-      setUserScrolled(false);
-      onTimestampClick?.(time);
-    },
-    [onTimestampClick]
-  );
+  // Content-space y of a row anchor, from the current measurements.
+  const resolveAnchor = (anchor: RowAnchor): number | null => {
+    const i = indexByKey.get(anchor.key);
+    const item = i === undefined ? undefined : virtualizer.measurementsCache[i];
+    return item ? item.start + anchor.offset : null;
+  };
 
   // Compute auto-scroll velocity from a pointer's clientY relative to
   // the viewport. Linear ramp inside the hot zones, zero otherwise.
@@ -300,13 +501,15 @@ export function ChatView({
     const ptr = lastPointerRef.current;
     const container = containerRef.current;
     if (!start || !ptr || !container) return;
+    const startY = resolveAnchor(start.anchor);
+    if (startY === null) return;
     const rect = container.getBoundingClientRect();
-    const x = ptr.x - rect.left + container.scrollLeft;
-    const y = ptr.y - rect.top + container.scrollTop;
+    const x = ptr.x - rect.left;
+    const y = ptr.y - rect.top;
     const left = Math.min(start.x, x);
-    const top = Math.min(start.y, y);
+    const top = Math.min(startY, y);
     const width = Math.abs(x - start.x);
-    const height = Math.abs(y - start.y);
+    const height = Math.abs(y - startY);
     if (width < DRAG_THRESHOLD_PX && height < DRAG_THRESHOLD_PX) return;
     const next = { left, top, width, height };
     marqueeRectRef.current = next;
@@ -359,9 +562,15 @@ export function ChatView({
     scrollRafRef.current = requestAnimationFrame(tickAutoScroll);
   };
 
-  // Cancel any in-flight RAF when the component unmounts mid-drag.
+  // Cancel any in-flight RAF when the component unmounts mid-drag, and the
+  // playback auto-scroll cap.
   useEffect(() => {
-    return () => stopAutoScroll();
+    return () => {
+      stopAutoScroll();
+      if (autoScrollTimerRef.current !== null) {
+        clearTimeout(autoScrollTimerRef.current);
+      }
+    };
   }, []);
 
   const handleContainerPointerDown = (e: React.PointerEvent) => {
@@ -391,6 +600,17 @@ export function ChatView({
       const dx = Math.abs(e.clientX - pending.clientX);
       const dy = Math.abs(e.clientY - pending.clientY);
       if (Math.max(dx, dy) < DRAG_THRESHOLD_PX) return;
+      const container = e.currentTarget as HTMLElement;
+      const rect = container.getBoundingClientRect();
+      // Anchor the marquee at the *pending* start, not the current
+      // pointer — otherwise the first 6 px of movement wouldn't be
+      // covered by the rect.
+      const anchor = anchorAt(
+        virtualizer.measurementsCache,
+        rows,
+        pending.clientY - rect.top,
+      );
+      if (!anchor) return;
       // Promote to marquee mode. Pointer capture so pointermove keeps
       // firing past the viewport edge for auto-scroll.
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -402,20 +622,9 @@ export function ChatView({
       // selection changes underneath it.
       const active = document.activeElement as HTMLElement | null;
       if (active && active !== document.body) active.blur();
-      const container = e.currentTarget as HTMLElement;
       containerRef.current = container;
-      viewportRef.current =
-        scrollAreaRef.current?.querySelector<HTMLElement>(
-          '[data-slot="scroll-area-viewport"]',
-        ) ?? null;
-      const rect = container.getBoundingClientRect();
-      // Anchor the marquee at the *pending* start, not the current
-      // pointer — otherwise the first 6 px of movement wouldn't be
-      // covered by the rect.
-      marqueeStartRef.current = {
-        x: pending.clientX - rect.left + container.scrollLeft,
-        y: pending.clientY - rect.top + container.scrollTop,
-      };
+      viewportRef.current = getViewport();
+      marqueeStartRef.current = { x: pending.clientX - rect.left, anchor };
       pendingDownRef.current = null;
     }
     // Clear any selection the browser may have started before we
@@ -449,42 +658,25 @@ export function ChatView({
     if (!rect) {
       // Threshold was crossed (start ref was set) but the marquee never
       // rendered (movement stayed under the per-axis render threshold).
-      // Treat as a whitespace clear if we started on whitespace.
       // The originating bubble (if any) will not receive a click because
       // suppressNextClickRef was armed at promotion time.
       return;
     }
-    const container = e.currentTarget as HTMLElement;
-    const containerRect = container.getBoundingClientRect();
-    const marqueeRect = {
-      left: rect.left - container.scrollLeft + containerRect.left,
-      top: rect.top - container.scrollTop + containerRect.top,
-      right:
-        rect.left + rect.width - container.scrollLeft + containerRect.left,
-      bottom:
-        rect.top + rect.height - container.scrollTop + containerRect.top,
-    };
-    const nodes = container.querySelectorAll<HTMLElement>("[data-segment-id]");
-    const picked = new Set<string>();
-    nodes.forEach((node) => {
-      const r = node.getBoundingClientRect();
-      const intersects =
-        r.left < marqueeRect.right &&
-        r.right > marqueeRect.left &&
-        r.top < marqueeRect.bottom &&
-        r.bottom > marqueeRect.top;
-      if (intersects) {
-        const id = node.getAttribute("data-segment-id");
-        if (id) picked.add(id);
-      }
-    });
+    // Picked from measurements, not the DOM: rows the drag scrolled past
+    // have unmounted.
+    const picked = pickSegmentsInBand(
+      virtualizer.measurementsCache,
+      rows,
+      rect.top,
+      rect.top + rect.height,
+    );
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     if (additive) {
       const merged = new Set(selectedSegmentIds);
       picked.forEach((id) => merged.add(id));
       setSegmentSelection(merged);
     } else {
-      setSegmentSelection(picked);
+      setSegmentSelection(new Set(picked));
     }
     // Belt-and-suspenders: if Chromium suppressed the synthetic click
     // after the drag, the onClickCapture interceptor won't fire and the
@@ -506,16 +698,6 @@ export function ChatView({
     resetMarqueeState();
   };
 
-  // Find the active segment based on playback time. Null when not
-  // playing — `currentPlaybackTime` alone is unreliable (see above).
-  const activeSegmentId = useMemo(() => {
-    if (!isPlaying || currentPlaybackTime == null) return null;
-    return (
-      findLastSegmentStartingAtOrBefore(segments, currentPlaybackTime)?.id ??
-      null
-    );
-  }, [segments, currentPlaybackTime, isPlaying]);
-
   if (segments.length === 0 && !backfillActive) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -528,15 +710,24 @@ export function ChatView({
 
   return (
     <div className="relative min-h-0 flex-1 select-text">
-      <ScrollArea ref={scrollAreaRef} className="h-full">
+      <ScrollArea
+        ref={scrollAreaRef}
+        className="h-full"
+        // The virtualizer anchors scroll itself; browser anchoring (WebView2)
+        // would correct the same shift a second time.
+        viewportClassName="[overflow-anchor:none]"
+      >
         <SegmentListContext.Provider value={segmentList}>
           <SegmentContextMenu segments={segments} readOnly={!isEditable}>
             <div
-              className="relative min-h-full space-y-2 px-3 py-2 select-none"
+              className="relative min-h-full select-none"
+              style={{ height: virtualizer.getTotalSize() }}
               onPointerDown={handleContainerPointerDown}
               onPointerMove={handleContainerPointerMove}
               onPointerUp={handleContainerPointerUp}
               onPointerCancel={handleContainerPointerCancel}
+              onFocusCapture={handleFocusCapture}
+              onBlurCapture={handleBlurCapture}
               onClickCapture={(e) => {
                 if (suppressNextClickRef.current) {
                   suppressNextClickRef.current = false;
@@ -545,24 +736,40 @@ export function ChatView({
                 }
               }}
             >
-              {rows.map((row) => {
-                const segmentId = row.kind === "segment" ? row.segment.id : null;
-                return (
-                  <TranscriptRowView
-                    key={row.key}
-                    row={row}
-                    sessionId={sessionId ?? ""}
-                    isEditable={!!isEditable}
-                    isActive={segmentId !== null && segmentId === activeSegmentId}
-                    isSelected={segmentId !== null && selectedSegmentIds.has(segmentId)}
-                    selectionActive={selectionActive}
-                    onTimestampClick={handleTimestampClick}
-                    activeRef={activeRef}
-                  />
-                );
-              })}
+              <div role="list" aria-label="Transcript">
+                {virtualizer.getVirtualItems().map((item) => {
+                  const row = rows[item.index];
+                  const segmentId =
+                    row.kind === "segment" ? row.segment.id : null;
+                  return (
+                    <div
+                      key={item.key}
+                      data-index={item.index}
+                      ref={virtualizer.measureElement}
+                      role="listitem"
+                      aria-setsize={rows.length}
+                      aria-posinset={item.index + 1}
+                      className="absolute top-0 left-0 w-full px-3"
+                      style={{ transform: `translateY(${item.start}px)` }}
+                    >
+                      <TranscriptRowView
+                        row={row}
+                        sessionId={sessionId ?? ""}
+                        isEditable={!!isEditable}
+                        isActive={
+                          segmentId !== null && segmentId === activeSegmentId
+                        }
+                        isSelected={
+                          segmentId !== null && selectedSegmentIds.has(segmentId)
+                        }
+                        selectionActive={selectionActive}
+                        onTimestampClick={handleTimestampClick}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
               <MarqueeOverlay ref={marqueeOverlayRef} />
-              <div ref={bottomRef} />
             </div>
           </SegmentContextMenu>
         </SegmentListContext.Provider>

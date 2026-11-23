@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   tauriCoreMock,
   tauriEventMock,
@@ -11,6 +11,7 @@ import {
   tauriCommandsMock,
 } from "@/test/tauri-mocks";
 import type { DbSession, DbSegment } from "@/lib/db";
+import { installVirtualLayout, type VirtualLayout } from "@/test/virtual-layout";
 import type { SyncStatus } from "@/lib/sync";
 
 vi.mock("@tauri-apps/api/core", () => tauriCoreMock());
@@ -127,11 +128,13 @@ function openRemote(over: Partial<DbSession> = {}, segments: DbSegment[] = []) {
   });
 }
 
+// The transcript is virtualized, so its rows only render with layout.
+let layout: VirtualLayout;
 beforeEach(() => {
   vi.clearAllMocks();
-  // jsdom does not implement scrollIntoView; ChatView's stick-to-bottom uses it.
-  Element.prototype.scrollIntoView = vi.fn();
+  layout = installVirtualLayout();
 });
+afterEach(() => layout.uninstall());
 
 describe("isRemoteLiveSession selection (D3)", () => {
   const me = "ME";
