@@ -4486,7 +4486,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8409,7 +8409,7 @@ dependencies = [
  "uuid",
  "whoami",
  "windows 0.61.3",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "yapstack-audio",
  "yapstack-common",
  "yapstack-crypto",
@@ -8518,7 +8518,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "yapstack-common",
 ]
 
